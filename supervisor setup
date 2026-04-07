@@ -1,0 +1,2015 @@
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import {
+    Button,
+    Text,
+    DataGrid,
+    DataGridHeader,
+    DataGridBody,
+    DataGridRow,
+    DataGridCell,
+    DataGridHeaderCell,
+    TableCellLayout,
+    createTableColumn,
+    ProgressBar,
+    Input,
+    Divider,
+    Badge,
+    Spinner,
+    Checkbox,
+    Dialog,
+    DialogSurface,
+    DialogTitle,
+    DialogContent,
+    DialogBody,
+    DialogActions
+} from "@fluentui/react-components";
+
+// ============================================================================
+// SECTION 0: ARCHITECTURE MANIFEST, HISTORICAL LEARNINGS & RECREATION PROMPT
+// ============================================================================
+/*
+    WHAT THIS APP IS ATTEMPTING TO DO:
+    This is a "Supervisor Hub" Task Assignment Manager built as a React-based PCF 
+    (PowerApps Component Framework) control or Custom Page. It allows Supervisors 
+    to visually manage shift workers by dragging and dropping "un-utilized" employees 
+    into specific production "Areas" and "Equipment" overseen by "Leads". 
+
+    TABLE ARCHITECTURE & SOURCE OF TRUTH:
+    1. craa5_taskassignment (Primary Source of Truth): Used exclusively to load 
+       presets, reconstruct the board state, and read current shift assignments.
+    2. craa5__aa_eeutilization (Backup Log): STRICTLY WRITE-ONLY. We write to this 
+       table for historical backup and reporting purposes, but NEVER read from it.
+    3. craa5__aa_employee: Holds the roster and the `craa5_Utilized` boolean toggle.
+    4. craa5_aa_mss_area: Master list of production areas.
+    5. craa5_aa_assets: Master list of equipment/assets tied to specific areas.
+
+    CRITICAL HISTORICAL LEARNINGS (DO NOT DEVIATE FROM THESE IN FUTURE EDITS):
+    - [LEARNING 1: EXACT ODATA CASING]: Dataverse Web API strictly accepts LOGICAL NAMES for payloads, 
+      which are 100% lowercase. FIX: When writing records, ALL keys MUST be lowercase.
+    - [LEARNING 2: PCF VIEW DATA TRUNCATION]: Props passed natively from PowerApps truncate un-viewed columns.
+      FIX: We completely bypass PCF inputs and use `fetchAllActiveRecords()` to query Dataverse directly.
+    - [LEARNING 3: DATAVERSE PAGINATION BUGS]: Standard API calls cap at 50 records. 
+      FIX: All fetches use a helper that sends `<fetch top='5000'>` XML to grab the entire table securely.
+    - [LEARNING 8: DURATION TRACKING]: The app tracks exact duration an employee spends in a bucket. 
+      This maps to `craa5__duration_assigned`.
+    - [LEARNING 9: EMAIL PAYLOAD MAPPINGS & VALIDATION]: Emails must map to `craa5_email`, `craa5_leademail`, 
+      and `craa5_supervisoremail`. Missing emails trigger a visual ✖ indicator.
+    - [LEARNING 14: EQUIPMENT TREE & SUB-BUCKETS]: A new step queries equipment to render nested dropzones, 
+      routing assignment data to the `craa5_equip` and `craa5_equipment` payload fields.
+    - [LEARNING 16: GLOBAL EMPLOYEE LOOKUP]: Restricting the employee pool to only active shift members 
+      caused off-shift employees (restored from presets) to lose their associated email payload during submission. 
+      FIX: Introduced a global `allEmployees` state hash map to guarantee total profile restoration.
+    - [LEARNING 18: FLUENT UI INPUT FALLBACKS]: PowerApps environments often proxy native DOM events instead 
+      of synthetic `(e, data)` objects. If `data?.value` is called blindly, inputs lock up and checkboxes freeze.
+      FIX: All `<Input>` and `<Checkbox>` components strictly use inline fallbacks: `d?.value ?? e.target?.value ?? ""`
+    - [LEARNING 19: AUTOMATIC SHIFT IMPERSONATION]: Instead of trying to match the user's specific email 
+      to an off-shift supervisor profile, the app calculates the active shift and forces impersonation of 
+      that supervisor, instantly granting `adminMode` for managers.
+    - [LEARNING 20: UNIVERSAL ACCESS / NO READ-ONLY]: All off-shift, impersonation, and read-only UI 
+      locks (`disabled={isReadOnly}`) have been entirely stripped from the app. All users have full write access.
+    - [LEARNING 21: INFINITE RENDER LOOP ASSASSINATION]: Background timers attempting to write to `localStorage` 
+      in sandboxed iframes throw silent DOM exceptions, triggering infinite `useEffect` loops that freeze the 
+      main thread (locking inputs). PCF `updateView` also re-injects prop array references continuously.
+      FIX: `localStorage` is eradicated. Dependencies rely strictly on `.length` primitive hashes to prevent 
+      reference cascading and infinite re-renders.
+    - [LEARNING 23: DYNAMIC AREA CATEGORIZATION]: Area Selection was upgraded to a 3-column drag-and-drop board 
+      ("Supporting", "Production", "Assigned") driven by the `craa5_production` Dataverse yes/no flag.
+    - [LEARNING 24: CSS BOX-SIZING CLIPPING]: 100% height wrappers with padding will clip out the bottom of 
+      scrollable lists if `boxSizing: 'border-box'` is not strictly enforced on the parent layout container.
+    - [LEARNING 25: CONCISE HEADCOUNT EXPORT]: The clipboard formatting uses a `getAreaEmoji` helper to append 
+      scannable icons. Headcount mode eliminates the bottom attendance block, instead consolidating PTO/Sick/Late 
+      at the top of the export, and formatting areas to a highly condensed `({count}) {Area}` format.
+
+    HOW TO RECREATE THIS APP FROM SCRATCH (PROMPT):
+    "Create a React application using @fluentui/react-components designed for a Power Apps / PCF environment. 
+    The app is a 'Supervisor Hub' for task management. It requires a step-by-step wizard.
+    Data must be fetched and written using either a passed-in `dataApi` prop or a safely extracted `Xrm.WebApi`."
+*/
+// ============================================================================
+
+// ============================================================================
+// SECTION 1: TYPES & INTERFACES
+// ============================================================================
+
+interface ExtendedTaskAssignment {
+    craa5_id: string; 
+    craa5_lead: string; 
+    craa5_team: string; 
+    craa5_area: string; 
+    craa5_equip?: string;
+    craa5_equipment?: string;
+    craa5_room: string; 
+    craa5_datetimeofassignment: string; 
+    craa5_shift: string; 
+    craa5_email?: string; 
+    statecode?: number; 
+    craa5_percentagecomplete?: number;
+    craa5__currentstatus?: string;
+    craa5__future_or_notes?: string;
+    craa5__duration_assigned?: string;
+}
+
+// ============================================================================
+// SECTION 2: HELPER FUNCTIONS
+// ============================================================================
+
+function formatFullName(name?: string | null): string {
+    if (!name) return "";
+    const parts = name.split(",");
+    if (parts.length > 1) {
+        const lastName = parts[0].trim();
+        const firstNames = parts.slice(1).join(",").trim();
+        return `${firstNames} ${lastName}`;
+    }
+    return name.trim();
+}
+
+function getInitials(name?: string | null): string {
+    if (!name) return "";
+    const parts = name.split(",");
+    const last = parts[0].trim().charAt(0).toUpperCase();
+    const first = parts.length > 1 ? parts[1].trim().charAt(0).toUpperCase() : "";
+    if (first && last) return `${first}.${last}.`;
+    if (last) return `${last}.`;
+    return name.trim().charAt(0).toUpperCase() + ".";
+}
+
+function renderSafe(val: any): string {
+    if (val === null || val === undefined) return "";
+    if (typeof val === 'object') return String(val.Label || val.Value || val.name || JSON.stringify(val));
+    return String(val);
+}
+
+function getInputValue(e: any, d: any): string {
+    if (typeof d === 'string') return d;
+    if (typeof e === 'string') return e;
+    if (d && typeof d === 'object' && d.value !== undefined) return d.value;
+    if (e && e.target && e.target.value !== undefined) return e.target.value;
+    return "";
+}
+
+function getCheckboxValue(e: any, d: any): boolean {
+    if (typeof d === 'boolean') return d;
+    if (typeof e === 'boolean') return e;
+    if (d && typeof d === 'object' && d.checked !== undefined) return !!d.checked;
+    if (e && e.target && e.target.checked !== undefined) return !!e.target.checked;
+    return false;
+}
+
+function getSelectionValue(e: any, d: any): Set<any> {
+    if (d && d.selectedItems) return d.selectedItems;
+    if (e && e.target && e.target.selectedItems) return e.target.selectedItems;
+    return new Set();
+}
+
+/** * [SURGICAL CHANGE: EMOJI MAPPER] */
+function getAreaEmoji(name: string): string {
+    if (!name) return "";
+    const n = String(name).toLowerCase();
+    
+    // Explicit user requests
+    if (n.includes("breading")) return "🍞";
+    if (n.includes("waterjet") || n.includes("water jet")) return "🍰";
+    if (n.includes("pie")) return "🥧";
+    if (n.includes("highspeed") || n.includes("high speed")) return "🍎";
+    if (n.includes("custard")) return "🎃";
+    if (n.includes("ibl4") || n.includes("ibl 4")) return "4️⃣";
+    if (n.includes("ibl5") || n.includes("ibl 5")) return "5️⃣";
+    
+    // Expanded Area Recommendations based on screenshots
+    if (n.includes("admin")) return "💻";
+    if (n.includes("cip - bakery")) return "🥐";
+    if (n.includes("cip - creme")) return "🍦";
+    if (n.includes("floor scrubber") || n.includes("drains")) return "🧽";
+    if (n.includes("grounds")) return "🌳";
+    if (n.includes("janitorial")) return "🧹";
+    if (n.includes("leadership")) return "📋";
+    if (n.includes("silos")) return "🏭";
+    if (n.includes("trash")) return "🗑️";
+    if (n.includes("minor ingredients")) return "🧂";
+    if (n.includes("small steam pit")) return "💨";
+    if (n.includes("large steam pit")) return "♨️";
+    if (n.includes("traywash") || n.includes("tray wash")) return "🚿";
+    if (n.includes("breakroom") || n.includes("break room")) return "☕";
+    if (n.includes("kettle")) return "🥘";
+    if (n.includes("scm")) return "🚚";
+    if (n.includes("smock")) return "🥼";
+    if (n.includes("warehouse 1")) return "📦";
+    if (n.includes("warehouse 5")) return "🏭";
+    if (n.includes("chemical")) return "🧪";
+    if (n.includes("dough")) return "🥣";
+    if (n.includes("sifter")) return "🌪️";
+    if (n.includes("tote")) return "🛍️";
+    
+    return ""; 
+}
+
+function normalizeShift(val: any): string {
+    if (val === null || val === undefined) return "";
+    let str = typeof val === 'object' ? String(val.Label || val.Value || val.name || "") : String(val);
+    const upper = str.toUpperCase();
+    if (upper.includes("256000000") || upper === "A" || upper.includes("SHIFT A")) return "A";
+    if (upper.includes("256000001") || upper === "B" || upper.includes("SHIFT B")) return "B";
+    if (upper.includes("256000002") || upper === "C" || upper.includes("SHIFT C")) return "C";
+    if (upper.includes("256000003") || upper === "D" || upper.includes("SHIFT D")) return "D";
+    
+    if (upper.includes("A")) return "A";
+    if (upper.includes("B")) return "B";
+    if (upper.includes("C")) return "C";
+    if (upper.includes("D")) return "D";
+    return "";
+}
+
+function determineCurrentShift(): string {
+    const now = new Date();
+    const day = now.getDay(); 
+    const hour = now.getHours();
+    if (hour >= 6 && hour < 18) {
+        if (day === 0 || day === 1 || day === 2) return "A";
+        if (day === 4 || day === 5 || day === 6) return "C";
+        if (day === 3) return hour < 12 ? "A" : "C"; 
+    } else {
+        if (hour >= 18) {
+            if (day === 0 || day === 1 || day === 2 || day === 3) return "B"; 
+            if (day === 4 || day === 5 || day === 6) return "D";              
+        } else {
+            if (day === 1 || day === 2 || day === 3) return "B";              
+            if (day === 4 || day === 5 || day === 6 || day === 0) return "D"; 
+        }
+    }
+    return "A";
+}
+
+function safeGetXrm() {
+    if (typeof window === 'undefined') return null;
+    if ((window as any).Xrm) return (window as any).Xrm;
+    try { if (window.parent && window.parent !== window && (window.parent as any).Xrm) return (window.parent as any).Xrm; } catch (e) {}
+    try { if (window.top && window.top !== window && (window.top as any).Xrm) return (window.top as any).Xrm; } catch (e) {}
+    return null;
+}
+
+async function fetchAllActiveRecords(entityName: string, dataApi: any): Promise<any[]> {
+    const xrm = safeGetXrm();
+    
+    if (xrm?.WebApi) {
+        try {
+            const fetchXml = `<fetch top='5000'><entity name='${entityName}'><all-attributes/><filter><condition attribute='statecode' operator='eq' value='0'/></filter></entity></fetch>`;
+            const res = await xrm.WebApi.retrieveMultipleRecords(entityName, "?fetchXml=" + encodeURIComponent(fetchXml));
+            if (res && res.entities) return res.entities;
+        } catch (e) {
+            console.warn(`FetchXML failed for ${entityName}, falling back...`, e);
+        }
+    }
+    
+    if (dataApi?.queryTable) {
+        try {
+            const res = await dataApi.queryTable(entityName, { filter: "statecode eq 0", top: 5000 });
+            if (res && res.rows) return res.rows;
+        } catch (e) {
+            console.warn(`queryTable failed for ${entityName}`, e);
+        }
+    }
+    
+    return [];
+}
+
+function isEmployeeUtilized(e: any): boolean {
+    if (!e) return false;
+    const u = e.craa5_utilized ?? e.craa5_Utilized ?? e.Utilized ?? e.utilized ?? e["craa5_Utilized@OData.Community.Display.V1.FormattedValue"] ?? e["craa5_utilized@OData.Community.Display.V1.FormattedValue"];
+    if (u === true || u === 1) return true;
+    const str = String(typeof u === 'object' ? (u?.Label || u?.Value || "") : (u || "")).toLowerCase();
+    return str === "yes" || str === "true" || str === "1";
+}
+
+function isEverydayArea(area: any): boolean {
+    if (!area) return false;
+    const val = area.craa5_everyday ?? area.craa5_Everyday ?? area.Everyday ?? area.everyday ?? area["craa5_everyday@OData.Community.Display.V1.FormattedValue"] ?? area["craa5_Everyday@OData.Community.Display.V1.FormattedValue"];
+    if (val === true || val === 1) return true;
+    const str = String(typeof val === 'object' ? (val?.Label || val?.Value || "") : (val || "")).toLowerCase();
+    return str === "yes" || str === "true" || str === "1";
+}
+
+function isProductionArea(area: any): boolean {
+    if (!area) return false;
+    const val = area.craa5_production ?? area.craa5_Production ?? area.production ?? area["craa5_production@OData.Community.Display.V1.FormattedValue"] ?? area["craa5_Production@OData.Community.Display.V1.FormattedValue"];
+    if (val === true || val === 1) return true;
+    const str = String(typeof val === 'object' ? (val?.Label || val?.Value || "") : (val || "")).toLowerCase();
+    return str === "yes" || str === "true" || str === "1";
+}
+
+function isStatusArea(areaName?: string): boolean {
+    if (!areaName) return false;
+    const lower = String(areaName).toLowerCase().trim();
+    return ["pto", "sick", "late", "left early"].includes(lower);
+}
+
+function getEmployeeEmail(e: any): string {
+    if (!e) return "";
+    return e.craa5_email || e.craa5_Email || e.email || e.emailaddress1 || e.internalemailaddress || "";
+}
+
+function isAssetInArea(asset: any, areaName: string): boolean {
+    if (!asset || !areaName) return false;
+    const aName = (asset["_craa5_area_lookup_value@OData.Community.Display.V1.FormattedValue"] 
+                || asset["craa5_areaname@OData.Community.Display.V1.FormattedValue"] 
+                || asset.craa5_areaname 
+                || asset.craa5_Area_Lookup 
+                || "").toString().toLowerCase();
+    return aName.includes(areaName.toLowerCase()) || areaName.toLowerCase().includes(aName);
+}
+
+
+// ============================================================================
+// SECTION 3: UI WIZARD SUB-COMPONENTS
+// ============================================================================
+
+const BucketColumn = ({ lead, isSupervisor, isCollapsed, onToggle, onRemoveLead, children, onDrop, onSetStatus }: any) => {
+    const leadEmail = getEmployeeEmail(lead);
+    const isMissingEmail = lead && !leadEmail;
+
+    return (
+        <div onDragOver={(e) => e.preventDefault()} onDrop={onDrop} style={{ width: isCollapsed ? 64 : 350, flex: isCollapsed ? "0 0 64px" : "0 0 350px", background: isSupervisor ? "#F0F7FF" : "#F3F2F1", borderRadius: "12px", padding: isCollapsed ? "16px 8px" : "16px", boxSizing: "border-box", display: "flex", flexDirection: "column", border: isSupervisor ? "2px solid #0078D4" : "1px solid #E1DFDD", transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)", overflow: "hidden", boxShadow: "0 2px 8px rgba(0,0,0,0.05)" }}>
+            {isCollapsed ? (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", height: "100%" }}>
+                    <Button appearance="subtle" size="small" onClick={onToggle} style={{ minWidth: "auto", marginBottom: "12px" }}>↔️</Button>
+                    <div style={{ writingMode: "vertical-rl", transform: "rotate(180deg)", color: "#323130", fontWeight: 600, fontSize: "14px", flex: 1, textAlign: "center" }}>
+                        {formatFullName(lead?.craa5_name)} {isSupervisor ? "(Sup)" : ""}
+                        {isMissingEmail && <span style={{ color: "#D83B01", display: "inline-block", marginLeft: "4px", transform: "rotate(180deg)" }} title="Missing Email Address in Dataverse">✖</span>}
+                    </div>
+                </div>
+            ) : (
+                <>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", paddingBottom: 12, marginBottom: 12, borderBottom: "1px solid #D1D1D1", flexShrink: 0 }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+                            <Text weight="bold" size={400} truncate style={{ color: isSupervisor ? "#0078D4" : "inherit" }}>
+                                {formatFullName(lead?.craa5_name)}
+                                {isMissingEmail && <span style={{ color: "#D83B01", marginLeft: "6px", fontWeight: "bold" }} title="Missing Email Address in Dataverse">✖</span>}
+                            </Text>
+                            <Text size={200} color="neutralSecondary">{isSupervisor ? "Supervisor" : "Lead"}</Text>
+                            
+                            {isSupervisor && onSetStatus && (
+                                <div style={{ display: 'flex', gap: '4px', marginTop: '6px', flexWrap: 'wrap' }}>
+                                    {["PTO", "Sick", "Late", "Left Early"].map(s => (
+                                        <Button key={s} size="small" appearance="subtle" style={{ padding: "2px 6px", fontSize: "10px", height: "20px" }} onClick={() => onSetStatus(s)}>{s}</Button>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                        <div style={{ display: "flex", gap: "4px" }}>
+                            <Button appearance="subtle" size="small" onClick={onToggle}>Collapse</Button>
+                            {!isSupervisor && onRemoveLead && (
+                                <Button appearance="subtle" size="small" onClick={onRemoveLead} style={{ color: "#D83B01", padding: "0 4px", minWidth: "auto" }}>✖</Button>
+                            )}
+                        </div>
+                    </div>
+                    <div style={{ flex: 1, overflowY: "auto", display: "block", paddingBottom: "20px" }}>
+                        <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>{children}</div>
+                    </div>
+                </>
+            )}
+        </div>
+    );
+};
+
+function SupervisorSelectionScreen({ supervisors, selectedSupervisorId, onSelect }: any) {
+    const columns = useMemo(() => [
+        createTableColumn({ columnId: "craa5_name", renderHeaderCell: () => <Text weight="bold">Supervisor Name</Text>, renderCell: (item: any) => <TableCellLayout media={<span>👤</span>}>{renderSafe(formatFullName(item?.craa5_name))}</TableCellLayout> }),
+        createTableColumn({ columnId: "craa5_role", renderHeaderCell: () => <Text weight="bold">Role</Text>, renderCell: (item: any) => <TableCellLayout>{renderSafe(item?.["craa5_role@OData.Community.Display.V1.FormattedValue"] || item?.["craa5_Role@OData.Community.Display.V1.FormattedValue"] || "Supervisor")}</TableCellLayout> }),
+        createTableColumn({ columnId: "craa5_shift", renderHeaderCell: () => <Text weight="bold">Shift</Text>, renderCell: (item: any) => <TableCellLayout>{renderSafe(item?.["craa5_shift@OData.Community.Display.V1.FormattedValue"] || item?.craa5_shift || item?.craa5_Shift || "N/A")}</TableCellLayout> })
+    ], []);
+
+    return (
+        <div style={{ padding: "20px", height: "100%", display: "flex", flexDirection: "column", maxWidth: "800px", margin: "0 auto", width: "100%", boxSizing: "border-box" }}>
+            <div style={{ marginBottom: "24px", textAlign: "center", marginTop: "40px" }}><span style={{ fontSize: "48px", display: "block", marginBottom: "16px" }}>👋</span><Text as="h1" size={600} weight="semibold" block style={{ marginBottom: "8px" }}>Welcome to Shift Assignment</Text><Text size={400} color="neutralSecondary" block>Select a Supervisor below to view or manage their board.</Text></div>
+            <DataGrid 
+                items={supervisors} 
+                columns={columns} 
+                selectionMode="single" 
+                getRowId={(item: any) => item.craa5__aa_employeeid} 
+                selectedItems={selectedSupervisorId ? new Set([selectedSupervisorId]) : new Set()} 
+                onSelectionChange={(e, data) => { 
+                    const selectedItems = getSelectionValue(e, data);
+                    const selected = Array.from(selectedItems)[0]; 
+                    if (selected) onSelect(selected as string); 
+                }} 
+                style={{ background: "#fff", borderRadius: "8px", border: "1px solid #E1DFDD", boxShadow: "0 4px 12px rgba(0,0,0,0.05)" }}
+            >
+                <DataGridHeader><DataGridRow>{({ renderHeaderCell }) => <DataGridHeaderCell>{renderHeaderCell()}</DataGridHeaderCell>}</DataGridRow></DataGridHeader>
+                <DataGridBody>{({ item }) => <DataGridRow key={item.craa5__aa_employeeid} style={{ cursor: 'pointer' }}>{({ renderCell }) => <DataGridCell>{renderCell(item)}</DataGridCell>}</DataGridRow>}</DataGridBody>
+            </DataGrid>
+        </div>
+    );
+}
+
+function LeadSelectionScreen({ leads, selectedLeadIds, onSelectChange, onSearchCustom }: any) {
+    const [searchText, setSearchText] = useState("");
+    const columns = useMemo(() => [
+        createTableColumn({ columnId: "craa5_name", renderHeaderCell: () => <Text weight="bold">Lead Name</Text>, renderCell: (item: any) => <TableCellLayout media={<span>👤</span>}>{renderSafe(formatFullName(item?.craa5_name))}</TableCellLayout> }),
+        createTableColumn({ columnId: "craa5_shift", renderHeaderCell: () => <Text weight="bold">Shift</Text>, renderCell: (item: any) => <TableCellLayout>{renderSafe(item?.["craa5_shift@OData.Community.Display.V1.FormattedValue"] || item?.craa5_shift || item?.craa5_Shift || "Shift")}</TableCellLayout> })
+    ], []);
+
+    return (
+        <div style={{ padding: "20px", height: "100%", display: "flex", flexDirection: "column", boxSizing: "border-box" }}>
+            <Text as="h1" size={600} weight="semibold">Select Leads</Text>
+            <div style={{ display: 'flex', gap: '8px', margin: '16px 0' }}>
+                <Input 
+                    placeholder="Search custom lead..." 
+                    value={searchText} 
+                    onChange={(e: any, d: any) => setSearchText(getInputValue(e, d))} 
+                />
+                <Button onClick={() => { onSearchCustom(searchText); setSearchText(""); }}>Add</Button>
+            </div>
+            <DataGrid 
+                items={leads} 
+                columns={columns} 
+                selectionMode="multiselect" 
+                getRowId={(item: any) => item.craa5__aa_employeeid} 
+                selectedItems={selectedLeadIds} 
+                onSelectionChange={(e, data) => { 
+                    const selectedItems = getSelectionValue(e, data);
+                    onSelectChange(selectedItems); 
+                }} 
+                style={{ background: "#fff", borderRadius: "8px", border: "1px solid #E1DFDD" }}
+            >
+                <DataGridHeader><DataGridRow>{({ renderHeaderCell }) => <DataGridHeaderCell>{renderHeaderCell()}</DataGridHeaderCell>}</DataGridRow></DataGridHeader>
+                <DataGridBody>{({ item }) => <DataGridRow key={item.craa5__aa_employeeid} style={{ cursor: 'pointer' }}>{({ renderCell }) => <DataGridCell>{renderCell(item)}</DataGridCell>}</DataGridRow>}</DataGridBody>
+            </DataGrid>
+        </div>
+    );
+}
+
+function AreaSelectionScreen({ areas, selectedAreaIds, onSelectChange, onAddCustomArea, onMarkNonEverydayComplete }: any) {
+    const [searchText, setSearchText] = useState("");
+    const [customText, setCustomText] = useState("");
+    const filtered = areas.filter((a: any) => renderSafe(a.craa5_area).toLowerCase().includes(searchText.toLowerCase()));
+
+    const assignedList = filtered.filter((a: any) => selectedAreaIds.has(a.craa5_aa_mss_areaid));
+    const unassignedList = filtered.filter((a: any) => !selectedAreaIds.has(a.craa5_aa_mss_areaid));
+    
+    const productionList = unassignedList.filter((a: any) => isProductionArea(a));
+    const supportingList = unassignedList.filter((a: any) => !isProductionArea(a));
+
+    const handleDrop = (e: React.DragEvent, action: 'ASSIGN' | 'UNASSIGN') => {
+        const areaId = e.dataTransfer.getData("areaId");
+        if (!areaId) return;
+
+        const newSelected = new Set(selectedAreaIds);
+        if (action === 'ASSIGN') {
+            newSelected.add(areaId);
+        } else {
+            newSelected.delete(areaId);
+        }
+        onSelectChange(newSelected);
+    };
+
+    const renderDraggableArea = (a: any) => (
+        <div 
+            key={a.craa5_aa_mss_areaid} 
+            draggable={true} 
+            onDragStart={e => { e.dataTransfer.setData("areaId", a.craa5_aa_mss_areaid); }} 
+            style={{ padding: "12px", background: "#fff", border: "1px solid #E1DFDD", borderRadius: "8px", marginBottom: "10px", cursor: "grab", fontSize: "14px", fontWeight: 500, boxShadow: "0 1px 3px rgba(0,0,0,0.05)" }}
+        >
+            {renderSafe(a.craa5_area)}
+        </div>
+    );
+
+    return (
+        <div style={{ padding: "20px", height: "100%", display: "flex", flexDirection: "column", boxSizing: "border-box" }}>
+            <Text as="h1" size={600} weight="semibold">Select Active Areas</Text>
+            <div style={{ display: 'flex', justifyContent: 'space-between', margin: '16px 0', flexWrap: 'wrap', gap: '12px' }}>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                    <Input 
+                        placeholder="Filter areas..." 
+                        value={searchText} 
+                        onChange={(e: any, d: any) => setSearchText(getInputValue(e, d))} 
+                    />
+                    <Input 
+                        placeholder="Custom area..." 
+                        value={customText} 
+                        onChange={(e: any, d: any) => setCustomText(getInputValue(e, d))} 
+                    />
+                    <Button onClick={() => { onAddCustomArea(customText); setCustomText(""); }}>Add Custom</Button>
+                </div>
+                <Button appearance="primary" onClick={onMarkNonEverydayComplete}>Auto-Complete Non-Everyday</Button>
+            </div>
+            
+            <div style={{ display: "flex", gap: "20px", flex: 1, overflow: "hidden" }}>
+                
+                <div 
+                    onDragOver={(e) => e.preventDefault()} 
+                    onDrop={(e) => handleDrop(e, 'UNASSIGN')}
+                    style={{ flex: 1, background: "#f9f9f9", borderRadius: "8px", border: "1px dashed #605E5C", padding: "16px", display: "flex", flexDirection: "column", boxSizing: "border-box" }}
+                >
+                    <Text weight="semibold" style={{ marginBottom: "12px", color: "#323130" }}>Supporting Areas</Text>
+                    <div style={{ flex: 1, overflowY: "auto", paddingRight: "4px", paddingBottom: "24px" }}>
+                        {supportingList.map(renderDraggableArea)}
+                        {supportingList.length === 0 && <Text size={200} color="neutralSecondary" style={{ fontStyle: "italic" }}>No unassigned supporting areas found.</Text>}
+                    </div>
+                </div>
+
+                <div 
+                    onDragOver={(e) => e.preventDefault()} 
+                    onDrop={(e) => handleDrop(e, 'UNASSIGN')}
+                    style={{ flex: 1, background: "#F3F2F1", borderRadius: "8px", border: "1px dashed #323130", padding: "16px", display: "flex", flexDirection: "column", boxSizing: "border-box" }}
+                >
+                    <Text weight="semibold" style={{ marginBottom: "12px", color: "#323130" }}>Production Areas</Text>
+                    <div style={{ flex: 1, overflowY: "auto", paddingRight: "4px", paddingBottom: "24px" }}>
+                        {productionList.map(renderDraggableArea)}
+                        {productionList.length === 0 && <Text size={200} color="neutralSecondary" style={{ fontStyle: "italic" }}>No unassigned production areas found.</Text>}
+                    </div>
+                </div>
+
+                <div 
+                    onDragOver={(e) => e.preventDefault()} 
+                    onDrop={(e) => handleDrop(e, 'ASSIGN')}
+                    style={{ flex: 1, background: "#F0F7FF", borderRadius: "8px", border: "1px dashed #0078D4", padding: "16px", display: "flex", flexDirection: "column", boxSizing: "border-box" }}
+                >
+                    <Text weight="semibold" style={{ marginBottom: "12px", color: "#0078D4" }}>Assigned For Today</Text>
+                    <div style={{ flex: 1, overflowY: "auto", paddingRight: "4px", paddingBottom: "24px" }}>
+                        {assignedList.map(renderDraggableArea)}
+                        {assignedList.length === 0 && <Text size={200} color="neutralSecondary" style={{ fontStyle: "italic" }}>Drag areas here to assign to leads...</Text>}
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    );
+}
+
+function EquipmentSelectionScreen({ areas, areaAssignments, assets, selectedEquipIds, onSelectChange }: any) {
+    const activeAreaIds = Object.keys(areaAssignments);
+    
+    const handleToggle = (assetId: string, checked: boolean) => {
+        const newSet = new Set(selectedEquipIds);
+        if (checked) newSet.add(assetId);
+        else newSet.delete(assetId);
+        onSelectChange(newSet);
+    };
+
+    return (
+        <div style={{ padding: "20px", height: "100%", display: "flex", flexDirection: "column", overflowY: "auto", boxSizing: "border-box" }}>
+            <Text as="h1" size={600} weight="semibold" style={{ marginBottom: "16px" }}>Select Equipment for Assigned Areas</Text>
+            {activeAreaIds.length === 0 && <Text color="neutralSecondary">No areas have been assigned to leads yet. Please go back to Step 3.</Text>}
+            
+            <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: "24px", paddingBottom: "40px" }}>
+                {activeAreaIds.map(areaId => {
+                    const area = areas.find((a:any) => a.craa5_aa_mss_areaid === areaId);
+                    const areaName = area?.craa5_area || "";
+                    const areaAssets = assets.filter((a:any) => isAssetInArea(a, areaName));
+                    
+                    if (areaAssets.length === 0) return null;
+
+                    const allSelected = areaAssets.every((a:any) => selectedEquipIds.has(a.craa5_aa_assetsid));
+                    const handleToggleAll = () => {
+                        const newSet = new Set(selectedEquipIds);
+                        if (allSelected) {
+                            areaAssets.forEach((a:any) => newSet.delete(a.craa5_aa_assetsid));
+                        } else {
+                            areaAssets.forEach((a:any) => newSet.add(a.craa5_aa_assetsid));
+                        }
+                        onSelectChange(newSet);
+                    };
+
+                    return (
+                        <div key={areaId} style={{ background: "#fff", padding: "16px", borderRadius: "8px", border: "1px solid #E1DFDD", boxShadow: "0 2px 4px rgba(0,0,0,0.02)" }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px", borderBottom: "1px solid #E1DFDD", paddingBottom: "8px" }}>
+                                <Text weight="bold" size={400} style={{ color: "#0078D4" }}>
+                                    {renderSafe(areaName)}
+                                </Text>
+                                <Button size="small" appearance="subtle" onClick={handleToggleAll}>
+                                    {allSelected ? "Deselect All" : "Select All"}
+                                </Button>
+                            </div>
+                            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(250px, 1fr))", gap: "12px" }}>
+                                {areaAssets.map((asset:any) => (
+                                    <Checkbox
+                                        key={asset.craa5_aa_assetsid}
+                                        label={renderSafe(asset.craa5_equipmentidentifier)}
+                                        checked={selectedEquipIds.has(asset.craa5_aa_assetsid)}
+                                        onChange={(e, d) => handleToggle(asset.craa5_aa_assetsid, getCheckboxValue(e, d))}
+                                    />
+                                ))}
+                            </div>
+                        </div>
+                    );
+                })}
+            </div>
+        </div>
+    );
+}
+
+// ============================================================================
+// SECTION 4: MAIN COMPONENT SETUP & STATE DECLARATIONS
+// ============================================================================
+
+export function MainComponent({ 
+    dataApi, 
+    inputEmployees = [], 
+    inputAreas = [], 
+    inputPresets = [], 
+    ...props 
+}: any) {
+    const steps = ["Leads", "Areas", "Assign Areas", "Equipment", "Assign Employees", "Manage"];
+    const [currentStep, setCurrentStep] = useState(0);
+    const [currentShift, setCurrentShift] = useState("");
+    const [presetsApplied, setPresetsApplied] = useState(false);
+    const [hasAutoAssignedEveryday, setHasAutoAssignedEveryday] = useState(false);
+    const [collapsedBuckets, setCollapsedBuckets] = useState<Set<string>>(new Set());
+    
+    const [refreshToggle, setRefreshToggle] = useState(0);
+    const lastKnownShiftRef = useRef(""); 
+
+    // MASTER DATA COLLECTIONS
+    const [allEmployees, setAllEmployees] = useState<any[]>([]); 
+    const [supervisors, setSupervisors] = useState<any[]>([]);
+    const [leads, setLeads] = useState<any[]>([]);
+    const [employees, setEmployees] = useState<any[]>([]);
+    const [areas, setAreas] = useState<any[]>([]);
+    const [assets, setAssets] = useState<any[]>([]);
+    const [presetRecords, setPresetRecords] = useState<ExtendedTaskAssignment[]>([]);
+
+    // BOARD STATE
+    const [selectedSupervisorId, setSelectedSupervisorId] = useState<string | null>(null);
+    const [customLeads, setCustomLeads] = useState<any[]>([]);
+    const [selectedLeadIds, setSelectedLeadIds] = useState<Set<string>>(new Set());
+    const [customEmployees, setCustomEmployees] = useState<any[]>([]);
+    const [customAreas, setCustomAreas] = useState<any[]>([]);
+    const [selectedAreaIds, setSelectedAreaIds] = useState<Set<string>>(new Set());
+    const [selectedEquipIds, setSelectedEquipIds] = useState<Set<string>>(new Set());
+    
+    const [empSearchText, setEmpSearchText] = useState("");
+    const [searchSuggestions, setSearchSuggestions] = useState<any[]>([]);
+
+    // RELATIONSHIP MAPS
+    const [areaAssignments, setAreaAssignments] = useState<Record<string, string>>({}); 
+    const [assignments, setAssignments] = useState<Record<string, string[]>>({}); 
+    const [equipAssignments, setEquipAssignments] = useState<Record<string, string[]>>({});
+    
+    const [areaDetails, setAreaDetails] = useState<Record<string, { currentStatus: string, futureNotes: string, percent: string }>>({});
+    const [employeeStartTimes, setEmployeeStartTimes] = useState<Record<string, string>>({});
+    const [currentTime, setCurrentTime] = useState(Date.now());
+
+    // UX & SYSTEM STATE
+    const [appHeight, setAppHeight] = useState(window.innerHeight);
+    const [isLoading, setIsLoading] = useState(false);
+    const [isAuthenticating, setIsAuthenticating] = useState(true);
+    const [showDebugModal, setShowDebugModal] = useState(false);
+    const [msUser, setMsUser] = useState<any>(null);
+    const [realUserEmail, setRealUserEmail] = useState("");
+    
+    const [clipboardFormat, setClipboardFormat] = useState<"headcount" | "initials" | "fullname">("headcount");
+
+    // SECURITY CONTROLS
+    const [disableAutoLogin, setDisableAutoLogin] = useState(false);
+    const [adminMode, setAdminMode] = useState(true); 
+    const [saveSuccess, setSaveSuccess] = useState(false);
+    const [submissionError, setSubmissionError] = useState<string | null>(null);
+
+    const hasInitialized = useRef(false);
+
+    const activeSupervisorObj = supervisors.find(s => s.craa5__aa_employeeid === selectedSupervisorId);
+
+// ============================================================================
+// O(1) LOOKUP DICTIONARIES & MEMOIZED RENDER ARRAYS
+// ============================================================================
+    const employeeMap = useMemo(() => {
+        const map = new Map();
+        [...allEmployees, ...customEmployees, ...leads].forEach(e => {
+            if (e.craa5__aa_employeeid) map.set(e.craa5__aa_employeeid, e);
+        });
+        return map;
+    }, [allEmployees, customEmployees, leads]);
+
+    const areaMap = useMemo(() => {
+        const map = new Map();
+        [...areas, ...customAreas].forEach(a => {
+            const aId = a.craa5_aa_mss_areaid || a.craa5_area?.craa5_aa_mss_areaid;
+            if (aId) map.set(aId, a);
+        });
+        return map;
+    }, [areas, customAreas]);
+
+    const unselectedAvailableLeads = useMemo(() => {
+        return leads.filter(l => {
+            if (selectedLeadIds.has(l.craa5__aa_employeeid)) return false; 
+            return !isEmployeeUtilized(l); 
+        });
+    }, [leads, selectedLeadIds]);
+
+    const combinedEmployees = useMemo(() => {
+        return [...employees, ...customEmployees, ...unselectedAvailableLeads];
+    }, [employees, customEmployees, unselectedAvailableLeads]);
+    
+    const activeBuckets = useMemo(() => {
+        const uniqueBuckets = new Map();
+        const sup = supervisors.find(s => s.craa5__aa_employeeid === selectedSupervisorId);
+        if (sup) uniqueBuckets.set(sup.craa5__aa_employeeid, sup);
+
+        [...leads, ...customLeads].forEach(l => {
+            if (selectedLeadIds.has(l.craa5__aa_employeeid) && l.craa5__aa_employeeid !== selectedSupervisorId) {
+                uniqueBuckets.set(l.craa5__aa_employeeid, l);
+            }
+        });
+
+        return Array.from(uniqueBuckets.values());
+    }, [supervisors, leads, customLeads, selectedLeadIds, selectedSupervisorId]);
+
+
+// ============================================================================
+// SECTION 5: BACKGROUND SHIFT RESET LOGIC & TIMERS
+// ============================================================================
+
+    const triggerSoftReset = useCallback(() => {
+        setPresetsApplied(false);
+        setHasAutoAssignedEveryday(false);
+        setSelectedLeadIds(new Set());
+        setSelectedAreaIds(new Set());
+        setSelectedEquipIds(new Set());
+        setAreaAssignments({});
+        setAssignments({});
+        setEquipAssignments({});
+        setAreaDetails({});
+        setEmployeeStartTimes({});
+        setCustomLeads([]);
+        setCustomAreas([]);
+        setCustomEmployees([]);
+        setRefreshToggle(prev => prev + 1);
+        setCurrentStep(0);
+    }, []);
+
+    useEffect(() => {
+        const interval = setInterval(() => setCurrentTime(Date.now()), 60000);
+        return () => clearInterval(interval);
+    }, []);
+
+    const formatDuration = (startTimeIso?: string) => {
+        if (!startTimeIso) return "0m";
+        const startMs = new Date(startTimeIso).getTime();
+        if (isNaN(startMs)) return "0m";
+        const diffMs = currentTime - startMs;
+        if (diffMs < 0) return "0m";
+        const diffMins = Math.floor(diffMs / 60000);
+        const hrs = Math.floor(diffMins / 60);
+        const mins = diffMins % 60;
+        if (hrs > 0) return `${hrs}h ${mins}m`;
+        return `${mins}m`;
+    };
+
+    // Background Shift Reset Checker
+    useEffect(() => {
+        let isChecking = false;
+
+        const performReset = async (oldShift: string, newShift: string) => {
+            if (isChecking) return;
+            isChecking = true;
+            console.log(`[Shift Reset] Transition detected: ${oldShift} -> ${newShift}. Executing utilized reset...`);
+
+            const getWriteApi = () => {
+                if (dataApi?.createRecord && dataApi?.updateRecord) return dataApi;
+                const xrm = safeGetXrm();
+                return xrm?.WebApi || null;
+            };
+            const writeApi = getWriteApi();
+
+            if (writeApi) {
+                try {
+                    const allEmps = await fetchAllActiveRecords("craa5__aa_employee", dataApi);
+                    const utilizedEmps = allEmps.filter(isEmployeeUtilized);
+
+                    if (utilizedEmps.length > 0) {
+                        console.log(`[Shift Reset] Found ${utilizedEmps.length} utilized employees. Resetting to 'No'...`);
+                        const operations = utilizedEmps.map((emp: any) => 
+                            writeApi.updateRecord("craa5__aa_employee", emp.craa5__aa_employeeid, { craa5_utilized: false })
+                        );
+                        await Promise.all(operations);
+                        console.log("[Shift Reset] Background reset complete.");
+                    }
+                } catch (err) {
+                    console.error("[Shift Reset] Error during background reset:", err);
+                }
+            }
+            
+            triggerSoftReset();
+            isChecking = false;
+        };
+
+        const intervalId = setInterval(() => {
+            const currentActualShift = determineCurrentShift();
+            if (!lastKnownShiftRef.current) {
+                lastKnownShiftRef.current = currentActualShift;
+            }
+            
+            if (currentActualShift !== lastKnownShiftRef.current) {
+                performReset(lastKnownShiftRef.current, currentActualShift);
+                lastKnownShiftRef.current = currentActualShift;
+            }
+        }, 60000);
+
+        return () => clearInterval(intervalId);
+    }, [dataApi, triggerSoftReset]);
+
+
+// ============================================================================
+// SECTION 6: DATA FETCHING & HYDRATION
+// ============================================================================
+
+    // ONE-PASS DATA FETCH
+    useEffect(() => {
+        if (hasInitialized.current && refreshToggle === 0) return;
+        hasInitialized.current = true;
+        setCurrentShift(determineCurrentShift());
+        
+        let isMounted = true;
+        
+        const loadEverything = async () => {
+            setIsLoading(true);
+            setIsAuthenticating(true);
+
+            // 1. Fetch User Profile
+            let uName = props?.context?.userSettings?.userName || props?.userName || props?.Input_UserName;
+            let uId = props?.context?.userSettings?.userId || props?.userId || props?.Input_UserId;
+            let actualEmail = props?.context?.userSettings?.email || props?.userEmail || props?.Input_UserEmail;
+            
+            const globalXrm = safeGetXrm();
+            if ((!uName || !uId) && globalXrm?.Utility) {
+                try {
+                    const xrmContext = globalXrm.Utility.getGlobalContext();
+                    uName = uName || xrmContext.userSettings.userName;
+                    uId = uId || xrmContext.userSettings.userId;
+                } catch(e) {}
+            }
+
+            if (uName) {
+                if (!actualEmail && uId && globalXrm?.WebApi) {
+                    try {
+                        const cleanUserId = uId.replace(/[{}]/g, '');
+                        const sysUser = await globalXrm.WebApi.retrieveRecord("systemuser", cleanUserId, "?$select=internalemailaddress");
+                        if (sysUser && sysUser.internalemailaddress) actualEmail = sysUser.internalemailaddress;
+                    } catch (error) {}
+                }
+                if (isMounted) {
+                    setMsUser({ name: uName, email: actualEmail || "", id: uId || "000-000-000" });
+                    setRealUserEmail(actualEmail?.toLowerCase() || "");
+                    setIsAuthenticating(false); 
+                }
+            } else {
+                if (isMounted) {
+                    setMsUser({ name: "Local Developer", email: "dev@localhost", id: "DEV-MODE-ID" });
+                    setAdminMode(true); 
+                    setIsAuthenticating(false);
+                }
+            }
+
+            // 2. Fetch Master Tables
+            try {
+                let fullEmpList = inputEmployees?.length > 0 ? inputEmployees : [];
+                if (fullEmpList.length === 0 && (dataApi?.queryTable || safeGetXrm()?.WebApi)) {
+                    fullEmpList = await fetchAllActiveRecords("craa5__aa_employee", dataApi);
+                }
+                
+                let activeAreas = inputAreas?.length > 0 ? [...inputAreas] : [];
+                if (activeAreas.length === 0 && (dataApi?.queryTable || safeGetXrm()?.WebApi)) {
+                    activeAreas = await fetchAllActiveRecords("craa5_aa_mss_area", dataApi);
+                }
+
+                let assetData = [];
+                if (dataApi?.queryTable || safeGetXrm()?.WebApi) {
+                    assetData = await fetchAllActiveRecords("craa5_aa_assets", dataApi);
+                }
+
+                const shift = determineCurrentShift();
+                let recent = [];
+                if (dataApi?.queryTable || safeGetXrm()?.WebApi) {
+                    const allTasks = await fetchAllActiveRecords("craa5_taskassignment", dataApi);
+                    recent = allTasks.filter((r: any) => {
+                        const rShift = normalizeShift(r["craa5_shift@OData.Community.Display.V1.FormattedValue"] || r.craa5_shift || r.craa5_Shift);
+                        if (rShift !== shift) return false;
+                        const dateVal = r.craa5_datetimeofassignment || r.craa5_Datetimeofassignment || r["craa5_Datetimeofassignment@OData.Community.Display.V1.FormattedValue"];
+                        if (!dateVal) return true;
+                        const assignDate = new Date(dateVal);
+                        const now = new Date();
+                        const isToday = assignDate.toDateString() === now.toDateString();
+                        const isRecent = (now.getTime() - assignDate.getTime()) <= 50400000;
+                        return isToday || isRecent;
+                    });
+                } else if (inputPresets?.length > 0) {
+                    recent = inputPresets.filter((r: any) => {
+                        const rShift = normalizeShift(r["craa5_shift@OData.Community.Display.V1.FormattedValue"] || r.craa5_shift || r.craa5_Shift);
+                        if (rShift !== shift) return false;
+                        const dateVal = r.craa5_datetimeofassignment || r.craa5_Datetimeofassignment;
+                        if (!dateVal) return true;
+                        const assignDate = new Date(dateVal);
+                        const now = new Date();
+                        const isToday = assignDate.toDateString() === now.toDateString();
+                        const isRecent = (now.getTime() - assignDate.getTime()) <= 50400000; 
+                        return isToday || isRecent;
+                    });
+                }
+
+                if (isMounted) {
+                    const sups = fullEmpList.filter((e: any) => (e.craa5_role || e.craa5_Role) === 256000002);
+                    setAllEmployees(fullEmpList);
+                    setSupervisors(sups.sort((a: any, b: any) => (a.craa5_name || "").localeCompare(b.craa5_name || "")));
+                    setAreas(activeAreas.sort((a: any, b: any) => (a.craa5_area || "").localeCompare(b.craa5_area || "")));
+                    setAssets(assetData);
+                    setPresetRecords(recent);
+                }
+            } catch (e) { console.error("Data Load Error", e); }
+            finally { if (isMounted) setIsLoading(false); }
+        };
+
+        loadEverything();
+        return () => { isMounted = false; };
+    }, [dataApi, refreshToggle]); 
+
+    // Hydrate Shift Staff based on Supervisor selection
+    useEffect(() => {
+        let isMounted = true;
+        if (!selectedSupervisorId || supervisors.length === 0 || allEmployees.length === 0) return;
+        const sup = supervisors.find(s => s.craa5__aa_employeeid === selectedSupervisorId);
+        if (!sup) return;
+
+        const loadShiftStaff = async () => {
+            let shiftStaff = [];
+            const checkShiftMatch = (e: any) => {
+                const empShift = normalizeShift(e["craa5_shift@OData.Community.Display.V1.FormattedValue"] || e.craa5_shift || e.craa5_Shift);
+                const supShift = normalizeShift(sup["craa5_shift@OData.Community.Display.V1.FormattedValue"] || sup.craa5_shift || sup.craa5_Shift);
+                return empShift === supShift;
+            };
+
+            let currentPool = allEmployees;
+            if (currentPool.length === 0 && dataApi?.queryTable) {
+                currentPool = await fetchAllActiveRecords("craa5__aa_employee", dataApi);
+            }
+            
+            if (isMounted) {
+                setAllEmployees(currentPool); 
+                shiftStaff = currentPool.filter(checkShiftMatch);
+                setLeads(shiftStaff.filter((e: any) => (e.craa5_role || e.craa5_Role) === 256000001 && e.craa5__aa_employeeid !== selectedSupervisorId));
+                setEmployees(shiftStaff.filter((e: any) => {
+                    const role = e.craa5_role || e.craa5_Role;
+                    return role !== 256000001 && role !== 256000002 && e.craa5__aa_employeeid !== selectedSupervisorId;
+                }));
+            }
+        };
+
+        loadShiftStaff();
+        return () => { isMounted = false; };
+    }, [selectedSupervisorId, supervisors.length, allEmployees.length, refreshToggle]); 
+
+    // Auto-Impersonate Active Shift
+    useEffect(() => {
+        if (disableAutoLogin || supervisors.length === 0 || selectedSupervisorId) return;
+
+        const activeShift = currentShift || determineCurrentShift();
+        const onShiftSup = supervisors.find(s => normalizeShift(s.craa5_shift || s.craa5_Shift || s["craa5_shift@OData.Community.Display.V1.FormattedValue"]) === activeShift);
+        const targetSup = onShiftSup || supervisors[0];
+
+        if (targetSup) {
+            console.log(`[Auto-Login] Routing to active shift: ${activeShift}. Auto-loading ${targetSup.craa5_name}`);
+            setSelectedSupervisorId(targetSup.craa5__aa_employeeid);
+            setAdminMode(true); 
+        }
+    }, [supervisors.length, selectedSupervisorId, disableAutoLogin, currentShift]);
+
+    // Restore Preset Board State
+    useEffect(() => {
+        if (presetsApplied || presetRecords.length === 0 || supervisors.length === 0 || areas.length === 0 || allEmployees.length === 0 || !selectedSupervisorId) return;
+
+        const supervisor = supervisors.find(s => s.craa5__aa_employeeid === selectedSupervisorId);
+        if (!supervisor) return;
+
+        const myTeamRecords = presetRecords.filter(r => 
+            (r.craa5_team || r.craa5_Team || "").toLowerCase() === (supervisor.craa5_name || "").toLowerCase()
+        );
+
+        if (myTeamRecords.length === 0) {
+            setPresetsApplied(true);
+            return;
+        }
+
+        const newLeadIds = new Set<string>();
+        const newSelectedAreaIds = new Set(selectedAreaIds);
+        const newSelectedEquipIds = new Set<string>();
+        const newAreaAssignments: Record<string, string> = {};
+        const newAssignments: Record<string, string[]> = {};
+        const newEquipAssignments: Record<string, string[]> = {};
+        const newAreaDetails: Record<string, { currentStatus: string, futureNotes: string, percent: string }> = {};
+        const newEmployeeStartTimes: Record<string, string> = {};
+        
+        const discCustomAreas: any[] = [];
+        const discCustomLeads: any[] = [];
+        const discCustomEmps: any[] = [];
+
+        myTeamRecords.forEach(record => {
+            const leadName = record.craa5_lead?.trim() || record.craa5_Lead?.trim() || "";
+            const empName = (record.craa5_id || record.craa5_ID)?.trim() || ""; 
+            const areaName = (record.craa5_area || record.craa5_Area)?.trim() || "";
+            const equipName = (record.craa5_equip || record.craa5_equipment)?.trim() || "";
+
+            if (leadName) {
+                const isSup = (supervisor.craa5_name || "").toLowerCase() === leadName.toLowerCase();
+                let leadId = isSup ? selectedSupervisorId : "";
+                
+                if (!isSup) {
+                    let leadObj = [...leads, ...customLeads, ...discCustomLeads].find(l => l.craa5_name.trim().toLowerCase() === leadName.toLowerCase());
+                    if (!leadObj) {
+                        const actualLead = allEmployees.find(e => (e.craa5_name || "").toLowerCase() === leadName.toLowerCase());
+                        if (actualLead) {
+                            leadObj = actualLead;
+                        } else {
+                            leadObj = { craa5__aa_employeeid: `preset_lead_${Date.now()}_${Math.random()}`, craa5_name: leadName, craa5_role: 256000001 };
+                        }
+                        discCustomLeads.push(leadObj);
+                    }
+                    leadId = leadObj.craa5__aa_employeeid;
+                    newLeadIds.add(leadId);
+                }
+
+                if (areaName && leadId) {
+                    let areaObj = [...areas, ...customAreas, ...discCustomAreas].find(a => a.craa5_area.trim().toLowerCase() === areaName.toLowerCase());
+                    if (!areaObj) {
+                        areaObj = { craa5_aa_mss_areaid: `preset_area_${Date.now()}_${Math.random()}`, craa5_area: areaName };
+                        discCustomAreas.push(areaObj);
+                    }
+                    
+                    newSelectedAreaIds.add(areaObj.craa5_aa_mss_areaid);
+                    newAreaAssignments[areaObj.craa5_aa_mss_areaid] = leadId;
+
+                    if (!newAreaDetails[areaObj.craa5_aa_mss_areaid]) {
+                        newAreaDetails[areaObj.craa5_aa_mss_areaid] = {
+                            currentStatus: record.craa5__currentstatus || "",
+                            futureNotes: record.craa5__future_or_notes || "",
+                            percent: record.craa5_percentagecomplete !== undefined && record.craa5_percentagecomplete !== null ? String(record.craa5_percentagecomplete) : ""
+                        };
+                    }
+
+                    if (empName) {
+                        let empObj = [...allEmployees, ...customEmployees, ...leads, ...discCustomEmps].find(e => e.craa5_name.trim().toLowerCase() === empName.toLowerCase());
+                        
+                        const isLeadingBucket = empObj && (newLeadIds.has(empObj.craa5__aa_employeeid) || selectedSupervisorId === empObj.craa5__aa_employeeid);
+                        
+                        if (!isLeadingBucket) {
+                            if (!empObj) {
+                                empObj = { 
+                                    craa5__aa_employeeid: `preset_emp_${Date.now()}_${Math.random()}`, 
+                                    craa5_name: empName,
+                                    craa5_email: record.craa5_email || record.craa5_Email || "" 
+                                };
+                                discCustomEmps.push(empObj);
+                            }
+                            
+                            if (equipName) {
+                                let assetObj = assets.find(a => (a.craa5_equipmentidentifier || "").toLowerCase() === equipName.toLowerCase());
+                                if (assetObj) {
+                                    newSelectedEquipIds.add(assetObj.craa5_aa_assetsid);
+                                    if (!newEquipAssignments[assetObj.craa5_aa_assetsid]) newEquipAssignments[assetObj.craa5_aa_assetsid] = [];
+                                    if (!newEquipAssignments[assetObj.craa5_aa_assetsid].includes(empObj.craa5__aa_employeeid)) {
+                                        newEquipAssignments[assetObj.craa5_aa_assetsid].push(empObj.craa5__aa_employeeid);
+                                        newEmployeeStartTimes[empObj.craa5__aa_employeeid] = record.craa5_datetimeofassignment || new Date().toISOString();
+                                    }
+                                }
+                            } else {
+                                if (!newAssignments[areaObj.craa5_aa_mss_areaid]) newAssignments[areaObj.craa5_aa_mss_areaid] = [];
+                                if (!newAssignments[areaObj.craa5_aa_mss_areaid].includes(empObj.craa5__aa_employeeid)) {
+                                    newAssignments[areaObj.craa5_aa_mss_areaid].push(empObj.craa5__aa_employeeid);
+                                    newEmployeeStartTimes[empObj.craa5__aa_employeeid] = record.craa5_datetimeofassignment || new Date().toISOString();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        if (discCustomLeads.length > 0) setCustomLeads(p => [...p, ...discCustomLeads]);
+        if (discCustomAreas.length > 0) setCustomAreas(p => [...p, ...discCustomAreas]);
+        if (discCustomEmps.length > 0) setCustomEmployees(p => [...p, ...discCustomEmps]);
+        setSelectedLeadIds(newLeadIds);
+        setSelectedAreaIds(newSelectedAreaIds);
+        setSelectedEquipIds(newSelectedEquipIds);
+        setAreaAssignments(newAreaAssignments);
+        setAssignments(newAssignments);
+        setEquipAssignments(newEquipAssignments);
+        setAreaDetails(newAreaDetails);
+        setEmployeeStartTimes(newEmployeeStartTimes);
+        setPresetsApplied(true);
+        setCurrentStep(5); 
+        
+    }, [presetRecords.length, presetsApplied, supervisors.length, areas.length, leads.length, selectedSupervisorId, assets.length, allEmployees.length]);
+
+    // Everyday task auto-population
+    useEffect(() => {
+        if (areas.length > 0 && selectedSupervisorId && !hasAutoAssignedEveryday) {
+            const everydayAreas = areas.filter(isEverydayArea);
+            if (everydayAreas.length > 0) {
+                setSelectedAreaIds(prev => { const next = new Set(prev); everydayAreas.forEach(a => next.add(a.craa5_aa_mss_areaid)); return next; });
+                setAreaAssignments(prev => { const next = { ...prev }; everydayAreas.forEach(a => { if (!next[a.craa5_aa_mss_areaid]) next[a.craa5_aa_mss_areaid] = selectedSupervisorId; }); return next; });
+            }
+            setHasAutoAssignedEveryday(true);
+        }
+    }, [areas.length, selectedSupervisorId, hasAutoAssignedEveryday]);
+
+// ============================================================================
+// SECTION 7: USER INTERACTION HANDLERS
+// ============================================================================
+
+    useEffect(() => {
+        const delay = setTimeout(async () => {
+            if (empSearchText.length < 2) {
+                setSearchSuggestions([]);
+                return;
+            }
+            
+            const apiMatches = allEmployees.filter((e: any) => renderSafe(e.craa5_name).toLowerCase().includes(empSearchText.toLowerCase()));
+            const unique = Array.from(new Map(apiMatches.map(item => [item.craa5__aa_employeeid, item])).values());
+            
+            const filtered = unique.filter((e: any) => {
+                const r = e.craa5_role || e.craa5_Role;
+                const isSelectedLead = selectedLeadIds.has(e.craa5__aa_employeeid);
+                return r !== 256000002 && e.craa5__aa_employeeid !== selectedSupervisorId && !isSelectedLead;
+            });
+            
+            setSearchSuggestions(filtered);
+        }, 300); 
+        return () => clearTimeout(delay);
+    }, [empSearchText, allEmployees.length, selectedSupervisorId, selectedLeadIds]);
+
+    const handleAddSuggestedEmployee = (emp: any) => {
+        const empId = emp.craa5__aa_employeeid;
+
+        setAssignments(prev => {
+            const next = { ...prev };
+            Object.keys(next).forEach(areaId => {
+                next[areaId] = next[areaId].filter(id => id !== empId);
+            });
+            return next;
+        });
+
+        setEquipAssignments(prev => {
+            const next = { ...prev };
+            Object.keys(next).forEach(eqId => {
+                next[eqId] = next[eqId].filter(id => id !== empId);
+            });
+            return next;
+        });
+
+        setCustomEmployees(prev => {
+            if (prev.find(e => e.craa5__aa_employeeid === empId)) return prev;
+            return [...prev, emp];
+        });
+
+        setEmpSearchText("");
+        setSearchSuggestions([]);
+    };
+
+    const toggleBucket = (id: string) => {
+        setCollapsedBuckets(prev => {
+            const next = new Set(prev);
+            if (next.has(id)) next.delete(id); else next.add(id);
+            return next;
+        });
+    };
+
+    const handleRemoveLead = (leadIdToRemove: string) => {
+        const fallbackLeadId = Array.from(selectedLeadIds).find(id => id !== leadIdToRemove) || selectedSupervisorId;
+        if (!fallbackLeadId) return;
+
+        setAreaAssignments(prev => {
+            const next = { ...prev };
+            Object.keys(next).forEach(areaId => {
+                if (next[areaId] === leadIdToRemove) {
+                    next[areaId] = fallbackLeadId;
+                }
+            });
+            return next;
+        });
+
+        setSelectedLeadIds(prev => {
+            const next = new Set(prev);
+            next.delete(leadIdToRemove);
+            return next;
+        });
+    };
+
+    const handleImpersonate = (supId: string) => {
+        setDisableAutoLogin(true);
+        setSelectedSupervisorId(supId);
+        triggerSoftReset();
+        setShowDebugModal(false);
+    };
+
+    const handleClearImpersonation = () => {
+        setDisableAutoLogin(false); 
+        setSelectedSupervisorId(null);
+        triggerSoftReset();
+        setShowDebugModal(false);
+    };
+
+    const handleSearchCustomLead = async (name: string) => {
+        if (!name.trim()) return;
+        
+        const found = allEmployees.filter((e: any) => renderSafe(e.craa5_name).toLowerCase().includes(name.toLowerCase()) && e.craa5__aa_employeeid !== selectedSupervisorId);
+        
+        if (found.length > 0) {
+            setCustomLeads(p => {
+                const existingIds = new Set(p.map(l => l.craa5__aa_employeeid));
+                const newLeads = found.filter((r: any) => !existingIds.has(r.craa5__aa_employeeid));
+                return [...p, ...newLeads];
+            });
+        }
+    };
+
+    const handleSearchCustomEmployee = async (name: string) => {
+        if (!name.trim()) return;
+        const filterFn = (e: any) => {
+            const isMatch = renderSafe(e.craa5_name).toLowerCase().includes(name.toLowerCase());
+            const role = e.craa5_role || e.craa5_Role;
+            const isSelectedLead = selectedLeadIds.has(e.craa5__aa_employeeid);
+            return isMatch && role !== 256000002 && e.craa5__aa_employeeid !== selectedSupervisorId && !isSelectedLead;
+        };
+
+        const found = allEmployees.filter(filterFn);
+        
+        if (found.length > 0) {
+            const newEmps = found.filter((r: any) => !customEmployees.some(emp => emp.craa5__aa_employeeid === r.craa5__aa_employeeid));
+            
+            setAssignments(prev => {
+                const next = { ...prev };
+                newEmps.forEach(emp => {
+                    Object.keys(next).forEach(areaId => {
+                        next[areaId] = next[areaId].filter(id => id !== emp.craa5__aa_employeeid);
+                    });
+                });
+                return next;
+            });
+
+            setEquipAssignments(prev => {
+                const next = { ...prev };
+                newEmps.forEach(emp => {
+                    Object.keys(next).forEach(eqId => {
+                        next[eqId] = next[eqId].filter(id => id !== emp.craa5__aa_employeeid);
+                    });
+                });
+                return next;
+            });
+
+            setEmployeeStartTimes(prev => {
+                const next = {...prev};
+                newEmps.forEach(emp => { next[emp.craa5__aa_employeeid] = new Date().toISOString(); });
+                return next;
+            });
+
+            setCustomEmployees(p => [...p, ...newEmps]);
+            setEmpSearchText("");
+            setSearchSuggestions([]);
+        } else alert("No matching employees found for overtime.");
+    };
+
+    const handleSetEmployeeStatus = (empId: string, status: string) => {
+        let area = areaMap.get(status.toLowerCase()); 
+        if (!area) area = [...areas, ...customAreas].find(a => renderSafe(a.craa5_area).toLowerCase() === status.toLowerCase());
+        
+        if (!area) {
+            const newId = `status_${Date.now()}`;
+            area = { craa5_aa_mss_areaid: newId, craa5_area: status };
+            setCustomAreas(p => [...p, area]);
+        }
+        
+        setEmployeeStartTimes(prev => ({...prev, [empId]: new Date().toISOString()}));
+
+        setSelectedAreaIds(p => { const next = new Set(p); next.add(area.craa5_aa_mss_areaid); return next; });
+        setAreaAssignments(p => ({ ...p, [area.craa5_aa_mss_areaid]: selectedSupervisorId! }));
+        
+        setAssignments(prev => {
+            const next = { ...prev };
+            Object.keys(next).forEach(k => { next[k] = next[k].filter(id => id !== empId); });
+            next[area.craa5_aa_mss_areaid] = [...(next[area.craa5_aa_mss_areaid] || []), empId];
+            return next;
+        });
+
+        setEquipAssignments(prev => {
+            const next = { ...prev };
+            Object.keys(next).forEach(k => { next[k] = next[k].filter(id => id !== empId); });
+            return next;
+        });
+    };
+
+    const handleCopyToClipboard = () => {
+        let text = `Shift Progress Update\n`;
+        text += `Time: ${new Date().toLocaleString()}\n`;
+        
+        let totalHeadcount = 0;
+        let offShiftHeadcount = 0;
+        const leadNames = new Set<string>();
+
+        activeBuckets.forEach(lead => {
+            const lAreas = Object.keys(areaAssignments).filter(aid => areaAssignments[aid] === lead.craa5__aa_employeeid);
+            if (lAreas.length > 0) {
+                const hasRealAreas = lAreas.some(aid => !isStatusArea(areaMap.get(aid)?.craa5_area));
+                if (hasRealAreas) leadNames.add(formatFullName(lead.craa5_name));
+            }
+            lAreas.forEach(aid => {
+                const areaName = areaMap.get(aid)?.craa5_area || "";
+                if (!isStatusArea(areaName)) {
+                    const areaEmpIds = assignments[aid] || [];
+                    totalHeadcount += areaEmpIds.length;
+                    
+                    const areaEquips = assets.filter(a => selectedEquipIds.has(a.craa5_aa_assetsid) && isAssetInArea(a, areaName));
+                    areaEquips.forEach(eq => {
+                        const eqEmps = equipAssignments[eq.craa5_aa_assetsid] || [];
+                        totalHeadcount += eqEmps.length;
+                    });
+                    
+                    const tallyOffShift = (eid: string) => {
+                        const emp = employeeMap.get(eid);
+                        if (emp) {
+                            const empShift = normalizeShift(emp.craa5_shift || emp.craa5_Shift || emp["craa5_shift@OData.Community.Display.V1.FormattedValue"]);
+                            if (empShift && empShift !== currentShift) {
+                                offShiftHeadcount++;
+                            }
+                        }
+                    };
+
+                    areaEmpIds.forEach(tallyOffShift);
+                    areaEquips.forEach(eq => (equipAssignments[eq.craa5_aa_assetsid] || []).forEach(tallyOffShift));
+                }
+            });
+        });
+
+        // Tally Top-Level Attendance
+        let ptoCount = 0, sickCount = 0, lateCount = 0, leftEarlyCount = 0;
+        const activeAreaIds = Object.keys(areaAssignments);
+        const statusAreas = activeAreaIds.filter(id => isStatusArea(areaMap.get(id)?.craa5_area));
+        
+        statusAreas.forEach(aid => {
+            const areaName = (areaMap.get(aid)?.craa5_area || "").toLowerCase();
+            const emps = assignments[aid] || [];
+            if (areaName === "pto") ptoCount += emps.length;
+            else if (areaName === "sick") sickCount += emps.length;
+            else if (areaName === "late") lateCount += emps.length;
+            else if (areaName === "left early") leftEarlyCount += emps.length;
+        });
+
+        text += `Total Headcount Assigned: ${totalHeadcount}\n`;
+        if (offShiftHeadcount > 0) {
+            text += `Off-Shift Employees Assigned: ${offShiftHeadcount}\n`;
+        }
+        text += `Leads: ${Array.from(leadNames).join(', ') || "None"}\n`;
+
+        // Render attendance compactly
+        let attendanceStr = [];
+        if (ptoCount > 0) attendanceStr.push(`PTO (${ptoCount})`);
+        if (sickCount > 0) attendanceStr.push(`Sick (${sickCount})`);
+        if (lateCount > 0) attendanceStr.push(`Late (${lateCount})`);
+        if (leftEarlyCount > 0) attendanceStr.push(`Left Early (${leftEarlyCount})`);
+        if (attendanceStr.length > 0) text += `Attendance: ${attendanceStr.join(", ")}\n`;
+        text += `\n`;
+        
+        const productionAreas = activeAreaIds.filter(id => !isEverydayArea(areaMap.get(id)) && !isStatusArea(areaMap.get(id)?.craa5_area));
+        const everydayTasks = activeAreaIds.filter(id => isEverydayArea(areaMap.get(id)) && !isStatusArea(areaMap.get(id)?.craa5_area));
+        
+        const formatEmployeeString = (eid: string) => {
+            const emp = employeeMap.get(eid);
+            const duration = formatDuration(employeeStartTimes[eid]);
+            if (clipboardFormat === 'fullname') return `${formatFullName(emp?.craa5_name)} [${duration}]`;
+            return `${getInitials(emp?.craa5_name)} [${duration}]`;
+        };
+
+        const renderAreaClipboardBlock = (aid: string) => {
+            const area = areaMap.get(aid);
+            const areaName = renderSafe(area?.craa5_area || "");
+            const emojiStr = getAreaEmoji(areaName) ? ` ${getAreaEmoji(areaName)}` : "";
+            const areaEmps = assignments[aid] || [];
+            
+            const areaEquips = assets.filter(a => selectedEquipIds.has(a.craa5_aa_assetsid) && isAssetInArea(a, areaName));
+            const details = areaDetails[aid] || { currentStatus: '', futureNotes: '', percent: '' };
+
+            let block = "";
+            
+            if (clipboardFormat === "headcount") {
+                // Highly condensed format
+                let hc = areaEmps.length;
+                areaEquips.forEach(eq => hc += (equipAssignments[eq.craa5_aa_assetsid] || []).length);
+                block += `(${hc}) ${areaName}${emojiStr}\n`;
+                
+                // Nest equipment
+                areaEquips.forEach(eq => {
+                    const eqEmps = equipAssignments[eq.craa5_aa_assetsid] || [];
+                    if (eqEmps.length > 0) {
+                        block += `  - (${eqEmps.length}) ${renderSafe(eq.craa5_equipmentidentifier)}\n`;
+                    }
+                });
+
+            } else {
+                block += `📍 ${areaName}${emojiStr}\n`;
+                if (areaEmps.length > 0) {
+                    block += `   General: ${areaEmps.map(formatEmployeeString).join(", ")}\n`;
+                }
+                areaEquips.forEach(eq => {
+                    const eqEmps = equipAssignments[eq.craa5_aa_assetsid] || [];
+                    if (eqEmps.length > 0) {
+                        block += `   ⚙️ ${renderSafe(eq.craa5_equipmentidentifier)}: ${eqEmps.map(formatEmployeeString).join(", ")}\n`;
+                    }
+                });
+                if (areaEmps.length === 0 && !areaEquips.some(eq => (equipAssignments[eq.craa5_aa_assetsid] || []).length > 0)) {
+                    block += `   Personnel: None\n`;
+                }
+            }
+
+            if (details.currentStatus) block += `   Current Status: ${details.currentStatus}\n`;
+            if (details.futureNotes) block += `   Future / Notes: ${details.futureNotes}\n`;
+            if (details.percent) block += `   Completion: ${details.percent}%\n`;
+            return block;
+        };
+
+        // Omitting "Time & Attendance" from bottom of headcount format
+        if (statusAreas.length > 0 && clipboardFormat !== "headcount") {
+            text += `--- Time & Attendance ---\n`;
+            statusAreas.forEach(aid => {
+                const area = areaMap.get(aid);
+                const areaEmps = assignments[aid] || [];
+                const empsDisplay = areaEmps.length > 0 ? areaEmps.map(formatEmployeeString).join(", ") : "None";
+                text += `📍 ${renderSafe(area?.craa5_area)}: ${empsDisplay}\n`;
+            });
+            text += `\n`;
+        }
+
+        text += `--- Production Areas ---\n`;
+        if (productionAreas.length > 0) {
+            productionAreas.forEach(aid => { text += renderAreaClipboardBlock(aid); });
+        } else {
+            text += `No production areas assigned.\n`;
+        }
+
+        text += `\n--- Everyday Tasks ---\n`;
+        if (everydayTasks.length > 0) {
+            everydayTasks.forEach(aid => { text += renderAreaClipboardBlock(aid); });
+        } else {
+            text += `No everyday tasks assigned.\n`;
+        }
+
+        const el = document.createElement('textarea'); el.value = text; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el);
+        alert("Copied to clipboard!");
+    };
+
+
+// ============================================================================
+// SECTION 8: PAYLOAD DELIVERY (Dataverse Submit)
+// ============================================================================
+
+    const handleSubmission = async () => {
+        setIsLoading(true);
+        setSaveSuccess(false);
+        setSubmissionError(null);
+        
+        const timestamp = new Date().toISOString();
+        const supervisor = supervisors.find(s => s.craa5__aa_employeeid === selectedSupervisorId);
+        const supervisorEmail = getEmployeeEmail(supervisor);
+        const operations = [];
+
+        const getWriteApi = () => {
+            if (dataApi?.createRecord && dataApi?.updateRecord) return dataApi;
+            const xrm = safeGetXrm();
+            return xrm?.WebApi || null;
+        };
+
+        const writeApi = getWriteApi();
+
+        try {
+            if (!writeApi) throw new Error("Dataverse API connection is missing or not configured for writing.");
+
+            for (const areaId of Object.keys(areaAssignments)) {
+                
+                const leadId = areaAssignments[areaId];
+                const lead = employeeMap.get(leadId) || supervisor; 
+                const leadEmail = getEmployeeEmail(lead);
+                const area = areaMap.get(areaId);
+                const areaNameStr = area?.craa5_area || "";
+                const details = areaDetails[areaId] || { currentStatus: '', futureNotes: '', percent: '' };
+                const percentInt = details.percent ? parseInt(details.percent, 10) : null;
+
+                const basePayload = {
+                    craa5_area: renderSafe(areaNameStr), 
+                    craa5_lead: renderSafe(lead?.craa5_name),
+                    craa5_leademail: renderSafe(leadEmail), 
+                    craa5_team: renderSafe(supervisor?.craa5_name), 
+                    craa5_supervisoremail: renderSafe(supervisorEmail),
+                    craa5_datetimeofassignment: timestamp, 
+                    craa5_shift: currentShift,
+                    craa5__currentstatus: details.currentStatus || "",
+                    craa5__future_or_notes: details.futureNotes || "",
+                    craa5_equipment: "", 
+                    craa5_equip: "",
+                    craa5_percentagecomplete: percentInt 
+                };
+
+                const empIds = assignments[areaId] || [];
+                
+                const areaEquips = assets.filter(a => selectedEquipIds.has(a.craa5_aa_assetsid) && isAssetInArea(a, areaNameStr));
+                const hasEquipEmps = areaEquips.some(eq => (equipAssignments[eq.craa5_aa_assetsid] || []).length > 0);
+
+                if (empIds.length === 0 && !hasEquipEmps) {
+                    operations.push(writeApi.createRecord("craa5_taskassignment", { 
+                        ...basePayload,
+                        craa5_id: ""
+                    }));
+                } else {
+                    for (const eid of empIds) {
+                        const emp = employeeMap.get(eid);
+                        if (!emp) continue; 
+                        
+                        const empEmail = getEmployeeEmail(emp);
+                        
+                        operations.push(writeApi.createRecord("craa5_taskassignment", { 
+                            ...basePayload,
+                            craa5_id: renderSafe(emp?.craa5_name), 
+                            craa5_email: renderSafe(empEmail), 
+                            craa5__duration_assigned: formatDuration(employeeStartTimes[eid])
+                        }));
+                        
+                        operations.push(writeApi.createRecord("craa5__aa_eeutilization", { 
+                            craa5_nameofemployee: renderSafe(emp?.craa5_name), craa5_in: timestamp, craa5_lead: renderSafe(lead?.craa5_name), craa5_area: renderSafe(areaNameStr) 
+                        }));
+
+                        if (eid && !eid.startsWith("preset_") && !eid.startsWith("c_")) {
+                            operations.push(writeApi.updateRecord("craa5__aa_employee", eid, { craa5_utilized: true }));
+                        }
+                    }
+
+                    for (const eq of areaEquips) {
+                        const eqId = eq.craa5_aa_assetsid;
+                        const eqEmpIds = equipAssignments[eqId] || [];
+                        const equipNameStr = renderSafe(eq.craa5_equipmentidentifier);
+
+                        for (const eid of eqEmpIds) {
+                            const emp = employeeMap.get(eid);
+                            if (!emp) continue;
+                            
+                            const empEmail = getEmployeeEmail(emp);
+                            
+                            operations.push(writeApi.createRecord("craa5_taskassignment", { 
+                                ...basePayload,
+                                craa5_id: renderSafe(emp?.craa5_name), 
+                                craa5_email: renderSafe(empEmail),
+                                craa5_equipment: equipNameStr,
+                                craa5_equip: equipNameStr,
+                                craa5__duration_assigned: formatDuration(employeeStartTimes[eid])
+                            }));
+                            operations.push(writeApi.createRecord("craa5__aa_eeutilization", { 
+                                craa5_nameofemployee: renderSafe(emp?.craa5_name), craa5_in: timestamp, craa5_lead: renderSafe(lead?.craa5_name), craa5_area: `${renderSafe(areaNameStr)} - ${equipNameStr}` 
+                            }));
+                            if (eid && !eid.startsWith("preset_") && !eid.startsWith("c_")) operations.push(writeApi.updateRecord("craa5__aa_employee", eid, { craa5_utilized: true }));
+                        }
+                    }
+                }
+            }
+
+            if (operations.length === 0) throw new Error("No assignments were detected to submit.");
+            await Promise.all(operations);
+            setSaveSuccess(true); 
+            setCurrentStep(5); 
+
+        } catch (err: any) {
+            console.error("Submission Error:", err);
+            setSubmissionError(renderSafe(err?.message || err || "An unexpected error occurred while saving to Dataverse."));
+        } finally { setIsLoading(false); }
+    };
+
+
+// ============================================================================
+// SECTION 9: MAIN RENDER LOOP
+// ============================================================================
+
+    const renderEmpToken = (eid: string, removeFn: () => void) => {
+        const emp = employeeMap.get(eid);
+        const empEmail = getEmployeeEmail(emp);
+        const isMissingEmail = emp && !empEmail;
+        
+        return (
+            <div key={eid} draggable={true} onDragStart={ev => { ev.dataTransfer.setData("empId", eid); ev.stopPropagation(); }} style={{ fontSize: '12px', background: '#fff', padding: '4px 8px', borderRadius: '4px', marginTop: '4px', cursor: 'grab', border: '1px solid #D1D1D1', display: 'flex', justifyContent: 'space-between', alignItems: 'center', boxShadow: '0 1px 2px rgba(0,0,0,0.05)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', overflow: 'hidden' }}>
+                    <Text truncate>
+                        {formatFullName(emp?.craa5_name)}
+                        {/* Validation Mark */}
+                        {isMissingEmail && <span style={{ color: "#D83B01", marginLeft: "4px", fontWeight: "bold" }} title="Missing Email Address in Dataverse">✖</span>}
+                    </Text>
+                    <Badge color="informative" appearance="tint" size="small" style={{ fontSize: '10px' }}>
+                        {formatDuration(employeeStartTimes[eid])}
+                    </Badge>
+                </div>
+                <Button appearance="transparent" size="small" style={{ minWidth: "auto", padding: "0 4px", color: "#A80000", flexShrink: 0, height: '20px' }} onClick={(e) => { e.stopPropagation(); removeFn(); }}>✖</Button>
+            </div>
+        );
+    };
+
+    let stepContent;
+    if (!selectedSupervisorId) {
+        stepContent = <SupervisorSelectionScreen supervisors={supervisors} selectedSupervisorId={selectedSupervisorId} onSelect={(id: string) => handleImpersonate(id)} />; 
+    } else {
+        switch(currentStep) {
+            case 0: 
+                stepContent = <LeadSelectionScreen leads={[...leads, ...customLeads]} selectedLeadIds={selectedLeadIds} onSelectChange={setSelectedLeadIds} onSearchCustom={handleSearchCustomLead} />; 
+                break;
+            case 1: 
+                stepContent = <AreaSelectionScreen 
+                    areas={[...areas, ...customAreas]} 
+                    selectedAreaIds={selectedAreaIds} 
+                    onSelectChange={setSelectedAreaIds} 
+                    onAddCustomArea={(n:string)=>setCustomAreas(p=>[...p,{craa5_aa_mss_areaid:`c_${Date.now()}`,craa5_area:n, craa5_production: true}])} 
+                    onMarkNonEverydayComplete={()=>{}} 
+                />; 
+                break;
+            case 3:
+                stepContent = <EquipmentSelectionScreen areas={[...areas, ...customAreas]} areaAssignments={areaAssignments} assets={assets} selectedEquipIds={selectedEquipIds} onSelectChange={setSelectedEquipIds} />;
+                break;
+            case 5:
+                const activeAreaIds = Object.keys(areaAssignments);
+                const statusAreas = activeAreaIds.filter(id => isStatusArea(areaMap.get(id)?.craa5_area));
+                const productionAreas = activeAreaIds.filter(id => !isEverydayArea(areaMap.get(id)) && !isStatusArea(areaMap.get(id)?.craa5_area));
+                const everydayTasks = activeAreaIds.filter(id => isEverydayArea(areaMap.get(id)) && !isStatusArea(areaMap.get(id)?.craa5_area));
+
+                const renderAreaCard = (areaId: string) => {
+                    const leadId = areaAssignments[areaId];
+                    const lead = employeeMap.get(leadId) || supervisors.find(s => s.craa5__aa_employeeid === selectedSupervisorId);
+                    const area = areaMap.get(areaId);
+                    const areaEmps = assignments[areaId] || [];
+                    const areaName = area?.craa5_area || "";
+                    
+                    const areaEquips = assets.filter(a => selectedEquipIds.has(a.craa5_aa_assetsid) && isAssetInArea(a, areaName));
+                    let totalEmps = areaEmps.length;
+                    areaEquips.forEach(eq => totalEmps += (equipAssignments[eq.craa5_aa_assetsid] || []).length);
+
+                    const details = areaDetails[areaId] || { currentStatus: '', futureNotes: '', percent: '' };
+
+                    return (
+                        <div key={areaId} style={{ background: '#FAFAFA', padding: '20px', borderRadius: '8px', border: '1px solid #E1DFDD', boxShadow: '0 2px 4px rgba(0,0,0,0.02)' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                                <Text weight="bold" size={400}>{renderSafe(area?.craa5_area)}</Text>
+                                <Badge appearance="filled" color="brand">Headcount: {totalEmps}</Badge>
+                            </div>
+                            <Text size={200} color="neutralSecondary" block style={{ marginBottom: '16px' }}>Lead: {formatFullName(lead?.craa5_name)}</Text>
+                            
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 150px', gap: '16px' }}>
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                                    <Text size={200} weight="semibold">Current Status</Text>
+                                    <Input 
+                                        placeholder="Enter current status..." 
+                                        value={details.currentStatus || ""} 
+                                        onChange={(e: any, d: any) => setAreaDetails(p => ({...p, [areaId]: { ...p[areaId], currentStatus: getInputValue(e, d) }}))}
+                                    />
+                                </div>
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                                    <Text size={200} weight="semibold">Future / Notes</Text>
+                                    <Input 
+                                        placeholder="Enter future tasks or notes..." 
+                                        value={details.futureNotes || ""} 
+                                        onChange={(e: any, d: any) => setAreaDetails(p => ({...p, [areaId]: { ...p[areaId], futureNotes: getInputValue(e, d) }}))}
+                                    />
+                                </div>
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                                    <Text size={200} weight="semibold">% Complete</Text>
+                                    <select 
+                                        value={details.percent || ""} 
+                                        onChange={(e) => setAreaDetails(p => ({...p, [areaId]: { ...p[areaId], percent: e.target.value }}))} 
+                                        style={{ padding: '6px 10px', borderRadius: '4px', border: '1px solid #D1D1D1', height: '32px', fontFamily: 'inherit' }}
+                                    >
+                                        <option value="">Select...</option>
+                                        {Array.from({length: 21}, (_, i) => i * 5).map(val => (
+                                            <option key={val} value={val}>{val}%</option>
+                                        ))}
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+                    );
+                };
+
+                stepContent = (
+                    <div style={{ display: "flex", flexDirection: "column", height: "100%", padding: "20px", overflowY: "auto", background: "#fff", flex: 1, boxSizing: "border-box" }}>
+                        {saveSuccess && (
+                            <div style={{ background: '#DFF6DD', color: '#107C10', padding: '12px 20px', borderRadius: '8px', marginBottom: '16px', border: '1px solid #C3E6CB', flexShrink: 0 }}>
+                                <strong>✅ Success!</strong> Assignments and progress have been successfully saved to Dataverse.
+                            </div>
+                        )}
+                        {submissionError && (
+                            <div style={{ background: '#FDE7E9', color: '#A80000', padding: '12px 20px', borderRadius: '8px', marginBottom: '16px', border: '1px solid #FBCED2', flexShrink: 0 }}>
+                                <strong>❌ Submission Failed:</strong> {submissionError}
+                            </div>
+                        )}
+                        
+                        <Text as="h2" size={600} weight="semibold" style={{ marginBottom: "20px" }}>Manage Shift Progress</Text>
+                        
+                        {activeAreaIds.length === 0 ? (
+                            <Text>No areas have been assigned yet.</Text>
+                        ) : (
+                            <div style={{ display: "flex", flexDirection: "column", gap: "32px" }}>
+                                {statusAreas.length > 0 && (
+                                    <div>
+                                        <Text as="h3" size={500} weight="semibold" style={{ marginBottom: "16px", color: "#D83B01", borderBottom: "2px solid #D83B01", paddingBottom: "4px" }}>Time & Attendance</Text>
+                                        <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: "16px" }}>
+                                            {statusAreas.map(areaId => {
+                                                const area = areaMap.get(areaId);
+                                                const emps = assignments[areaId] || [];
+                                                return (
+                                                    <div key={areaId} style={{ background: '#FAFAFA', padding: '12px 20px', borderRadius: '8px', border: '1px solid #E1DFDD' }}>
+                                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                                            <Text weight="bold" size={400}>{renderSafe(area?.craa5_area)}</Text>
+                                                            <Text>{emps.map(eid => formatFullName(employeeMap.get(eid)?.craa5_name)).join(", ")}</Text>
+                                                        </div>
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    </div>
+                                )}
+
+                                {productionAreas.length > 0 && (
+                                    <div>
+                                        <Text as="h3" size={500} weight="semibold" style={{ marginBottom: "16px", color: "#0078D4", borderBottom: "2px solid #0078D4", paddingBottom: "4px" }}>Production Areas</Text>
+                                        <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: "16px" }}>
+                                            {productionAreas.map(renderAreaCard)}
+                                        </div>
+                                    </div>
+                                )}
+                                
+                                {everydayTasks.length > 0 && (
+                                    <div>
+                                        <Text as="h3" size={500} weight="semibold" style={{ marginBottom: "16px", color: "#107C10", borderBottom: "2px solid #107C10", paddingBottom: "4px" }}>Everyday Tasks</Text>
+                                        <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: "16px" }}>
+                                            {everydayTasks.map(renderAreaCard)}
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                );
+                break;
+            case 2:
+            case 4:
+                stepContent = (
+                    <div style={{ display: "flex", flexDirection: "column", height: "100%", padding: "20px", overflowX: "auto", boxSizing: "border-box" }}>
+                        <div style={{ display: "flex", gap: "24px", flex: 1, alignItems: "stretch", minHeight: 0 }}>
+                            
+                            <div style={{ width: 280, flexShrink: 0, background: "#fff", borderRadius: "12px", border: "1px solid #E1DFDD", padding: "16px", display: "flex", flexDirection: "column", height: "100%", maxHeight: "calc(100vh - 250px)", boxShadow: "0 4px 12px rgba(0,0,0,0.03)" }}>
+                                <div style={{ flexShrink: 0, display: "flex", flexDirection: "column", gap: "12px", marginBottom: "12px" }}>
+                                    <Text weight="bold">{currentStep === 2 ? "Select Areas" : "Available Staff"}</Text>
+                                    {currentStep > 2 && (
+                                        <div style={{ position: 'relative' }}>
+                                            <div style={{ display: 'flex', gap: '8px' }}>
+                                                <Input 
+                                                    size="small" 
+                                                    placeholder="Search OT staff..." 
+                                                    value={empSearchText} 
+                                                    onChange={(e: any, d: any) => setEmpSearchText(getInputValue(e, d))} 
+                                                    style={{ flex: 1 }} 
+                                                    onKeyDown={(e) => { 
+                                                        if (e.key === 'Enter') {
+                                                            if (searchSuggestions.length > 0) {
+                                                                handleAddSuggestedEmployee(searchSuggestions[0]);
+                                                            } else {
+                                                                handleSearchCustomEmployee(empSearchText);
+                                                            }
+                                                        } 
+                                                    }} 
+                                                />
+                                                <Button size="small" onClick={() => handleSearchCustomEmployee(empSearchText)}>Add</Button>
+                                            </div>
+                                            {searchSuggestions.length > 0 && (
+                                                <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: '#fff', border: '1px solid #ccc', borderRadius: '4px', zIndex: 100, maxHeight: '150px', overflowY: 'auto', boxShadow: '0 4px 8px rgba(0,0,0,0.1)', marginTop: '4px' }}>
+                                                    {searchSuggestions.map(s => {
+                                                        const sShift = normalizeShift(s.craa5_shift || s.craa5_Shift || s["craa5_shift@OData.Community.Display.V1.FormattedValue"]);
+                                                        return (
+                                                            <div key={s.craa5__aa_employeeid} onClick={() => handleAddSuggestedEmployee(s)} style={{ padding: '8px', cursor: 'pointer', borderBottom: '1px solid #f0f0f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                                                <Text>{formatFullName(s.craa5_name)}</Text>
+                                                                {sShift && <Badge size="small" appearance="outline" color="informative">Shift {sShift}</Badge>}
+                                                            </div>
+                                                        );
+                                                    })}
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+                                    <Divider />
+                                </div>
+                                <div style={{ flex: 1, overflowY: "auto", paddingRight: "4px" }}>
+                                    {currentStep === 2 ? (
+                                        <>
+                                            {[...areas, ...customAreas]
+                                                .filter(a => selectedAreaIds.has(a.craa5_aa_mss_areaid) && !areaAssignments[a.craa5_aa_mss_areaid])
+                                                .map(a => (
+                                                    <div key={a.craa5_aa_mss_areaid} draggable={true} onDragStart={e => { e.dataTransfer.setData("areaId", a.craa5_aa_mss_areaid); }} style={{ padding: "12px", background: "#f9f9f9", border: "1px solid #ddd", borderRadius: "8px", marginBottom: "10px", cursor: "grab", fontSize: "14px", fontWeight: 500 }}>{a.craa5_area}</div>
+                                                ))}
+                                        </>
+                                    ) : (
+                                        combinedEmployees
+                                            .filter(e => {
+                                                const inGeneral = Object.values(assignments).flat().includes(e.craa5__aa_employeeid);
+                                                const inEquip = Object.values(equipAssignments).flat().includes(e.craa5__aa_employeeid);
+                                                if (inGeneral || inEquip) return false;
+                                                const isCustomAdded = customEmployees.some(ce => ce.craa5__aa_employeeid === e.craa5__aa_employeeid);
+                                                if (isCustomAdded) return true;
+                                                if (isEmployeeUtilized(e)) return false; 
+                                                return true;
+                                            })
+                                            .map(e => (
+                                                <div key={e.craa5__aa_employeeid} draggable={true} onDragStart={ev => { ev.dataTransfer.setData("empId", e.craa5__aa_employeeid); ev.stopPropagation(); }} style={{ padding: "12px", background: "#fff", border: "1px solid #eee", borderRadius: "8px", marginBottom: "10px", cursor: "grab", boxShadow: "0 1px 3px rgba(0,0,0,0.05)" }}>
+                                                    <Text size={200} weight="semibold" block>{formatFullName(e.craa5_name)}</Text>
+                                                    {e.craa5_email && <Badge size="small" appearance="outline" color="brand">AAD Linked</Badge>}
+                                                    <div style={{ display: 'flex', gap: '4px', marginTop: '6px' }}>
+                                                        {["PTO", "Sick", "Late", "Left Early"].map(s => <Button key={s} size="small" appearance="subtle" style={{ padding: "2px 6px", fontSize: "10px", height: "20px" }} onClick={() => handleSetEmployeeStatus(e.craa5__aa_employeeid, s)}>{s}</Button>)}
+                                                    </div>
+                                                </div>
+                                            ))
+                                    )}
+                                </div>
+                            </div>
+
+                            <div style={{ display: "flex", gap: "20px", flex: 1, height: "100%", alignItems: "stretch" }}>
+                                {activeBuckets.map(lead => (
+                                    <BucketColumn 
+                                        key={lead.craa5__aa_employeeid} 
+                                        lead={lead} 
+                                        isSupervisor={(lead.craa5_role || lead.craa5_Role) === 256000002} 
+                                        isCollapsed={collapsedBuckets.has(lead.craa5__aa_employeeid)} 
+                                        onToggle={() => toggleBucket(lead.craa5__aa_employeeid)} 
+                                        onRemoveLead={() => handleRemoveLead(lead.craa5__aa_employeeid)}
+                                        onDrop={e => { const aid = e.dataTransfer.getData("areaId"); if (aid) setAreaAssignments(p => ({ ...p, [aid]: lead.craa5__aa_employeeid })); }}
+                                        onSetStatus={(status: string) => handleSetEmployeeStatus(lead.craa5__aa_employeeid, status)}
+                                    >
+                                        {Object.keys(areaAssignments)
+                                            .filter(aid => areaAssignments[aid] === lead.craa5__aa_employeeid)
+                                            .map(aid => {
+                                                const area = [...areas, ...customAreas].find(a => a.craa5_aa_mss_areaid === aid);
+                                                const areaNameStr = area?.craa5_area || "";
+                                                const areaEmps = assignments[aid] || [];
+                                                const areaEquips = assets.filter(a => selectedEquipIds.has(a.craa5_aa_assetsid) && isAssetInArea(a, areaNameStr));
+
+                                                return (
+                                                    <div 
+                                                        key={aid} 
+                                                        draggable={true}
+                                                        onDragStart={ev => {
+                                                            ev.dataTransfer.setData("areaId", aid);
+                                                        }}
+                                                        style={{ padding: "8px", background: "#fff", borderRadius: "8px", border: "1px solid #D1D1D1", position: 'relative', boxShadow: "0 2px 4px rgba(0,0,0,0.04)", cursor: 'grab' }}
+                                                    >
+                                                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+                                                            <Text weight="bold" size={200}>{renderSafe(areaNameStr)}</Text>
+                                                            <Button appearance="subtle" size="small" onClick={() => { setAreaAssignments(p => { const n = { ...p }; delete n[aid]; return n; }); }}>❌</Button>
+                                                        </div>
+                                                        
+                                                        {/* General Area Dropzone */}
+                                                        <div 
+                                                            onDragOver={e => e.preventDefault()} 
+                                                            onDrop={e => { 
+                                                                const eid = e.dataTransfer.getData("empId"); 
+                                                                if (eid) {
+                                                                    e.stopPropagation(); 
+                                                                    setEquipAssignments(p => { const next = { ...p }; Object.keys(next).forEach(k => next[k] = next[k].filter(id => id !== eid)); return next; });
+                                                                    setAssignments(p => {
+                                                                        const next = { ...p };
+                                                                        Object.keys(next).forEach(k => next[k] = next[k].filter(id => id !== eid));
+                                                                        if (!next[aid]) next[aid] = [];
+                                                                        if (!next[aid].includes(eid)) {
+                                                                            next[aid].push(eid);
+                                                                            setEmployeeStartTimes(prev => ({...prev, [eid]: new Date().toISOString()}));
+                                                                        }
+                                                                        return next;
+                                                                    });
+                                                                }
+                                                            }}
+                                                            style={{ minHeight: '40px', background: '#F9F9F9', border: '1px dashed #CCC', borderRadius: '4px', padding: '4px', marginBottom: areaEquips.length > 0 ? '12px' : '0' }}
+                                                        >
+                                                            {areaEquips.length > 0 && <Text size={100} color="neutralSecondary" block style={{ marginBottom: '4px' }}>General Area Tasks</Text>}
+                                                            {areaEmps.map(eid => renderEmpToken(eid, () => setAssignments(p => ({ ...p, [aid]: (p[aid] || []).filter(id => id !== eid) }))))}
+                                                        </div>
+
+                                                        {/* Equipment Specific Dropzones */}
+                                                        {areaEquips.map(eq => {
+                                                            const eqId = eq.craa5_aa_assetsid;
+                                                            const eqEmpIds = equipAssignments[eqId] || [];
+                                                            return (
+                                                                <div 
+                                                                    key={eqId}
+                                                                    onDragOver={e => e.preventDefault()} 
+                                                                    onDrop={e => { 
+                                                                        const eid = e.dataTransfer.getData("empId"); 
+                                                                        if (eid) {
+                                                                            e.stopPropagation(); 
+                                                                            setAssignments(p => { const next = { ...p }; Object.keys(next).forEach(k => next[k] = next[k].filter(id => id !== eid)); return next; });
+                                                                            setEquipAssignments(p => {
+                                                                                const next = { ...p };
+                                                                                Object.keys(next).forEach(k => next[k] = next[k].filter(id => id !== eid));
+                                                                                if (!next[eqId]) next[eqId] = [];
+                                                                                if (!next[eqId].includes(eid)) {
+                                                                                    next[eqId].push(eid);
+                                                                                    setEmployeeStartTimes(prev => ({...prev, [eid]: new Date().toISOString()}));
+                                                                                }
+                                                                                return next;
+                                                                            });
+                                                                        }
+                                                                    }}
+                                                                    style={{ marginTop: '8px', minHeight: '40px', background: '#F0F7FF', border: '1px solid #0078D4', borderRadius: '4px', padding: '4px' }}
+                                                                >
+                                                                    <Text size={100} weight="semibold" block style={{ marginBottom: '4px', color: '#0078D4' }}>⚙️ {renderSafe(eq.craa5_equipmentidentifier)}</Text>
+                                                                    {eqEmpIds.map(eid => renderEmpToken(eid, () => setEquipAssignments(p => ({ ...p, [eqId]: (p[eqId] || []).filter(id => id !== eid) }))))}
+                                                                </div>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                );
+                                            })}
+                                    </BucketColumn>
+                                ))}
+                            </div>
+
+                        </div>
+                    </div>
+                );
+                break;
+        }
+    }
+
+    if (isAuthenticating) return <div style={{ width: "100%", height: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "#F3F2F1" }}><Spinner size="large" label="Authenticating with Microsoft Teams SSO..." /><Text color="neutralSecondary" style={{ marginTop: "12px" }}>Securely fetching your Dataverse credentials...</Text></div>;
+
+    return (
+        <div style={{ width: "100%", height: `${appHeight}px`, display: "flex", flexDirection: "column", background: "#FAFAFA", overflow: "hidden" }}>
+            <header style={{ flexShrink: 0, background: "#fff", padding: "0" }}>
+                
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 20px", borderBottom: "1px solid #E1DFDD" }}>
+                    
+                    <div style={{ display: 'flex', gap: '4px', alignItems: 'center', background: '#F3F2F1', padding: '4px', borderRadius: '8px' }}>
+                        {selectedSupervisorId && steps.map((label, idx) => (
+                            <Button 
+                                key={label} 
+                                appearance={currentStep === idx ? "primary" : "subtle"} 
+                                size="small"
+                                onClick={() => setCurrentStep(idx)}
+                                style={{ borderRadius: '4px' }}
+                            >
+                                {label}
+                            </Button>
+                        ))}
+                    </div>
+
+                    <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
+                        
+                        {selectedSupervisorId && currentStep >= 3 && (
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', background: '#F3F2F1', padding: '4px 8px', borderRadius: '6px' }}>
+                                <select 
+                                    value={clipboardFormat} 
+                                    onChange={(e) => setClipboardFormat(e.target.value as any)} 
+                                    style={{ padding: '4px 8px', borderRadius: '4px', border: '1px solid #D1D1D1', fontSize: '12px', outline: 'none', background: '#fff', cursor: 'pointer', height: '26px' }}
+                                >
+                                    <option value="headcount">Headcount</option>
+                                    <option value="initials">Initials</option>
+                                    <option value="fullname">Full Name</option>
+                                </select>
+                                <Button appearance="secondary" size="small" onClick={handleCopyToClipboard}>Copy</Button>
+                                <div style={{ width: '1px', height: '16px', background: '#D1D1D1', margin: '0 4px' }} />
+                                <Button appearance="primary" size="small" onClick={handleSubmission}>{currentStep === 5 ? "Save Progress" : "Submit Assignments"}</Button>
+                            </div>
+                        )}
+                        
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', background: adminMode ? '#DFF6DD' : 'transparent', padding: '2px 8px', borderRadius: '4px', transition: 'background 0.2s', border: adminMode ? '1px solid #C3E6CB' : '1px solid transparent' }}>
+                                <Checkbox 
+                                    label={<Text size={200} weight={adminMode ? "semibold" : "regular"} style={{ color: adminMode ? '#107C10' : 'inherit' }}>Acting Sup.</Text>}
+                                    checked={adminMode}
+                                    onChange={(e: any, d: any) => setAdminMode(getCheckboxValue(e, d))}
+                                />
+                            </div>
+                            <div style={{ width: '1px', height: '24px', background: '#E1DFDD' }} />
+                            <Button appearance="transparent" size="small" onClick={() => setShowDebugModal(true)} style={{ padding: "4px 8px" }}>
+                                {selectedSupervisorId && msUser?.id !== selectedSupervisorId 
+                                    ? <Text size={200} weight="semibold">🕵️ {formatFullName(activeSupervisorObj?.craa5_name)}</Text> 
+                                    : <Text size={200}><span style={{marginRight: '4px'}}>👤</span>{msUser ? msUser.name : "Error"}</Text>
+                                }
+                            </Button>
+                            <Badge appearance="filled" color="informative">Shift {currentShift}</Badge>
+                        </div>
+                    </div>
+                </div>
+                {selectedSupervisorId && <ProgressBar value={(currentStep + 1) / steps.length} color={currentStep === 5 ? "success" : "brand"} />}
+            </header>
+            <main style={{ flex: 1, overflow: "hidden" }}>{isLoading && <div style={{ position: 'absolute', inset: 0, background: 'rgba(255,255,255,0.7)', zIndex: 10, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Spinner label="Updating Dataverse..." /></div>}{stepContent}</main>
+            
+            {showDebugModal && (
+                <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 10000 }}>
+                    <div style={{ background: "#fff", width: "80%", maxWidth: "650px", padding: "24px", borderRadius: "16px", boxShadow: "0 12px 48px rgba(0,0,0,0.3)", display: "flex", flexDirection: "column", gap: "16px", border: "1px solid #0078D4" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><div><Text weight="bold" size={500}>Microsoft Account Session</Text><Text block size={200} color="neutralSecondary">Active User Profile Information</Text></div><Button appearance="subtle" onClick={() => setShowDebugModal(false)}>✖</Button></div>
+                        <div style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: "8px", background: "#F0F7FF", padding: "16px", borderRadius: "8px" }}><Text weight="semibold">Name:</Text><Text>{renderSafe(msUser?.name || "Unknown")}</Text><Text weight="semibold">Email:</Text><Text>{renderSafe(msUser?.email || "Unknown")}</Text></div>
+                        <Divider /><div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#FFF4CE', padding: '12px 16px', borderRadius: '8px' }}><div><Text weight="bold" block>Admin Override Mode</Text><Text size={200} color="neutralSecondary">Allows full write access to off-shift boards.</Text></div><Button appearance={adminMode ? "primary" : "outline"} onClick={() => setAdminMode(!adminMode)}>{adminMode ? "Admin Mode ON" : "Enable Admin Mode"}</Button></div>
+                        <Divider /><div><div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>{supervisors.map(sup => (<Button key={sup.craa5__aa_employeeid} appearance={selectedSupervisorId === sup.craa5__aa_employeeid ? "primary" : "outline"} onClick={() => handleImpersonate(sup.craa5__aa_employeeid)} size="small">{formatFullName(sup.craa5_name)}</Button>))}<Button appearance="subtle" size="small" onClick={handleClearImpersonation}>Clear / Return Home</Button></div></div>
+                        <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "8px" }}><Button appearance="primary" onClick={() => setShowDebugModal(false)}>Acknowledge</Button></div>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
+const App = (props: any) => <MainComponent {...props} />;
+export default App;
