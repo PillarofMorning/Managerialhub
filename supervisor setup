@@ -37,11 +37,9 @@ import {
     TABLE ARCHITECTURE & SOURCE OF TRUTH:
     1. craa5_taskassignment (Primary Source of Truth): Used exclusively to load 
        presets, reconstruct the board state, and read current shift assignments.
-    2. craa5__aa_eeutilization (Backup Log): STRICTLY WRITE-ONLY. We write to this 
-       table for historical backup and reporting purposes, but NEVER read from it.
-    3. craa5__aa_employee: Holds the roster and the `craa5_Utilized` boolean toggle.
-    4. craa5_aa_mss_area: Master list of production areas.
-    5. craa5_aa_assets: Master list of equipment/assets tied to specific areas.
+    2. craa5__aa_employee: Holds the roster and the `craa5_Utilized` boolean toggle.
+    3. craa5_aa_mss_area: Master list of production areas.
+    4. craa5_aa_assets: Master list of equipment/assets tied to specific areas.
 
     CRITICAL HISTORICAL LEARNINGS (DO NOT DEVIATE FROM THESE IN FUTURE EDITS):
     - [LEARNING 1: EXACT ODATA CASING]: Dataverse Web API strictly accepts LOGICAL NAMES for payloads, 
@@ -68,22 +66,20 @@ import {
     - [LEARNING 20: UNIVERSAL ACCESS / NO READ-ONLY]: All off-shift, impersonation, and read-only UI 
       locks (`disabled={isReadOnly}`) have been entirely stripped from the app. All users have full write access.
     - [LEARNING 21: INFINITE RENDER LOOP ASSASSINATION]: Background timers attempting to write to `localStorage` 
-      in sandboxed iframes throw silent DOM exceptions, triggering infinite `useEffect` loops that freeze the 
-      main thread (locking inputs). PCF `updateView` also re-injects prop array references continuously.
-      FIX: `localStorage` is eradicated. Dependencies rely strictly on `.length` primitive hashes to prevent 
-      reference cascading and infinite re-renders.
-    - [LEARNING 23: DYNAMIC AREA CATEGORIZATION]: Area Selection was upgraded to a 3-column drag-and-drop board 
-      ("Supporting", "Production", "Assigned") driven by the `craa5_production` Dataverse yes/no flag.
-    - [LEARNING 24: CSS BOX-SIZING CLIPPING]: 100% height wrappers with padding will clip out the bottom of 
-      scrollable lists if `boxSizing: 'border-box'` is not strictly enforced on the parent layout container.
-    - [LEARNING 25: CONCISE HEADCOUNT EXPORT]: The clipboard formatting uses a `getAreaEmoji` helper to append 
-      scannable icons. Headcount mode eliminates the bottom attendance block, instead consolidating PTO/Sick/Late 
-      at the top of the export, and formatting areas to a highly condensed `({count}) {Area}` format.
-
-    HOW TO RECREATE THIS APP FROM SCRATCH (PROMPT):
-    "Create a React application using @fluentui/react-components designed for a Power Apps / PCF environment. 
-    The app is a 'Supervisor Hub' for task management. It requires a step-by-step wizard.
-    Data must be fetched and written using either a passed-in `dataApi` prop or a safely extracted `Xrm.WebApi`."
+      in sandboxed iframes throw silent DOM exceptions, triggering infinite `useEffect` loops that freeze the main thread.
+      FIX: `localStorage` is eradicated. Dependencies rely strictly on `.length` primitive hashes to prevent cascading.
+    - [LEARNING 26: FINALIZE / TIME TRACKING TAB]: Fetches the live Dataverse list of shift assignments. Provides full edit,
+      update (UID overwrite), and delete capabilities for individual rows. Allows creation of missing manual entries.
+    - [LEARNING 27: DELTA HASH SUBMISSION]: Introduced `lastSubmittedRef` to hash payload structures. Submissions now 
+      dynamically skip duplicate Dataverse payload entries if an employee's state hasn't changed since the last submission.
+    - [LEARNING 28: PAYLOAD MAPPING CRITICALITY]: (VERY IMPORTANT) The payload delivery MUST explicitly map `craa5_uid_associated`
+      to the ASSET ID (`craa5_aa_assetsid`) when equipment is assigned, or left blank (`""`) if it's a general area. 
+      `craa5_leademail` must be explicitly populated. Durations must be clamped to the start of the current shift to prevent 17h+ carryovers.
+    - [LEARNING 29: DATAGRID REWRITE]: The finalize tab was completely rewritten from FluentUI Cards to a dense HTML 
+      DataGrid mapping strictly to the active shift, complete with HTML5 `<datalist>` autocompletes matching the DB.
+    - [LEARNING 30: TIMEZONE & DATE CLAMPING]: Replaced `.toISOString()` parsing in the Finalize tab with local timezone 
+      formatting (`getLocalYMD`) to prevent evening tasks from rolling over into "tomorrow". Implemented `getLogicalShiftDateStr` 
+      to explicitly filter the list to "Today's Shift" while handling post-midnight rollover gracefully.
 */
 // ============================================================================
 
@@ -107,11 +103,30 @@ interface ExtendedTaskAssignment {
     craa5__currentstatus?: string;
     craa5__future_or_notes?: string;
     craa5__duration_assigned?: string;
+    craa5_uid_associated?: string;
 }
 
 // ============================================================================
 // SECTION 2: HELPER FUNCTIONS
 // ============================================================================
+
+// Gets YYYY-MM-DD in Local Timezone (Prevents UTC push-to-tomorrow bugs)
+function getLocalYMD(dateObj: Date): string {
+    const y = dateObj.getFullYear();
+    const m = String(dateObj.getMonth() + 1).padStart(2, '0');
+    const d = String(dateObj.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+}
+
+// Gets YYYY-MM-DDTHH:mm in Local Timezone (For datetime-local inputs)
+function getLocalYMDHM(dateObj: Date): string {
+    const y = dateObj.getFullYear();
+    const m = String(dateObj.getMonth() + 1).padStart(2, '0');
+    const d = String(dateObj.getDate()).padStart(2, '0');
+    const h = String(dateObj.getHours()).padStart(2, '0');
+    const min = String(dateObj.getMinutes()).padStart(2, '0');
+    return `${y}-${m}-${d}T${h}:${min}`;
+}
 
 function formatFullName(name?: string | null): string {
     if (!name) return "";
@@ -318,6 +333,44 @@ function isAssetInArea(asset: any, areaName: string): boolean {
     return aName.includes(areaName.toLowerCase()) || areaName.toLowerCase().includes(aName);
 }
 
+// Custom Duration & Default Time Tracking Helpers
+const getDefaultStartTime = (shift: string) => {
+    if (shift === 'A' || shift === 'C') return "06:00";
+    if (shift === 'B' || shift === 'D') return "18:00";
+    return "06:00";
+};
+
+const getCurrentTimeStr = () => {
+    const now = new Date();
+    const h = String(now.getHours()).padStart(2, '0');
+    const m = String(now.getMinutes()).padStart(2, '0');
+    return `${h}:${m}`;
+};
+
+const getShiftStartMs = (shift: string) => {
+    const now = new Date();
+    const [h, m] = getDefaultStartTime(shift).split(':').map(Number);
+    const shiftStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0);
+    
+    // If current time is early AM and shift is B/D (starts at 18:00), the shift started yesterday.
+    if (h >= 12 && now.getHours() < 12) {
+        shiftStart.setDate(shiftStart.getDate() - 1);
+    }
+    return shiftStart.getTime();
+};
+
+const calculateCustomDuration = (start: string, stop: string) => {
+    if (!start || !stop) return null;
+    const [sh, sm] = start.split(':').map(Number);
+    const [eh, em] = stop.split(':').map(Number);
+    let startMins = sh * 60 + sm;
+    let stopMins = eh * 60 + em;
+    if (stopMins < startMins) stopMins += 24 * 60; // Handle overnight shifts
+    const diffMins = stopMins - startMins;
+    const hrs = Math.floor(diffMins / 60);
+    const mins = diffMins % 60;
+    return hrs > 0 ? `${hrs}h ${mins}m` : `${mins}m`;
+};
 
 // ============================================================================
 // SECTION 3: UI WIZARD SUB-COMPONENTS
@@ -609,7 +662,7 @@ export function MainComponent({
     inputPresets = [], 
     ...props 
 }: any) {
-    const steps = ["Leads", "Areas", "Assign Areas", "Equipment", "Assign Employees", "Manage"];
+    const steps = ["Leads", "Areas", "Assign Areas", "Equipment", "Assign Employees", "Manage", "Finalize"];
     const [currentStep, setCurrentStep] = useState(0);
     const [currentShift, setCurrentShift] = useState("");
     const [presetsApplied, setPresetsApplied] = useState(false);
@@ -645,9 +698,13 @@ export function MainComponent({
     const [assignments, setAssignments] = useState<Record<string, string[]>>({}); 
     const [equipAssignments, setEquipAssignments] = useState<Record<string, string[]>>({});
     
-    const [areaDetails, setAreaDetails] = useState<Record<string, { currentStatus: string, futureNotes: string, percent: string }>>({});
+    const [areaDetails, setAreaDetails] = useState<Record<string, { currentStatus: string, futureNotes: string, percent: string, startTime?: string, stopTime?: string }>>({});
     const [employeeStartTimes, setEmployeeStartTimes] = useState<Record<string, string>>({});
     const [currentTime, setCurrentTime] = useState(Date.now());
+
+    // FINALIZE TAB STATE (Live Dataverse Connection)
+    const [finalizeTasks, setFinalizeTasks] = useState<any[]>([]);
+    const [isFinalizeLoading, setIsFinalizeLoading] = useState(false);
 
     // UX & SYSTEM STATE
     const [appHeight, setAppHeight] = useState(window.innerHeight);
@@ -666,6 +723,7 @@ export function MainComponent({
     const [submissionError, setSubmissionError] = useState<string | null>(null);
 
     const hasInitialized = useRef(false);
+    const lastSubmittedRef = useRef<Record<string, string>>({});
 
     const activeSupervisorObj = supervisors.find(s => s.craa5__aa_employeeid === selectedSupervisorId);
 
@@ -674,11 +732,11 @@ export function MainComponent({
 // ============================================================================
     const employeeMap = useMemo(() => {
         const map = new Map();
-        [...allEmployees, ...customEmployees, ...leads].forEach(e => {
+        [...allEmployees, ...customEmployees, ...leads, ...customLeads].forEach(e => {
             if (e.craa5__aa_employeeid) map.set(e.craa5__aa_employeeid, e);
         });
         return map;
-    }, [allEmployees, customEmployees, leads]);
+    }, [allEmployees, customEmployees, leads, customLeads]);
 
     const areaMap = useMemo(() => {
         const map = new Map();
@@ -733,6 +791,7 @@ export function MainComponent({
         setCustomLeads([]);
         setCustomAreas([]);
         setCustomEmployees([]);
+        lastSubmittedRef.current = {};
         setRefreshToggle(prev => prev + 1);
         setCurrentStep(0);
     }, []);
@@ -744,8 +803,16 @@ export function MainComponent({
 
     const formatDuration = (startTimeIso?: string) => {
         if (!startTimeIso) return "0m";
-        const startMs = new Date(startTimeIso).getTime();
+        let startMs = new Date(startTimeIso).getTime();
         if (isNaN(startMs)) return "0m";
+
+        // Clamp duration strictly to the start of the current shift 
+        // to prevent 17h+ carryover bugs from yesterday's presets.
+        const shiftStartMs = getShiftStartMs(currentShift);
+        if (startMs < shiftStartMs) {
+            startMs = shiftStartMs;
+        }
+
         const diffMs = currentTime - startMs;
         if (diffMs < 0) return "0m";
         const diffMins = Math.floor(diffMs / 60000);
@@ -994,18 +1061,25 @@ export function MainComponent({
         const newAreaAssignments: Record<string, string> = {};
         const newAssignments: Record<string, string[]> = {};
         const newEquipAssignments: Record<string, string[]> = {};
-        const newAreaDetails: Record<string, { currentStatus: string, futureNotes: string, percent: string }> = {};
+        const newAreaDetails: Record<string, { currentStatus: string, futureNotes: string, percent: string, startTime?: string, stopTime?: string }> = {};
         const newEmployeeStartTimes: Record<string, string> = {};
         
         const discCustomAreas: any[] = [];
         const discCustomLeads: any[] = [];
         const discCustomEmps: any[] = [];
 
-        myTeamRecords.forEach(record => {
+        const sortedMyTeamRecords = [...myTeamRecords].sort((a, b) => {
+            return new Date(a.craa5_datetimeofassignment || 0).getTime() - new Date(b.craa5_datetimeofassignment || 0).getTime();
+        });
+
+        sortedMyTeamRecords.forEach(record => {
             const leadName = record.craa5_lead?.trim() || record.craa5_Lead?.trim() || "";
             const empName = (record.craa5_id || record.craa5_ID)?.trim() || ""; 
             const areaName = (record.craa5_area || record.craa5_Area)?.trim() || "";
             const equipName = (record.craa5_equip || record.craa5_equipment)?.trim() || "";
+            const status = record.craa5__currentstatus || "";
+            const notes = record.craa5__future_or_notes || "";
+            const pct = record.craa5_percentagecomplete || 0;
 
             if (leadName) {
                 const isSup = (supervisor.craa5_name || "").toLowerCase() === leadName.toLowerCase();
@@ -1038,9 +1112,9 @@ export function MainComponent({
 
                     if (!newAreaDetails[areaObj.craa5_aa_mss_areaid]) {
                         newAreaDetails[areaObj.craa5_aa_mss_areaid] = {
-                            currentStatus: record.craa5__currentstatus || "",
-                            futureNotes: record.craa5__future_or_notes || "",
-                            percent: record.craa5_percentagecomplete !== undefined && record.craa5_percentagecomplete !== null ? String(record.craa5_percentagecomplete) : ""
+                            currentStatus: status,
+                            futureNotes: notes,
+                            percent: pct !== undefined && pct !== null ? String(pct) : ""
                         };
                     }
 
@@ -1067,6 +1141,7 @@ export function MainComponent({
                                     if (!newEquipAssignments[assetObj.craa5_aa_assetsid].includes(empObj.craa5__aa_employeeid)) {
                                         newEquipAssignments[assetObj.craa5_aa_assetsid].push(empObj.craa5__aa_employeeid);
                                         newEmployeeStartTimes[empObj.craa5__aa_employeeid] = record.craa5_datetimeofassignment || new Date().toISOString();
+                                        lastSubmittedRef.current[empObj.craa5__aa_employeeid] = `${leadName}_${areaName}_${equipName}_${status}_${notes}_${pct}`;
                                     }
                                 }
                             } else {
@@ -1074,9 +1149,12 @@ export function MainComponent({
                                 if (!newAssignments[areaObj.craa5_aa_mss_areaid].includes(empObj.craa5__aa_employeeid)) {
                                     newAssignments[areaObj.craa5_aa_mss_areaid].push(empObj.craa5__aa_employeeid);
                                     newEmployeeStartTimes[empObj.craa5__aa_employeeid] = record.craa5_datetimeofassignment || new Date().toISOString();
+                                    lastSubmittedRef.current[empObj.craa5__aa_employeeid] = `${leadName}_${areaName}__${status}_${notes}_${pct}`;
                                 }
                             }
                         }
+                    } else if (!empName || empName === "Unassigned Area Task") {
+                        if (areaObj) lastSubmittedRef.current[`area_${areaObj.craa5_aa_mss_areaid}`] = `${leadName}_${areaName}__${status}_${notes}_${pct}`;
                     }
                 }
             }
@@ -1094,7 +1172,7 @@ export function MainComponent({
         setAreaDetails(newAreaDetails);
         setEmployeeStartTimes(newEmployeeStartTimes);
         setPresetsApplied(true);
-        setCurrentStep(5); 
+        setCurrentStep(5); // Jump ahead to Manage so they can verify/finalize
         
     }, [presetRecords.length, presetsApplied, supervisors.length, areas.length, leads.length, selectedSupervisorId, assets.length, allEmployees.length]);
 
@@ -1109,6 +1187,92 @@ export function MainComponent({
             setHasAutoAssignedEveryday(true);
         }
     }, [areas.length, selectedSupervisorId, hasAutoAssignedEveryday]);
+
+    // ============================================================================
+    // FINALIZE TAB (STEP 6) LIVE DATAVERSE CONNECTION
+    // ============================================================================
+    useEffect(() => {
+        if (currentStep === 6 && selectedSupervisorId) {
+            const loadFinalizeData = async () => {
+                setIsFinalizeLoading(true);
+                const getApi = () => (dataApi?.queryTable ? dataApi : safeGetXrm()?.WebApi);
+                const writeApi = getApi();
+                try {
+                    let freshTasks = [];
+                    
+                    const supervisor = supervisors.find(s => s.craa5__aa_employeeid === selectedSupervisorId);
+                    const supName = supervisor?.craa5_name || "";
+                    const shift = currentShift;
+
+                    const safeSupNameXml = supName.replace(/'/g, "&apos;");
+                    const safeSupNameOData = supName.replace(/'/g, "''");
+                    
+                    const yesterdayIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+                    if (writeApi && writeApi.retrieveMultipleRecords) {
+                         const fetchXml = `<fetch top='1000'><entity name='craa5_taskassignment'><attribute name='craa5_taskassignmentid'/><attribute name='craa5_id'/><attribute name='craa5_lead'/><attribute name='craa5_area'/><attribute name='craa5_equipment'/><attribute name='craa5_equip'/><attribute name='craa5_starttime'/><attribute name='craa5_endtime'/><attribute name='craa5_datetimeofassignment'/><attribute name='createdon'/><attribute name='craa5_shift'/><attribute name='craa5_team'/><attribute name='craa5_percentagecomplete'/><attribute name='craa5_complete'/><attribute name='statecode'/><attribute name='craa5__currentstatus'/><filter><condition attribute='createdon' operator='last-x-hours' value='24'/><condition attribute='craa5_team' operator='eq' value='${safeSupNameXml}'/></filter></entity></fetch>`;
+                         const res = await writeApi.retrieveMultipleRecords("craa5_taskassignment", "?fetchXml=" + encodeURIComponent(fetchXml));
+                         freshTasks = res.entities;
+                    } else if (dataApi?.queryTable) {
+                         const res = await dataApi.queryTable("craa5_taskassignment", { 
+                             select: ["craa5_taskassignmentid", "craa5_id", "craa5_lead", "craa5_area", "craa5_equipment", "craa5_equip", "craa5_starttime", "craa5_endtime", "craa5_datetimeofassignment", "createdon", "craa5_shift", "craa5_team", "craa5_percentagecomplete", "craa5_complete", "statecode", "craa5__currentstatus"],
+                             filter: `createdon ge '${yesterdayIso}' and craa5_team eq '${safeSupNameOData}'`, 
+                             top: 1000 
+                         });
+                         freshTasks = res.rows;
+                    }
+                    
+                    // HELPER: Determine the logical shift day (e.g. 2 AM is logically "yesterday" if it's the night shift)
+                    const getLogicalShiftDateStr = (dateObj: Date) => {
+                        const d = new Date(dateObj);
+                        if (d.getHours() < 6) d.setDate(d.getDate() - 1);
+                        return getLocalYMD(d);
+                    };
+                    const currentLogicalDateStr = getLogicalShiftDateStr(new Date());
+
+                    const myTasks = freshTasks.filter((t: any) => {
+                        const tShift = normalizeShift(t["craa5_shift@OData.Community.Display.V1.FormattedValue"] || t.craa5_shift || t.craa5_Shift);
+                        const tDateVal = t.craa5_datetimeofassignment || t.createdon;
+                        if (!tDateVal) return false;
+                        
+                        const taskLogicalDateStr = getLogicalShiftDateStr(new Date(tDateVal));
+                        
+                        // ONLY return tasks that precisely match the logical shift day AND the active shift letter
+                        return taskLogicalDateStr === currentLogicalDateStr && tShift === shift;
+                    });
+
+                    const formatted = myTasks.map((t: any) => {
+                        const tDateVal = t.craa5_datetimeofassignment || t.createdon;
+                        const dateObj = tDateVal ? new Date(tDateVal) : new Date();
+                        
+                        const isComplete = t.craa5_percentagecomplete === 100 || t.craa5_complete === true || t.statecode === 1 || t.craa5__currentstatus === 'Completed';
+
+                        return {
+                            id: t.craa5_taskassignmentid,
+                            assignmentDateTime: getLocalYMDHM(dateObj),
+                            empName: t.craa5_id || t.craa5_ID || "",
+                            leadName: t.craa5_lead || t.craa5_Lead || "",
+                            area: t.craa5_area || t.craa5_Area || "",
+                            equipment: t.craa5_equipment || t.craa5_equip || "",
+                            startTime: t.craa5_starttime ? new Date(t.craa5_starttime).toTimeString().substring(0,5) : (t.craa5_datetimeofassignment ? new Date(t.craa5_datetimeofassignment).toTimeString().substring(0,5) : ""),
+                            stopTime: t.craa5_endtime ? new Date(t.craa5_endtime).toTimeString().substring(0,5) : "",
+                            isComplete: isComplete,
+                            isNew: false,
+                            isModified: false
+                        };
+                    });
+                    
+                    formatted.sort((a: any, b: any) => a.empName.localeCompare(b.empName));
+                    setFinalizeTasks(formatted);
+                } catch (e) {
+                    console.error("Failed to load finalize tasks", e);
+                }
+                setIsFinalizeLoading(false);
+            };
+
+            loadFinalizeData();
+        }
+    }, [currentStep, selectedSupervisorId, currentShift, supervisors, dataApi, refreshToggle]);
 
 // ============================================================================
 // SECTION 7: USER INTERACTION HANDLERS
@@ -1458,6 +1622,150 @@ export function MainComponent({
 // SECTION 8: PAYLOAD DELIVERY (Dataverse Submit)
 // ============================================================================
 
+    const handleAddFinalizeRow = () => {
+        setFinalizeTasks([
+            {
+                id: `new_${Date.now()}`,
+                assignmentDateTime: getLocalYMDHM(new Date()),
+                empName: "",
+                leadName: "",
+                area: "",
+                equipment: "",
+                startTime: getDefaultStartTime(currentShift),
+                stopTime: "",
+                isComplete: false,
+                isNew: true,
+                isModified: true
+            },
+            ...finalizeTasks
+        ]);
+    };
+
+    const handleUpdateFinalizeRow = async (index: number) => {
+        const row = finalizeTasks[index];
+        const writeApi = dataApi?.updateRecord ? dataApi : safeGetXrm()?.WebApi;
+        if (!writeApi) { alert("No Write API found. Are you in a preview environment?"); return; }
+        
+        try {
+            let startIso = null;
+            let endIso = null;
+            let assignIso = null;
+
+            if (row.assignmentDateTime) {
+                const [datePart, timePart] = row.assignmentDateTime.split('T');
+                const [y, mo, d] = datePart.split('-').map(Number);
+                const [dtH, dtM] = timePart.split(':').map(Number);
+                assignIso = new Date(y, mo - 1, d, dtH, dtM, 0).toISOString();
+                
+                if (row.startTime) {
+                    const [h,m] = row.startTime.split(':').map(Number);
+                    const stD = new Date(y, mo - 1, d, h, m, 0);
+                    startIso = stD.toISOString();
+                }
+                
+                if (row.stopTime) {
+                    const [h,m] = row.stopTime.split(':').map(Number);
+                    const endD = new Date(y, mo - 1, d, h, m, 0);
+                    // Overnight check: if end time is before start time, add a day.
+                    if (startIso && endD < new Date(startIso)) endD.setDate(endD.getDate() + 1);
+                    endIso = endD.toISOString();
+                }
+            }
+            
+            const duration = calculateCustomDuration(row.startTime, row.stopTime);
+            const isComplete = row.isComplete;
+
+            // Map Equipment UID & Lead Email properly for the update
+            const matchedEquip = assets.find((a:any) => renderSafe(a.craa5_equipmentidentifier).toLowerCase() === row.equipment.toLowerCase());
+            const equipUid = matchedEquip ? renderSafe(matchedEquip.craa5_aa_assetsid || matchedEquip.craa5_uid || "") : "";
+
+            const leadObj = allEmployees.find((e:any) => renderSafe(e.craa5_name).toLowerCase() === row.leadName.toLowerCase());
+            const leadEmailStr = leadObj ? renderSafe(getEmployeeEmail(leadObj)) : "";
+            
+            const empObj = allEmployees.find(e => renderSafe(e.craa5_name).toLowerCase() === row.empName.toLowerCase());
+            const empEmail = empObj ? renderSafe(getEmployeeEmail(empObj)) : "";
+            const empUid = empObj ? renderSafe(empObj.craa5_uidm || empObj.craa5_uid || empObj.craa5__aa_employeeid || "") : "";
+
+            const payload: any = {
+                craa5_id: renderSafe(row.empName),
+                craa5_lead: renderSafe(row.leadName),
+                craa5_leademail: leadEmailStr, 
+                craa5_area: renderSafe(row.area),
+                craa5_equipment: renderSafe(row.equipment),
+                craa5_equip: renderSafe(row.equipment),
+                craa5_uid_associated: equipUid, 
+                craa5_email: empEmail,
+                craa5_percentagecomplete: isComplete ? 100 : 0,
+                craa5_complete: isComplete,
+                craa5__currentstatus: isComplete ? "Completed" : "Working",
+                statecode: isComplete ? 1 : 0
+            };
+            
+            if (assignIso) {
+                payload.craa5_datetimeofassignment = assignIso;
+            }
+            if (startIso) {
+                payload.craa5_starttime = startIso;
+            }
+            if (endIso) {
+                payload.craa5_endtime = endIso;
+            }
+            if (duration) {
+                payload.craa5__duration_assigned = duration;
+            }
+
+            if (row.isNew) {
+                const supervisor = supervisors.find(s => s.craa5__aa_employeeid === selectedSupervisorId);
+                payload.craa5_team = renderSafe(supervisor?.craa5_name);
+                payload.craa5_supervisoremail = renderSafe(getEmployeeEmail(supervisor));
+                payload.craa5_shift = currentShift;
+                
+                if (!equipUid) {
+                    payload.craa5_uid_associated = ""; 
+                }
+                
+                const res = await writeApi.createRecord("craa5_taskassignment", payload);
+                
+                const newTasks = [...finalizeTasks];
+                newTasks[index].isNew = false;
+                newTasks[index].id = res?.id || newTasks[index].id;
+                setFinalizeTasks(newTasks);
+                alert("Created successfully!");
+            } else {
+                await writeApi.updateRecord("craa5_taskassignment", row.id, payload);
+                alert("Updated successfully!");
+            }
+        } catch (e: any) {
+            console.error(e);
+            alert("Failed to save: " + (e.message || "Unknown error"));
+        }
+    };
+
+    const handleDeleteFinalizeRow = async (index: number) => {
+        const row = finalizeTasks[index];
+        if (row.isNew) {
+            const newTasks = [...finalizeTasks];
+            newTasks.splice(index, 1);
+            setFinalizeTasks(newTasks);
+            return;
+        }
+        
+        const writeApi = dataApi?.deleteRecord ? dataApi : safeGetXrm()?.WebApi;
+        if (!writeApi) { alert("No Delete API found."); return; }
+        
+        if (window.confirm("Are you sure you want to permanently delete this assignment?")) {
+            try {
+                await writeApi.deleteRecord("craa5_taskassignment", row.id);
+                const newTasks = [...finalizeTasks];
+                newTasks.splice(index, 1);
+                setFinalizeTasks(newTasks);
+            } catch (e) {
+                console.error(e);
+                alert("Delete failed.");
+            }
+        }
+    };
+
     const handleSubmission = async () => {
         setIsLoading(true);
         setSaveSuccess(false);
@@ -1479,93 +1787,139 @@ export function MainComponent({
         try {
             if (!writeApi) throw new Error("Dataverse API connection is missing or not configured for writing.");
 
+            let submittedCount = 0;
+
+            const getEmailForName = (name: string) => {
+                if (!name) return "";
+                const emp = allEmployees.find(e => renderSafe(e.craa5_name).toLowerCase() === name.toLowerCase());
+                return emp ? renderSafe(getEmployeeEmail(emp)) : "";
+            };
+
             for (const areaId of Object.keys(areaAssignments)) {
                 
                 const leadId = areaAssignments[areaId];
                 const lead = employeeMap.get(leadId) || supervisor; 
-                const leadEmail = getEmployeeEmail(lead);
+                const leadEmail = getEmailForName(lead?.craa5_name) || getEmployeeEmail(lead); // Explicitly lookup email to ensure it's mapped
+                
                 const area = areaMap.get(areaId);
                 const areaNameStr = area?.craa5_area || "";
                 const details = areaDetails[areaId] || { currentStatus: '', futureNotes: '', percent: '' };
-                const percentInt = details.percent ? parseInt(details.percent, 10) : null;
+                
+                // SAFE INTEGER PARSING FOR DATAVERSE
+                const parsedPct = parseInt(details.percent, 10);
+                const safePercent = isNaN(parsedPct) ? 0 : parsedPct;
 
-                const basePayload = {
+                // Explicit Payload Mapping matched to Schema Notes
+                const basePayload: any = {
                     craa5_area: renderSafe(areaNameStr), 
                     craa5_lead: renderSafe(lead?.craa5_name),
                     craa5_leademail: renderSafe(leadEmail), 
                     craa5_team: renderSafe(supervisor?.craa5_name), 
                     craa5_supervisoremail: renderSafe(supervisorEmail),
-                    craa5_datetimeofassignment: timestamp, 
                     craa5_shift: currentShift,
                     craa5__currentstatus: details.currentStatus || "",
                     craa5__future_or_notes: details.futureNotes || "",
-                    craa5_equipment: "", 
-                    craa5_equip: "",
-                    craa5_percentagecomplete: percentInt 
+                    craa5_percentagecomplete: safePercent
                 };
+                
+                if (safePercent === 100 || details.currentStatus === "Completed") {
+                    basePayload.craa5_complete = true;
+                }
 
                 const empIds = assignments[areaId] || [];
-                
                 const areaEquips = assets.filter(a => selectedEquipIds.has(a.craa5_aa_assetsid) && isAssetInArea(a, areaNameStr));
                 const hasEquipEmps = areaEquips.some(eq => (equipAssignments[eq.craa5_aa_assetsid] || []).length > 0);
 
                 if (empIds.length === 0 && !hasEquipEmps) {
-                    operations.push(writeApi.createRecord("craa5_taskassignment", { 
-                        ...basePayload,
-                        craa5_id: ""
-                    }));
+                    const areaHash = `${lead?.craa5_name}_${areaNameStr}__${details.currentStatus || ""}_${details.futureNotes || ""}_${safePercent}`;
+                    if (lastSubmittedRef.current[`area_${areaId}`] !== areaHash) {
+                        operations.push(writeApi.createRecord("craa5_taskassignment", { 
+                            ...basePayload,
+                            craa5_id: "Unassigned Area Task", // Fallback to avoid Dataverse rejecting empty Primary Name
+                            craa5_uid_associated: "", // Blank if no equipment
+                            craa5_equipment: "", 
+                            craa5_equip: "",
+                            craa5_datetimeofassignment: timestamp,
+                            craa5_starttime: timestamp
+                        }));
+                        lastSubmittedRef.current[`area_${areaId}`] = areaHash;
+                        submittedCount++;
+                    }
                 } else {
                     for (const eid of empIds) {
                         const emp = employeeMap.get(eid);
                         if (!emp) continue; 
                         
-                        const empEmail = getEmployeeEmail(emp);
+                        const empHash = `${lead?.craa5_name}_${areaNameStr}__${details.currentStatus || ""}_${details.futureNotes || ""}_${safePercent}`;
+                        if (lastSubmittedRef.current[eid] === empHash) continue;
+
+                        const empEmail = getEmailForName(emp.craa5_name) || getEmployeeEmail(emp);
                         
                         operations.push(writeApi.createRecord("craa5_taskassignment", { 
                             ...basePayload,
                             craa5_id: renderSafe(emp?.craa5_name), 
                             craa5_email: renderSafe(empEmail), 
-                            craa5__duration_assigned: formatDuration(employeeStartTimes[eid])
-                        }));
-                        
-                        operations.push(writeApi.createRecord("craa5__aa_eeutilization", { 
-                            craa5_nameofemployee: renderSafe(emp?.craa5_name), craa5_in: timestamp, craa5_lead: renderSafe(lead?.craa5_name), craa5_area: renderSafe(areaNameStr) 
+                            craa5_uid_associated: "", // General area, no equipment ID
+                            craa5_equipment: "", 
+                            craa5_equip: "",
+                            craa5__duration_assigned: formatDuration(employeeStartTimes[eid]),
+                            craa5_datetimeofassignment: timestamp,
+                            craa5_starttime: timestamp
                         }));
 
                         if (eid && !eid.startsWith("preset_") && !eid.startsWith("c_")) {
                             operations.push(writeApi.updateRecord("craa5__aa_employee", eid, { craa5_utilized: true }));
                         }
+                        
+                        lastSubmittedRef.current[eid] = empHash;
+                        submittedCount++;
                     }
 
                     for (const eq of areaEquips) {
                         const eqId = eq.craa5_aa_assetsid;
                         const eqEmpIds = equipAssignments[eqId] || [];
                         const equipNameStr = renderSafe(eq.craa5_equipmentidentifier);
+                        const equipUid = renderSafe(eq.craa5_aa_assetsid || eq.craa5_uid || "");
 
                         for (const eid of eqEmpIds) {
                             const emp = employeeMap.get(eid);
                             if (!emp) continue;
                             
-                            const empEmail = getEmployeeEmail(emp);
+                            const empHash = `${lead?.craa5_name}_${areaNameStr}_${equipNameStr}_${details.currentStatus || ""}_${details.futureNotes || ""}_${safePercent}`;
+                            if (lastSubmittedRef.current[eid] === empHash) continue;
+
+                            const empEmail = getEmailForName(emp.craa5_name) || getEmployeeEmail(emp);
                             
                             operations.push(writeApi.createRecord("craa5_taskassignment", { 
                                 ...basePayload,
                                 craa5_id: renderSafe(emp?.craa5_name), 
                                 craa5_email: renderSafe(empEmail),
+                                craa5_uid_associated: equipUid, // Accurately route Asset ID
                                 craa5_equipment: equipNameStr,
                                 craa5_equip: equipNameStr,
-                                craa5__duration_assigned: formatDuration(employeeStartTimes[eid])
+                                craa5__duration_assigned: formatDuration(employeeStartTimes[eid]),
+                                craa5_datetimeofassignment: timestamp,
+                                craa5_starttime: timestamp
                             }));
-                            operations.push(writeApi.createRecord("craa5__aa_eeutilization", { 
-                                craa5_nameofemployee: renderSafe(emp?.craa5_name), craa5_in: timestamp, craa5_lead: renderSafe(lead?.craa5_name), craa5_area: `${renderSafe(areaNameStr)} - ${equipNameStr}` 
-                            }));
-                            if (eid && !eid.startsWith("preset_") && !eid.startsWith("c_")) operations.push(writeApi.updateRecord("craa5__aa_employee", eid, { craa5_utilized: true }));
+
+                            if (eid && !eid.startsWith("preset_") && !eid.startsWith("c_")) {
+                                operations.push(writeApi.updateRecord("craa5__aa_employee", eid, { craa5_utilized: true }));
+                            }
+                            
+                            lastSubmittedRef.current[eid] = empHash;
+                            submittedCount++;
                         }
                     }
                 }
             }
 
-            if (operations.length === 0) throw new Error("No assignments were detected to submit.");
+            if (operations.length === 0) {
+                setSaveSuccess(true); 
+                setCurrentStep(5);
+                setIsLoading(false);
+                return;
+            }
+            
             await Promise.all(operations);
             setSaveSuccess(true); 
             setCurrentStep(5); 
@@ -1607,6 +1961,11 @@ export function MainComponent({
     if (!selectedSupervisorId) {
         stepContent = <SupervisorSelectionScreen supervisors={supervisors} selectedSupervisorId={selectedSupervisorId} onSelect={(id: string) => handleImpersonate(id)} />; 
     } else {
+        const activeAreaIds = Object.keys(areaAssignments);
+        const statusAreas = activeAreaIds.filter(id => isStatusArea(areaMap.get(id)?.craa5_area));
+        const productionAreas = activeAreaIds.filter(id => !isEverydayArea(areaMap.get(id)) && !isStatusArea(areaMap.get(id)?.craa5_area));
+        const everydayTasks = activeAreaIds.filter(id => isEverydayArea(areaMap.get(id)) && !isStatusArea(areaMap.get(id)?.craa5_area));
+
         switch(currentStep) {
             case 0: 
                 stepContent = <LeadSelectionScreen leads={[...leads, ...customLeads]} selectedLeadIds={selectedLeadIds} onSelectChange={setSelectedLeadIds} onSearchCustom={handleSearchCustomLead} />; 
@@ -1624,11 +1983,6 @@ export function MainComponent({
                 stepContent = <EquipmentSelectionScreen areas={[...areas, ...customAreas]} areaAssignments={areaAssignments} assets={assets} selectedEquipIds={selectedEquipIds} onSelectChange={setSelectedEquipIds} />;
                 break;
             case 5:
-                const activeAreaIds = Object.keys(areaAssignments);
-                const statusAreas = activeAreaIds.filter(id => isStatusArea(areaMap.get(id)?.craa5_area));
-                const productionAreas = activeAreaIds.filter(id => !isEverydayArea(areaMap.get(id)) && !isStatusArea(areaMap.get(id)?.craa5_area));
-                const everydayTasks = activeAreaIds.filter(id => isEverydayArea(areaMap.get(id)) && !isStatusArea(areaMap.get(id)?.craa5_area));
-
                 const renderAreaCard = (areaId: string) => {
                     const leadId = areaAssignments[areaId];
                     const lead = employeeMap.get(leadId) || supervisors.find(s => s.craa5__aa_employeeid === selectedSupervisorId);
@@ -1746,6 +2100,157 @@ export function MainComponent({
                     </div>
                 );
                 break;
+            case 6:
+                // Finalize / Time Tracking Tab (Live Dataverse Direct List)
+                stepContent = (
+                    <div style={{ display: "flex", flexDirection: "column", height: "100%", padding: "20px", overflowY: "hidden", background: "#fff", flex: 1, boxSizing: "border-box" }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '20px', flexWrap: 'wrap', gap: '12px' }}>
+                            <div>
+                                <Text as="h2" size={600} weight="semibold">Finalize & Time Tracking</Text>
+                                <Text size={300} color="neutralSecondary" block style={{ marginTop: '4px' }}>
+                                    Review all assignments currently logged to your shift in Dataverse. Update start/stop times, correct areas, or add missed tasks.
+                                </Text>
+                            </div>
+                            <Button appearance="primary" onClick={handleAddFinalizeRow}>+ Add Entry</Button>
+                        </div>
+                        
+                        {/* NATIVE DATALISTS FOR AUTOCOMPLETE */}
+                        <datalist id="emp-list">
+                            {allEmployees.map(e => <option key={e.craa5__aa_employeeid} value={renderSafe(e.craa5_name)} />)}
+                        </datalist>
+                        <datalist id="lead-list">
+                            {allEmployees.filter(e => e.craa5_role === 256000001 || e.craa5_role === 256000002).map(e => <option key={e.craa5__aa_employeeid} value={renderSafe(e.craa5_name)} />)}
+                        </datalist>
+                        <datalist id="area-list">
+                            {areas.map(a => <option key={a.craa5_aa_mss_areaid} value={renderSafe(a.craa5_area)} />)}
+                        </datalist>
+                        <datalist id="equip-list">
+                            {assets.map(a => <option key={a.craa5_aa_assetsid} value={renderSafe(a.craa5_equipmentidentifier)} />)}
+                        </datalist>
+
+                        {isFinalizeLoading ? (
+                            <Spinner label="Fetching shift assignments from Dataverse..." style={{ margin: '40px auto' }} />
+                        ) : finalizeTasks.length === 0 ? (
+                            <div style={{ textAlign: 'center', padding: '40px', background: '#FAFAFA', borderRadius: '8px', border: '1px dashed #CCC' }}>
+                                <Text color="neutralSecondary">No assignments found for this shift.</Text>
+                            </div>
+                        ) : (
+                            <div style={{ flex: 1, overflow: 'auto', border: '1px solid #E1DFDD', borderRadius: '8px' }}>
+                                <table style={{ minWidth: '100%', borderCollapse: 'collapse', fontSize: '13px', textAlign: 'left' }}>
+                                    <thead style={{ position: 'sticky', top: 0, backgroundColor: '#F3F2F1', zIndex: 10, boxShadow: '0 1px 2px rgba(0,0,0,0.1)' }}>
+                                        <tr>
+                                            <th style={{ padding: '12px', fontWeight: 600, color: '#323130', borderBottom: '1px solid #E1DFDD' }}>Date/Time</th>
+                                            <th style={{ padding: '12px', fontWeight: 600, color: '#323130', borderBottom: '1px solid #E1DFDD' }}>Lead</th>
+                                            <th style={{ padding: '12px', fontWeight: 600, color: '#323130', borderBottom: '1px solid #E1DFDD' }}>ID / Employee Name</th>
+                                            <th style={{ padding: '12px', fontWeight: 600, color: '#323130', borderBottom: '1px solid #E1DFDD' }}>Area</th>
+                                            <th style={{ padding: '12px', fontWeight: 600, color: '#323130', borderBottom: '1px solid #E1DFDD' }}>Equipment</th>
+                                            <th style={{ padding: '12px', fontWeight: 600, color: '#323130', borderBottom: '1px solid #E1DFDD' }}>Start Time</th>
+                                            <th style={{ padding: '12px', fontWeight: 600, color: '#323130', borderBottom: '1px solid #E1DFDD', textAlign: 'center' }}>Complete</th>
+                                            <th style={{ padding: '12px', fontWeight: 600, color: '#323130', borderBottom: '1px solid #E1DFDD' }}>End Time</th>
+                                            <th style={{ padding: '12px', fontWeight: 600, color: '#323130', borderBottom: '1px solid #E1DFDD', textAlign: 'center' }}>Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody style={{ backgroundColor: '#fff' }}>
+                                        {finalizeTasks.map((row, index) => {
+                                            const inputStyle = { width: '100%', border: '1px solid #D1D1D1', borderRadius: '4px', padding: '6px 8px', fontSize: '13px', outline: 'none' };
+                                            return (
+                                                <tr key={row.id} style={{ borderBottom: '1px solid #F3F2F1', backgroundColor: row.isComplete ? '#F8FBF8' : 'transparent', transition: 'background 0.2s' }}>
+                                                    <td style={{ padding: '8px' }}>
+                                                        <input 
+                                                            type="datetime-local" 
+                                                            value={row.assignmentDateTime} 
+                                                            onChange={(e) => { const t = [...finalizeTasks]; t[index].assignmentDateTime = e.target.value; setFinalizeTasks(t); }} 
+                                                            style={inputStyle}
+                                                        />
+                                                    </td>
+                                                    <td style={{ padding: '8px' }}>
+                                                        <input 
+                                                            list="lead-list"
+                                                            value={row.leadName} 
+                                                            onChange={(e) => { const t = [...finalizeTasks]; t[index].leadName = e.target.value; setFinalizeTasks(t); }} 
+                                                            style={inputStyle}
+                                                            placeholder="Lead Name"
+                                                        />
+                                                    </td>
+                                                    <td style={{ padding: '8px' }}>
+                                                        <input 
+                                                            list="emp-list"
+                                                            value={row.empName} 
+                                                            onChange={(e) => { const t = [...finalizeTasks]; t[index].empName = e.target.value; setFinalizeTasks(t); }} 
+                                                            style={inputStyle}
+                                                            placeholder="Employee Name"
+                                                        />
+                                                    </td>
+                                                    <td style={{ padding: '8px' }}>
+                                                        <input 
+                                                            list="area-list"
+                                                            value={row.area} 
+                                                            onChange={(e) => { const t = [...finalizeTasks]; t[index].area = e.target.value; setFinalizeTasks(t); }} 
+                                                            style={inputStyle}
+                                                            placeholder="Area"
+                                                        />
+                                                    </td>
+                                                    <td style={{ padding: '8px' }}>
+                                                        <input 
+                                                            list="equip-list"
+                                                            value={row.equipment} 
+                                                            onChange={(e) => { const t = [...finalizeTasks]; t[index].equipment = e.target.value; setFinalizeTasks(t); }} 
+                                                            style={inputStyle}
+                                                            placeholder="Equipment"
+                                                        />
+                                                    </td>
+                                                    <td style={{ padding: '8px' }}>
+                                                        <input 
+                                                            type="time" 
+                                                            value={row.startTime} 
+                                                            onChange={(e) => { const t = [...finalizeTasks]; t[index].startTime = e.target.value; setFinalizeTasks(t); }} 
+                                                            style={inputStyle}
+                                                        />
+                                                    </td>
+                                                    <td style={{ padding: '8px', textAlign: 'center' }}>
+                                                        <label style={{ position: 'relative', display: 'inline-flex', alignItems: 'center', cursor: 'pointer' }}>
+                                                            <input 
+                                                                type="checkbox" 
+                                                                style={{ position: 'absolute', opacity: 0, width: 0, height: 0 }}
+                                                                checked={row.isComplete} 
+                                                                onChange={(e) => { const t = [...finalizeTasks]; t[index].isComplete = e.target.checked; setFinalizeTasks(t); }} 
+                                                            />
+                                                            <div style={{
+                                                                width: '36px', height: '20px', backgroundColor: row.isComplete ? '#5B5FC7' : '#E1DFDD', 
+                                                                borderRadius: '999px', position: 'relative', transition: 'background-color 0.2s'
+                                                            }}>
+                                                                <div style={{
+                                                                    position: 'absolute', top: '2px', left: row.isComplete ? '18px' : '2px',
+                                                                    width: '16px', height: '16px', backgroundColor: '#fff', borderRadius: '50%',
+                                                                    transition: 'left 0.2s', boxShadow: '0 1px 2px rgba(0,0,0,0.2)'
+                                                                }}></div>
+                                                            </div>
+                                                        </label>
+                                                    </td>
+                                                    <td style={{ padding: '8px' }}>
+                                                        <input 
+                                                            type="time" 
+                                                            value={row.stopTime} 
+                                                            onChange={(e) => { const t = [...finalizeTasks]; t[index].stopTime = e.target.value; setFinalizeTasks(t); }} 
+                                                            style={inputStyle}
+                                                        />
+                                                    </td>
+                                                    <td style={{ padding: '8px', textAlign: 'center', whiteSpace: 'nowrap' }}>
+                                                        <Button appearance="transparent" size="small" style={{ color: '#D83B01', minWidth: 'auto', padding: '0 6px', marginRight: '4px' }} onClick={() => handleDeleteFinalizeRow(index)} title="Delete Row">✖</Button>
+                                                        <Button appearance={row.isComplete ? "primary" : "outline"} size="small" style={row.isComplete ? { backgroundColor: '#5B5FC7', color: 'white', minWidth: 'auto', padding: '0 8px' } : { minWidth: 'auto', padding: '0 8px' }} onClick={() => handleUpdateFinalizeRow(index)}>
+                                                            {row.isNew ? "Save" : "Update UID"}
+                                                        </Button>
+                                                    </td>
+                                                </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+                            </div>
+                        )}
+                    </div>
+                );
+                break;
             case 2:
             case 4:
                 stepContent = (
@@ -1805,6 +2310,7 @@ export function MainComponent({
                                     ) : (
                                         combinedEmployees
                                             .filter(e => {
+                                                if (selectedLeadIds.has(e.craa5__aa_employeeid)) return false;
                                                 const inGeneral = Object.values(assignments).flat().includes(e.craa5__aa_employeeid);
                                                 const inEquip = Object.values(equipAssignments).flat().includes(e.craa5__aa_employeeid);
                                                 if (inGeneral || inEquip) return false;
@@ -1992,7 +2498,7 @@ export function MainComponent({
                         </div>
                     </div>
                 </div>
-                {selectedSupervisorId && <ProgressBar value={(currentStep + 1) / steps.length} color={currentStep === 5 ? "success" : "brand"} />}
+                {selectedSupervisorId && <ProgressBar value={(currentStep + 1) / steps.length} color={currentStep === steps.length - 1 ? "success" : "brand"} />}
             </header>
             <main style={{ flex: 1, overflow: "hidden" }}>{isLoading && <div style={{ position: 'absolute', inset: 0, background: 'rgba(255,255,255,0.7)', zIndex: 10, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Spinner label="Updating Dataverse..." /></div>}{stepContent}</main>
             
