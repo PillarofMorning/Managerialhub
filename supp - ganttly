@@ -43,13 +43,36 @@ const XCircle = (props) => <svg {...IconProps} {...props}><circle cx="12" cy="12
 // ============================================================================
 // SECTION 2: OBJECT-ORIENTED DOMAIN MODELS 
 // ============================================================================
+// 🚨 ARCHITECTURE NOTE: Shift-Aware Workers
+// Each Gantt lane is one real person (or a placeholder seat) belonging to a crew (A/B/C/D).
+// `windows` are the on-shift spans (mins from plan start) for that crew inside the planning
+// window. A worker can only be booked inside a window, so the engine naturally hands work
+// from one crew to the next at shift change.
 class Worker {
-    constructor(id) {
+    constructor(id, crew, name, windows) {
         this.id = id;
+        this.crew = crew || '';
+        this.name = name || ('Worker ' + (id + 1));
+        this.windows = windows || [{ start: 0, end: Infinity }];
         this.schedule = []; 
+    }
+    windowAt(t) {
+        return this.windows.find(function(w) { return t >= w.start && t < w.end; }) || null;
+    }
+    isOnShift(start, end) {
+        return this.windows.some(function(w) { return start >= w.start && end <= w.end + 0.01; });
     }
     isFree(start, end) {
         return !this.schedule.some(slot => Math.max(start, slot.start) < Math.min(end, slot.end));
+    }
+    // How long this worker can keep going from `t` before a booked slot or the end of their shift.
+    runFrom(t) {
+        const w = this.windowAt(t);
+        if (!w) return { run: 0, shiftEnd: t, freeToShiftEnd: false };
+        if (this.schedule.some(function(s) { return t >= s.start && t < s.end; })) return { run: 0, shiftEnd: w.end, freeToShiftEnd: false };
+        let nextBooked = Infinity;
+        this.schedule.forEach(function(s) { if (s.start >= t && s.start < nextBooked) nextBooked = s.start; });
+        return { run: Math.min(w.end, nextBooked) - t, shiftEnd: w.end, freeToShiftEnd: nextBooked >= w.end };
     }
     assign(start, end, taskId, areaName) {
         this.schedule.push({ start: start, end: end, taskId: taskId, area: areaName });
@@ -85,9 +108,17 @@ class Equipment {
         // split by the Greedy Splitting algorithm over a hard downtime wall.
         this.isSplitPart1 = false;
         this.isSplitPart2 = false;
+
+        // Shift handover splits: a part's workload is fixed once it has been carved off.
+        this.parentId = data.id;
+        this.baseName = data.name;
+        this.splitIndex = 1;
+        this.workOverrideMins = null;
+        this.earliestStart = 0;
     }
 
     get rawWorkloadMins() {
+        if (this.workOverrideMins !== null) return this.workOverrideMins;
         let mins = this.baseMins;
         if (this.isPbActive && this.pbMins > 0) mins = this.pbMins;
         else if (this.isAllergenActive && this.allergenMins > 0) mins = this.allergenMins;
@@ -164,20 +195,109 @@ function getLocalYMD(d) {
 
 function normalizeShift(val) {
     let s = "";
-    if (val) {
-        s = String(val.Label || val.Value || val.name || val || "").toUpperCase();
+    if (val !== undefined && val !== null && val !== "") {
+        s = String(val.Label || val.Value || val.name || val || "").toUpperCase().trim();
     }
-    if (s.indexOf("256000000") > -1 || s === "A") return "A";
-    if (s.indexOf("256000001") > -1 || s === "B") return "B";
-    if (s.indexOf("256000002") > -1 || s === "C") return "C";
-    if (s.indexOf("256000003") > -1 || s === "D") return "D";
+    if (s.indexOf("256000000") > -1 || s === "A" || s === "1") return "A";
+    if (s.indexOf("256000001") > -1 || s === "B" || s === "2") return "B";
+    if (s.indexOf("256000002") > -1 || s === "C" || s === "3") return "C";
+    if (s.indexOf("256000003") > -1 || s === "D" || s === "4") return "D";
     return "";
 }
 
-function determineCurrentShift() {
-    const d = new Date().getDay(), h = new Date().getHours();
-    if (h >= 6 && h < 18) return (d === 0 || d <= 2 || (d === 3 && h < 12)) ? "A" : "C";
-    return ((d >= 0 && d <= 2 && h >= 18) || (d >= 1 && d <= 3 && h < 6)) ? "B" : "D";
+// ============================================================================
+// SHIFT ROTATION
+// 🚨 ARCHITECTURE NOTE: 4-Crew 12h Rotation
+// `days` uses JS getDay() numbering (0 = Sun ... 6 = Sat) and is the day the shift STARTS.
+//   C: Wed–Sat 6a–6p        D: Wed–Sat 6p–6a (last D shift ends Sunday 6a)
+//   A: Sun–Tue 6a–6p        B: Sun–Tue 6p–6a (last B shift ends Wednesday 6a)
+// If the craa5_workshift table has rows, they replace this default on first load.
+// Users can also edit days/hours per crew on the Setup tab (saved to local storage).
+// ============================================================================
+const CREW_CODES = ['A', 'B', 'C', 'D'];
+const DAY_LETTERS = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
+const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const FALLBACK_CREW_SIZE = 8;
+const MIN_SPLIT_MINS = 60;
+const DEFAULT_SHIFT_ROTATION = {
+    A: { days: [0, 1, 2], startHour: 6, lengthHours: 12 },
+    B: { days: [0, 1, 2], startHour: 18, lengthHours: 12 },
+    C: { days: [3, 4, 5, 6], startHour: 6, lengthHours: 12 },
+    D: { days: [3, 4, 5, 6], startHour: 18, lengthHours: 12 }
+};
+const CREW_STYLES = {
+    A: { badge: 'bg-sky-600 text-white', soft: 'bg-sky-50 border-sky-200 text-sky-900', line: 'border-sky-500' },
+    B: { badge: 'bg-indigo-700 text-white', soft: 'bg-indigo-50 border-indigo-200 text-indigo-900', line: 'border-indigo-600' },
+    C: { badge: 'bg-amber-500 text-white', soft: 'bg-amber-50 border-amber-200 text-amber-900', line: 'border-amber-500' },
+    D: { badge: 'bg-violet-700 text-white', soft: 'bg-violet-50 border-violet-200 text-violet-900', line: 'border-violet-600' }
+};
+
+function getCrewStyle(crew) {
+    return CREW_STYLES[crew] || { badge: 'bg-slate-500 text-white', soft: 'bg-slate-50 border-slate-200 text-slate-800', line: 'border-slate-400' };
+}
+
+function getRowField(row, name) {
+    if (!row) return undefined;
+    const fmt = row[name + '@OData.Community.Display.V1.FormattedValue'];
+    if (fmt !== undefined) return fmt;
+    if (row[name] !== undefined) return row[name];
+    const lower = name.toLowerCase();
+    const key = Object.keys(row).find(function(k) { return k.toLowerCase() === lower; });
+    return key ? row[key] : undefined;
+}
+
+// craa5_workshift rows: craa5_shiftcode, craa5_daynumber (1 = Sun ... 7 = Sat), craa5_shiftstarthour, craa5_shiftendhour
+function buildRotationFromWorkShifts(rows) {
+    if (!rows || rows.length === 0) return null;
+    const rotation = {};
+    rows.forEach(function(r) {
+        const crew = normalizeShift(getRowField(r, 'craa5_shiftcode'));
+        const dayNum = parseInt(r.craa5_daynumber, 10);
+        const startH = parseInt(r.craa5_shiftstarthour, 10);
+        const endH = parseInt(r.craa5_shiftendhour, 10);
+        if (!crew || isNaN(dayNum) || isNaN(startH) || isNaN(endH)) return;
+        if (!rotation[crew]) rotation[crew] = { days: [], startHour: startH, lengthHours: ((endH - startH + 24) % 24) || 24 };
+        const jsDay = ((dayNum - 1) % 7 + 7) % 7;
+        if (rotation[crew].days.indexOf(jsDay) === -1) rotation[crew].days.push(jsDay);
+    });
+    if (Object.keys(rotation).length === 0) return null;
+    Object.keys(rotation).forEach(function(c) { rotation[c].days.sort(); });
+    return rotation;
+}
+
+// Every crew shift that overlaps [0, horizonMins), as minutes from the plan start.
+function buildShiftWindows(rotation, planStart, horizonMins) {
+    const windows = [];
+    const days = Math.ceil(horizonMins / 1440) + 1;
+    for (let day = -1; day <= days; day++) {
+        const base = new Date(planStart.getFullYear(), planStart.getMonth(), planStart.getDate() + day);
+        CREW_CODES.forEach(function(crew) {
+            const cfg = rotation[crew];
+            if (!cfg || !cfg.days || cfg.days.indexOf(base.getDay()) === -1) return;
+            const s = new Date(base.getFullYear(), base.getMonth(), base.getDate(), cfg.startHour, 0, 0);
+            const startOff = Math.round((s.getTime() - planStart.getTime()) / 60000);
+            const endOff = startOff + (cfg.lengthHours || 12) * 60;
+            const cs = Math.max(0, startOff), ce = Math.min(horizonMins, endOff);
+            if (ce > cs) windows.push({ crew: crew, start: cs, end: ce, shiftStart: startOff, startHour: cfg.startHour, dayLabel: DAY_NAMES[base.getDay()] });
+        });
+    }
+    return windows.sort(function(a, b) { return a.start - b.start || a.crew.localeCompare(b.crew); });
+}
+
+// Working minutes inside [start, end) once breaks / downtimes (possibly overlapping) are removed.
+function netWorkingMins(start, end, interrupts) {
+    let blocked = 0, cursor = start;
+    (interrupts || []).slice().sort(function(a, b) { return a.start - b.start; }).forEach(function(b) {
+        const s = Math.max(b.start, cursor), e = Math.min(b.end, end);
+        if (e > s) { blocked += e - s; cursor = e; }
+    });
+    return Math.max(0, end - start - blocked);
+}
+
+function formatHourLabel(h) {
+    const hh = ((h % 24) + 24) % 24;
+    const ampm = hh >= 12 ? 'PM' : 'AM';
+    return (hh % 12 || 12) + ampm;
 }
 
 function formatMinutesToHours(totalMinutes) {
@@ -296,6 +416,15 @@ async function fetchAllActiveRecords(entityName, dataApi) {
     return [];
 }
 
+// Tries each logical name in turn (e.g. 'craa5__aa_employee' vs 'craa5_aa_employee') and returns the first with rows.
+async function fetchFirstAvailable(entityNames, dataApi) {
+    for (let i = 0; i < entityNames.length; i++) {
+        const rows = await fetchAllActiveRecords(entityNames[i], dataApi);
+        if (rows && rows.length > 0) return rows;
+    }
+    return [];
+}
+
 const MOCK_ASSETS = [
     { id: 'eq1', name: 'Freezer Deep Clean', area: 'CUSTARD', minutesRequired: 1440, heads: 1, priority: 1, isComplete: false },
     { id: 'eq2', name: 'Norman Area', area: 'CUSTARD', minutesRequired: 720, heads: 1, priority: 2, isComplete: false },
@@ -339,6 +468,7 @@ export default function App(props) {
                 .touch-draggable { touch-action: none; cursor: grab; }
                 .touch-draggable:active { cursor: grabbing; }
                 .break-stripes { background-image: repeating-linear-gradient(45deg, transparent, transparent 5px, rgba(0,0,0,0.03) 5px, rgba(0,0,0,0.03) 10px); }
+                .off-shift-stripes { background-image: repeating-linear-gradient(-45deg, transparent, transparent 6px, rgba(100,116,139,0.18) 6px, rgba(100,116,139,0.18) 12px); }
                 .complete-stripes { background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.2), rgba(255,255,255,0.2) 10px, transparent 10px, transparent 20px); }
             `;
             document.head.appendChild(style);
@@ -350,7 +480,8 @@ export default function App(props) {
     // Increment the _vX tag if you ever want to force-wipe the cache for users during major schema changes.
     const getSavedSettings = function() {
         try {
-            const s = localStorage.getItem('itp_settings_v9');
+            // v10 introduced multi-shift planning; fall back to v9 so room configs carry over.
+            const s = localStorage.getItem('itp_settings_v10') || localStorage.getItem('itp_settings_v9');
             if (s) return JSON.parse(s);
         } catch(e) {}
         return {};
@@ -396,11 +527,20 @@ export default function App(props) {
     const [newTaskHeads, setNewTaskHeads] = useState(1);
     const [newTaskPriority, setNewTaskPriority] = useState(2);
 
-    const [globalHeadcount, setGlobalHeadcount] = useState(initialSettings.globalHeadcount !== undefined ? initialSettings.globalHeadcount : 18);
     const [hourlyRate, setHourlyRate] = useState(initialSettings.hourlyRate || 25);
     const [ganttStartDate, setGanttStartDate] = useState(initialSettings.ganttStartDate || getLocalYMD(new Date()));
     const [ganttStartHour, setGanttStartHour] = useState(initialSettings.ganttStartHour !== undefined ? initialSettings.ganttStartHour : 6); 
-    const [currentShift, setCurrentShift] = useState(initialSettings.currentShift || "A");
+    // 🚨 ARCHITECTURE NOTE: Multi-Shift Planning Window
+    // The plan runs from (ganttStartDate @ ganttStartHour) for `planHours`. Every crew shift that
+    // overlaps that window contributes its own worker lanes, so a weekend plan shows D → C → D → A → B
+    // with each crew's real headcount.
+    const [planHours, setPlanHours] = useState(initialSettings.planHours || 12);
+    const [shiftRotation, setShiftRotation] = useState(initialSettings.shiftRotation || DEFAULT_SHIFT_ROTATION);
+    const [crewHeadcountOverrides, setCrewHeadcountOverrides] = useState(initialSettings.crewHeadcountOverrides || {});
+    const [absentEmployees, setAbsentEmployees] = useState(initialSettings.absentEmployees || {});
+    const [handoverMins, setHandoverMins] = useState(initialSettings.handoverMins !== undefined ? initialSettings.handoverMins : 15);
+    const [expandedRosters, setExpandedRosters] = useState({});
+    const [rotationSource, setRotationSource] = useState(initialSettings.shiftRotation ? 'Saved' : 'Default');
 
     const [includeBreaks, setIncludeBreaks] = useState(initialSettings.includeBreaks !== undefined ? initialSettings.includeBreaks : true); 
     const [includeTransit, setIncludeTransit] = useState(initialSettings.includeTransit || false);
@@ -434,18 +574,21 @@ export default function App(props) {
             roomConfigured: roomConfigured,
             hiddenRooms: hiddenRooms,
             hideConfiguredRooms: hideConfiguredRooms,
-            globalHeadcount: globalHeadcount,
             hourlyRate: hourlyRate,
             ganttStartDate: ganttStartDate,
             ganttStartHour: ganttStartHour,
-            currentShift: currentShift,
+            planHours: planHours,
+            shiftRotation: rotationSource === 'Default' || rotationSource === 'Dataverse' ? undefined : shiftRotation,
+            crewHeadcountOverrides: crewHeadcountOverrides,
+            absentEmployees: absentEmployees,
+            handoverMins: handoverMins,
             includeBreaks: includeBreaks,
             includeTransit: includeTransit,
             includeInspection: includeInspection,
             pbMode: pbMode
         };
-        try { localStorage.setItem('itp_settings_v9', JSON.stringify(s)); } catch(e) {}
-    }, [roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, roomConfigured, hiddenRooms, hideConfiguredRooms, globalHeadcount, hourlyRate, ganttStartDate, ganttStartHour, currentShift, includeBreaks, includeTransit, includeInspection, pbMode]);
+        try { localStorage.setItem('itp_settings_v10', JSON.stringify(s)); } catch(e) {}
+    }, [roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, roomConfigured, hiddenRooms, hideConfiguredRooms, hourlyRate, ganttStartDate, ganttStartHour, planHours, shiftRotation, rotationSource, crewHeadcountOverrides, absentEmployees, handoverMins, includeBreaks, includeTransit, includeInspection, pbMode]);
 
     const [liveTime, setLiveTime] = useState(new Date());
     useEffect(function() {
@@ -456,12 +599,20 @@ export default function App(props) {
     useEffect(() => {
         async function loadAssets() {
             try {
-                const [dvAssets, dvEmps] = await Promise.all([
+                const [dvAssets, dvEmps, dvShifts] = await Promise.all([
                     fetchAllActiveRecords("craa5_aa_assets", props.dataApi),
-                    fetchAllActiveRecords("craa5_aa_employee", props.dataApi)
+                    fetchFirstAvailable(["craa5__aa_employee", "craa5_aa_employee"], props.dataApi),
+                    fetchFirstAvailable(["craa5_workshift"], props.dataApi)
                 ]);
 
                 setRawEmployees(dvEmps);
+
+                // A rotation the user edited on the Setup tab wins; otherwise use the Dataverse shift table.
+                const dvRotation = buildRotationFromWorkShifts(dvShifts);
+                if (dvRotation && !initialSettings.shiftRotation) {
+                    setShiftRotation(Object.assign({}, DEFAULT_SHIFT_ROTATION, dvRotation));
+                    setRotationSource('Dataverse');
+                }
 
                 let parsed = MOCK_ASSETS;
                 if (dvAssets && dvAssets.length > 0) {
@@ -496,15 +647,106 @@ export default function App(props) {
         loadAssets();
     }, [props.dataApi]);
 
-    useEffect(function() {
-        if (rawEmployees.length === 0) return;
-        const shiftEmps = rawEmployees.filter(function(e) { 
-            return normalizeShift(e.craa5_shift) === currentShift; 
+    // ============================================================================
+    // CREW ROSTERS & WORKER LANES
+    // Hourly staff from craa5__aa_employee grouped by craa5_shift. Supervisors / managers are excluded
+    // from the cleaning headcount. Anyone marked absent on the Setup tab is dropped from the lanes.
+    // ============================================================================
+    const crewRosters = useMemo(function() {
+        const rosters = { A: [], B: [], C: [], D: [] };
+        rawEmployees.forEach(function(e, i) {
+            const crew = normalizeShift(getRowField(e, 'craa5_shift'));
+            if (!crew) return;
+            const role = String(e.craa5_role !== undefined ? e.craa5_role : (e.craa5_Role !== undefined ? e.craa5_Role : '')) + ' ' + String(e['craa5_role@OData.Community.Display.V1.FormattedValue'] || '');
+            if (/256000002|256000003|super|manag/i.test(role)) return;
+            rosters[crew].push({
+                id: e.craa5__aa_employeeid || e.craa5_aa_employeeid || ('emp_' + i),
+                name: String(e.craa5_name || e.craa5_Name || ('Employee ' + (i + 1))).trim(),
+                isLead: /256000001|lead/i.test(role)
+            });
         });
-        if (shiftEmps.length > 0 && globalHeadcount !== shiftEmps.length) {
-            setGlobalHeadcount(shiftEmps.length);
+        CREW_CODES.forEach(function(c) { rosters[c].sort(function(a, b) { return a.name.localeCompare(b.name); }); });
+        return rosters;
+    }, [rawEmployees]);
+
+    const hasDataverseRoster = rawEmployees.length > 0;
+
+    const getCrewHeadcount = function(crew) {
+        if (crewHeadcountOverrides[crew] !== undefined) return crewHeadcountOverrides[crew];
+        const present = crewRosters[crew].filter(function(p) { return !absentEmployees[p.id]; }).length;
+        return hasDataverseRoster ? present : FALLBACK_CREW_SIZE;
+    };
+
+    const planHorizonMins = Math.max(60, Math.round(Number(planHours) || 12) * 60);
+
+    const shiftWindows = useMemo(function() {
+        return buildShiftWindows(shiftRotation, getGlobalStart(ganttStartDate, ganttStartHour), planHorizonMins);
+    }, [shiftRotation, ganttStartDate, ganttStartHour, planHorizonMins]);
+
+    // One lane per person per crew working inside the plan window, ordered by when the crew first clocks in.
+    const laneRoster = useMemo(function() {
+        const crewOrder = [];
+        shiftWindows.forEach(function(w) { if (crewOrder.indexOf(w.crew) === -1) crewOrder.push(w.crew); });
+        const lanes = [];
+        crewOrder.forEach(function(crew) {
+            const crewWindows = shiftWindows.filter(function(w) { return w.crew === crew; }).map(function(w) { return { start: w.start, end: w.end }; });
+            const present = crewRosters[crew].filter(function(p) { return !absentEmployees[p.id]; });
+            const n = Math.max(0, Math.round(getCrewHeadcount(crew)));
+            for (let k = 0; k < n; k++) {
+                const person = present[k];
+                lanes.push({ lane: lanes.length, crew: crew, name: person ? person.name : (crew + ' Crew #' + (k + 1)), empId: person ? person.id : null, windows: crewWindows });
+            }
+        });
+        return lanes;
+    }, [shiftWindows, crewRosters, absentEmployees, crewHeadcountOverrides, hasDataverseRoster]);
+
+    const globalHeadcount = laneRoster.length;
+    const maxCrewSize = CREW_CODES.reduce(function(m, c) { return laneRoster.some(function(l) { return l.crew === c; }) ? Math.max(m, getCrewHeadcount(c)) : m; }, 0) || 1;
+
+    const toggleCrewDay = function(crew, day) {
+        setRotationSource('Saved');
+        setShiftRotation(function(prev) {
+            const cfg = Object.assign({}, prev[crew] || { days: [], startHour: 6, lengthHours: 12 });
+            cfg.days = cfg.days.indexOf(day) > -1 ? cfg.days.filter(function(d) { return d !== day; }) : cfg.days.concat([day]).sort();
+            return Object.assign({}, prev, { [crew]: cfg });
+        });
+    };
+    const handleCrewHourChange = function(crew, field, val) {
+        setRotationSource('Saved');
+        setShiftRotation(function(prev) {
+            const cfg = Object.assign({}, prev[crew] || { days: [], startHour: 6, lengthHours: 12 });
+            cfg[field] = field === 'startHour' ? Math.max(0, Math.min(23, Number(val) || 0)) : Math.max(1, Math.min(24, Number(val) || 12));
+            return Object.assign({}, prev, { [crew]: cfg });
+        });
+    };
+    const handleCrewHeadcountChange = function(crew, val) {
+        setCrewHeadcountOverrides(function(prev) {
+            const next = Object.assign({}, prev);
+            const parsed = parseInt(val, 10);
+            if (isNaN(parsed) || parsed < 0) delete next[crew]; else next[crew] = parsed;
+            return next;
+        });
+    };
+    const toggleAbsent = function(empId) {
+        setAbsentEmployees(function(prev) { const next = Object.assign({}, prev); if (next[empId]) delete next[empId]; else next[empId] = true; return next; });
+    };
+    const resetRotation = function() {
+        setShiftRotation(DEFAULT_SHIFT_ROTATION);
+        setRotationSource('Default');
+    };
+
+    // Plan presets. "Weekend" = Friday 6PM through Monday 6AM (D → C → D → A → B).
+    const applyPlanPreset = function(preset) {
+        if (preset === 'shift') { setPlanHours(12); return; }
+        if (preset === 'week') { setPlanHours(168); return; }
+        if (preset === 'weekend') {
+            const d = new Date();
+            d.setDate(d.getDate() + ((5 - d.getDay() + 7) % 7));
+            setGanttStartDate(getLocalYMD(d));
+            setGanttStartHour(18);
+            setPlanHours(60);
         }
-    }, [currentShift, rawEmployees]); 
+    };
 
     const allUniqueRooms = Array.from(new Set(assets.map(function(a) { return String(a.area); }))).sort();
     
@@ -515,7 +757,7 @@ export default function App(props) {
         let breaks = [];
         if (includeBreaks && ganttStartDate && typeof ganttStartDate === 'string') {
             const globalStart = getGlobalStart(ganttStartDate, ganttStartHour);
-            for (let day = -1; day <= 2; day++) {
+            for (let day = -1; day <= Math.ceil(planHorizonMins / 1440) + 1; day++) {
                 const base = new Date(globalStart.getTime());
                 base.setDate(base.getDate() + day);
                 const y = base.getFullYear();
@@ -525,7 +767,7 @@ export default function App(props) {
                 const addB = function(h, min, dur, label) {
                     const bTime = new Date(y, m, d, h, min, 0);
                     const offset = Math.round((bTime.getTime() - globalStart.getTime()) / 60000);
-                    if (offset >= 0 && offset < 1440 * 3) {
+                    if (offset >= 0 && offset < planHorizonMins + 1440) {
                         breaks.push({ start: offset, end: offset + dur, duration: dur, label: label, isCustom: false });
                     }
                 };
@@ -541,7 +783,7 @@ export default function App(props) {
             }
         }
         return breaks;
-    }, [includeBreaks, ganttStartDate, ganttStartHour]);
+    }, [includeBreaks, ganttStartDate, ganttStartHour, planHorizonMins]);
 
     const allInterrupts = useMemo(function() {
         const globalStartMs = getGlobalStart(ganttStartDate, ganttStartHour).getTime();
@@ -559,12 +801,11 @@ export default function App(props) {
     const handleRoomCleanTogetherChange = function(area, val) { setRoomCleanTogether(function(prev) { return Object.assign({}, prev, { [area]: val }); }); };
     const handleRoomAllergenChange = function(area, val) { setRoomAllergen(function(prev) { return Object.assign({}, prev, { [area]: val }); }); };
     const handleRoomConfiguredChange = function(area, val) { setRoomConfigured(function(prev) { return Object.assign({}, prev, { [area]: val }); }); };
-    const handleGlobalHeadcountChange = function(val) { setGlobalHeadcount(Math.max(1, Number(val)||1)); };
     
     // 🚨 ARCHITECTURE NOTE: Dynamic Room Caps
     // If a room limit is deleted/empty by the user, we explicitly delete the key from the state dictionary.
-    // The physics engine checks `roomLimits[area] !== undefined` and if so, it assigns `globalHeadcount`.
-    // This allows seamless, instant scaling when the global workforce number is changed.
+    // The engine treats a missing key as "no cap", so the room can use as many on-shift workers as are free
+    // (still bounded by the largest crew in the plan window).
     const handleRoomLimitsChange = function(area, val) { 
         setRoomLimits(function(prev) { 
             const parsed = parseInt(val, 10);
@@ -657,23 +898,26 @@ export default function App(props) {
     // Exports precisely the calculated durations (which includes math for inspections and transit)
     // but excludes general shift breaks from the pure "Task Duration" calculation for Excel mapping.
     const handleExportExcel = () => {
-        let csvContent = "Worker,Area,Task Name,Start Time,End Time,Duration (Mins)\n";
+        let csvContent = "Crew,Worker,Area,Task Name,Start Time,End Time,Duration (Mins)\n";
         const allTasks = [];
-        scheduleData.forEach(function(g) {
-            if (g._workers) return;
+        scheduleData.groups.forEach(function(g) {
             g.tasks.forEach(function(t) { allTasks.push(t); });
         });
         for (let i = 0; i < globalHeadcount; i++) {
-            const wName = `Worker ${i+1}`;
+            const wName = laneRoster[i].name.replace(/"/g, '""');
+            const wCrew = laneRoster[i].crew;
             const workerTasks = allTasks.filter(function(t) { return t.assignedLanes && t.assignedLanes.indexOf(i) > -1; });
             workerTasks.sort(function(a,b) { return a.startMin - b.startMin; });
             workerTasks.forEach(function(t) {
                 const sTime = formatClockTime(ganttStartDate, ganttStartHour, t.startMin);
                 const eTime = formatClockTime(ganttStartDate, ganttStartHour, t.startMin + t.finalDuration);
                 const tName = `"${t.name.replace(/"/g, '""')}"`;
-                csvContent += `"${wName}","${t.originalArea}",${tName},"${sTime}","${eTime}",${t.finalDuration}\n`;
+                csvContent += `"${wCrew}","${wName}","${t.originalArea}",${tName},"${sTime}","${eTime}",${Math.round(t.finalDuration)}\n`;
             });
         }
+        scheduleData.unscheduled.forEach(function(t) {
+            csvContent += `"","UNSCHEDULED","${t.originalArea}","${t.name.replace(/"/g, '""')}","","",${Math.round(t.rawWorkloadMins)}\n`;
+        });
         const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
         const link = document.createElement("a");
         const url = URL.createObjectURL(blob);
@@ -686,17 +930,23 @@ export default function App(props) {
     };
 
     // ============================================================================
-    // SECTION 5: CASCADE & SWARM ENGINE (Gap-Finding, Affinity, Greedy Splits)
-    // 🚨 ARCHITECTURE NOTE: This is the unified gap-finding mathematical engine.
-    // It replaced the older "Waterfall" method because Waterfall left massive
-    // unutilized white space if a worker in the middle finished a task early.
+    // SECTION 5: SHIFT-AWARE CASCADE ENGINE (Gap-Finding, Affinity, Shift Handovers)
+    // 🚨 ARCHITECTURE NOTE: Event-driven list scheduling across crews.
+    // For every task (rooms in handover/priority order, tasks by priority then size) the engine walks
+    // candidate start times (room handover, shift starts, the moment any worker frees up) and picks the
+    // earliest moment where H on-shift workers are free for the whole (break-stretched) duration.
+    // If the task cannot finish before the crew clocks out, it is SPLIT at shift end: the outgoing crew
+    // does what fits, and a "(Pt N)" continuation carrying the remaining work + a handover overhead is
+    // queued for the next crew. Work that cannot fit inside the planning window is reported as overflow.
     // ============================================================================
     const scheduleData = useMemo(function() {
-        const workers = Array.from({length: globalHeadcount}, function(_, i) { return new Worker(i); });
+        const workers = laneRoster.map(function(l) { return new Worker(l.lane, l.crew, l.name, l.windows); });
+        const totalLanes = workers.length;
         const virtualRoomsMap = {};
         const CLEAN_TOGETHER_KEY = '__CLEAN_TOGETHER__';
         const globalStartMs = getGlobalStart(ganttStartDate, ganttStartHour).getTime();
         const allTasks = [];
+        const unscheduled = [];
         
         // Ensure strictly omitted (hidden) rooms do not enter the mathematical queue
         assets.filter(function(a) { return !hiddenRooms[a.area]; }).forEach(function(rawT) {
@@ -710,7 +960,7 @@ export default function App(props) {
                     name: isCleanTogether ? 'Combined Clean' : area,
                     isCombined: isCleanTogether,
                     tasks: [],
-                    limit: globalHeadcount, 
+                    limit: Infinity, 
                     startOffset: Infinity,
                     priority: Infinity,
                     areas: {}
@@ -720,13 +970,14 @@ export default function App(props) {
             const vRoom = virtualRoomsMap[vRoomKey];
             vRoom.areas[area] = true;
             
-            const rLimit = roomLimits[area] !== undefined ? roomLimits[area] : globalHeadcount;
+            // Max Workers = how many people may work in the room at the same time (blank = no cap).
+            const rLimit = roomLimits[area] !== undefined ? roomLimits[area] : Infinity;
             if (rLimit < vRoom.limit) vRoom.limit = rLimit; 
             
             let rStartMins = 0;
             if (roomHandovers[area]) {
                 const handMs = new Date(roomHandovers[area]).getTime();
-                rStartMins = Math.max(0, Math.round((handMs - globalStartMs) / 60000));
+                if (!isNaN(handMs)) rStartMins = Math.max(0, Math.round((handMs - globalStartMs) / 60000));
             }
             if (rStartMins < vRoom.startOffset) vRoom.startOffset = rStartMins;
             
@@ -751,33 +1002,47 @@ export default function App(props) {
             vRoom.tasks.push(t);
             allTasks.push(t);
         });
+
+        const isAreaOf = function(vRoom, area) { return !!vRoom.areas[area]; };
+
+        // Distinct workers (other than `exclude`) already working in this room during [start, end).
+        const busyInRoom = function(vRoom, start, end, exclude) {
+            let n = 0;
+            workers.forEach(function(w) {
+                if (exclude.indexOf(w.id) > -1) return;
+                if (w.schedule.some(function(s) { return isAreaOf(vRoom, s.area) && Math.max(start, s.start) < Math.min(end, s.end); })) n++;
+            });
+            return n;
+        };
+
+        const capHeads = function(task, vRoom) {
+            return Math.max(1, Math.min(task.heads, vRoom.limit, maxCrewSize, Math.max(1, totalLanes)));
+        };
         
         // Pass 1: Handle Overrides (Pins) & Define Solid Walls
         Object.values(virtualRoomsMap).forEach(function(vRoom) {
             if (vRoom.startOffset === Infinity) vRoom.startOffset = 0;
-            if (vRoom.limit === Infinity) vRoom.limit = globalHeadcount;
-            if (vRoom.isCombined) vRoom.limit = globalHeadcount; 
+            if (vRoom.isCombined) vRoom.limit = Infinity; 
             
             vRoom.unpinnedTasks = [];
             vRoom.tasks.forEach(function(task) {
-                if (overrides[task.id]) {
+                if (overrides[task.id] && totalLanes > 0) {
                     task.isPinned = true;
-                    task.appliedHeads = Math.min(task.heads, vRoom.limit, globalHeadcount);
+                    task.appliedHeads = Math.min(capHeads(task, vRoom), totalLanes);
                     task.startMin = overrides[task.id].startMin;
                     
                     let safeLane = overrides[task.id].startLane;
-                    if (safeLane > globalHeadcount - task.appliedHeads) {
-                        safeLane = Math.max(0, globalHeadcount - task.appliedHeads);
+                    if (safeLane > totalLanes - task.appliedHeads) {
+                        safeLane = Math.max(0, totalLanes - task.appliedHeads);
                     }
                     
                     task.assignedLanes = Array.from({length: task.appliedHeads}, function(_, i) { return safeLane + i; });
                     task.finalDuration = task.getDuration(task.customInterrupts, task.appliedHeads, task.startMin); 
                     task.segments = task.calculateSegments(task.customInterrupts, task.appliedHeads, task.startMin);
+                    task.isOffShift = task.assignedLanes.some(function(l) { return !workers[l].isOnShift(task.startMin, task.startMin + task.finalDuration); });
                     
                     task.assignedLanes.forEach(function(l) {
-                        if (l < globalHeadcount) {
-                            workers[l].assign(task.startMin, task.startMin + task.finalDuration, task.id, task.originalArea);
-                        }
+                        workers[l].assign(task.startMin, task.startMin + task.finalDuration, task.id, task.originalArea);
                     });
                 } else {
                     vRoom.unpinnedTasks.push(task);
@@ -785,201 +1050,144 @@ export default function App(props) {
             });
         });
 
-        // Pass 2: Cascade & Swarm Loop
+        const taskOrder = function(a, b) {
+            if (a.priority !== b.priority) return a.priority - b.priority;
+            return b.rawWorkloadMins - a.rawWorkloadMins;
+        };
+
+        // Every moment the picture can change: a worker frees up or a crew clocks in.
+        const candidateTimes = function(from) {
+            const set = {};
+            set[from] = true;
+            workers.forEach(function(w) {
+                w.windows.forEach(function(win) { if (win.start > from) set[win.start] = true; });
+                w.schedule.forEach(function(s) { if (s.end > from) set[s.end] = true; });
+            });
+            return Object.keys(set).map(Number).filter(function(t) { return t < planHorizonMins; }).sort(function(a, b) { return a - b; });
+        };
+
+        // Prefer one crew, people who already worked this area (fewer walk-overs), then the tightest fit.
+        const pickLanes = function(options, H, task, preferLongest) {
+            const crewCount = {};
+            options.forEach(function(o) { crewCount[o.w.crew] = (crewCount[o.w.crew] || 0) + 1; });
+            return options.slice().sort(function(a, b) {
+                const ca = crewCount[a.w.crew] >= H ? 1 : 0, cb = crewCount[b.w.crew] >= H ? 1 : 0;
+                if (ca !== cb) return cb - ca;
+                const affA = a.w.schedule.some(function(s) { return s.area === task.originalArea; }) ? 1 : 0;
+                const affB = b.w.schedule.some(function(s) { return s.area === task.originalArea; }) ? 1 : 0;
+                if (affA !== affB) return affB - affA;
+                if (a.r.run !== b.r.run) return preferLongest ? b.r.run - a.r.run : a.r.run - b.r.run;
+                return a.w.id - b.w.id;
+            }).slice(0, H);
+        };
+
+        const placeTask = function(task, H, lanes, start, duration) {
+            task.startMin = start;
+            task.appliedHeads = H;
+            task.assignedLanes = lanes.slice().sort(function(a, b) { return a - b; });
+            task.segments = task.calculateSegments(task.customInterrupts, H, start);
+            task.finalDuration = duration;
+            task.crew = workers[task.assignedLanes[0]].crew;
+            task.assignedLanes.forEach(function(l) { workers[l].assign(start, start + duration, task.id, task.originalArea); });
+        };
+
+        // Pass 2: Cascade loop
         const sortedVRooms = Object.values(virtualRoomsMap).sort(function(a, b) {
             if (a.startOffset !== b.startOffset) return a.startOffset - b.startOffset;
             return a.priority - b.priority;
         });
 
         sortedVRooms.forEach(function(vRoom) {
-            if (vRoom.unpinnedTasks.length === 0) return;
-            
-            const C = Math.min(vRoom.limit, globalHeadcount);
-            
-            let bestTeamLanes = [];
-            let minTeamAvailSum = Infinity;
-            
-            for (let i = 0; i <= globalHeadcount - C; i++) {
-                let sum = 0;
-                let maxAvail = vRoom.startOffset;
-                for (let j = 0; j < C; j++) {
-                    let wMax = vRoom.startOffset;
-                    workers[i+j].schedule.forEach(function(s) { if (s.end > wMax) wMax = s.end; });
-                    if (wMax > maxAvail) maxAvail = wMax;
-                    sum += wMax;
-                }
-                const score = (maxAvail * 1000) + sum;
-                if (score < minTeamAvailSum) {
-                    minTeamAvailSum = score;
-                    bestTeamLanes = Array.from({length: C}, function(_, idx) { return i + idx; });
-                }
-            }
-            
-            const sortedWorkers = workers.map(function(w, idx) {
-                let wMax = vRoom.startOffset;
-                w.schedule.forEach(function(s) { if (s.end > wMax) wMax = s.end; });
-                return { lane: idx, avail: wMax };
-            }).sort(function(a,b) { return a.avail - b.avail; });
-            
-            let absoluteEarliestMax = sortedWorkers[C-1].avail;
-            const chosenMaxAvail = Math.floor(minTeamAvailSum / 1000);
-            
-            const teamLanes = (chosenMaxAvail > absoluteEarliestMax + 30) 
-                ? sortedWorkers.slice(0, C).map(function(w){return w.lane;}) 
-                : bestTeamLanes;
+            const queue = vRoom.unpinnedTasks.slice().sort(taskOrder);
 
-            let tasksToProcess = vRoom.unpinnedTasks.slice();
-            
-            tasksToProcess.sort(function(a, b) {
-                if (a.priority !== b.priority) return a.priority - b.priority;
-                return b.rawWorkloadMins - a.rawWorkloadMins;
-            });
+            while (queue.length > 0) {
+                const task = queue.shift();
+                if (totalLanes === 0) { unscheduled.push(task); continue; }
 
-            while (tasksToProcess.length > 0) {
-                const task = tasksToProcess.shift(); 
-                const H = Math.min(task.heads, teamLanes.length);
-                
-                let checkT = vRoom.startOffset;
-                let earliestT = Infinity;
-                let bestHLanes = null;
-                let finalDur = 0;
-                let isSplit = false;
-                let part2 = null;
+                const H = capHeads(task, vRoom);
+                const from = Math.max(vRoom.startOffset, task.earliestStart || 0);
+                let placed = false;
+                let continuation = null;
 
-                while (true) {
-                    // Standard breaks are mathematically absorbed, only hard gaps matter for split collision
-                    let dur = task.calculateDuration(checkT, task.customInterrupts, H);
-                    
-                    let freeTeamLanes = [];
-                    for (let i = 0; i < teamLanes.length; i++) {
-                        const lane = teamLanes[i];
-                        if (workers[lane].isFree(checkT, checkT + dur)) {
-                            freeTeamLanes.push(lane);
-                        }
-                    }
+                const times = candidateTimes(from);
+                for (let ci = 0; ci < times.length && !placed; ci++) {
+                    const t = times[ci];
+                    const dur = task.calculateDuration(t, task.customInterrupts, H);
+                    const options = workers.map(function(w) { return { w: w, r: w.runFrom(t) }; }).filter(function(o) { return o.r.run > 0; });
+                    if (options.length < H) continue;
 
-                    if (freeTeamLanes.length >= H) {
-                        let contiguousBlocks = [];
-                        for (let i = 0; i <= freeTeamLanes.length - H; i++) {
-                            if (freeTeamLanes[i + H - 1] === freeTeamLanes[i] + H - 1) {
-                                contiguousBlocks.push(freeTeamLanes.slice(i, i + H));
-                            }
-                        }
-
-                        let selectedCombo = null;
-                        let maxAff = -1;
-
-                        if (contiguousBlocks.length > 0) {
-                            for (let i = 0; i < contiguousBlocks.length; i++) {
-                                const block = contiguousBlocks[i];
-                                let affScore = block.reduce(function(acc, l) {
-                                    return acc + (workers[l].schedule.some(function(s) { return s.area === task.originalArea; }) ? 1 : 0);
-                                }, 0);
-                                if (affScore > maxAff) {
-                                    maxAff = affScore;
-                                    selectedCombo = block;
-                                }
-                            }
-                        } else {
-                            freeTeamLanes.sort(function(a, b) {
-                                let affA = workers[a].schedule.some(function(s) { return s.area === task.originalArea; }) ? 1 : 0;
-                                let affB = workers[b].schedule.some(function(s) { return s.area === task.originalArea; }) ? 1 : 0;
-                                return affB - affA; 
-                            });
-                            selectedCombo = freeTeamLanes.slice(0, H);
-                        }
-
-                        earliestT = checkT;
-                        bestHLanes = selectedCombo;
-                        finalDur = dur;
-                        break; 
-                    }
-
-                    let nextCollision = Infinity;
-                    teamLanes.forEach(function(l) {
-                        workers[l].schedule.forEach(function(s) {
-                            if (s.start > checkT + 0.01 && s.start < nextCollision) nextCollision = s.start;
-                        });
-                    });
-                    
-                    // 🚨 ARCHITECTURE NOTE: Greedy Splitting Penalty
-                    // ONLY Hard Custom Downtimes trigger the 45m greedy split penalty.
-                    // This forces the algorithm to "swallow" normal shift breaks without shattering the task.
-                    task.customInterrupts.forEach(function(b) {
-                        if (b.isCustom && b.start > checkT + 0.01 && b.start < nextCollision) nextCollision = b.start;
-                    });
-
-                    let gapDur = nextCollision - checkT;
-                    
-                    if (gapDur >= 60 && gapDur < dur) {
-                        let potentialLanes = [];
-                        for (let i = 0; i < teamLanes.length; i++) {
-                            if (workers[teamLanes[i]].isFree(checkT, checkT + gapDur)) potentialLanes.push(teamLanes[i]);
-                        }
-                        if (potentialLanes.length >= H) {
-                            part2 = Object.assign(Object.create(Object.getPrototypeOf(task)), task);
-                            part2.id = task.id + '_p2';
-                            part2.name = task.name + ' (Pt 2)';
-                            
-                            part2.baseMins = ((dur - gapDur) + 45) * H;
-                            part2.allergenMins = part2.baseMins;
-                            part2.pbMins = part2.baseMins;
-                            part2.isTransitActive = false;
-                            part2.isSplitPart2 = true;
-                            
-                            task.isInspectionActive = false; 
-                            task.isSplitPart1 = true;
-                            task.baseMins = (gapDur * H) - (task.isTransitActive ? (10 * H) : 0);
-                            task.allergenMins = task.baseMins;
-                            task.pbMins = task.baseMins;
-
-                            earliestT = checkT;
-                            bestHLanes = potentialLanes.slice(0, H);
-                            finalDur = gapDur;
-                            isSplit = true;
+                    // (a) Whole task fits before these workers clock out / get booked.
+                    const fits = options.filter(function(o) { return o.r.run >= dur - 0.01; });
+                    if (fits.length >= H) {
+                        const chosen = pickLanes(fits, H, task, false);
+                        const ids = chosen.map(function(o) { return o.w.id; });
+                        if (busyInRoom(vRoom, t, t + dur, ids) + H <= vRoom.limit) {
+                            placeTask(task, H, ids, t, dur);
+                            placed = true;
                             break;
                         }
                     }
 
-                    if (nextCollision === Infinity) checkT += 15; else checkT = nextCollision; 
+                    // (b) Shift handover: the outgoing crew works until clock-out, the rest carries over.
+                    const handoverReady = options.filter(function(o) { return o.r.freeToShiftEnd; });
+                    if (handoverReady.length >= H && task.splitIndex < 40) {
+                        const chosen = pickLanes(handoverReady, H, task, true);
+                        const ids = chosen.map(function(o) { return o.w.id; });
+                        const usable = Math.min.apply(null, chosen.map(function(o) { return o.r.run; }));
+                        const done = netWorkingMins(t, t + usable, task.customInterrupts) * H;
+                        if (usable >= MIN_SPLIT_MINS && done > 0 && done < task.rawWorkloadMins && busyInRoom(vRoom, t, t + usable, ids) + H <= vRoom.limit) {
+                            const remaining = task.rawWorkloadMins - done;
+
+                            continuation = Object.assign(Object.create(Object.getPrototypeOf(task)), task);
+                            continuation.splitIndex = task.splitIndex + 1;
+                            continuation.id = task.parentId + '_p' + continuation.splitIndex;
+                            continuation.name = task.baseName + ' (Pt ' + continuation.splitIndex + ')';
+                            continuation.workOverrideMins = remaining + (handoverMins * H);
+                            continuation.isSplitPart2 = true;
+                            continuation.isSplitPart1 = false;
+                            continuation.isTransitActive = false;
+                            continuation.isInspectionActive = false;
+                            continuation.earliestStart = t + usable;
+                            continuation.assignedLanes = [];
+                            continuation.segments = [];
+
+                            if (task.splitIndex === 1) task.name = task.baseName + ' (Pt 1)';
+                            task.workOverrideMins = done;
+                            task.isSplitPart1 = true;
+                            placeTask(task, H, ids, t, usable);
+                            placed = true;
+                            break;
+                        }
+                    }
                 }
 
-                if (bestHLanes) {
-                    task.startMin = earliestT;
-                    task.assignedLanes = bestHLanes;
-                    task.finalDuration = finalDur;
-                    task.appliedHeads = H;
-                    task.segments = task.calculateSegments(task.customInterrupts, H, earliestT); 
-                    
-                    bestHLanes.forEach(function(l) { 
-                        workers[l].assign(earliestT, earliestT + finalDur, task.id, task.originalArea); 
-                    });
-                    
-                    if (isSplit && part2) {
-                        tasksToProcess.push(part2);
-                        tasksToProcess.sort(function(a, b) {
-                            if (a.priority !== b.priority) return a.priority - b.priority;
-                            return b.rawWorkloadMins - a.rawWorkloadMins;
-                        });
-                        allTasks.push(part2);
-                    }
+                if (!placed) { unscheduled.push(task); continue; }
+                if (continuation) {
+                    queue.unshift(continuation);
+                    allTasks.push(continuation);
                 }
             }
         });
 
+        const scheduledTasks = allTasks.filter(function(t) { return unscheduled.indexOf(t) === -1 && t.assignedLanes && t.assignedLanes.length > 0; });
+
         const finalGrouped = {};
-        allTasks.forEach(function(t) {
+        scheduledTasks.forEach(function(t) {
             const area = t.originalArea;
             if (!finalGrouped[area]) finalGrouped[area] = { name: area, tasks: [], highestLane: 0 };
             finalGrouped[area].tasks.push(t);
-            const tHigh = Math.max.apply(null, (t.assignedLanes && t.assignedLanes.length > 0 ? t.assignedLanes : [0]));
+            const tHigh = Math.max.apply(null, t.assignedLanes);
             if (tHigh > finalGrouped[area].highestLane) finalGrouped[area].highestLane = tHigh;
         });
         
-        finalGrouped._workers = workers;
+        workers.forEach(function(w) { w.schedule.sort(function(a, b) { return a.start - b.start; }); });
 
-        return Object.values(finalGrouped).filter(function(g) { return g.name !== undefined; }).sort(function(a, b) { return a.name.localeCompare(b.name); });
-    }, [assets, roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, overrides, targetDowntimes, allInterrupts, includeTransit, includeInspection, pbMode, hiddenRooms, globalHeadcount, ganttStartDate, ganttStartHour]);
+        return {
+            groups: Object.values(finalGrouped).sort(function(a, b) { return a.name.localeCompare(b.name); }),
+            workers: workers,
+            unscheduled: unscheduled
+        };
+    }, [assets, roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, overrides, targetDowntimes, allInterrupts, includeTransit, includeInspection, pbMode, hiddenRooms, laneRoster, maxCrewSize, planHorizonMins, handoverMins, ganttStartDate, ganttStartHour]);
 
 
     // ============================================================================
@@ -1046,10 +1254,9 @@ export default function App(props) {
 
     let globalMaxEnd = 0;
     let totalManpowerMins = 0;
-    let metricsWorkers = [];
+    const metricsWorkers = scheduleData.workers;
     
-    scheduleData.forEach(function(g) { 
-        if (g._workers) { metricsWorkers = g._workers; return; }
+    scheduleData.groups.forEach(function(g) { 
         g.tasks.forEach(function(t) { 
             if (t.startMin + t.finalDuration > globalMaxEnd) globalMaxEnd = t.startMin + t.finalDuration; 
             totalManpowerMins += (t.finalDuration * t.appliedHeads);
@@ -1058,8 +1265,7 @@ export default function App(props) {
     
     // Deep Metrics Calculation
     let deepTransit = 0, deepInspect = 0, deepBreak = 0, deepDown = 0;
-    scheduleData.forEach(function(g) {
-        if (g._workers) return;
+    scheduleData.groups.forEach(function(g) {
         g.tasks.forEach(function(t) {
             if (t.isTransitActive && !t.isSplitPart2) deepTransit += (10 * t.appliedHeads);
             if (t.isInspectionActive) {
@@ -1069,21 +1275,37 @@ export default function App(props) {
         });
     });
     
+    // Breaks / downtime that land inside a worker's booked time (absorbed into their blocks).
     metricsWorkers.forEach(function(w) {
-        if (w.schedule.length === 0) return;
-        let wStart = w.schedule[0].start;
-        let wEnd = w.schedule[w.schedule.length - 1].end;
-        allInterrupts.forEach(function(b) {
-            let oStart = Math.max(wStart, b.start);
-            let oEnd = Math.min(wEnd, b.end);
-            if (oEnd > oStart) {
-                if (b.isCustom) deepDown += (oEnd - oStart);
-                else deepBreak += (oEnd - oStart);
-            }
+        w.schedule.forEach(function(slot) {
+            allInterrupts.forEach(function(b) {
+                const oStart = Math.max(slot.start, b.start);
+                const oEnd = Math.min(slot.end, b.end);
+                if (oEnd > oStart) {
+                    if (b.isCustom) deepDown += (oEnd - oStart);
+                    else deepBreak += (oEnd - oStart);
+                }
+            });
         });
     });
+
+    // Per-crew utilization inside the plan window.
+    const crewStats = [];
+    laneRoster.forEach(function(l) {
+        let cs = crewStats.find(function(c) { return c.crew === l.crew; });
+        if (!cs) {
+            cs = { crew: l.crew, heads: 0, availMins: 0, bookedMins: 0, shifts: shiftWindows.filter(function(w) { return w.crew === l.crew; }) };
+            crewStats.push(cs);
+        }
+        const w = metricsWorkers[l.lane];
+        cs.heads += 1;
+        l.windows.forEach(function(win) { cs.availMins += (win.end - win.start); });
+        if (w) w.schedule.forEach(function(s) { cs.bookedMins += (s.end - s.start); });
+    });
+    const unscheduledWorkMins = scheduleData.unscheduled.reduce(function(acc, t) { return acc + t.rawWorkloadMins; }, 0);
+    const handoverCount = scheduleData.groups.reduce(function(acc, g) { return acc + g.tasks.filter(function(t) { return t.isSplitPart2; }).length; }, 0);
     
-    const dynamicTotalHours = Math.max(24, Math.ceil(globalMaxEnd / 60) + 4); 
+    const dynamicTotalHours = Math.max(Math.ceil(planHorizonMins / 60), Math.ceil(globalMaxEnd / 60)) + 2; 
     const GANTT_TOTAL_WIDTH_PX = dynamicTotalHours * zoomLevel;
     const hourStep = zoomLevel < 25 ? 4 : 2; 
     const TIME_MARKERS = Array.from({ length: Math.ceil(dynamicTotalHours / hourStep) + 1 }, function(_, i) { return i * hourStep; });
@@ -1091,11 +1313,31 @@ export default function App(props) {
     let activeEditorTask = null;
     if (selectedTaskEditor) {
         const flatTasks = [];
-        scheduleData.forEach(function(a) { if(a._workers) return; a.tasks.forEach(function(t) { flatTasks.push(t); }); });
+        scheduleData.groups.forEach(function(a) { a.tasks.forEach(function(t) { flatTasks.push(t); }); });
         activeEditorTask = flatTasks.find(function(a) { return a.id === selectedTaskEditor; });
     }
 
-    const displayData = activeTab === 'focus' && focusRoom ? scheduleData.filter(function(g) { return g.name === focusRoom; }) : scheduleData.filter(function(g){ return !g._workers; });
+    const displayData = activeTab === 'focus' && focusRoom ? scheduleData.groups.filter(function(g) { return g.name === focusRoom; }) : scheduleData.groups;
+
+    // Grey "off shift" bands per lane (time outside that worker's crew windows).
+    const ganttTotalMins = dynamicTotalHours * 60;
+    const laneOffShift = laneRoster.map(function(l) {
+        const gaps = [];
+        let cursor = 0;
+        l.windows.forEach(function(w) {
+            if (w.start > cursor) gaps.push({ start: cursor, end: w.start });
+            cursor = Math.max(cursor, w.end);
+        });
+        if (cursor < ganttTotalMins) gaps.push({ start: cursor, end: ganttTotalMins });
+        return gaps;
+    });
+    // First lane index of each crew block, for the crew divider lines.
+    const crewBlocks = [];
+    laneRoster.forEach(function(l) {
+        const last = crewBlocks[crewBlocks.length - 1];
+        if (!last || last.crew !== l.crew) crewBlocks.push({ crew: l.crew, firstLane: l.lane, count: 1 });
+        else last.count += 1;
+    });
 
     const globalStartMs = getGlobalStart(ganttStartDate, ganttStartHour).getTime();
     const liveOffsetMins = Math.round((liveTime.getTime() - globalStartMs) / 60000);
@@ -1150,7 +1392,7 @@ export default function App(props) {
                         <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden flex-shrink-0">
                             <div className="bg-indigo-50 border-b border-indigo-100 px-6 py-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
                                 <h2 className="font-black text-indigo-900 uppercase tracking-widest text-sm flex items-center">
-                                    <SettingsIcon className="w-5 h-5 mr-2" /> Global Master Configuration
+                                    <SettingsIcon className="w-5 h-5 mr-2" /> Planning Window
                                 </h2>
                                 <label className="flex items-center gap-2 cursor-pointer bg-white px-3 py-1.5 rounded-lg border border-indigo-200 shadow-sm transition-colors hover:bg-indigo-50">
                                     <input type="checkbox" checked={hideConfiguredRooms} onChange={function(e) { setHideConfiguredRooms(e.target.checked); }} className="w-4 h-4 accent-indigo-600 cursor-pointer" />
@@ -1159,29 +1401,114 @@ export default function App(props) {
                             </div>
                             <div className="p-6 grid grid-cols-1 md:grid-cols-4 gap-6 items-end">
                                 <div>
-                                    <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Global Start Date</label>
+                                    <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Plan Start Date</label>
                                     <input type="date" value={ganttStartDate} onChange={function(e) { setGanttStartDate(e.target.value); }} className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none no-pan" />
                                 </div>
                                 <div>
-                                    <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Global Start Hour</label>
+                                    <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Plan Start Hour</label>
                                     <div className="flex items-center">
-                                        <input type="number" min="0" max="23" value={ganttStartHour} onChange={function(e) { setGanttStartHour(Number(e.target.value)||0); }} className="w-full border border-slate-300 rounded-l p-2 text-sm font-bold outline-none no-pan text-center" />
+                                        <input type="number" min="0" max="23" value={ganttStartHour} onChange={function(e) { setGanttStartHour(Math.max(0, Math.min(23, Number(e.target.value)||0))); }} className="w-full border border-slate-300 rounded-l p-2 text-sm font-bold outline-none no-pan text-center" />
                                         <span className="bg-slate-100 border-y border-r border-slate-300 rounded-r px-3 py-2 text-sm font-bold text-slate-500">:00</span>
                                     </div>
                                 </div>
                                 <div>
-                                    <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Active Shift</label>
-                                    <select className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none no-pan" value={currentShift} onChange={function(e) { setCurrentShift(e.target.value); }}>
-                                        <option value="A">A (6AM)</option>
-                                        <option value="B">B (6PM)</option>
-                                        <option value="C">C (6AM)</option>
-                                        <option value="D">D (6PM)</option>
-                                    </select>
+                                    <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Plan Length (Hours)</label>
+                                    <input type="number" min="1" max="336" value={planHours} onChange={function(e) { setPlanHours(Math.max(1, Math.min(336, Number(e.target.value)||12))); }} className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none no-pan text-center" />
                                 </div>
                                 <div>
-                                    <label className="block text-[10px] font-black text-indigo-500 uppercase tracking-widest mb-1.5">Global Workforce</label>
-                                    <input type="number" min="1" value={globalHeadcount} onChange={function(e) { handleGlobalHeadcountChange(e.target.value); }} className="w-full border-2 border-indigo-400 bg-indigo-50 text-indigo-900 rounded p-2 text-sm font-black outline-none no-pan text-center" title="Adjusting this changes all un-capped rooms" />
+                                    <label className="block text-[10px] font-black text-indigo-500 uppercase tracking-widest mb-1.5">Workforce In Window</label>
+                                    <div className="w-full border-2 border-indigo-400 bg-indigo-50 text-indigo-900 rounded p-2 text-sm font-black text-center" title="Sum of every crew's headcount that works inside the plan window">{globalHeadcount} people · {shiftWindows.length} shifts</div>
                                 </div>
+                            </div>
+                            <div className="px-6 pb-5 flex flex-wrap items-center gap-2">
+                                <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest mr-1">Presets:</span>
+                                <Button variant="outline" size="sm" onClick={function() { applyPlanPreset('shift'); }}>Single Shift (12h)</Button>
+                                <Button variant="outline" size="sm" onClick={function() { applyPlanPreset('weekend'); }}>Weekend (Fri 6PM → Mon 6AM)</Button>
+                                <Button variant="outline" size="sm" onClick={function() { applyPlanPreset('week'); }}>Full Rotation (7 days)</Button>
+                                <span className="text-xs font-bold text-slate-500 ml-auto">
+                                    {formatClockTime(ganttStartDate, ganttStartHour, 0)} → {formatClockTime(ganttStartDate, ganttStartHour, planHorizonMins)}
+                                </span>
+                            </div>
+                        </div>
+
+                        {/* CREW ROTATION & HEADCOUNT */}
+                        <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden flex-shrink-0">
+                            <div className="bg-slate-50 border-b border-gray-200 px-6 py-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                                <h2 className="font-black text-slate-800 uppercase tracking-widest text-sm flex items-center">
+                                    <Users className="w-5 h-5 mr-2 text-indigo-500" /> Crew Rotation & Headcount
+                                    <span className="ml-3 text-[10px] font-bold normal-case tracking-normal text-slate-500 bg-white border border-slate-200 rounded px-2 py-0.5">Rotation: {rotationSource}</span>
+                                </h2>
+                                <div className="flex items-center gap-3">
+                                    <div className="flex items-center gap-2 bg-white px-2 py-1.5 rounded border border-slate-200 shadow-sm" title="Extra minutes per head added to the continuation when a task is handed to the next crew">
+                                        <span className="text-[10px] font-black text-slate-500 uppercase">Handover Overhead:</span>
+                                        <input type="number" min="0" value={handoverMins} onChange={function(e) { setHandoverMins(Math.max(0, Number(e.target.value)||0)); }} className="w-12 text-center font-bold text-xs outline-none border-b border-slate-200 no-pan" />
+                                        <span className="text-[10px] font-bold text-slate-400">min</span>
+                                    </div>
+                                    <Button variant="outline" size="sm" onClick={resetRotation}><RefreshCw className="w-3.5 h-3.5 mr-1" /> Reset Rotation</Button>
+                                </div>
+                            </div>
+                            <div className="p-4 md:p-6 grid grid-cols-1 md:grid-cols-2 gap-4 bg-slate-50/50">
+                                {CREW_CODES.map(function(crew) {
+                                    const cfg = shiftRotation[crew] || { days: [], startHour: 6, lengthHours: 12 };
+                                    const style = getCrewStyle(crew);
+                                    const roster = crewRosters[crew];
+                                    const presentCount = roster.filter(function(p) { return !absentEmployees[p.id]; }).length;
+                                    const crewShifts = shiftWindows.filter(function(w) { return w.crew === crew; });
+                                    const isOverridden = crewHeadcountOverrides[crew] !== undefined;
+                                    return (
+                                        <div key={crew} className={`border rounded-xl overflow-hidden bg-white shadow-sm ${crewShifts.length > 0 ? '' : 'opacity-60'}`}>
+                                            <div className={`px-4 py-3 border-b flex items-center justify-between ${style.soft}`}>
+                                                <div className="flex items-center gap-2">
+                                                    <span className={`w-7 h-7 rounded-md flex items-center justify-center font-black text-sm ${style.badge}`}>{crew}</span>
+                                                    <span className="font-bold text-sm">{formatHourLabel(cfg.startHour)} – {formatHourLabel(cfg.startHour + cfg.lengthHours)}</span>
+                                                </div>
+                                                <span className="text-[10px] font-black uppercase tracking-wider">{crewShifts.length} shift{crewShifts.length === 1 ? '' : 's'} in window</span>
+                                            </div>
+                                            <div className="p-4 space-y-3">
+                                                <div className="flex items-center gap-1">
+                                                    {DAY_LETTERS.map(function(letter, day) {
+                                                        const on = cfg.days.indexOf(day) > -1;
+                                                        return <button key={day} title={DAY_NAMES[day] + ' (shift start day)'} onClick={function() { toggleCrewDay(crew, day); }} className={`w-7 h-7 rounded text-[11px] font-black border transition-colors ${on ? style.badge + ' border-transparent' : 'bg-white text-slate-400 border-slate-200 hover:bg-slate-50'}`}>{letter}</button>;
+                                                    })}
+                                                </div>
+                                                <div className="flex flex-wrap items-center gap-3">
+                                                    <label className="flex items-center gap-1.5 text-[10px] font-black text-slate-500 uppercase">Start
+                                                        <input type="number" min="0" max="23" value={cfg.startHour} onChange={function(e) { handleCrewHourChange(crew, 'startHour', e.target.value); }} className="w-12 text-center font-bold text-xs outline-none border border-slate-200 rounded p-1 no-pan" />
+                                                    </label>
+                                                    <label className="flex items-center gap-1.5 text-[10px] font-black text-slate-500 uppercase">Hours
+                                                        <input type="number" min="1" max="24" value={cfg.lengthHours} onChange={function(e) { handleCrewHourChange(crew, 'lengthHours', e.target.value); }} className="w-12 text-center font-bold text-xs outline-none border border-slate-200 rounded p-1 no-pan" />
+                                                    </label>
+                                                    <label className="flex items-center gap-1.5 text-[10px] font-black text-indigo-600 uppercase" title="Blank = present employees from Dataverse">Headcount
+                                                        <input type="number" min="0" value={isOverridden ? crewHeadcountOverrides[crew] : ''} placeholder={String(hasDataverseRoster ? presentCount : FALLBACK_CREW_SIZE)} onChange={function(e) { handleCrewHeadcountChange(crew, e.target.value); }} className={`w-14 text-center font-black text-xs outline-none border rounded p-1 no-pan ${isOverridden ? 'border-indigo-400 bg-indigo-50' : 'border-slate-200'}`} />
+                                                    </label>
+                                                </div>
+                                                <div className="text-[11px] font-bold text-slate-500">
+                                                    {hasDataverseRoster ? `${presentCount} of ${roster.length} on roster available` : 'No Dataverse roster found — using placeholder seats'}
+                                                    {crewShifts.length > 0 && <span className="text-slate-400"> · {crewShifts.map(function(w) { return w.dayLabel; }).join(', ')}</span>}
+                                                </div>
+                                                {roster.length > 0 && (
+                                                    <div>
+                                                        <button onClick={function() { setExpandedRosters(function(prev) { return Object.assign({}, prev, { [crew]: !prev[crew] }); }); }} className="text-[11px] font-black text-indigo-600 hover:text-indigo-800 flex items-center gap-1">
+                                                            {expandedRosters[crew] ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />} Roster / mark absent
+                                                        </button>
+                                                        {expandedRosters[crew] && (
+                                                            <div className="mt-2 flex flex-wrap gap-1.5">
+                                                                {roster.map(function(p) {
+                                                                    const absent = !!absentEmployees[p.id];
+                                                                    return (
+                                                                        <button key={p.id} onClick={function() { toggleAbsent(p.id); }} title={absent ? 'Absent — click to mark present' : 'Present — click to mark absent'} className={`px-2 py-1 rounded-full text-[10px] font-bold border transition-colors ${absent ? 'bg-slate-100 text-slate-400 border-slate-200 line-through' : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'}`}>
+                                                                            {p.name}{p.isLead ? ' ★' : ''}
+                                                                        </button>
+                                                                    );
+                                                                })}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </div>
+                                    );
+                                })}
                             </div>
                         </div>
 
@@ -1233,7 +1560,7 @@ export default function App(props) {
                                                     </div>
                                                     <div className="flex items-center gap-2 bg-white px-2 py-1.5 rounded border border-indigo-200 shadow-sm">
                                                         <span className="text-[10px] font-black text-slate-500 uppercase">Max Workers:</span>
-                                                        <input type="number" min="1" value={roomLimits[room] !== undefined ? roomLimits[room] : ''} placeholder={globalHeadcount} onChange={function(e) { handleRoomLimitsChange(room, e.target.value); }} className="w-10 md:w-12 text-center font-bold text-xs md:text-sm outline-none border-b border-slate-200 no-pan" title="Leave blank to inherit global workforce" />
+                                                        <input type="number" min="1" value={roomLimits[room] !== undefined ? roomLimits[room] : ''} placeholder="∞" onChange={function(e) { handleRoomLimitsChange(room, e.target.value); }} className="w-10 md:w-12 text-center font-bold text-xs md:text-sm outline-none border-b border-slate-200 no-pan" title="Max people in this room at the same time. Leave blank for no cap." />
                                                     </div>
                                                     <div className="flex items-center gap-2 bg-white px-2 py-1.5 rounded border border-indigo-200 shadow-sm">
                                                         <span className="text-[10px] font-black text-slate-500 uppercase">Priority:</span>
@@ -1373,7 +1700,7 @@ export default function App(props) {
                                     <div className="text-3xl font-black text-teal-600 mb-1">{(totalManpowerMins / 60).toFixed(1)} <span className="text-lg">hrs</span></div>
                                 </div>
                                 <div className="text-sm font-bold text-slate-500 bg-slate-50 p-2 rounded mt-4 border border-slate-100">
-                                    Across <span className="text-teal-700 font-black">{globalHeadcount}</span> Active Personnel
+                                    Across <span className="text-teal-700 font-black">{globalHeadcount}</span> people in <span className="text-teal-700 font-black">{shiftWindows.length}</span> shifts
                                 </div>
                             </div>
 
@@ -1414,6 +1741,42 @@ export default function App(props) {
                             </div>
                         </div>
 
+                        {/* CREW UTILIZATION */}
+                        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                            <div className="bg-slate-50 px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+                                <h2 className="text-lg font-black text-slate-800 flex items-center"><Users className="w-5 h-5 mr-2 text-indigo-500" /> Crew Utilization</h2>
+                                <span className="text-xs font-bold text-slate-500">{handoverCount} shift handover{handoverCount === 1 ? '' : 's'}</span>
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 p-6 bg-slate-50/50">
+                                {crewStats.length === 0 ? (
+                                    <p className="text-center text-slate-400 w-full col-span-full font-bold py-6">No crews work inside the plan window.</p>
+                                ) : crewStats.map(function(cs) {
+                                    const pct = cs.availMins > 0 ? Math.round((cs.bookedMins / cs.availMins) * 100) : 0;
+                                    const style = getCrewStyle(cs.crew);
+                                    return (
+                                        <div key={cs.crew} className="bg-white border border-gray-200 p-4 rounded-lg shadow-sm flex flex-col gap-2">
+                                            <div className="flex items-center gap-2 border-b border-slate-100 pb-2">
+                                                <span className={`w-6 h-6 rounded flex items-center justify-center font-black text-xs ${style.badge}`}>{cs.crew}</span>
+                                                <span className="font-bold text-slate-700">{cs.heads} people · {cs.shifts.length} shift{cs.shifts.length === 1 ? '' : 's'}</span>
+                                            </div>
+                                            <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden"><div className={`h-full ${style.badge}`} style={{ width: `${Math.min(100, pct)}%` }} /></div>
+                                            <div className="flex justify-between text-sm"><span className="text-[11px] text-slate-500 font-bold uppercase">Utilization</span><span className="font-black text-slate-800">{pct}%</span></div>
+                                            <div className="flex justify-between text-sm"><span className="text-[11px] text-slate-500 font-bold uppercase">Assigned</span><span className="font-black text-slate-800">{(cs.bookedMins / 60).toFixed(1)} hrs</span></div>
+                                            <div className="flex justify-between text-sm"><span className="text-[11px] text-slate-500 font-bold uppercase">Idle Capacity</span><span className="font-black text-emerald-700">{((cs.availMins - cs.bookedMins) / 60).toFixed(1)} hrs</span></div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                            {scheduleData.unscheduled.length > 0 && (
+                                <div className="mx-6 mb-6 p-4 rounded-lg border border-rose-200 bg-rose-50">
+                                    <div className="font-black text-rose-700 text-sm flex items-center mb-2"><AlertCircle className="w-4 h-4 mr-2" /> {scheduleData.unscheduled.length} task{scheduleData.unscheduled.length === 1 ? '' : 's'} ({(unscheduledWorkMins / 60).toFixed(1)} manpower hrs) don't fit in the plan window</div>
+                                    <div className="flex flex-wrap gap-1.5">
+                                        {scheduleData.unscheduled.map(function(t) { return <span key={t.id} className="text-[11px] font-bold bg-white border border-rose-200 text-rose-800 rounded px-2 py-0.5">{t.originalArea}: {t.name}</span>; })}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+
                         <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
                             <div className="bg-slate-50 px-6 py-4 border-b border-slate-200">
                                 <h2 className="text-lg font-black text-slate-800 flex items-center"><Zap className="w-5 h-5 mr-2 text-indigo-500" /> Room-by-Room Breakdown</h2>
@@ -1422,7 +1785,7 @@ export default function App(props) {
                                 {activeRooms.length === 0 ? (
                                     <p className="text-center text-slate-400 w-full col-span-full font-bold py-10">No active rooms to display.</p>
                                 ) : activeRooms.map(function(room) {
-                                    const roomData = scheduleData.find(function(g) { return g.name === room; });
+                                    const roomData = scheduleData.groups.find(function(g) { return g.name === room; });
                                     let roomStart = Infinity;
                                     let roomEnd = 0;
                                     let roomManpowerMins = 0;
@@ -1482,7 +1845,16 @@ export default function App(props) {
                                 </div>
                             );
                         })}
+                        <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest ml-4 mr-1">Crews:</span>
+                        {crewBlocks.map(function(b) {
+                            return <span key={b.crew + b.firstLane} className={`text-[10px] font-black rounded px-1.5 py-0.5 ${getCrewStyle(b.crew).badge}`}>{b.crew} · {b.count}</span>;
+                        })}
                     </div>
+                    {scheduleData.unscheduled.length > 0 && (
+                        <div className="bg-rose-50 border-b border-rose-200 px-5 py-1.5 text-[11px] font-bold text-rose-700 flex items-center gap-2 flex-shrink-0">
+                            <AlertCircle className="w-3.5 h-3.5" /> {scheduleData.unscheduled.length} task{scheduleData.unscheduled.length === 1 ? '' : 's'} ({(unscheduledWorkMins / 60).toFixed(1)} manpower hrs) overflow the plan window — extend the plan length or add headcount. See Metrics for the list.
+                        </div>
+                    )}
 
                     <div className="flex-1 flex flex-col bg-white border-t border-gray-200 overflow-hidden relative">
                         
@@ -1534,7 +1906,7 @@ export default function App(props) {
                         <div className={`flex-1 overflow-auto custom-scrollbar relative bg-slate-50/50 pan-container touch-pan ${isPanning ? 'cursor-grabbing' : ''}`} ref={scrollRef} onPointerDown={onPanDown}>
                             <div className="min-w-max pb-12 touch-none">
                                 
-                                <div className="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-gray-300 flex ml-[120px] shadow-sm pointer-events-none">
+                                <div className="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-gray-300 flex ml-[170px] shadow-sm pointer-events-none">
                                     <div className="relative h-10" style={{ width: `${GANTT_TOTAL_WIDTH_PX}px` }}>
                                         {TIME_MARKERS.map(function(hour) {
                                             return (
@@ -1545,11 +1917,15 @@ export default function App(props) {
                                             </div>
                                             );
                                         })}
+                                        {shiftWindows.map(function(w, idx) {
+                                            return <span key={`shift-lbl-${idx}`} className={`absolute bottom-0 text-[9px] font-black px-1.5 rounded-t whitespace-nowrap ${getCrewStyle(w.crew).badge}`} style={{ left: `${(w.start / 60) * zoomLevel}px` }}>{w.crew} · {w.dayLabel} {formatHourLabel(w.startHour)}</span>;
+                                        })}
+                                        <span className="absolute bottom-0 text-[9px] font-black px-1.5 rounded-t bg-rose-700 text-white whitespace-nowrap" style={{ left: `${(planHorizonMins / 60) * zoomLevel}px` }}>PLAN END</span>
                                     </div>
                                 </div>
 
                                 <div className="relative z-10 pt-2 touch-none">
-                                    <div className="absolute top-0 bottom-0 left-[120px] z-0 pointer-events-none" style={{ width: `${GANTT_TOTAL_WIDTH_PX}px` }}>
+                                    <div className="absolute top-0 bottom-0 left-[170px] z-0 pointer-events-none" style={{ width: `${GANTT_TOTAL_WIDTH_PX}px` }}>
                                         
                                         {/* LIVE TIME INDICATOR */}
                                         {liveLeftPx >= 0 && liveLeftPx <= GANTT_TOTAL_WIDTH_PX && (
@@ -1566,6 +1942,12 @@ export default function App(props) {
                                         {TIME_MARKERS.map(function(hour) {
                                             return <div key={hour} className="absolute top-0 bottom-0 border-l border-gray-200 border-dashed" style={{ left: `${hour * zoomLevel}px` }} />;
                                         })}
+                                        {shiftWindows.map(function(w, idx) {
+                                            return (
+                                                <div key={`shift-${idx}`} className={`absolute top-0 bottom-0 border-l-2 z-20 ${getCrewStyle(w.crew).line}`} style={{ left: `${(w.start / 60) * zoomLevel}px` }} />
+                                            );
+                                        })}
+                                        <div className="absolute top-0 bottom-0 border-l-2 border-rose-700 border-dashed z-20" style={{ left: `${(planHorizonMins / 60) * zoomLevel}px` }} />
                                         {allInterrupts.filter(function(b) { return b.start < dynamicTotalHours * 60; }).map(function(brk, idx) {
                                             const lPx = (brk.start / 60) * zoomLevel;
                                             const wPx = (brk.duration / 60) * zoomLevel;
@@ -1579,11 +1961,13 @@ export default function App(props) {
                                     </div>
 
                                     <div className="flex relative z-10 bg-transparent touch-none">
-                                        <div className="sticky left-0 w-[120px] flex-shrink-0 bg-slate-50 border-r border-gray-300 z-30 shadow-[4px_0_10px_rgba(0,0,0,0.03)] flex flex-col relative no-pan">
-                                            {Array.from({ length: globalHeadcount }).map(function(_, i) {
+                                        <div className="sticky left-0 w-[170px] flex-shrink-0 bg-slate-50 border-r border-gray-300 z-30 shadow-[4px_0_10px_rgba(0,0,0,0.03)] flex flex-col relative no-pan">
+                                            {laneRoster.map(function(l) {
+                                                const isCrewStart = crewBlocks.some(function(b) { return b.firstLane === l.lane && l.lane > 0; });
                                                 return (
-                                                <div key={i} className="flex-1 border-b border-gray-200/60 flex items-center justify-start px-2 bg-white" style={{ height: `${LANE_HEIGHT_PX}px` }}>
-                                                    <span className="text-[10px] font-bold text-slate-700 truncate w-full">Worker {i+1}</span>
+                                                <div key={l.lane} className={`flex-1 border-b border-gray-200/60 flex items-center justify-start gap-1.5 px-2 bg-white ${isCrewStart ? 'border-t-2 border-t-slate-400' : ''}`} style={{ height: `${LANE_HEIGHT_PX}px` }} title={`${l.name} (${l.crew} crew)`}>
+                                                    <span className={`text-[9px] font-black rounded px-1 py-0.5 flex-shrink-0 ${getCrewStyle(l.crew).badge}`}>{l.crew}</span>
+                                                    <span className="text-[10px] font-bold text-slate-700 truncate w-full">{l.name}</span>
                                                 </div>
                                                 );
                                             })}
@@ -1592,6 +1976,11 @@ export default function App(props) {
                                         <div className="relative no-pan touch-none" style={{ width: `${GANTT_TOTAL_WIDTH_PX}px`, height: `${globalHeadcount * LANE_HEIGHT_PX}px` }}>
                                             {Array.from({ length: globalHeadcount }).map(function(_, i) {
                                                 return <div key={i} className="absolute w-full border-t border-gray-200 border-dashed pointer-events-none" style={{ top: `${i * LANE_HEIGHT_PX}px` }} />;
+                                            })}
+                                            {laneOffShift.map(function(gaps, lane) {
+                                                return gaps.map(function(g, gi) {
+                                                    return <div key={`off-${lane}-${gi}`} className="absolute bg-slate-300/40 off-shift-stripes pointer-events-none" style={{ left: `${(g.start / 60) * zoomLevel}px`, width: `${((g.end - g.start) / 60) * zoomLevel}px`, top: `${lane * LANE_HEIGHT_PX}px`, height: `${LANE_HEIGHT_PX}px` }} />;
+                                                });
                                             })}
 
                                             {displayData.map(function(areaGroup) {
@@ -1608,6 +1997,7 @@ export default function App(props) {
 
                                                     const sortedLanes = rLanes.slice().sort(function(a,b) { return a-b; });
 
+                                                    const isHandoverPart = task.isSplitPart1 || task.isSplitPart2;
                                                     const transitEnd = task.isTransitActive && !task.isSplitPart2 ? 10 * task.appliedHeads : 0;
                                                     let activeWorkMins = task.baseMins;
                                                     if (task.isPbActive && task.pbMins > 0) activeWorkMins = task.pbMins;
@@ -1651,6 +2041,8 @@ export default function App(props) {
                                                                     onPointerDown={function(e) {
                                                                         if (e && typeof e.stopPropagation === 'function') e.stopPropagation(); 
                                                                         setHasDragged(false);
+                                                                        // Handover continuations are generated by the engine; pin the Pt 1 block instead.
+                                                                        if (task.isSplitPart2) return;
                                                                         setDragState({ taskId: task.id, areaName: areaGroup.name, initialX: e.clientX, initialY: e.clientY, initialMin: task.startMin, initialLane: task.isPinned ? (task.assignedLanes[0]||0) : (task.assignedLanes[0]||0), currentMin: task.startMin, currentLane: task.isPinned ? (task.assignedLanes[0]||0) : (task.assignedLanes[0]||0), appliedHeads: task.appliedHeads, duration: activeDuration });
                                                                         if (e.currentTarget && typeof e.currentTarget.setPointerCapture === 'function') e.currentTarget.setPointerCapture(e.pointerId);
                                                                     }}
@@ -1667,11 +2059,14 @@ export default function App(props) {
                                                                     `}
                                                                     style={{ left: `${leftPx}px`, width: `${Math.max(widthPx, 8)}px`, top: `${topPx + 2}px`, height: `${heightPx - 4}px` }} 
                                                                 >
-                                                                    <div className={`absolute inset-0 rounded-md overflow-hidden flex shadow-sm border ${task.isPinned && !isDraggingMe ? 'border-[2px] border-slate-900 border-dashed opacity-90' : 'border-black/20'}`}>
-                                                                        {transitOverlap && <div className="absolute top-0 bottom-0 bg-slate-900" style={{ left: `${transitOverlap.leftPct}%`, width: `${transitOverlap.widthPct}%` }} title="Transit/Prep (10m)" />}
-                                                                        {baseOverlap && <div className={`absolute top-0 bottom-0 ${getRoomColor(task.originalArea)} ${task.isComplete ? 'complete-stripes' : ''}`} style={{ left: `${baseOverlap.leftPct}%`, width: `${baseOverlap.widthPct}%` }} />}
-                                                                        {allergenOverlap && <div className={`absolute top-0 bottom-0 ${getRoomColor(task.originalArea)} opacity-40 ${task.isComplete ? 'complete-stripes' : ''}`} style={{ left: `${allergenOverlap.leftPct}%`, width: `${allergenOverlap.widthPct}%` }} title="Allergen Extra Time" />}
-                                                                        {inspectOverlap && <div className="absolute top-0 bottom-0 bg-slate-900" style={{ left: `${inspectOverlap.leftPct}%`, width: `${inspectOverlap.widthPct}%` }} title="Inspection" />}
+                                                                    <div className={`absolute inset-0 rounded-md overflow-hidden flex shadow-sm border ${task.isPinned && !isDraggingMe ? 'border-[2px] border-slate-900 border-dashed opacity-90' : 'border-black/20'} ${task.isOffShift ? 'ring-2 ring-rose-500' : ''}`}>
+                                                                        {isHandoverPart && <div className={`absolute inset-0 ${getRoomColor(task.originalArea)} ${task.isComplete ? 'complete-stripes' : ''}`} />}
+                                                                        {isHandoverPart && task.isSplitPart1 && <div className="absolute top-0 bottom-0 right-0 w-1.5 bg-white/70" title="Handed over to next crew" />}
+                                                                        {isHandoverPart && task.isSplitPart2 && <div className="absolute top-0 bottom-0 left-0 w-1.5 bg-white/70" title="Continued from previous crew" />}
+                                                                        {!isHandoverPart && transitOverlap && <div className="absolute top-0 bottom-0 bg-slate-900" style={{ left: `${transitOverlap.leftPct}%`, width: `${transitOverlap.widthPct}%` }} title="Transit/Prep (10m)" />}
+                                                                        {!isHandoverPart && baseOverlap && <div className={`absolute top-0 bottom-0 ${getRoomColor(task.originalArea)} ${task.isComplete ? 'complete-stripes' : ''}`} style={{ left: `${baseOverlap.leftPct}%`, width: `${baseOverlap.widthPct}%` }} />}
+                                                                        {!isHandoverPart && allergenOverlap && <div className={`absolute top-0 bottom-0 ${getRoomColor(task.originalArea)} opacity-40 ${task.isComplete ? 'complete-stripes' : ''}`} style={{ left: `${allergenOverlap.leftPct}%`, width: `${allergenOverlap.widthPct}%` }} title="Allergen Extra Time" />}
+                                                                        {!isHandoverPart && inspectOverlap && <div className="absolute top-0 bottom-0 bg-slate-900" style={{ left: `${inspectOverlap.leftPct}%`, width: `${inspectOverlap.widthPct}%` }} title="Inspection" />}
                                                                     </div>
 
                                                                     {isFirstSegment && task.isPinned && !isDraggingMe && <div className="absolute top-0 right-0 w-0 h-0 border-l-[12px] border-l-transparent border-t-[12px] border-t-white/80 z-30 pointer-events-none" />}
@@ -1821,26 +2216,42 @@ export default function App(props) {
                             <div>
                                 <h3 className="text-lg font-black text-slate-800 leading-tight">{activeEditorTask.name}</h3>
                                 <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest mt-1 flex items-center"><MapPin className="w-3 h-3 mr-1"/> {activeEditorTask.area}</p>
+                                <p className="text-[11px] text-slate-600 font-bold mt-1">{formatClockTime(ganttStartDate, ganttStartHour, activeEditorTask.startMin)} → {formatClockTime(ganttStartDate, ganttStartHour, activeEditorTask.startMin + activeEditorTask.finalDuration)}</p>
                             </div>
                             <Button variant="outline" size="sm" onClick={function() { setSelectedTaskEditor(null); }} className="px-2 py-1 shadow-none text-slate-400 hover:text-slate-800">✕</Button>
                         </div>
 
                         <div className="space-y-5">
+                            <div>
+                                <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5 flex items-center"><Users className="w-3 h-3 mr-1"/> Assigned Workers</label>
+                                <div className="flex flex-wrap gap-1.5">
+                                    {(activeEditorTask.assignedLanes || []).map(function(l) {
+                                        const lr = laneRoster[l];
+                                        if (!lr) return null;
+                                        return <span key={l} className={`text-[11px] font-bold rounded px-2 py-0.5 border ${getCrewStyle(lr.crew).soft}`}>{lr.crew} · {lr.name}</span>;
+                                    })}
+                                </div>
+                                {activeEditorTask.isSplitPart1 && <p className="text-[11px] font-bold text-amber-700 mt-2">Handed over to the next crew at shift end.</p>}
+                                {activeEditorTask.isSplitPart2 && <p className="text-[11px] font-bold text-amber-700 mt-2">Continues work started by the previous crew (+{handoverMins}m/head handover).</p>}
+                                {activeEditorTask.isOffShift && <p className="text-[11px] font-bold text-rose-700 mt-2">Pinned outside these workers' shift.</p>}
+                            </div>
                             <div className="flex gap-4">
+                                {!activeEditorTask.isSplitPart2 && (
                                 <div className="flex-1">
                                     <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5 flex items-center"><Clock className="w-3 h-3 mr-1"/> Start (Mins)</label>
                                     <input type="number" min="0" value={activeEditorTask.startMin} onChange={function(e) {
                                         setOverrides(function(prev) { return Object.assign({}, prev, { [activeEditorTask.id]: { startMin: Number(e.target.value), startLane: activeEditorTask.assignedLanes[0]||0 } }); });
                                     }} className="w-full text-center border border-slate-300 rounded-lg p-2 text-sm font-bold outline-none" />
                                 </div>
+                                )}
                                 <div className="flex-1">
                                     <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5 flex items-center"><Users className="w-3 h-3 mr-1"/> Heads</label>
-                                    <input type="number" min="1" value={activeEditorTask.heads} onChange={function(e) { handleTaskHeadsChange(activeEditorTask.id, e.target.value); }} className="w-full text-center border border-slate-300 rounded-lg p-2 text-sm font-bold outline-none" />
+                                    <input type="number" min="1" value={activeEditorTask.heads} onChange={function(e) { handleTaskHeadsChange(activeEditorTask.parentId || activeEditorTask.id, e.target.value); }} className="w-full text-center border border-slate-300 rounded-lg p-2 text-sm font-bold outline-none" />
                                 </div>
                             </div>
 
                             <label className="flex items-center gap-3 p-3 border border-slate-200 rounded-lg cursor-pointer hover:bg-slate-50 transition-colors">
-                                <input type="checkbox" checked={activeEditorTask.isComplete} onChange={function(e) { handleCompleteToggle(activeEditorTask.id, e.target.checked); }} className="w-5 h-5 accent-emerald-500" />
+                                <input type="checkbox" checked={activeEditorTask.isComplete} onChange={function(e) { handleCompleteToggle(activeEditorTask.parentId || activeEditorTask.id, e.target.checked); }} className="w-5 h-5 accent-emerald-500" />
                                 <span className="font-bold text-slate-700">Mark Task Complete</span>
                             </label>
                             
