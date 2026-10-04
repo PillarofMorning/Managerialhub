@@ -1,20 +1,9 @@
-import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 
-// ============================================================================
-// HUB - SHIFT START
-// 1. Autoselects the rooms crews were assigned to this shift (craa5_taskassignment)
-//    and counts heads per room from each employee's latest assignment.
-// 2. Tracks sanitation progress per room (room slider cascades to equipment) and
-//    per piece of equipment, with N/A + reason.
-// 3. Autosaves ONE record per shift to Dataverse (craa5_sanitationshiftreport) and
-//    restores it on reload, so progress survives refreshes and device changes.
-// 4. Builds a copy/paste shift update: heads as a number, focused on what was
-//    accomplished and what remains.
-// ============================================================================
-
-// --- Inline SVG icons (keeps the app self-contained for Power Apps, no bundler needed) ---
+// --- CIRCUMVENTION: Replaced lucide-react with inline SVGs ---
+// This ensures the app is 100% self-contained for PowerApps and doesn't require a package bundler.
 const SvgIcon = ({ children, className = "w-6 h-6", ...props }: any) => (
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true" {...props}>
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} {...props}>
     {children}
   </svg>
 );
@@ -27,932 +16,701 @@ const Settings2 = (props: any) => <SvgIcon {...props}><path d="M20 7h-9"/><path 
 const AlertCircle = (props: any) => <SvgIcon {...props}><circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/></SvgIcon>;
 const Save = (props: any) => <SvgIcon {...props}><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></SvgIcon>;
 const Users = (props: any) => <SvgIcon {...props}><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></SvgIcon>;
-const RefreshCw = (props: any) => <SvgIcon {...props}><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></SvgIcon>;
-const Search = (props: any) => <SvgIcon {...props}><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></SvgIcon>;
-const Loader = (props: any) => <SvgIcon {...props} className={`animate-spin ${props.className || ''}`}><path d="M21 12a9 9 0 1 1-6.219-8.56"/></SvgIcon>;
-
-// --- CONFIG ---
-const CLEAN_STEPS = ["Dry Clean", "Rinse", "Foam", "Rinse", "Post Clean Inspect", "Sanitize", "FSQ Inspection", "Swab"];
-const TOTAL_STEPS = CLEAN_STEPS.length;
-// Repeated step names get a number so "next: Rinse" is never ambiguous ("Rinse #2").
-const STEP_LABELS = CLEAN_STEPS.map((s, i) => { const n = CLEAN_STEPS.slice(0, i + 1).filter(x => x === s).length; return n > 1 ? `${s} #${n}` : s; });
-const ITEMS_PER_PAGE = 3;
-const AUTOSAVE_DELAY_MS = 2500;
-const ASSIGNMENT_REFRESH_MS = 5 * 60 * 1000;   // re-check task assignments so newly assigned rooms autoselect
-const PRE_SHIFT_BUFFER_MIN = 60;               // assignments made up to an hour before shift start count for this shift
-const API_TIMEOUT_MS = 20000;                  // a slow call fails over to dataApi for that call only
-const MAX_NAMES_LISTED = 15;                   // caps long "equipment complete" lists in the update
-const AREA_TABLES = ["craa5_aa_mss_area", "craa5_aa_mss_areas"];
-const ASSET_TABLES = ["craa5_aa_assets", "craa5_aa_asset", "craa5_aa_assetses"];
-const TASK_TABLE = "craa5_taskassignment";
-const REPORT_TABLE = "craa5_sanitationshiftreport";
-// Pseudo-areas the assignment board uses for attendance; never rooms, never heads.
-const STATUS_AREAS = new Set(["pto", "sick", "late", "left early", "ncns", "unassigned"]);
-
-type Asset = { id: string; name: string };
-type Area = { id: string; name: string; assets: Asset[] };
-type ShiftInfo = { startMs: number; isNight: boolean; dateKey: string };
-type ShiftState = {
-  selected: string[];                    // rooms on the report
-  dismissed: string[];                   // rooms the supervisor removed (autoselect won't re-add them)
-  progress: Record<string, number>;      // steps completed (0..TOTAL_STEPS) per room id and equipment id
-  na: Record<string, boolean>;
-  naReasons: Record<string, string>;
-  heads: Record<string, number>;         // manual overrides only; otherwise heads come from assignments
-  notes: Record<string, string>;         // per-room context for the update
-  shiftNotes: string;
-};
-type SaveState = { status: 'idle' | 'dirty' | 'saving' | 'saved' | 'error' | 'offline'; at?: Date; error?: string };
-type Notice = { kind: 'info' | 'error'; text: string } | null;
-type LoadLogEntry = { table: string; source: string; rows?: number; error?: string; ms: number };
-type LoadLogger = (entry: LoadLogEntry) => void;
-
-const emptyState = (): ShiftState => ({ selected: [], dismissed: [], progress: {}, na: {}, naReasons: {}, heads: {}, notes: {}, shiftNotes: "" });
+const Plus = (props: any) => <SvgIcon {...props}><path d="M5 12h14"/><path d="M12 5v14"/></SvgIcon>;
+const Trash2 = (props: any) => <SvgIcon {...props}><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></SvgIcon>;
+const Loader = (props: any) => <SvgIcon {...props} className={`animate-spin ${props.className}`}><path d="M21 12a9 9 0 1 1-6.219-8.56"/></SvgIcon>;
+// --- END CIRCUMVENTION ---
 
 // --- UTILITIES ---
 function safeGetXrm() { if (typeof window === 'undefined') return null; if ((window as any).Xrm) return (window as any).Xrm; try { if (window.parent && (window.parent as any).Xrm) return (window.parent as any).Xrm; } catch (e) {} return null; }
-function getReadApi(props?: any) { const xrm = safeGetXrm(); if (xrm?.WebApi) return xrm.WebApi; if (props?.context?.webAPI) return props.context.webAPI; return props?.webAPI || null; }
-// createRecord returns { id }, generative-page createRow returns the id string
-const idOf = (res: any) => { const id = typeof res === 'string' ? res : res?.id; return id ? String(id).replace(/[{}]/g, '') : null; };
-function getWriteApi(props?: any): { create: (t: string, d: any) => Promise<string | null>; update: (t: string, id: string, d: any) => Promise<any> } | null {
-  const web = getReadApi(props), dataApi = props?.dataApi;
-  if (web?.createRecord && web?.updateRecord) return { create: async (t, d) => idOf(await web.createRecord(t, d)), update: (t, id, d) => web.updateRecord(t, id, d) };
-  if (dataApi?.createRow && dataApi?.updateRow) return { create: async (t, d) => idOf(await dataApi.createRow(t, d)), update: (t, id, d) => dataApi.updateRow(t, id, d) };
-  if (dataApi?.createRecord && dataApi?.updateRecord) return { create: async (t, d) => idOf(await dataApi.createRecord(t, d)), update: (t, id, d) => dataApi.updateRecord(t, id, d) };
-  return null;
-}
-const hasReadApi = (props?: any) => !!(getReadApi(props)?.retrieveMultipleRecords || props?.dataApi?.queryTable);
+function getWebApi(props?: any) { const xrm = safeGetXrm(); if (xrm?.WebApi) return xrm.WebApi; if (props?.context?.webAPI) return props.context.webAPI; return props?.webAPI || null; }
+const asyncRace = async (p: any, ms: number, l: string) => { if (!p) return Promise.reject(new Error(`No query for ${l}`)); let t: any; return Promise.race([Promise.resolve(p), new Promise((_, r) => { t = setTimeout(() => r(new Error(`TIMEOUT: ${l}`)), ms); })]).finally(() => clearTimeout(t)); };
 const errMsg = (e: any) => String(e?.message || e || "Unknown error");
-
-function withTimeout<T = any>(p: any, ms: number, label: string): Promise<T> {
-  if (!p) return Promise.reject(new Error(`No query for ${label}`));
-  let timer: any;
-  return Promise.race([Promise.resolve(p), new Promise<T>((_, reject) => { timer = setTimeout(() => reject(new Error(`TIMEOUT: ${label}`)), ms); })])
-    .finally(() => clearTimeout(timer));
-}
+const norm = (v: any) => String(v ?? "").toLowerCase().trim();
 
 const getField = (obj: any, fn: string) => {
-  if (!obj) return undefined; if (obj[fn] !== undefined) return obj[fn];
-  const lf = fn.toLowerCase(), k = Object.keys(obj).find(x => x.toLowerCase() === lf);
-  return k ? obj[k] : undefined;
+    if (!obj) return undefined; if (obj[fn] !== undefined) return obj[fn];
+    const lf = fn.toLowerCase(), k = Object.keys(obj).find(x => x.toLowerCase() === lf);
+    return k ? obj[k] : undefined;
 };
 
-const norm = (s: any) => String(s ?? "").toLowerCase().trim();
-const tokens = (s: any) => norm(s).split(/[^a-z0-9]+/).filter(Boolean);
-const containsTokens = (hay: string[], needle: string[]) => {
-  for (let i = 0; i + needle.length <= hay.length; i++) if (needle.every((t, j) => hay[i + j] === t)) return true;
-  return false;
-};
-const byNameNatural = (a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-const uniq = (ids: string[]) => Array.from(new Set(ids));
-const clampStep = (v: any) => { const n = Math.round(Number(v)); return Number.isFinite(n) ? Math.min(TOTAL_STEPS, Math.max(0, n)) : 0; };
-const stepLabel = (p: number) => p <= 0 ? "Not started" : p >= TOTAL_STEPS ? "Complete" : `${STEP_LABELS[p - 1]} done`;
-const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
-const sameCounts = (a: Record<string, number>, b: Record<string, number>) => {
-  const ka = Object.keys(a), kb = Object.keys(b);
-  return ka.length === kb.length && ka.every(k => a[k] === b[k]);
-};
+const CLEAN_STEPS = ["Dry Clean", "Rinse", "Foam", "Rinse", "Post Clean Inspect", "Sanitize", "FSQ Inspection", "Swab"];
+const LAST_STEP = CLEAN_STEPS.length - 1;
+const ITEMS_PER_PAGE = 3;
+const API_TIMEOUT_MS = 20000;
+// Attendance pseudo-areas on the assignment board: never rooms, never heads in a room.
+const STATUS_AREAS = new Set(["pto", "sick", "late", "left early", "ncns", "unassigned"]);
 
-// --- SHIFT WINDOW (6:00-18:00 days, 18:00-6:00 nights; same rotation as the assignment board) ---
-function determineShiftLetter(now: Date): string {
-  const d = now.getDay(), h = now.getHours();
-  if (h >= 6 && h < 18) return (d <= 2 || (d === 3 && h < 12)) ? "A" : "C";
-  return ((d <= 2 && h >= 18) || (d >= 1 && d <= 3 && h < 6)) ? "B" : "D";
+// Shifts run 6:00-18:00 (days) and 18:00-6:00 (nights); same rotation as the assignment board.
+function getShiftInfo(now = new Date()) {
+    const h = now.getHours(), d = now.getDay(), isNight = h < 6 || h >= 18, start = new Date(now);
+    if (isNight && h < 6) start.setDate(start.getDate() - 1);
+    start.setHours(isNight ? 18 : 6, 0, 0, 0);
+    const letter = !isNight ? ((d <= 2 || (d === 3 && h < 12)) ? "A" : "C") : (((d <= 2 && h >= 18) || (d >= 1 && d <= 3 && h < 6)) ? "B" : "D");
+    return { start, letter, isNight };
 }
 
-function getShiftInfo(now = new Date()): ShiftInfo {
-  const h = now.getHours(), isNight = h < 6 || h >= 18, start = new Date(now);
-  if (isNight && h < 6) start.setDate(start.getDate() - 1);
-  start.setHours(isNight ? 18 : 6, 0, 0, 0);
-  const dateKey = `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')}`;
-  return { startMs: start.getTime(), isNight, dateKey };
-}
-
-// Keyed on the shift window (not the letter) so a mid-shift letter change never starts a blank report.
-const reportName = (s: ShiftInfo) => `Sanitation Report - ${s.dateKey} ${s.isNight ? "Night" : "Day"}`;
-const shiftLetterFor = (s: ShiftInfo, now: Date) => determineShiftLetter(new Date(Math.min(now.getTime(), s.startMs + 12 * 3600000 - 60000)));
-
-// --- DATAVERSE ---
-// Tries Xrm.WebApi, then the generative page's dataApi (only sees tables added to the page).
-// A failure or timeout only affects that one call; it never disables an API for later calls.
-// Returns rows, or null when no API answered, so callers can tell "empty" from "failed".
-async function queryRecords(props: any, entityNames: string | string[], q: { select?: string[]; filter?: string; orderby?: string; top?: number } = {}, log?: LoadLogger): Promise<any[] | null> {
-  const webApi = getReadApi(props), dataApi = props?.dataApi, names = Array.isArray(entityNames) ? entityNames : [entityNames], top = q.top ?? 5000;
-  const odata = [q.select?.length ? `$select=${q.select.join(',')}` : '', q.filter ? `$filter=${q.filter}` : '', q.orderby ? `$orderby=${q.orderby}` : '', `$top=${top}`].filter(Boolean).join('&');
-  for (const en of names) {
-    if (webApi?.retrieveMultipleRecords) {
-      const t0 = Date.now();
-      try {
-        const res: any = await withTimeout(webApi.retrieveMultipleRecords(en, `?${odata}`), API_TIMEOUT_MS, `Xrm.WebApi ${en}`);
-        if (!Array.isArray(res?.entities)) throw new Error("Unexpected response (no entities)");
-        log?.({ table: en, source: 'Xrm.WebApi', rows: res.entities.length, ms: Date.now() - t0 });
-        return res.entities;
-      } catch (e) { log?.({ table: en, source: 'Xrm.WebApi', error: errMsg(e), ms: Date.now() - t0 }); }
+// Reads rows through a generative page's dataApi (queryTable -> { rows, hasMoreRows, loadMoreRows }).
+async function queryDataApi(dataApi: any, table: string, opts: any): Promise<any[]> {
+    let page: any = await asyncRace(dataApi.queryTable(table, { pageSize: 500, ...opts }), API_TIMEOUT_MS, `queryTable ${table}`);
+    if (!Array.isArray(page?.rows)) throw new Error(`queryTable ${table}: no rows`);
+    const rows = [...page.rows];
+    while (page?.hasMoreRows && typeof page.loadMoreRows === 'function' && rows.length < 5000) {
+        page = await asyncRace(page.loadMoreRows(), API_TIMEOUT_MS, `queryTable ${table}`);
+        rows.push(...(Array.isArray(page?.rows) ? page.rows : []));
     }
-    if (dataApi?.queryTable) {
-      const t0 = Date.now();
-      try {
-        const opts: any = { pageSize: Math.min(top, 500) };
-        if (q.select?.length) opts.select = q.select;
-        if (q.filter) opts.filter = q.filter;
-        if (q.orderby) opts.orderBy = q.orderby;
-        let page: any = await withTimeout(dataApi.queryTable(en, opts), API_TIMEOUT_MS, `dataApi ${en}`);
-        if (!Array.isArray(page?.rows)) throw new Error("Unexpected response (no rows)");
-        const rows = [...page.rows];
-        while (page?.hasMoreRows && typeof page.loadMoreRows === 'function' && rows.length < top) {
-          page = await withTimeout(page.loadMoreRows(), API_TIMEOUT_MS, `dataApi ${en} (more rows)`);
-          rows.push(...(Array.isArray(page?.rows) ? page.rows : []));
+    return rows;
+}
+
+// Dataverse Fetch Fallback Engine: Xrm.WebApi, then the page's dataApi.
+// A slow or failed call only falls back for that call; it never switches an API off for later loads.
+async function fetchFallbackRecords(entityNames: string | string[], props?: any, filter = "statecode eq 0", select?: string[]): Promise<any[]> {
+    const webApi = getWebApi(props); const names = Array.isArray(entityNames) ? entityNames : [entityNames];
+    for (const en of names) {
+        if (webApi?.retrieveMultipleRecords) {
+            try { const res: any = await asyncRace(webApi.retrieveMultipleRecords(en, `?${select ? `$select=${select.join(',')}&` : ''}$filter=${filter}&$top=5000`), API_TIMEOUT_MS, `WebApi ${en}`); if (Array.isArray(res?.entities)) return res.entities; } catch (e) { console.warn(`[Shift Start] ${en} via WebApi:`, errMsg(e)); }
         }
-        log?.({ table: en, source: 'dataApi', rows: Math.min(rows.length, top), ms: Date.now() - t0 });
-        return rows.slice(0, top);
-      } catch (e) { log?.({ table: en, source: 'dataApi', error: errMsg(e), ms: Date.now() - t0 }); }
+        if (props?.dataApi?.queryTable) {
+            try { return await queryDataApi(props.dataApi, en, select ? { filter, select } : { filter }); } catch (e) { console.warn(`[Shift Start] ${en} via dataApi:`, errMsg(e)); }
+        }
     }
-  }
-  return null;
+    return [];
 }
 
-const fetchShiftTasks = (props: any, shift: ShiftInfo, log?: LoadLogger) => queryRecords(props, TASK_TABLE, {
-  select: ['craa5_area', 'craa5_id', 'craa5_datetimeofassignment', 'createdon'],
-  filter: `createdon ge ${new Date(shift.startMs - PRE_SHIFT_BUFFER_MIN * 60000).toISOString().replace(/\.\d{3}Z$/, 'Z')}`,
-}, log);
-
-// undefined = lookup failed, null = no report saved yet this shift
-async function findSavedReport(props: any, name: string, log?: LoadLogger): Promise<{ id: string; json: any; modifiedon?: string } | null | undefined> {
-  const rows = await queryRecords(props, REPORT_TABLE, {
-    select: ['craa5_sanitationshiftreportid', 'craa5_equipmentjson', 'modifiedon'],
-    filter: `craa5_name eq '${name.replace(/'/g, "''")}' and statecode eq 0`,
-    orderby: 'modifiedon desc',
-    top: 1,
-  }, log);
-  if (!rows) return undefined;
-  const r = rows[0];
-  const id = r && getField(r, 'craa5_sanitationshiftreportid');
-  return id ? { id: String(id), json: getField(r, 'craa5_equipmentjson'), modifiedon: getField(r, 'modifiedon') } : null;
-}
-
-// Each asset belongs to exactly one room: lookup id, then exact name, then the longest room name it contains as whole words.
-function buildAreas(rawAreas: any[], rawAssets: any[]): Area[] {
-  const areas: Area[] = rawAreas
-    .map(a => ({ id: String(getField(a, 'craa5_aa_mss_areaid') ?? ''), name: String(getField(a, 'craa5_area') ?? '').trim(), assets: [] as Asset[] }))
-    .filter(a => a.id && a.name && !STATUS_AREAS.has(norm(a.name)));
-  const byId = new Map(areas.map(a => [norm(a.id), a]));
-  const byName = new Map<string, Area>();
-  areas.forEach(a => { if (!byName.has(norm(a.name))) byName.set(norm(a.name), a); });
-  const areaTokens = areas.map(a => ({ area: a, toks: tokens(a.name) })).filter(x => x.toks.length);
-
-  rawAssets.forEach((ast, i) => {
-    const lookupId = norm(getField(ast, '_craa5_area_lookup_value'));
-    const label = getField(ast, 'craa5_areaname') || getField(ast, '_craa5_area_lookup_value@OData.Community.Display.V1.FormattedValue') || "";
-    let area = (lookupId && byId.get(lookupId)) || byName.get(norm(label));
-    if (!area && label) {
-      const at = tokens(label); let bestLen = 0;
-      areaTokens.forEach(({ area: a, toks }) => { if (toks.length > bestLen && containsTokens(at, toks)) { area = a; bestLen = toks.length; } });
-    }
-    if (!area) return;
-    area.assets.push({ id: String(getField(ast, 'craa5_aa_assetsid') ?? `${area.id}:asset:${i}`), name: String(getField(ast, 'craa5_equipmentidentifier') || "Unknown Equipment") });
-  });
-
-  areas.forEach(a => a.assets.sort(byNameNatural));
-  return areas.sort(byNameNatural);
-}
-
-// Autoselect = every room anyone was assigned to this shift. Heads = employees whose LATEST assignment is that room.
-function summarizeAssignments(tasks: any[], areas: Area[]) {
-  const areaByName = new Map<string, string>();
-  areas.forEach(a => { if (!areaByName.has(norm(a.name))) areaByName.set(norm(a.name), a.id); });
-  const autoIds = new Set<string>(), latest = new Map<string, { t: number; areaId: string | null }>();
-  tasks.forEach(t => {
-    const areaId = areaByName.get(norm(getField(t, 'craa5_area'))) || null;
-    if (areaId) autoIds.add(areaId);
-    const emp = norm(getField(t, 'craa5_id'));
-    if (!emp || emp.includes('unassigned')) return;
-    const when = new Date(getField(t, 'craa5_datetimeofassignment') || getField(t, 'createdon') || 0).getTime() || 0;
-    const prev = latest.get(emp);
-    if (!prev || when >= prev.t) latest.set(emp, { t: when, areaId });
-  });
-  const heads: Record<string, number> = {};
-  latest.forEach(({ areaId }) => { if (areaId) heads[areaId] = (heads[areaId] || 0) + 1; });
-  return { autoIds, heads };
-}
-
-// Accepts the current saved shape ({ v: 2, areas: [...] }) and the original bare array (steps 0-7, 7 = finished).
-function restoreState(raw: any, areas: Area[]): ShiftState {
-  const s = emptyState();
-  let data = raw;
-  if (typeof raw === 'string') { try { data = JSON.parse(raw); } catch (e) { return s; } }
-  const legacy = Array.isArray(data);
-  const list: any[] = legacy ? data : Array.isArray(data?.areas) ? data.areas : [];
-  const step = (v: any) => { const n = clampStep(v); return legacy && n === TOTAL_STEPS - 1 ? TOTAL_STEPS : n; };
-  const byId = new Map(areas.map(a => [a.id, a])), byName = new Map(areas.map(a => [norm(a.name), a]));
-
-  list.forEach(sa => {
-    const area = byId.get(sa?.areaId) || byName.get(norm(sa?.areaName));
-    if (!area) return;
-    s.selected.push(area.id);
-    s.progress[area.id] = step(sa.masterStep);
-    if (typeof sa.headsOverride === 'number' && Number.isFinite(sa.headsOverride)) s.heads[area.id] = Math.max(0, Math.round(sa.headsOverride));
-    if (sa.notes) s.notes[area.id] = String(sa.notes);
-    (Array.isArray(sa.equipment) ? sa.equipment : []).forEach((se: any) => {
-      const eq = area.assets.find(e => e.id === se?.eqId) || area.assets.find(e => norm(e.name) === norm(se?.eqName));
-      if (!eq) return;
-      s.progress[eq.id] = step(se.step);
-      if (se.isNa) s.na[eq.id] = true;
-      if (se.naReason) s.naReasons[eq.id] = String(se.naReason);
+// Heads per area = employees whose most recent assignment this shift is that area.
+function countHeads(tasks: any[]): Record<string, number> {
+    const latest = new Map<string, { t: number; area: string }>();
+    tasks.forEach(t => {
+        const emp = norm(getField(t, 'craa5_id')), area = norm(getField(t, 'craa5_area'));
+        if (!emp || emp.includes('unassigned')) return;
+        const when = new Date(getField(t, 'craa5_datetimeofassignment') || getField(t, 'createdon') || 0).getTime() || 0;
+        const prev = latest.get(emp);
+        if (!prev || when >= prev.t) latest.set(emp, { t: when, area });
     });
-  });
-  if (!legacy && data) {
-    s.dismissed = (Array.isArray(data.dismissedAreaIds) ? data.dismissedAreaIds : []).filter((id: string) => byId.has(id));
-    s.shiftNotes = String(data.shiftNotes || "");
-  }
-  s.selected = uniq(s.selected);
-  return s;
+    const heads: Record<string, number> = {};
+    latest.forEach(({ area }) => { if (area && !STATUS_AREAS.has(area)) heads[area] = (heads[area] || 0) + 1; });
+    return heads;
 }
 
-// --- REPORT ---
-type AreaSummary = {
-  area: Area; heads: number; master: number; complete: boolean; note: string;
-  tracked: { eq: Asset; p: number }[]; eqDone: Asset[]; behind: { eq: Asset; p: number }[]; ahead: { eq: Asset; p: number }[];
-  na: { eq: Asset; reason: string }[];
-};
-
-const headsFor = (id: string, s: ShiftState, auto: Record<string, number>) => s.heads[id] ?? auto[id] ?? 0;
-
-function summarizeArea(area: Area, s: ShiftState, auto: Record<string, number>): AreaSummary {
-  const master = clampStep(s.progress[area.id]);
-  const tracked: { eq: Asset; p: number }[] = [], na: { eq: Asset; reason: string }[] = [];
-  area.assets.forEach(eq => { if (s.na[eq.id]) na.push({ eq, reason: (s.naReasons[eq.id] || "").trim() }); else tracked.push({ eq, p: clampStep(s.progress[eq.id]) }); });
-  const eqDone = tracked.filter(x => x.p >= TOTAL_STEPS).map(x => x.eq);
-  return {
-    area, master, na, tracked, eqDone,
-    heads: headsFor(area.id, s, auto),
-    complete: master >= TOTAL_STEPS && eqDone.length === tracked.length,
-    behind: tracked.filter(x => x.p < master),
-    ahead: tracked.filter(x => x.p > master && x.p < TOTAL_STEPS),
-    note: (s.notes[area.id] || "").trim(),
-  };
-}
-
-const listNames = (names: string[]) => names.length > MAX_NAMES_LISTED ? `${names.slice(0, MAX_NAMES_LISTED).join(", ")} +${names.length - MAX_NAMES_LISTED} more` : names.join(", ");
-const groupByStep = (items: { eq: Asset; p: number }[]) => {
-  const groups = new Map<number, string[]>();
-  items.forEach(({ eq, p }) => groups.set(p, [...(groups.get(p) || []), eq.name]));
-  return Array.from(groups.entries()).sort((a, b) => a[0] - b[0]).map(([p, names]) => `${names.join(", ")} (${stepLabel(p)})`).join("; ");
-};
-const naLine = (na: AreaSummary['na']) => `    N/A: ${na.map(n => n.reason ? `${n.eq.name} (${n.reason})` : n.eq.name).join("; ")}`;
-
-function buildUpdateText(sums: AreaSummary[], shift: ShiftInfo, shiftNotes: string, now: Date): string {
-  const L: string[] = [];
-  const totalHeads = sums.reduce((n, x) => n + x.heads, 0);
-  const roomsDone = sums.filter(x => x.complete).length;
-  const eqTracked = sums.reduce((n, x) => n + x.tracked.length, 0), eqDone = sums.reduce((n, x) => n + x.eqDone.length, 0);
-
-  L.push(`SANITATION SHIFT UPDATE — ${shiftLetterFor(shift, now)} Shift (${shift.isNight ? "Nights" : "Days"})`);
-  L.push(`${now.toLocaleDateString(undefined, { weekday: 'short', month: 'numeric', day: 'numeric' })} · ${now.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`);
-  L.push(`👥 ${plural(totalHeads, "head")} in ${plural(sums.length, "room")} — (#) = heads in that room`);
-  L.push(`📊 ${roomsDone}/${sums.length} rooms complete${eqTracked ? ` · ${eqDone}/${eqTracked} equipment complete (${Math.round((eqDone / eqTracked) * 100)}%)` : ""}`);
-
-  if (sums.length === 0) {
-    L.push("", "No rooms selected yet.");
-  } else {
-    L.push("", "✅ ACCOMPLISHED");
-    const acc = sums.filter(x => x.complete || x.master > 0 || x.eqDone.length > 0 || x.ahead.length > 0);
-    if (acc.length === 0) L.push("• Nothing completed yet.");
-    acc.forEach(x => {
-      const tag = `• (${x.heads}) ${x.area.name}`;
-      if (x.complete) {
-        L.push(`${tag} — COMPLETE. All ${TOTAL_STEPS} steps done${x.tracked.length ? `, ${x.tracked.length}/${x.tracked.length} equipment` : ""}.`);
-        if (x.na.length) L.push(naLine(x.na));
-        if (x.note) L.push(`    📝 ${x.note}`);
-        return;
-      }
-      L.push(`${tag} — ${x.master >= TOTAL_STEPS ? `all ${TOTAL_STEPS} room steps done` : x.master > 0 ? `${STEP_LABELS.slice(0, x.master).join(" → ")} done (${x.master}/${TOTAL_STEPS} steps)` : "room steps not started"}`);
-      if (x.eqDone.length) L.push(`    Equipment complete (${x.eqDone.length}/${x.tracked.length}): ${listNames(x.eqDone.map(e => e.name))}`);
-      if (x.ahead.length) L.push(`    Ahead of room: ${groupByStep(x.ahead)}`);
-    });
-
-    L.push("", "⏳ WHAT REMAINS");
-    const rem = sums.filter(x => !x.complete);
-    if (rem.length === 0) L.push("• Nothing. Every tracked room is complete.");
-    rem.forEach(x => {
-      const tag = `• (${x.heads}) ${x.area.name}`;
-      if (x.master >= TOTAL_STEPS) {
-        L.push(`${tag} — room steps done; waiting on ${plural(x.behind.length, "piece")} of equipment`);
-        L.push(`    Waiting on: ${groupByStep(x.behind)}`);
-      } else if (x.master === 0) {
-        L.push(`${tag} — not started; all ${TOTAL_STEPS} steps left`);
-      } else {
-        L.push(`${tag} — ${plural(TOTAL_STEPS - x.master, "step")} left: ${STEP_LABELS.slice(x.master).join(" → ")}`);
-        if (x.behind.length) L.push(`    Behind room: ${groupByStep(x.behind)}`);
-      }
-      if (x.na.length) L.push(naLine(x.na));
-      if (x.note) L.push(`    📝 ${x.note}`);
-    });
-  }
-
-  if (shiftNotes.trim()) L.push("", "📝 SHIFT NOTES", shiftNotes.trim());
-  return L.join("\n");
-}
-
-// iFrame/Power Apps-safe clipboard copy. Returns false when the host blocks both methods.
-async function copyText(text: string): Promise<boolean> {
-  try { if (navigator?.clipboard?.writeText && window.isSecureContext) { await navigator.clipboard.writeText(text); return true; } } catch (e) {}
-  try {
-    const ta = document.createElement("textarea");
-    ta.value = text; ta.setAttribute("readonly", ""); ta.style.cssText = "position:fixed;top:0;left:0;opacity:0;";
-    document.body.appendChild(ta); ta.focus(); ta.select();
-    const ok = document.execCommand('copy'); ta.remove();
-    return ok;
-  } catch (e) { return false; }
-}
-
-// --- EQUIPMENT STATUS SLIDER WITH N/A SUPPORT ---
-const StatusSlider = ({ value = 0, onChange, name, isNa, onNaToggle, naReason, onNaReasonChange }: any) => {
-  const percentage = (value / TOTAL_STEPS) * 100;
+// --- DYNAMIC STATUS SLIDER WITH N/A SUPPORT ---
+const StatusSlider = ({ value = 0, onChange, label, className = "", isNa, onNaToggle, naReason, onNaReasonChange }: any) => {
+  const percentage = (value / (CLEAN_STEPS.length - 1)) * 100;
+  
   return (
-    <div className="flex flex-col w-full">
-      <div className="flex justify-between items-center mb-2 gap-2">
-        <label className="flex items-center gap-1 cursor-pointer text-xs font-bold text-slate-500 bg-white px-2 py-0.5 rounded border border-slate-200 shadow-sm hover:bg-slate-50 transition-colors">
-          <input type="checkbox" checked={isNa} onChange={e => onNaToggle(e.target.checked)} className="accent-slate-500" />
-          N/A
-        </label>
+    <div className={`flex flex-col w-full ${className}`}>
+      <div className="flex justify-between items-center mb-2">
+        <span className="text-sm font-semibold text-slate-700 flex items-center gap-3">
+            {label}
+            <label className="flex items-center gap-1 cursor-pointer text-xs font-bold text-slate-500 bg-white px-2 py-0.5 rounded border border-slate-200 shadow-sm hover:bg-slate-50 transition-colors">
+                <input type="checkbox" checked={isNa} onChange={e => onNaToggle(e.target.checked)} className="accent-slate-500" />
+                N/A
+            </label>
+        </span>
         {!isNa && (
-          <span className={`text-xs font-bold px-2 py-1 rounded-full border ${value >= TOTAL_STEPS ? 'bg-green-100 text-green-800 border-green-200' : 'bg-blue-100 text-blue-800 border-blue-200'}`}>
-            {stepLabel(value)} ({value}/{TOTAL_STEPS})
-          </span>
+            <span className="text-xs font-bold px-2 py-1 bg-blue-100 text-blue-800 rounded-full border border-blue-200">
+              {CLEAN_STEPS[value]} ({value}/{LAST_STEP})
+            </span>
         )}
       </div>
+      
       {isNa ? (
-        <input
-          type="text"
-          placeholder="Reason for N/A (shows in the update)..."
-          value={naReason}
-          onChange={e => onNaReasonChange(e.target.value)}
-          className="w-full p-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-slate-400 outline-none bg-slate-50"
-        />
-      ) : (
-        <>
-          <input
-            type="range" min={0} max={TOTAL_STEPS} step={1} value={value}
-            onChange={e => onChange(Number(e.target.value))}
-            aria-label={`${name} progress`}
-            className="w-full h-3 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-600"
-            style={{ background: `linear-gradient(to right, #2563eb 0%, #2563eb ${percentage}%, #e2e8f0 ${percentage}%, #e2e8f0 100%)` }}
-          />
-          <div className="flex justify-between text-[10px] text-slate-400 mt-1 px-1">
-            <span>Not started</span>
-            <span>Complete</span>
+          <div className="animate-in fade-in zoom-in duration-200">
+            <input 
+                type="text" 
+                placeholder="Reason for N/A (Optional)..." 
+                value={naReason}
+                onChange={e => onNaReasonChange(e.target.value)}
+                className="w-full p-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-slate-400 outline-none bg-slate-50 transition-all"
+            />
           </div>
-        </>
+      ) : (
+          <div className="animate-in fade-in duration-200">
+              <input 
+                type="range" 
+                min="0" 
+                max={CLEAN_STEPS.length - 1} 
+                value={value} 
+                onChange={onChange}
+                className="w-full h-3 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                style={{
+                  background: `linear-gradient(to right, #2563eb 0%, #2563eb ${percentage}%, #e2e8f0 ${percentage}%, #e2e8f0 100%)`
+                }}
+              />
+              <div className="flex justify-between text-[10px] text-slate-400 mt-1 px-1">
+                <span>Start</span>
+                <span>Finish</span>
+              </div>
+          </div>
       )}
     </div>
   );
-};
-
-const SAVE_BADGE: Record<SaveState['status'], { text: string; cls: string }> = {
-  idle: { text: "Not saved yet", cls: "bg-slate-100 text-slate-600 border-slate-200" },
-  dirty: { text: "Unsaved changes…", cls: "bg-amber-50 text-amber-800 border-amber-200" },
-  saving: { text: "Saving…", cls: "bg-blue-50 text-blue-800 border-blue-200" },
-  saved: { text: "Saved", cls: "bg-emerald-50 text-emerald-800 border-emerald-200" },
-  error: { text: "Save failed", cls: "bg-rose-50 text-rose-800 border-rose-200" },
-  offline: { text: "Not connected to Dataverse", cls: "bg-slate-100 text-slate-600 border-slate-200" },
 };
 
 export default function AreaReportsApp(props: any) {
   const propsRef = useRef(props);
   propsRef.current = props;
 
-  // Data
-  const [phase, setPhase] = useState<'loading' | 'ready'>('loading');
-  const [connected, setConnected] = useState(true);
-  const [areas, setAreas] = useState<Area[]>([]);
-  const [autoIds, setAutoIds] = useState<Set<string>>(new Set());
-  const [autoHeads, setAutoHeads] = useState<Record<string, number>>({});
-  const [shift, setShift] = useState<ShiftInfo>(() => getShiftInfo());
+  // Initialization State
+  const [isInitializing, setIsInitializing] = useState(true);
+  const [liveAreas, setLiveAreas] = useState<any[]>([]);
 
-  // Everything persisted to Dataverse lives in one object; every user edit goes through edit().
-  const [state, setState] = useState<ShiftState>(emptyState);
-  const [dirtyTick, setDirtyTick] = useState(0);
-  const [save, setSave] = useState<SaveState>({ status: 'idle' });
-  const [loadWarning, setLoadWarning] = useState<string | null>(null);
-  const [notice, setNotice] = useState<Notice>(null);
-  const [refreshing, setRefreshing] = useState(false);
-  const [now, setNow] = useState(() => Date.now());
-  const [loadLog, setLoadLog] = useState<LoadLogEntry[]>([]);
+  // Tracks which areas the supervisor is actively monitoring
+  const [reportAreaIds, setReportAreaIds] = useState<Set<string>>(new Set()); 
+  
+  // Tracks the numeric slider value (0-7) for Areas AND Equipment
+  const [reportSteps, setReportSteps] = useState<Record<string, number>>({});
+  
+  // Tracks N/A statuses and reasons for equipment
+  const [naStatus, setNaStatus] = useState<Record<string, boolean>>({});
+  const [naReasons, setNaReasons] = useState<Record<string, string>>({});
 
-  // UI only
-  const [tab, setTab] = useState<'rooms' | 'update'>('rooms');
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  // Tracks which Area cards have their equipment lists toggled open
+  const [expandedReports, setExpandedReports] = useState<Set<string>>(new Set());
+
+  // Pagination State
   const [currentPage, setCurrentPage] = useState(1);
-  const [search, setSearch] = useState("");
-  const [copied, setCopied] = useState<'idle' | 'ok' | 'manual'>('idle');
-  const updateBoxRef = useRef<HTMLTextAreaElement>(null);
 
-  // Refs read by the save loop so it always writes the latest state
-  const stateRef = useRef(state); stateRef.current = state;
-  const areasRef = useRef(areas); areasRef.current = areas;
-  const autoHeadsRef = useRef(autoHeads); autoHeadsRef.current = autoHeads;
-  const shiftRef = useRef(shift); shiftRef.current = shift;
-  const dirtyTickRef = useRef(dirtyTick); dirtyTickRef.current = dirtyTick;
-  const recordIdRef = useRef<string | null>(null);
-  const savingRef = useRef(false);
-  const queuedRef = useRef(false);
-  const bootIdRef = useRef(0);
+  // Headcount data
+  const [scheduled, setScheduled] = useState(0);
+  const [headsByArea, setHeadsByArea] = useState<Record<string, number>>({}); // keyed by area id
+  const [attendance, setAttendance] = useState<any[]>([]);
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveMessage, setSaveMessage] = useState("");
+  const reportRecordId = useRef<string | null>(null); // first save creates the shift record, later saves update it
 
-  const edit = useCallback((fn: (s: ShiftState) => ShiftState) => { setState(fn); setDirtyTick(t => t + 1); }, []);
+  // UI state for showing report modal
+  const [showReport, setShowReport] = useState(false);
+  const [reportText, setReportText] = useState("");
+  const [copied, setCopied] = useState(false);
 
-  // --- LOAD: rooms + equipment + this shift's assignments + this shift's saved report ---
-  const boot = useCallback(async () => {
-    const bootId = ++bootIdRef.current;
-    const p = propsRef.current, sh = getShiftInfo();
-    const log: LoadLogEntry[] = [], logger: LoadLogger = e => log.push(e);
-    setPhase('loading'); setLoadWarning(null); setNotice(null);
-    try {
-      if (!hasReadApi(p)) {
-        recordIdRef.current = null;
-        setConnected(false); setShift(sh); setAreas([]); setAutoIds(new Set()); setAutoHeads({}); setState(emptyState()); setDirtyTick(0);
-        setSave({ status: 'offline' }); setLoadLog([]);
+  // --- DATAVERSE HYDRATION ---
+  useEffect(() => {
+      const bootSequence = async () => {
+          setIsInitializing(true);
+          const p = propsRef.current;
+          try {
+              // 1. Master data + this shift's task assignments (in parallel)
+              // Assignments made up to an hour before shift start count for this shift.
+              const sinceIso = new Date(getShiftInfo().start.getTime() - 60 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+              const [fetchedAreas, fetchedAssets, fetchedTasks] = await Promise.all([
+                  fetchFallbackRecords(["craa5_aa_mss_area", "craa5_aa_mss_areas"], p),
+                  fetchFallbackRecords(["craa5_aa_assets", "craa5_aa_asset", "craa5_aa_assetses"], p),
+                  fetchFallbackRecords("craa5_taskassignment", p, `createdon ge ${sinceIso}`, ['craa5_area', 'craa5_id', 'craa5_datetimeofassignment', 'createdon']),
+              ]);
+
+              // Unique area names worked on this shift
+              const shiftActiveAreaNames = new Set(fetchedTasks.map(t => norm(getField(t, 'craa5_area'))).filter(n => n.length > 0));
+              const headsByName = countHeads(fetchedTasks);
+
+              const autoSelectedIds = new Set<string>();
+              const heads: Record<string, number> = {};
+
+              // 2. Rooms (status areas like PTO/Sick/Late are not rooms)
+              const processedAreas = fetchedAreas
+                  .map(a => ({ id: String(getField(a, 'craa5_aa_mss_areaid') ?? ''), name: String(getField(a, 'craa5_area') || '').trim(), assets: [] as any[] }))
+                  .filter(a => a.id && a.name && !STATUS_AREAS.has(norm(a.name)))
+                  .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+              processedAreas.forEach(a => {
+                  if (shiftActiveAreaNames.has(norm(a.name))) autoSelectedIds.add(a.id);
+                  if (headsByName[norm(a.name)]) heads[a.id] = headsByName[norm(a.name)];
+              });
+
+              // 3. Each asset belongs to ONE room: exact name match first, otherwise the longest room name it
+              //    contains as whole words ("Room 1" no longer picks up "Room 10" equipment).
+              const words = (v: any) => norm(v).split(/[^a-z0-9]+/).filter(Boolean);
+              const hasWords = (hay: string[], needle: string[]) => hay.some((_, i) => needle.length > 0 && needle.every((w, j) => hay[i + j] === w));
+              fetchedAssets.forEach((ast, i) => {
+                  const label = getField(ast, 'craa5_areaname') || "";
+                  let room = processedAreas.find(a => norm(a.name) === norm(label));
+                  if (!room && label) room = processedAreas.filter(a => hasWords(words(label), words(a.name))).sort((a, b) => words(b.name).length - words(a.name).length)[0];
+                  if (room) room.assets.push({ id: String(getField(ast, 'craa5_aa_assetsid') ?? `${room.id}-asset-${i}`), name: getField(ast, 'craa5_equipmentidentifier') || "Unknown Equipment" });
+              });
+
+              setLiveAreas(processedAreas);
+              setReportAreaIds(autoSelectedIds);
+              setHeadsByArea(heads);
+
+          } catch (err) {
+              console.error("Initialization failed", err);
+          } finally {
+              setIsInitializing(false);
+          }
+      };
+
+      bootSequence();
+      // Run once: Power Apps hands down new props objects often, and re-running this wiped progress.
+  }, []);
+
+  // --- MEMOIZED ACTIVE AREAS FOR PAGINATION ---
+  const activeAreasList = useMemo(() => {
+      return liveAreas.filter(a => reportAreaIds.has(a.id));
+  }, [reportAreaIds, liveAreas]);
+
+  const totalPages = Math.max(1, Math.ceil(activeAreasList.length / ITEMS_PER_PAGE));
+
+  // Ensure current page is valid if areas are removed
+  useEffect(() => {
+      if (currentPage > totalPages) {
+          setCurrentPage(totalPages);
+      }
+  }, [totalPages, currentPage]);
+
+  const paginatedAreas = activeAreasList.slice((currentPage - 1) * ITEMS_PER_PAGE, currentPage * ITEMS_PER_PAGE);
+
+  const toggleAreaActive = (areaId: string) => {
+    setReportAreaIds(prev => {
+      const next = new Set(prev);
+      if (next.has(areaId)) next.delete(areaId);
+      else next.add(areaId);
+      return next;
+    });
+  };
+
+  const toggleExpand = (areaId: string) => {
+    setExpandedReports(prev => {
+      const next = new Set(prev);
+      if (next.has(areaId)) next.delete(areaId);
+      else next.add(areaId);
+      return next;
+    });
+  };
+
+  // The Master Slider Logic (The Magic)
+  const handleAreaSliderChange = (areaId: string, assets: any[], newValue: number) => {
+    setReportSteps(prev => {
+      // Update the main Area
+      const nextSteps = { ...prev, [areaId]: newValue };
+      
+      // Cascade the update to all child Equipment (Ignoring N/A equipment)
+      assets.forEach(eq => {
+        if (!naStatus[eq.id]) {
+            nextSteps[eq.id] = newValue;
+        }
+      });
+      
+      return nextSteps;
+    });
+  };
+
+  const handleEquipmentSliderChange = (eqId: string, newValue: number) => {
+    setReportSteps(prev => ({
+      ...prev,
+      [eqId]: newValue
+    }));
+  };
+
+  // --- NEW FUNCTIONS FOR ATTENDANCE & DATAVERSE ---
+  const addAttendanceRecord = () => {
+    setAttendance([...attendance, { id: Date.now().toString(), name: '', status: 'PTO', comment: '' }]);
+  };
+
+  const updateAttendance = (id: string, field: string, value: string) => {
+    setAttendance(attendance.map(a => a.id === id ? { ...a, [field]: value } : a));
+  };
+
+  const removeAttendance = (id: string) => {
+    setAttendance(attendance.filter(a => a.id !== id));
+  };
+
+  const actualCrew = activeAreasList.reduce((n, a) => n + (headsByArea[a.id] || 0), 0);
+  const openSpots = Math.max(0, scheduled - actualCrew);
+
+  // Executive update: (heads) area — where it stands, what's done, what's left.
+  const constructReportString = () => {
+    const shift = getShiftInfo();
+    const now = new Date();
+    const open: string[] = [];
+    const complete: string[] = [];
+
+    activeAreasList.forEach(area => {
+      const step = reportSteps[area.id] || 0;
+      const heads = headsByArea[area.id] || 0;
+      const tracked = area.assets.filter((eq: any) => !naStatus[eq.id]);
+      const behind = tracked.filter((eq: any) => (reportSteps[eq.id] || 0) < step);
+      const eqDone = tracked.filter((eq: any) => (reportSteps[eq.id] || 0) === LAST_STEP).length;
+      const naList = area.assets.filter((eq: any) => naStatus[eq.id]);
+
+      if (step === LAST_STEP && behind.length === 0) {
+        complete.push(`(${heads}) ${area.name}`);
         return;
       }
-      const [rawAreas, rawAssets, tasks, saved] = await Promise.all([
-        // Narrow $select keeps big tables fast; if a column is ever renamed, fall back to all columns.
-        queryRecords(p, AREA_TABLES, { select: ['craa5_aa_mss_areaid', 'craa5_area'], filter: 'statecode eq 0' }, logger)
-          .then(r => r ?? queryRecords(p, AREA_TABLES, { filter: 'statecode eq 0' }, logger)),
-        queryRecords(p, ASSET_TABLES, { select: ['craa5_aa_assetsid', 'craa5_equipmentidentifier', 'craa5_areaname'], filter: 'statecode eq 0' }, logger)
-          .then(r => r ?? queryRecords(p, ASSET_TABLES, { filter: 'statecode eq 0' }, logger)),
-        fetchShiftTasks(p, sh, logger),
-        findSavedReport(p, reportName(sh), logger),
-      ]);
-      if (bootId !== bootIdRef.current) return;
-      setLoadLog(log);
 
-      const builtAreas = buildAreas(rawAreas || [], rawAssets || []);
-      const assigned = summarizeAssignments(tasks || [], builtAreas);
-      const restored = saved ? restoreState(saved.json, builtAreas) : emptyState();
-      restored.selected = uniq([...restored.selected, ...Array.from(assigned.autoIds).filter(id => !restored.dismissed.includes(id))]);
+      const eqNote = tracked.length ? ` · ${eqDone}/${tracked.length} equipment complete` : '';
+      const lines = [`(${heads}) ${area.name} — ${step === LAST_STEP ? 'Final step, waiting on equipment' : step === 0 ? 'Not started' : `Step ${step + 1}/${CLEAN_STEPS.length}: ${CLEAN_STEPS[step]}`}`];
+      if (step > 0) lines.push(`   Done: ${CLEAN_STEPS.slice(0, step).join(', ')}${eqNote}`);
+      else if (eqDone) lines.push(`   Done:${eqNote.slice(2)}`);
+      if (step < LAST_STEP) lines.push(`   Left: ${step === 0 ? `All ${CLEAN_STEPS.length} steps` : CLEAN_STEPS.slice(step).join(', ')}`);
+      if (behind.length) lines.push(`   Behind: ${behind.map((eq: any) => `${eq.name} (${CLEAN_STEPS[reportSteps[eq.id] || 0]})`).join(', ')}`);
+      if (naList.length) lines.push(`   N/A: ${naList.map((eq: any) => naReasons[eq.id] ? `${eq.name} – ${naReasons[eq.id]}` : eq.name).join(', ')}`);
+      open.push(lines.join('\n'));
+    });
 
-      recordIdRef.current = saved?.id || null;
-      setConnected(true); setShift(sh); setAreas(builtAreas); setAutoIds(assigned.autoIds); setAutoHeads(assigned.heads);
-      setState(restored); setDirtyTick(0); setCurrentPage(1);
-      setSave(saved ? { status: 'saved', at: saved.modifiedon ? new Date(saved.modifiedon) : undefined } : { status: 'idle' });
+    const out = [`SANITATION UPDATE — ${shift.letter} Shift · ${now.toLocaleDateString(undefined, { weekday: 'short', month: 'numeric', day: 'numeric' })} ${now.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`];
+    const outCount = attendance.filter(a => a.name.trim() !== "").length;
+    out.push(`Crew: ${actualCrew} on floor${scheduled ? ` / ${scheduled} scheduled` : ''}${outCount ? ` · ${outCount} out` : ''}`);
+    out.push(`Progress: ${complete.length} of ${activeAreasList.length} areas complete`);
+    out.push('');
+    if (open.length) { out.push('IN PROGRESS'); out.push(open.join('\n\n')); out.push(''); }
+    if (complete.length) out.push(`COMPLETE: ${complete.join(', ')}`);
+    if (!activeAreasList.length) out.push('No areas selected.');
+    out.push('', '(#) = heads in area');
+    return out.join('\n').trim();
+  };
 
-      // Restoring against partial data and then autosaving would overwrite the saved copy, so pause autosave instead.
-      const failed = [!rawAreas && "rooms", !rawAssets && "equipment", saved === undefined && "this shift's saved progress"].filter(Boolean);
-      if (failed.length) setLoadWarning(`Couldn't load ${failed.join(", ")} from Dataverse. Autosave is paused so nothing saved gets overwritten.`);
-      if (!tasks) setNotice({ kind: 'error', text: "Couldn't load this shift's assignments, so rooms weren't autoselected. Use Refresh assignments to retry." });
-    } catch (e) {
-      console.error("[Shift Start] Initialization failed", e);
-      if (bootId === bootIdRef.current) setNotice({ kind: 'error', text: `Loading failed: ${errMsg(e)}` });
-    } finally {
-      if (bootId === bootIdRef.current) setPhase('ready');
-    }
-  }, []);
+  const generateReport = () => {
+    const textOut = constructReportString();
+    setReportText(textOut);
+    setShowReport(true);
+    setCopied(false);
+  };
 
-  // Run once. Power Apps hands down new props objects constantly; re-booting on them would wipe progress.
-  useEffect(() => { boot(); }, [boot]);
-
-  // --- SAVE: one record per shift, created once then updated ---
-  const buildPayload = () => {
-    const s = stateRef.current, sh = shiftRef.current, auto = autoHeadsRef.current;
-    const sums = areasRef.current.filter(a => s.selected.includes(a.id)).map(a => summarizeArea(a, s, auto));
-    return {
-      craa5_name: reportName(sh),
-      craa5_actualcrew: sums.reduce((n, x) => n + x.heads, 0),
-      craa5_handofftext: buildUpdateText(sums, sh, s.shiftNotes, new Date()),
-      craa5_equipmentjson: JSON.stringify({
-        v: 2,
-        shift: shiftLetterFor(sh, new Date()),
-        shiftStart: new Date(sh.startMs).toISOString(),
-        savedAt: new Date().toISOString(),
-        dismissedAreaIds: s.dismissed,
-        shiftNotes: s.shiftNotes,
-        areas: sums.map(x => ({
-          areaId: x.area.id,
-          areaName: x.area.name,
-          heads: x.heads,
-          headsOverride: s.heads[x.area.id] ?? null,
-          notes: s.notes[x.area.id] || "",
-          masterStep: x.master,
-          complete: x.complete,
-          equipment: x.area.assets.map(eq => ({
-            eqId: eq.id,
-            eqName: eq.name,
-            step: clampStep(s.progress[eq.id]),
-            isNa: !!s.na[eq.id],
-            naReason: s.naReasons[eq.id] || "",
-          })),
-        })),
-      }),
+  const handleSaveToDataverse = async () => {
+    setIsSaving(true);
+    setSaveMessage("");
+    const handoffText = constructReportString();
+    
+    // --- FLATTENED JSON PAYLOAD FOR DATAVERSE ---
+    const payload = {
+        craa5_name: `Sanitation Report - ${getShiftInfo().letter} Shift - ${new Date().toLocaleDateString()}`,
+        craa5_scheduledheadcount: scheduled,
+        craa5_actualcrew: actualCrew,
+        craa5_openspots: openSpots,
+        craa5_handofftext: handoffText,
+        
+        // Serializing the complex child arrays into JSON strings to avoid child table limitations
+        craa5_attendancejson: JSON.stringify(attendance),
+        craa5_equipmentjson: JSON.stringify(
+            activeAreasList.map(area => ({
+                areaName: area.name,
+                heads: headsByArea[area.id] || 0,
+                masterStep: reportSteps[area.id] || 0,
+                equipment: area.assets.map((eq: any) => ({
+                    eqName: eq.name,
+                    step: reportSteps[eq.id] || 0,
+                    isNa: naStatus[eq.id] || false,
+                    naReason: naReasons[eq.id] || ""
+                }))
+            }))
+        )
     };
-  };
 
-  const persist = useCallback(async () => {
-    if (savingRef.current) { queuedRef.current = true; return; }
-    const p = propsRef.current, api = getWriteApi(p);
-    if (!api) { setSave({ status: 'offline' }); return; }
-    savingRef.current = true;
-    setSave(s => ({ ...s, status: 'saving' }));
-    let savedTick = dirtyTickRef.current;
     try {
-      do {
-        queuedRef.current = false;
-        savedTick = dirtyTickRef.current;
-        const payload = buildPayload();
-        if (recordIdRef.current) {
-          try { await api.update(REPORT_TABLE, recordIdRef.current, payload); }
-          catch (e) { if (!/does not exist|not found|404/i.test(errMsg(e))) throw e; recordIdRef.current = null; }
+        const webApi = getWebApi(propsRef.current), dataApi = propsRef.current?.dataApi;
+        const table = "craa5_sanitationshiftreport";
+        if (webApi?.createRecord) {
+            if (reportRecordId.current) await webApi.updateRecord(table, reportRecordId.current, payload);
+            else reportRecordId.current = (await webApi.createRecord(table, payload))?.id || null;
+        } else if (dataApi?.createRow) {
+            if (reportRecordId.current) await dataApi.updateRow(table, reportRecordId.current, payload);
+            else reportRecordId.current = (await dataApi.createRow(table, payload)) || null;
+        } else {
+            console.log("Mock Save Payload:", payload);
+            setSaveMessage("Not connected to Dataverse (payload logged to console).");
+            return;
         }
-        if (!recordIdRef.current) {
-          // Guard against duplicates if the record was created elsewhere (another device, or a create that returned no id).
-          const existing = await findSavedReport(p, payload.craa5_name);
-          if (existing) { recordIdRef.current = existing.id; await api.update(REPORT_TABLE, existing.id, payload); }
-          else recordIdRef.current = await api.create(REPORT_TABLE, payload);
-        }
-      } while (queuedRef.current);
-      // An edit made mid-save still has its autosave timer pending
-      setSave({ status: dirtyTickRef.current !== savedTick ? 'dirty' : 'saved', at: new Date() });
+        setSaveMessage(`Saved ${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`);
     } catch (e) {
-      console.error("[Shift Start] Save failed", e);
-      setSave({ status: 'error', error: errMsg(e) });
+        console.error("Save failed", e);
+        setSaveMessage(`Save failed: ${errMsg(e)}`);
     } finally {
-      savingRef.current = false;
+        setIsSaving(false);
     }
-  }, []);
-
-  // Autosave shortly after the last edit
-  const autosavePaused = !connected || !!loadWarning;
-  useEffect(() => {
-    if (!dirtyTick) return;
-    setSave(s => s.status === 'saving' ? s : { ...s, status: connected ? 'dirty' : 'offline' });
-    if (autosavePaused) return;
-    const t = setTimeout(() => { persist(); }, AUTOSAVE_DELAY_MS);
-    return () => clearTimeout(t);
-  }, [dirtyTick, autosavePaused, connected, persist]);
-
-  // --- ASSIGNMENT REFRESH (manual + every few minutes) ---
-  const refreshAssignments = async (silent: boolean) => {
-    if (phase !== 'ready' || !connected || refreshing) return;
-    if (!silent) setRefreshing(true);
-    const log: LoadLogEntry[] = [];
-    const tasks = await fetchShiftTasks(propsRef.current, shiftRef.current, e => log.push(e));
-    setLoadLog(prev => [...prev.filter(x => x.table !== TASK_TABLE), ...log]);
-    if (!silent) setRefreshing(false);
-    if (!tasks) { if (!silent) setNotice({ kind: 'error', text: "Couldn't reach Dataverse to refresh assignments." }); return; }
-    const assigned = summarizeAssignments(tasks, areasRef.current);
-    const headsChanged = !sameCounts(assigned.heads, autoHeadsRef.current);
-    setAutoIds(assigned.autoIds);
-    setAutoHeads(assigned.heads);
-    const s = stateRef.current;
-    const added = Array.from(assigned.autoIds).filter(id => !s.selected.includes(id) && !s.dismissed.includes(id));
-    if (added.length) edit(st => ({ ...st, selected: uniq([...st.selected, ...added]) }));
-    else if (headsChanged) setDirtyTick(t => t + 1);
-    if (!silent) setNotice({ kind: 'info', text: added.length ? `Added ${plural(added.length, "newly assigned room")}.` : "Assignments are up to date." });
   };
-  const refreshRef = useRef(refreshAssignments);
-  refreshRef.current = refreshAssignments;
 
-  useEffect(() => {
-    const clock = setInterval(() => setNow(Date.now()), 60000);
-    const poll = setInterval(() => refreshRef.current(true), ASSIGNMENT_REFRESH_MS);
-    return () => { clearInterval(clock); clearInterval(poll); };
-  }, []);
-
-  useEffect(() => {
-    if (notice?.kind !== 'info') return;
-    const t = setTimeout(() => setNotice(null), 4000);
-    return () => clearTimeout(t);
-  }, [notice]);
-
-  // --- DERIVED ---
-  const selectedSet = useMemo(() => new Set(state.selected), [state.selected]);
-  const activeAreas = useMemo(() => areas.filter(a => selectedSet.has(a.id)), [areas, selectedSet]);
-  const summaries = useMemo(() => activeAreas.map(a => summarizeArea(a, state, autoHeads)), [activeAreas, state, autoHeads]);
-  const totals = useMemo(() => ({
-    heads: summaries.reduce((n, x) => n + x.heads, 0),
-    roomsDone: summaries.filter(x => x.complete).length,
-    eqTracked: summaries.reduce((n, x) => n + x.tracked.length, 0),
-    eqDone: summaries.reduce((n, x) => n + x.eqDone.length, 0),
-  }), [summaries]);
-  const updateText = useMemo(() => buildUpdateText(summaries, shift, state.shiftNotes, new Date(now)), [summaries, shift, state.shiftNotes, now]);
-  const shiftRolledOver = getShiftInfo(new Date(now)).startMs !== shift.startMs;
-  const visibleAreas = useMemo(() => { const q = norm(search); return q ? areas.filter(a => norm(a.name).includes(q)) : areas; }, [areas, search]);
-
-  const totalPages = Math.max(1, Math.ceil(summaries.length / ITEMS_PER_PAGE));
-  useEffect(() => { if (currentPage > totalPages) setCurrentPage(totalPages); }, [totalPages, currentPage]);
-  const pageSummaries = summaries.slice((currentPage - 1) * ITEMS_PER_PAGE, currentPage * ITEMS_PER_PAGE);
-
-  // --- ACTIONS ---
-  const toggleArea = (id: string) => edit(s => s.selected.includes(id)
-    ? { ...s, selected: s.selected.filter(x => x !== id), dismissed: uniq([...s.dismissed, id]) }
-    : { ...s, selected: [...s.selected, id], dismissed: s.dismissed.filter(x => x !== id) });
-
-  const toggleExpand = (id: string) => setExpanded(prev => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next; });
-
-  // Room slider cascades to every non-N/A piece of equipment in the room
-  const setAreaProgress = (area: Area, value: number) => edit(s => {
-    const progress = { ...s.progress, [area.id]: value };
-    area.assets.forEach(eq => { if (!s.na[eq.id]) progress[eq.id] = value; });
-    return { ...s, progress };
-  });
-  const setEqProgress = (id: string, value: number) => edit(s => ({ ...s, progress: { ...s.progress, [id]: value } }));
-  const bumpHeads = (id: string, delta: number) => edit(s => ({ ...s, heads: { ...s.heads, [id]: Math.max(0, headsFor(id, s, autoHeads) + delta) } }));
-  const resetHeads = (id: string) => edit(s => { const heads = { ...s.heads }; delete heads[id]; return { ...s, heads }; });
-  const setNote = (id: string, text: string) => edit(s => ({ ...s, notes: { ...s.notes, [id]: text } }));
-
-  const handleCopy = async () => {
-    if (await copyText(updateText)) { setCopied('ok'); setTimeout(() => setCopied('idle'), 2000); return; }
-    setCopied('manual'); setTab('update');
+  // --- CIRCUMVENTION: iFrame/PowerApps safe clipboard copy ---
+  const copyToClipboard = async () => {
+    try {
+      let ok = false;
+      try { if (navigator?.clipboard?.writeText) { await navigator.clipboard.writeText(reportText); ok = true; } } catch (e) {}
+      if (!ok) {
+        const textArea = document.createElement("textarea");
+        textArea.value = reportText;
+        textArea.style.position = "fixed";
+        textArea.style.left = "-999999px";
+        textArea.style.top = "-999999px";
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+        const successful = document.execCommand('copy');
+        textArea.remove();
+        if (!successful) throw new Error("Fallback copy failed");
+      }
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error("Clipboard copy failed:", err);
+      setSaveMessage("Clipboard is blocked here: click in the report box, then Ctrl+A and Ctrl+C.");
+    }
   };
-  useEffect(() => {
-    if (copied === 'manual' && tab === 'update') { updateBoxRef.current?.focus(); updateBoxRef.current?.select(); }
-  }, [copied, tab]);
 
-  if (phase === 'loading') {
-    return (
-      <div className="bg-slate-50 flex flex-col items-center justify-center py-24">
-        <Loader className="w-12 h-12 text-blue-600 mb-4" />
-        <h2 className="text-xl font-bold text-slate-700">Loading Shift Data...</h2>
-        <p className="text-slate-500">Cross-referencing this shift's task assignments</p>
-      </div>
-    );
+  if (isInitializing) {
+      return (
+          <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center">
+              <Loader className="w-12 h-12 text-blue-600 mb-4" />
+              <h2 className="text-xl font-bold text-slate-700">Loading Shift Data...</h2>
+              <p className="text-slate-500">Cross-referencing Task Assignments</p>
+          </div>
+      );
   }
 
-  const badge = SAVE_BADGE[save.status];
-
   return (
-    <div className="bg-slate-50 text-slate-800 font-sans p-4 md:p-8">
+    <div className="min-h-screen bg-slate-50 text-slate-800 font-sans p-4 md:p-8">
+      
       <div className="max-w-6xl mx-auto">
-
-        {/* Header */}
-        <header className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-4 bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+        {/* Header Section */}
+        <header className="flex flex-col md:flex-row md:flex-wrap md:items-center justify-between gap-4 mb-8 bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
           <div>
             <h1 className="text-2xl md:text-3xl font-extrabold text-slate-900 flex items-center gap-2">
               <Settings2 className="text-blue-600 h-8 w-8" />
-              Shift Start
+              Area Reports System
             </h1>
-            <p className="text-slate-500 mt-1">
-              {shiftLetterFor(shift, new Date(now))} Shift ({shift.isNight ? "Nights" : "Days"}) · {plural(activeAreas.length, "room")} · {plural(totals.heads, "head")}
-            </p>
+            <p className="text-slate-500 mt-1">Live Sanitation Tracking & Hand-off generation</p>
           </div>
-          <div className="flex flex-col sm:flex-row sm:items-center gap-3">
-            <span title={save.error || ""} className={`text-xs font-semibold px-3 py-1.5 rounded-full border flex items-center gap-1 justify-center ${badge.cls}`}>
-              {save.status === 'saving' && <Loader className="w-3 h-3" />}
-              {badge.text}{save.status === 'saved' && save.at ? ` ${save.at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : ""}
-            </span>
-            <button
-              onClick={() => refreshAssignments(false)}
-              disabled={!connected || refreshing}
-              className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-3 rounded-xl font-semibold transition-all active:scale-95 flex items-center gap-2 justify-center disabled:opacity-50"
+          <div className="flex flex-col sm:flex-row gap-3">
+            <button 
+              onClick={generateReport}
+              className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-xl font-semibold shadow-md shadow-blue-200 transition-all active:scale-95 flex items-center gap-2 justify-center"
             >
-              <RefreshCw className={`w-5 h-5 ${refreshing ? 'animate-spin' : ''}`} />
-              Refresh assignments
+              <ClipboardCopy className="w-5 h-5" />
+              Generate Shift Report
             </button>
-            <button
-              onClick={() => persist()}
-              disabled={!connected || !!loadWarning || save.status === 'saving'}
-              className="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-3 rounded-xl font-semibold shadow-md shadow-emerald-200 transition-all active:scale-95 flex items-center gap-2 justify-center disabled:bg-slate-400 disabled:shadow-none"
+            <button 
+              onClick={handleSaveToDataverse}
+              disabled={isSaving}
+              className={`${isSaving ? 'bg-slate-400' : 'bg-emerald-600 hover:bg-emerald-700'} text-white px-6 py-3 rounded-xl font-semibold shadow-md shadow-emerald-200 transition-all active:scale-95 flex items-center gap-2 justify-center`}
             >
               <Save className="w-5 h-5" />
-              Save now
-            </button>
-            <button
-              onClick={handleCopy}
-              className={`${copied === 'ok' ? 'bg-green-600 hover:bg-green-700' : 'bg-blue-600 hover:bg-blue-700'} text-white px-4 py-3 rounded-xl font-semibold shadow-md shadow-blue-200 transition-all active:scale-95 flex items-center gap-2 justify-center`}
-            >
-              {copied === 'ok' ? <CheckCircle2 className="w-5 h-5" /> : <ClipboardCopy className="w-5 h-5" />}
-              {copied === 'ok' ? 'Copied!' : 'Copy update'}
+              {isSaving ? 'Saving...' : 'Save to Dataverse'}
             </button>
           </div>
+          {saveMessage && <p className="text-xs font-semibold text-slate-500 md:basis-full md:text-right">{saveMessage}</p>}
         </header>
 
-        {/* Banners */}
-        {!connected && (
-          <div className="mb-4 p-4 rounded-xl border border-slate-300 bg-white text-slate-600 text-sm flex items-center gap-2">
-            <AlertCircle className="w-5 h-5 shrink-0" /> Not connected to Dataverse. Open this inside the Power Apps model-driven app to load rooms and save progress.
+        {/* --- NEW HEADCOUNT & ATTENDANCE SECTION --- */}
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6 mb-6">
+          <div className="flex items-center gap-2 mb-4">
+            <Users className="w-6 h-6 text-indigo-600" />
+            <h2 className="text-xl font-bold text-slate-800">Shift Headcount & Attendance</h2>
           </div>
-        )}
-        {loadWarning && (
-          <div className="mb-4 p-4 rounded-xl border border-amber-300 bg-amber-50 text-amber-900 text-sm flex flex-col sm:flex-row sm:items-center gap-3">
-            <span className="flex items-center gap-2 flex-1"><AlertCircle className="w-5 h-5 shrink-0" />{loadWarning}</span>
-            <div className="flex gap-2">
-              <button onClick={() => boot()} className="px-3 py-1.5 rounded-lg bg-amber-600 text-white font-semibold hover:bg-amber-700">Retry load</button>
-              <button onClick={() => { setLoadWarning(null); persist(); }} className="px-3 py-1.5 rounded-lg bg-white border border-amber-300 font-semibold hover:bg-amber-100">Save anyway</button>
-            </div>
-          </div>
-        )}
-        {shiftRolledOver && (
-          <div className="mb-4 p-4 rounded-xl border border-blue-300 bg-blue-50 text-blue-900 text-sm flex flex-col sm:flex-row sm:items-center gap-3">
-            <span className="flex items-center gap-2 flex-1"><AlertCircle className="w-5 h-5 shrink-0" />A new shift has started. This page still shows the previous shift's report.</span>
-            <button
-              onClick={() => boot()}
-              disabled={save.status === 'saving' || (save.status === 'dirty' && !autosavePaused)}
-              className="px-3 py-1.5 rounded-lg bg-blue-600 text-white font-semibold hover:bg-blue-700 disabled:opacity-50"
-            >
-              {save.status === 'saving' || (save.status === 'dirty' && !autosavePaused) ? 'Saving…' : 'Start new shift'}
-            </button>
-          </div>
-        )}
-        {save.status === 'error' && (
-          <div className="mb-4 p-4 rounded-xl border border-rose-300 bg-rose-50 text-rose-900 text-sm flex items-center gap-2">
-            <AlertCircle className="w-5 h-5 shrink-0" /> Couldn't save to Dataverse: {save.error}. Your changes are still here, so use "Save now" to retry.
-          </div>
-        )}
-        {notice && (
-          <div className={`mb-4 p-3 rounded-xl border text-sm flex items-center gap-2 ${notice.kind === 'error' ? 'border-rose-300 bg-rose-50 text-rose-900' : 'border-slate-200 bg-white text-slate-600'}`}>
-            <span className="flex-1">{notice.text}</span>
-            <button onClick={() => setNotice(null)} aria-label="Dismiss" className="px-2 text-slate-400 hover:text-slate-600">✕</button>
-          </div>
-        )}
-
-        {/* Tabs */}
-        <div className="flex gap-2 mb-4" role="tablist">
-          {([['rooms', 'Rooms'], ['update', 'Shift Update']] as const).map(([key, label]) => (
-            <button
-              key={key}
-              role="tab"
-              aria-selected={tab === key}
-              onClick={() => setTab(key)}
-              className={`px-5 py-2 rounded-xl font-semibold transition-colors ${tab === key ? 'bg-slate-900 text-white' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-100'}`}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-
-        {tab === 'rooms' ? (
-          <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-
-            {/* Sidebar: room selector */}
-            <div className="lg:col-span-1">
-              <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-5 lg:sticky lg:top-8">
-                <h2 className="text-sm uppercase tracking-wider font-bold text-slate-400 mb-3 flex items-center gap-2">
-                  Rooms
-                  <span className="bg-slate-100 text-slate-600 py-0.5 px-2 rounded-full text-xs">{activeAreas.length} / {areas.length}</span>
-                </h2>
-                <div className="relative mb-2">
-                  <Search className="w-4 h-4 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
-                  <input
-                    type="text" value={search} onChange={e => setSearch(e.target.value)} placeholder="Find a room..."
-                    className="w-full pl-8 pr-2 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                  />
-                </div>
-                <p className="text-[11px] text-slate-400 mb-3">AUTO = assigned this shift. (#) = heads in room.</p>
-                <div className="flex flex-col gap-2 max-h-[60vh] overflow-y-auto pr-1">
-                  {visibleAreas.map(area => {
-                    const isActive = selectedSet.has(area.id);
-                    const heads = headsFor(area.id, state, autoHeads);
-                    return (
-                      <button
-                        key={area.id}
-                        onClick={() => toggleArea(area.id)}
-                        aria-pressed={isActive}
-                        className={`flex items-center justify-between gap-2 w-full text-left px-4 py-3 rounded-xl border transition-all ${isActive ? 'bg-blue-50 border-blue-200 text-blue-900 shadow-inner' : 'bg-white border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-600'}`}
-                      >
-                        <span className={`font-semibold truncate ${isActive ? 'text-blue-700' : ''}`}>{area.name}</span>
-                        <span className="flex items-center gap-1.5 shrink-0">
-                          {autoIds.has(area.id) && <span className="text-[10px] font-bold text-blue-500">AUTO</span>}
-                          {heads > 0 && <span className="text-xs font-bold text-slate-500">({heads})</span>}
-                          {isActive && <CheckCircle2 className="w-5 h-5 text-blue-600" />}
-                        </span>
-                      </button>
-                    );
-                  })}
-                  {visibleAreas.length === 0 && (
-                    <div className="p-4 text-center text-sm text-slate-400">
-                      {areas.length ? "No rooms match." : "No rooms loaded from Dataverse."}
-                      {!areas.length && connected && (
-                        <button onClick={() => boot()} className="block mx-auto mt-2 px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold">Retry</button>
-                      )}
-                    </div>
-                  )}
-                </div>
-                {loadLog.length > 0 && (
-                  <details open={!areas.length || undefined} className="mt-4 text-[11px] text-slate-500">
-                    <summary className="cursor-pointer font-bold uppercase tracking-wider text-slate-400">Data connection</summary>
-                    <ul className="mt-2 flex flex-col gap-1">
-                      {loadLog.map((e, i) => (
-                        <li key={i} className={e.error ? 'text-rose-600' : ''}>
-                          <span className="font-semibold">{e.table}</span> · {e.source} · {e.error ? e.error : `${e.rows} rows`} · {e.ms} ms
-                        </li>
-                      ))}
-                    </ul>
-                  </details>
-                )}
+          
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+            {/* Headcount Summary */}
+            <div className="md:col-span-1 bg-indigo-50 rounded-xl p-4 border border-indigo-100 flex flex-col justify-center">
+              <div className="flex justify-between items-center mb-2">
+                <span className="text-sm font-semibold text-indigo-900">Scheduled:</span>
+                <input type="number" min={0} value={scheduled || ''} placeholder="0" onChange={e => setScheduled(Math.max(0, parseInt(e.target.value, 10) || 0))} className="w-16 text-right font-bold text-indigo-700 bg-white border border-indigo-200 rounded px-1" aria-label="Scheduled headcount" />
+              </div>
+              <div className="flex justify-between items-center mb-2">
+                <span className="text-sm font-semibold text-indigo-900">Actual Crew:</span>
+                <span className="font-bold text-emerald-600 text-lg" title="Heads assigned to the selected areas">{actualCrew}</span>
+              </div>
+              <div className="flex justify-between items-center pt-2 border-t border-indigo-200/50">
+                <span className="text-sm font-semibold text-indigo-900">Open Spots:</span>
+                <span className="font-bold text-rose-600">{openSpots}</span>
               </div>
             </div>
 
-            {/* Main: room cards */}
-            <div className="lg:col-span-3 flex flex-col gap-5">
-              {summaries.length === 0 ? (
-                <div className="bg-white border border-dashed border-slate-300 rounded-2xl p-12 text-center flex flex-col items-center justify-center text-slate-500">
-                  <AlertCircle className="w-12 h-12 mb-4 text-slate-300" />
-                  <h3 className="text-xl font-bold text-slate-700 mb-2">{areas.length ? "No Rooms Selected" : "No Rooms Loaded"}</h3>
-                  <p>{areas.length
-                    ? "Nobody is assigned to a room yet this shift. Pick rooms from the list, or refresh assignments."
-                    : "Rooms couldn't be read from Dataverse. Open \"Data connection\" in the left panel to see which table failed and why."}</p>
+            {/* Attendance Tracker */}
+            <div className="md:col-span-3">
+              <div className="flex justify-between items-end mb-3">
+                <span className="text-sm font-bold text-slate-500 uppercase tracking-wider">Exceptions Log</span>
+                <button 
+                  onClick={addAttendanceRecord}
+                  className="text-xs flex items-center gap-1 bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-1.5 rounded-lg font-semibold transition-colors"
+                >
+                  <Plus className="w-3 h-3" /> Add Exception
+                </button>
+              </div>
+              
+              {attendance.length === 0 ? (
+                <div className="text-center p-4 border-2 border-dashed border-slate-200 rounded-xl text-slate-400 text-sm font-medium">
+                  No attendance exceptions logged yet.
                 </div>
               ) : (
-                <>
-                  {pageSummaries.map(x => {
-                    const { area } = x;
-                    const isExpanded = expanded.has(area.id);
-                    const waiting = x.master >= TOTAL_STEPS ? x.behind.length : 0;
-                    const overridden = state.heads[area.id] !== undefined;
-                    return (
-                      <div key={area.id} className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+                <div className="flex flex-col gap-2">
+                  {attendance.map((record) => (
+                    <div key={record.id} className="flex flex-wrap md:flex-nowrap items-center gap-2 bg-slate-50 p-2 rounded-lg border border-slate-200 focus-within:border-indigo-300 transition-colors">
+                      <input 
+                        type="text" 
+                        placeholder="Employee Name"
+                        value={record.name}
+                        onChange={(e) => updateAttendance(record.id, 'name', e.target.value)}
+                        className="flex-1 min-w-[150px] text-sm p-2 border border-slate-300 rounded-md focus:ring-2 focus:ring-indigo-500 outline-none bg-white"
+                      />
+                      <select
+                        value={record.status}
+                        onChange={(e) => updateAttendance(record.id, 'status', e.target.value)}
+                        className="w-32 text-sm p-2 border border-slate-300 rounded-md focus:ring-2 focus:ring-indigo-500 outline-none bg-white font-semibold text-slate-700"
+                      >
+                        <option value="PTO">PTO</option>
+                        <option value="LATE">LATE</option>
+                        <option value="SICK">SICK</option>
+                        <option value="NCNS">NCNS</option>
+                      </select>
+                      <input 
+                        type="text" 
+                        placeholder="Comments (optional)..."
+                        value={record.comment}
+                        onChange={(e) => updateAttendance(record.id, 'comment', e.target.value)}
+                        className="flex-[2] min-w-[200px] text-sm p-2 border border-slate-300 rounded-md focus:ring-2 focus:ring-indigo-500 outline-none bg-white"
+                      />
+                      <button 
+                        onClick={() => removeAttendance(record.id)}
+                        title="Remove Record"
+                        className="p-2 text-rose-400 hover:text-rose-600 hover:bg-rose-50 rounded-md transition-colors"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
 
-                        {/* Room header (master control) */}
-                        <div className={`${x.complete ? 'bg-emerald-700' : 'bg-[#004aad]'} text-white p-5 flex flex-col md:flex-row gap-6 items-start md:items-center justify-between`}>
-                          <div className="flex items-center gap-4 flex-1 min-w-0">
-                            <button
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+          
+          {/* Sidebar: Area Selector */}
+          <div className="lg:col-span-1">
+            <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-5 sticky top-8">
+              <h2 className="text-sm uppercase tracking-wider font-bold text-slate-400 mb-4 flex items-center gap-2">
+                Active Areas
+                <span className="bg-slate-100 text-slate-600 py-0.5 px-2 rounded-full text-xs">
+                  {reportAreaIds.size} / {liveAreas.length}
+                </span>
+              </h2>
+              <div className="flex flex-col gap-2 max-h-[60vh] overflow-y-auto pr-2 custom-scrollbar">
+                {liveAreas.map(area => {
+                  const isActive = reportAreaIds.has(area.id);
+                  return (
+                    <button
+                      key={area.id}
+                      onClick={() => toggleAreaActive(area.id)}
+                      className={`flex items-center justify-between w-full text-left px-4 py-3 rounded-xl border transition-all ${
+                        isActive 
+                          ? 'bg-blue-50 border-blue-200 text-blue-900 shadow-inner' 
+                          : 'bg-white border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-600'
+                      }`}
+                    >
+                      <span className={`font-semibold ${isActive ? 'text-blue-700' : ''}`}>
+                        {area.name}
+                      </span>
+                      <span className="flex items-center gap-2 shrink-0">
+                        {(headsByArea[area.id] || 0) > 0 && <span className="text-xs font-bold text-slate-500">({headsByArea[area.id]})</span>}
+                        {isActive && <CheckCircle2 className="w-5 h-5 text-blue-600" />}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          {/* Main Content: Tracking Cards */}
+          <div className="lg:col-span-3 flex flex-col gap-5">
+            {reportAreaIds.size === 0 ? (
+              <div className="bg-white border border-dashed border-slate-300 rounded-2xl p-12 text-center flex flex-col items-center justify-center text-slate-500">
+                <AlertCircle className="w-12 h-12 mb-4 text-slate-300" />
+                <h3 className="text-xl font-bold text-slate-700 mb-2">No Areas Selected</h3>
+                <p>Select areas from the sidebar to begin tracking sanitation steps.</p>
+              </div>
+            ) : (
+              <>
+                  {paginatedAreas.map(area => {
+                    const isExpanded = expandedReports.has(area.id);
+                    const areaStep = reportSteps[area.id] || 0;
+                    
+                    // Calculate if waiting on equipment (ignoring N/A)
+                    const laggingCount = areaStep === LAST_STEP
+                      ? area.assets.filter((eq: any) => {
+                          if (naStatus[eq.id]) return false;
+                          return (reportSteps[eq.id] || 0) < LAST_STEP;
+                        }).length 
+                      : 0;
+
+                    return (
+                      <div key={area.id} className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden transition-all">
+                        
+                        {/* Area Header (Master Control) */}
+                        <div className="bg-[#004aad] text-white p-5 flex flex-col md:flex-row gap-6 items-start md:items-center justify-between">
+                          <div className="flex items-center gap-4 flex-1">
+                            <button 
                               onClick={() => toggleExpand(area.id)}
-                              aria-expanded={isExpanded}
-                              aria-label={`${isExpanded ? 'Hide' : 'Show'} equipment for ${area.name}`}
                               className="p-2 hover:bg-white/10 rounded-lg transition-colors"
                             >
                               {isExpanded ? <ChevronDown className="w-6 h-6" /> : <ChevronRight className="w-6 h-6" />}
                             </button>
-                            <div className="min-w-0">
-                              <h2 className="text-2xl font-black tracking-wide truncate">{area.name}</h2>
-                              <div className="flex flex-wrap items-center gap-2 mt-1">
-                                <span className="text-xs bg-white/20 rounded flex items-center" title={overridden ? `Set manually (assignments show ${autoHeads[area.id] || 0})` : "From this shift's assignments"}>
-                                  <button onClick={() => bumpHeads(area.id, -1)} aria-label={`One fewer head in ${area.name}`} className="px-2 py-1 hover:bg-white/20 rounded-l">−</button>
-                                  <span className="px-1 py-1 font-bold flex items-center gap-1"><Users className="w-3.5 h-3.5" />{x.heads}</span>
-                                  <button onClick={() => bumpHeads(area.id, 1)} aria-label={`One more head in ${area.name}`} className="px-2 py-1 hover:bg-white/20">+</button>
-                                  {overridden && <button onClick={() => resetHeads(area.id)} aria-label="Reset heads to assignment count" className="px-2 py-1 hover:bg-white/20 rounded-r">↺</button>}
+                            <div>
+                              <h2 className="text-2xl font-black tracking-wide">{area.name}</h2>
+                              <div className="flex gap-2 mt-1">
+                                <span className="text-xs bg-white/20 rounded flex items-center font-semibold" title="Heads in this area (from assignments)">
+                                  <button onClick={() => setHeadsByArea(h => ({ ...h, [area.id]: Math.max(0, (h[area.id] || 0) - 1) }))} className="px-2 py-1 hover:bg-white/20 rounded-l" aria-label={`One fewer head in ${area.name}`}>−</button>
+                                  <Users className="w-3.5 h-3.5 mr-1" />{headsByArea[area.id] || 0}
+                                  <button onClick={() => setHeadsByArea(h => ({ ...h, [area.id]: (h[area.id] || 0) + 1 }))} className="px-2 py-1 hover:bg-white/20 rounded-r" aria-label={`One more head in ${area.name}`}>+</button>
                                 </span>
                                 <span className="text-xs bg-white/20 px-2 py-1 rounded">
-                                  {x.tracked.length ? `${x.eqDone.length}/${x.tracked.length} equipment complete` : `${area.assets.length} equipment`}
+                                  {area.assets.length} Equipment Assets
                                 </span>
-                                {x.complete && <span className="text-xs bg-white text-emerald-800 px-2 py-1 rounded font-bold">✓ Room complete</span>}
-                                {waiting > 0 && (
+                                {laggingCount > 0 && (
                                   <span className="text-xs bg-amber-500/90 text-amber-50 px-2 py-1 rounded font-semibold flex items-center gap-1">
                                     <AlertCircle className="w-3 h-3" />
-                                    Waiting on {plural(waiting, "item")}
+                                    Waiting on {laggingCount} items
                                   </span>
                                 )}
                               </div>
                             </div>
                           </div>
 
-                          <div className="w-full md:w-1/2 lg:w-2/5 bg-white/10 p-4 rounded-xl border border-white/20 shadow-inner">
-                            <div className="flex justify-between items-center mb-2 gap-2">
-                              <span className="text-sm font-bold text-white uppercase tracking-wider">Room Progress</span>
-                              <span className="text-xs font-bold px-2 py-1 bg-white text-[#004aad] rounded-full shadow-sm">{stepLabel(x.master)} ({x.master}/{TOTAL_STEPS})</span>
+                          {/* Master Slider */}
+                          <div className="w-full md:w-1/2 lg:w-2/5 bg-white/10 p-4 rounded-xl border border-white/20 shadow-inner backdrop-blur-sm">
+                            <div className="flex justify-between items-center mb-2">
+                              <span className="text-sm font-bold text-white uppercase tracking-wider">Master Control</span>
+                              <span className="text-xs font-bold px-2 py-1 bg-white text-[#004aad] rounded-full shadow-sm">
+                                {CLEAN_STEPS[areaStep]}
+                              </span>
                             </div>
-                            <input
-                              type="range" min={0} max={TOTAL_STEPS} step={1} value={x.master}
-                              onChange={e => setAreaProgress(area, Number(e.target.value))}
-                              aria-label={`${area.name} room progress`}
+                            <input 
+                              type="range" 
+                              min="0" 
+                              max={CLEAN_STEPS.length - 1} 
+                              value={areaStep} 
+                              onChange={(e) => handleAreaSliderChange(area.id, area.assets, parseInt(e.target.value))}
                               className="w-full h-3 bg-black/20 rounded-lg appearance-none cursor-pointer accent-white"
                             />
-                            <div className="flex justify-between text-[10px] text-white/70 mt-1">
-                              <span>Not started</span>
-                              <span>{x.master < TOTAL_STEPS ? `Next: ${STEP_LABELS[x.master]}` : ""}</span>
-                              <span>Complete</span>
-                            </div>
                           </div>
                         </div>
 
-                        {/* Context for the update */}
-                        <div className="px-5 py-3 border-b border-slate-100">
-                          <input
-                            type="text"
-                            value={state.notes[area.id] || ""}
-                            onChange={e => setNote(area.id, e.target.value)}
-                            placeholder="Notes for the update: blockers, what's left, ETA..."
-                            aria-label={`Notes for ${area.name}`}
-                            className="w-full p-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                          />
-                        </div>
-
-                        {/* Equipment (scrollable to prevent frame clipping) */}
+                        {/* Expandable Equipment List (Scrollable to prevent frame clipping) */}
                         {isExpanded && (
                           <div className="divide-y divide-slate-100 bg-slate-50/50 p-2 max-h-[45vh] overflow-y-auto overscroll-contain shadow-inner">
-                            {area.assets.map(asset => {
-                              const p = clampStep(state.progress[asset.id]);
-                              const isNa = !!state.na[asset.id];
+                            {area.assets.map((asset: any) => {
+                              const eqStep = reportSteps[asset.id] || 0;
+                              const isNa = naStatus[asset.id] || false;
+                              const naReason = naReasons[asset.id] || '';
+
                               return (
                                 <div key={asset.id} className="p-4 flex flex-col md:flex-row items-start md:items-center gap-4 hover:bg-white transition-colors rounded-xl">
                                   <div className="w-full md:w-1/3 flex items-center gap-3">
-                                    <div className={`w-2 h-2 rounded-full shrink-0 ${isNa ? 'bg-slate-300' : p >= TOTAL_STEPS ? 'bg-green-500' : p < x.master ? 'bg-amber-400' : 'bg-blue-400'}`}></div>
+                                    <div className={`w-2 h-2 rounded-full shrink-0 ${isNa ? 'bg-slate-300' : eqStep === LAST_STEP ? 'bg-green-500' : 'bg-blue-400'}`}></div>
                                     <span className={`font-semibold ${isNa ? 'text-slate-400 line-through' : 'text-slate-700'}`}>{asset.name}</span>
                                   </div>
                                   <div className="w-full md:w-2/3">
-                                    <StatusSlider
-                                      value={p}
-                                      name={asset.name}
-                                      onChange={(v: number) => setEqProgress(asset.id, v)}
+                                    <StatusSlider 
+                                      value={eqStep} 
+                                      onChange={(e: any) => handleEquipmentSliderChange(asset.id, parseInt(e.target.value))}
+                                      label="Asset Status"
                                       isNa={isNa}
-                                      onNaToggle={(checked: boolean) => edit(s => ({ ...s, na: { ...s.na, [asset.id]: checked } }))}
-                                      naReason={state.naReasons[asset.id] || ""}
-                                      onNaReasonChange={(val: string) => edit(s => ({ ...s, naReasons: { ...s.naReasons, [asset.id]: val } }))}
+                                      onNaToggle={(checked: boolean) => setNaStatus(p => ({...p, [asset.id]: checked}))}
+                                      naReason={naReason}
+                                      onNaReasonChange={(val: string) => setNaReasons(p => ({...p, [asset.id]: val}))}
                                     />
                                   </div>
                                 </div>
                               );
                             })}
                             {area.assets.length === 0 && (
-                              <div className="p-6 text-center text-slate-500 italic">No equipment assets found for this room in Dataverse.</div>
+                                <div className="p-6 text-center text-slate-500 italic">No equipment assets found for this area in Dataverse.</div>
                             )}
                           </div>
                         )}
@@ -960,95 +718,76 @@ export default function AreaReportsApp(props: any) {
                     );
                   })}
 
-                  {summaries.length > ITEMS_PER_PAGE && (
-                    <div className="flex justify-between items-center bg-white p-4 rounded-2xl border border-slate-200 shadow-sm mt-2">
-                      <button
-                        onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
-                        disabled={currentPage === 1}
-                        className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-semibold disabled:opacity-50 transition-colors"
-                      >
-                        Previous
-                      </button>
-                      <span className="font-bold text-slate-600">Page {currentPage} of {totalPages}</span>
-                      <button
-                        onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-                        disabled={currentPage === totalPages}
-                        className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-semibold disabled:opacity-50 transition-colors"
-                      >
-                        Next
-                      </button>
-                    </div>
+                  {/* PAGINATION CONTROLS */}
+                  {activeAreasList.length > ITEMS_PER_PAGE && (
+                      <div className="flex justify-between items-center bg-white p-4 rounded-2xl border border-slate-200 shadow-sm mt-2">
+                          <button 
+                              onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                              disabled={currentPage === 1}
+                              className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-semibold disabled:opacity-50 transition-colors"
+                          >
+                              Previous
+                          </button>
+                          <span className="font-bold text-slate-600">
+                              Page {currentPage} of {totalPages}
+                          </span>
+                          <button 
+                              onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                              disabled={currentPage === totalPages}
+                              className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-semibold disabled:opacity-50 transition-colors"
+                          >
+                              Next
+                          </button>
+                      </div>
                   )}
-                </>
-              )}
-            </div>
+              </>
+            )}
           </div>
-        ) : (
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <div className="lg:col-span-1 flex flex-col gap-4">
-              <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-5 grid grid-cols-3 lg:grid-cols-1 gap-4">
-                <div>
-                  <div className="text-xs font-bold uppercase tracking-wider text-slate-400">Heads in rooms</div>
-                  <div className="text-3xl font-black text-slate-900">{totals.heads}</div>
-                </div>
-                <div>
-                  <div className="text-xs font-bold uppercase tracking-wider text-slate-400">Rooms complete</div>
-                  <div className="text-3xl font-black text-emerald-700">{totals.roomsDone}<span className="text-lg text-slate-400">/{summaries.length}</span></div>
-                </div>
-                <div>
-                  <div className="text-xs font-bold uppercase tracking-wider text-slate-400">Equipment complete</div>
-                  <div className="text-3xl font-black text-blue-700">
-                    {totals.eqDone}<span className="text-lg text-slate-400">/{totals.eqTracked}</span>
-                  </div>
-                </div>
-              </div>
-              <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-5">
-                <label htmlFor="shift-notes" className="text-sm font-bold text-slate-500 uppercase tracking-wider">Shift notes</label>
-                <p className="text-xs text-slate-400 mb-2">Added at the end of the update. Room notes live on each room card.</p>
-                <textarea
-                  id="shift-notes"
-                  rows={6}
-                  value={state.shiftNotes}
-                  onChange={e => { const v = e.target.value; edit(s => ({ ...s, shiftNotes: v })); }}
-                  placeholder="Overall blockers, maintenance, QA holds, handoff items..."
-                  className="w-full p-3 text-sm border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none"
-                />
-              </div>
-            </div>
-
-            <div className="lg:col-span-2 bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden flex flex-col">
-              <div className="bg-slate-100 p-4 border-b border-slate-200 flex flex-wrap justify-between items-center gap-3">
-                <h3 className="font-bold text-slate-800 text-lg flex items-center gap-2">
-                  <ClipboardCopy className="w-5 h-5 text-slate-500" />
-                  Shift Update
-                </h3>
-                <button
-                  onClick={handleCopy}
-                  className={`px-5 py-2 text-white font-semibold rounded-lg shadow-sm transition-all flex items-center gap-2 ${copied === 'ok' ? 'bg-green-600 hover:bg-green-700' : 'bg-blue-600 hover:bg-blue-700'}`}
-                >
-                  {copied === 'ok' ? <CheckCircle2 className="w-4 h-4" /> : <ClipboardCopy className="w-4 h-4" />}
-                  {copied === 'ok' ? 'Copied to Clipboard!' : 'Copy to Clipboard'}
-                </button>
-              </div>
-              {copied === 'manual' && (
-                <div className="px-4 py-2 bg-amber-50 border-b border-amber-200 text-amber-900 text-sm">
-                  Clipboard access is blocked here. The text below is selected, so press Ctrl+C (⌘C on Mac) to copy it.
-                </div>
-              )}
-              <div className="p-4 bg-slate-50 flex-1">
-                <textarea
-                  ref={updateBoxRef}
-                  readOnly
-                  value={updateText}
-                  onFocus={e => e.target.select()}
-                  aria-label="Shift update text"
-                  className="w-full min-h-[55vh] p-4 text-sm font-mono bg-white border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-inner"
-                />
-              </div>
-            </div>
-          </div>
-        )}
+        </div>
       </div>
+
+      {showReport && (
+        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl overflow-hidden border border-slate-200 flex flex-col max-h-[90vh]">
+            <div className="bg-slate-100 p-4 border-b border-slate-200 flex justify-between items-center">
+              <h3 className="font-bold text-slate-800 text-lg flex items-center gap-2">
+                <ClipboardCopy className="w-5 h-5 text-slate-500" />
+                Shift Handoff Report
+              </h3>
+              <button onClick={() => setShowReport(false)} className="text-slate-400 hover:text-slate-600 p-2">
+                ✕
+              </button>
+            </div>
+            
+            <div className="p-6 overflow-y-auto bg-slate-50 flex-1">
+              <textarea 
+                readOnly
+                value={reportText}
+                className="w-full h-64 p-4 text-sm font-mono bg-white border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-inner"
+              />
+            </div>
+            
+            <div className="p-4 bg-white border-t border-slate-200 flex justify-end gap-3">
+              <button 
+                onClick={() => setShowReport(false)}
+                className="px-4 py-2 text-slate-600 font-semibold hover:bg-slate-100 rounded-lg transition-colors"
+              >
+                Close
+              </button>
+              <button 
+                onClick={copyToClipboard}
+                className={`px-6 py-2 text-white font-semibold rounded-lg shadow-sm transition-all flex items-center gap-2 ${
+                  copied ? 'bg-green-600 hover:bg-green-700' : 'bg-blue-600 hover:bg-blue-700'
+                }`}
+              >
+                {copied ? <CheckCircle2 className="w-4 h-4" /> : <ClipboardCopy className="w-4 h-4" />}
+                {copied ? 'Copied to Clipboard!' : 'Copy to Clipboard'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      
     </div>
   );
 }
