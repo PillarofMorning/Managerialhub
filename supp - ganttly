@@ -247,24 +247,28 @@ function simpleHash(str) {
 
 // ============================================================================
 // SHIFT ROTATION
-// 🚨 ARCHITECTURE NOTE: 4-Crew 12h Rotation
-// `days` uses JS getDay() numbering (0 = Sun ... 6 = Sat) and is the day the shift STARTS.
-//   C: Wed–Sat 6a–6p        D: Wed–Sat 6p–6a (last D shift ends Sunday 6a)
-//   A: Sun–Tue 6a–6p        B: Sun–Tue 6p–6a (last B shift ends Wednesday 6a)
-// If the craa5_workshift table has rows, they replace this default on first load.
-// Users can also edit days/hours per crew on the Setup tab (saved to local storage).
+// 🚨 ARCHITECTURE NOTE: Shift Slots (4 crews, split Wednesday)
+// A rotation is a list of slots: { crew, day, startHour, lengthHours }. `day` is the calendar day the slot
+// STARTS (JS getDay(): 0 = Sun ... 6 = Sat). Default mirrors the plant pattern:
+//   A: Sun–Tue 6a–6p, Wed 6a–12p          B: Wed 12p–6p, Thu–Sat 6a–6p
+//   C: Sun–Tue 6p–6a, Wed 6p–12a          D: Wed night 12a–6a (Thu morning), Thu–Sat 6p–6a
+// The craa5_workshift table (one row per slot) replaces this on load; Setup can also edit it.
 // ============================================================================
 const CREW_CODES = ['A', 'B', 'C', 'D'];
 const DAY_LETTERS = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const FALLBACK_CREW_SIZE = 8;
 const MIN_SPLIT_MINS = 60;
-const DEFAULT_SHIFT_ROTATION = {
-    A: { days: [0, 1, 2], startHour: 6, lengthHours: 12 },
-    B: { days: [0, 1, 2], startHour: 18, lengthHours: 12 },
-    C: { days: [3, 4, 5, 6], startHour: 6, lengthHours: 12 },
-    D: { days: [3, 4, 5, 6], startHour: 18, lengthHours: 12 }
-};
+const DEFAULT_SHIFT_ROTATION = [
+    { crew: 'A', day: 0, startHour: 6, lengthHours: 12 }, { crew: 'A', day: 1, startHour: 6, lengthHours: 12 },
+    { crew: 'A', day: 2, startHour: 6, lengthHours: 12 }, { crew: 'A', day: 3, startHour: 6, lengthHours: 6 },
+    { crew: 'B', day: 3, startHour: 12, lengthHours: 6 }, { crew: 'B', day: 4, startHour: 6, lengthHours: 12 },
+    { crew: 'B', day: 5, startHour: 6, lengthHours: 12 }, { crew: 'B', day: 6, startHour: 6, lengthHours: 12 },
+    { crew: 'C', day: 0, startHour: 18, lengthHours: 12 }, { crew: 'C', day: 1, startHour: 18, lengthHours: 12 },
+    { crew: 'C', day: 2, startHour: 18, lengthHours: 12 }, { crew: 'C', day: 3, startHour: 18, lengthHours: 6 },
+    { crew: 'D', day: 4, startHour: 0, lengthHours: 6 }, { crew: 'D', day: 4, startHour: 18, lengthHours: 12 },
+    { crew: 'D', day: 5, startHour: 18, lengthHours: 12 }, { crew: 'D', day: 6, startHour: 18, lengthHours: 12 }
+];
 const CREW_STYLES = {
     A: { badge: 'bg-sky-600 text-white', soft: 'bg-sky-50 border-sky-200 text-sky-900', line: 'border-sky-500' },
     B: { badge: 'bg-indigo-700 text-white', soft: 'bg-indigo-50 border-indigo-200 text-indigo-900', line: 'border-indigo-600' },
@@ -286,42 +290,123 @@ function getRowField(row, name) {
     return key ? row[key] : undefined;
 }
 
-// craa5_workshift rows: craa5_shiftcode, craa5_daynumber (1 = Sun ... 7 = Sat), craa5_shiftstarthour, craa5_shiftendhour
-function buildRotationFromWorkShifts(rows) {
-    if (!rows || rows.length === 0) return null;
-    const rotation = {};
-    rows.forEach(function(r) {
-        const crew = normalizeShift(getRowField(r, 'craa5_shiftcode'));
-        const dayNum = parseInt(r.craa5_daynumber, 10);
-        const startH = parseInt(r.craa5_shiftstarthour, 10);
-        const endH = parseInt(r.craa5_shiftendhour, 10);
-        if (!crew || isNaN(dayNum) || isNaN(startH) || isNaN(endH)) return;
-        if (!rotation[crew]) rotation[crew] = { days: [], startHour: startH, lengthHours: ((endH - startH + 24) % 24) || 24 };
-        const jsDay = ((dayNum - 1) % 7 + 7) % 7;
-        if (rotation[crew].days.indexOf(jsDay) === -1) rotation[crew].days.push(jsDay);
-    });
-    if (Object.keys(rotation).length === 0) return null;
-    Object.keys(rotation).forEach(function(c) { rotation[c].days.sort(); });
-    return rotation;
+function slotLabel(s) {
+    return DAY_NAMES[s.day] + ' ' + formatHourLabel(s.startHour) + '–' + formatHourLabel(s.startHour + s.lengthHours);
 }
 
-// Every crew shift that overlaps [0, horizonMins), as minutes from the plan start.
-function buildShiftWindows(rotation, planStart, horizonMins) {
-    const windows = [];
+// craa5_workshift: one row per slot. craa5_dayname (text, e.g. "Wednesday"), craa5_daynumber (1 = Sun ... 7 = Sat),
+// craa5_shiftcode (text A-D), craa5_shiftstarthour / craa5_shiftendhour (whole numbers).
+// Dataverse rows can't hold 0 here, so midnight is stored as 1. If EVERY hour is stored +1 (1/7/13/19), all hours
+// are shifted back by one instead. A row that starts after midnight (before 4AM) is the back half of that named
+// day's night shift ("Wed 12am–6am" = Thursday 00:00–06:00) unless that would collide with another row, in which
+// case it stays on the named day. Setup → "Show shift rows" lists how every row was read.
+function parseWorkShiftRows(rows) {
+    if (!rows || rows.length === 0) return null;
+    const raw = [];
+    rows.forEach(function(r) {
+        const crew = normalizeShift(getRowField(r, 'craa5_shiftcode'));
+        const dayName = String(getRowField(r, 'craa5_dayname') || '');
+        const dayNum = parseInt(getRowField(r, 'craa5_daynumber'), 10);
+        const startH = parseInt(getRowField(r, 'craa5_shiftstarthour'), 10);
+        const endH = parseInt(getRowField(r, 'craa5_shiftendhour'), 10);
+        raw.push({ crew: crew, dayName: dayName, dayNum: dayNum, startH: startH, endH: endH });
+    });
+    const hours = [];
+    raw.forEach(function(x) { if (!isNaN(x.startH)) hours.push(x.startH); if (!isNaN(x.endH)) hours.push(x.endH); });
+    const plusOne = hours.length > 0 && hours.every(function(h) { return h >= 1 && (h - 1) % 6 === 0; });
+    const hasZeroDay = raw.some(function(x) { return x.dayNum === 0; });
+    const fixHour = function(h) {
+        if (plusOne) return (h - 1 + 24) % 24;
+        if (h === 1 || h === 24) return 0;
+        return ((h % 24) + 24) % 24;
+    };
+    const slots = [], details = [];
+    const pending = [];
+    raw.forEach(function(x) {
+        const m = x.dayName.toLowerCase().match(/sun|mon|tue|wed|thu|fri|sat/);
+        let day = m ? ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].indexOf(m[0]) : (isNaN(x.dayNum) ? -1 : (hasZeroDay ? x.dayNum : x.dayNum - 1));
+        const label = (x.crew || '?') + ' · ' + (x.dayName || ('day ' + x.dayNum)) + ' ' + x.startH + '→' + x.endH;
+        if (!x.crew || day < 0 || isNaN(x.startH) || isNaN(x.endH)) { details.push({ label: label, result: 'skipped (missing crew/day/hours)', ok: false }); return; }
+        day = ((day % 7) + 7) % 7;
+        const sH = fixHour(x.startH), eH = fixHour(x.endH);
+        const len = ((eH - sH + 24) % 24) || 24;
+        const slot = { crew: x.crew, day: day, startHour: sH, lengthHours: len };
+        if (sH < 4) { pending.push({ slot: slot, label: label }); return; }
+        slots.push(slot);
+        details.push({ label: label, result: x.crew + ' ' + slotLabel(slot), ok: true });
+    });
+    // After-midnight rows: named day vs the next calendar day — take whichever overlaps the other rows less.
+    const hoursOf = function(s) { const out = []; for (let h = 0; h < s.lengthHours; h++) out.push((s.day * 24 + s.startHour + h) % 168); return out; };
+    pending.forEach(function(p) {
+        const taken = {};
+        slots.forEach(function(s) { hoursOf(s).forEach(function(h) { taken[h] = true; }); });
+        const asNamed = p.slot;
+        const nextDay = Object.assign({}, p.slot, { day: (p.slot.day + 1) % 7 });
+        const clash = function(s) { return hoursOf(s).filter(function(h) { return taken[h]; }).length; };
+        const pick = clash(asNamed) < clash(nextDay) ? asNamed : nextDay;
+        slots.push(pick);
+        details.push({ label: p.label, result: pick.crew + ' ' + slotLabel(pick) + (pick === nextDay ? ' (after-midnight end of that night)' : ''), ok: true });
+    });
+    if (slots.length === 0) return { slots: null, details: details, hourMode: plusOne ? 'plus-one' : 'clock' };
+    return { slots: slots, details: details, hourMode: plusOne ? 'all hours stored +1' : 'clock hours (1 = midnight)' };
+}
+
+// Which hours of the week no crew covers, and which have two crews at once.
+function weeklyCoverage(slots) {
+    const count = new Array(168).fill(0);
+    const who = Array.from({ length: 168 }, function() { return []; });
+    (slots || []).forEach(function(s) {
+        for (let h = 0; h < s.lengthHours; h++) {
+            const idx = (s.day * 24 + s.startHour + h) % 168;
+            count[idx]++;
+            if (who[idx].indexOf(s.crew) === -1) who[idx].push(s.crew);
+        }
+    });
+    const ranges = function(test) {
+        const out = [];
+        for (let i = 0; i < 168; i++) {
+            if (!test(i)) continue;
+            let j = i;
+            while (j + 1 < 168 && test(j + 1)) j++;
+            out.push(DAY_NAMES[Math.floor(i / 24)] + ' ' + formatHourLabel(i % 24) + '–' + DAY_NAMES[Math.floor(((j + 1) % 168) / 24)] + ' ' + formatHourLabel((j + 1) % 24));
+            i = j;
+        }
+        return out;
+    };
+    const gaps = ranges(function(i) { return count[i] === 0; });
+    const overlaps = ranges(function(i) { return count[i] > 1; });
+    return { coveredHours: count.filter(function(c) { return c > 0; }).length, gaps: gaps, overlaps: overlaps };
+}
+
+function sortSlots(slots) {
+    return slots.slice().sort(function(a, b) { return a.crew.localeCompare(b.crew) || (a.day * 24 + a.startHour) - (b.day * 24 + b.startHour); });
+}
+
+// Every crew window that overlaps [0, horizonMins), as minutes from the plan start.
+// Back-to-back slots of the same crew are merged (no artificial handover at midnight).
+function buildShiftWindows(slots, planStart, horizonMins) {
+    const raw = [];
     const days = Math.ceil(horizonMins / 1440) + 1;
-    for (let day = -1; day <= days; day++) {
+    for (let day = -2; day <= days; day++) {
         const base = new Date(planStart.getFullYear(), planStart.getMonth(), planStart.getDate() + day);
-        CREW_CODES.forEach(function(crew) {
-            const cfg = rotation[crew];
-            if (!cfg || !cfg.days || cfg.days.indexOf(base.getDay()) === -1) return;
-            const s = new Date(base.getFullYear(), base.getMonth(), base.getDate(), cfg.startHour, 0, 0);
+        (slots || []).forEach(function(slot) {
+            if (slot.day !== base.getDay()) return;
+            const s = new Date(base.getFullYear(), base.getMonth(), base.getDate(), slot.startHour, 0, 0);
             const startOff = Math.round((s.getTime() - planStart.getTime()) / 60000);
-            const endOff = startOff + (cfg.lengthHours || 12) * 60;
-            const cs = Math.max(0, startOff), ce = Math.min(horizonMins, endOff);
-            if (ce > cs) windows.push({ crew: crew, start: cs, end: ce, shiftStart: startOff, startHour: cfg.startHour, dayLabel: DAY_NAMES[base.getDay()] });
+            raw.push({ crew: slot.crew, shiftStart: startOff, shiftEnd: startOff + (slot.lengthHours || 12) * 60, startHour: slot.startHour, dayLabel: DAY_NAMES[base.getDay()] });
         });
     }
-    return windows.sort(function(a, b) { return a.start - b.start || a.crew.localeCompare(b.crew); });
+    raw.sort(function(a, b) { return a.crew.localeCompare(b.crew) || a.shiftStart - b.shiftStart; });
+    const merged = [];
+    raw.forEach(function(w) {
+        const last = merged[merged.length - 1];
+        if (last && last.crew === w.crew && w.shiftStart <= last.shiftEnd) last.shiftEnd = Math.max(last.shiftEnd, w.shiftEnd);
+        else merged.push(Object.assign({}, w));
+    });
+    return merged
+        .map(function(w) { return Object.assign(w, { start: Math.max(0, w.shiftStart), end: Math.min(horizonMins, w.shiftEnd) }); })
+        .filter(function(w) { return w.end > w.start; })
+        .sort(function(a, b) { return a.start - b.start || a.crew.localeCompare(b.crew); });
 }
 
 // Working minutes inside [start, end) once breaks / downtimes (possibly overlapping) are removed.
@@ -587,12 +672,14 @@ export default function App(props) {
     // overlaps that window contributes its own worker lanes, so a weekend plan shows D → C → D → A → B
     // with each crew's real headcount.
     const [planHours, setPlanHours] = useState(initialSettings.planHours || 12);
-    const [shiftRotation, setShiftRotation] = useState(initialSettings.shiftRotation || DEFAULT_SHIFT_ROTATION);
+    const [shiftRotation, setShiftRotation] = useState(Array.isArray(initialSettings.shiftRotation) ? initialSettings.shiftRotation : DEFAULT_SHIFT_ROTATION);
+    const [shiftTableInfo, setShiftTableInfo] = useState(null);
+    const [newSlot, setNewSlot] = useState({});
     const [crewHeadcountOverrides, setCrewHeadcountOverrides] = useState(initialSettings.crewHeadcountOverrides || {});
     const [absentEmployees, setAbsentEmployees] = useState(initialSettings.absentEmployees || {});
     const [handoverMins, setHandoverMins] = useState(initialSettings.handoverMins !== undefined ? initialSettings.handoverMins : 15);
     const [expandedRosters, setExpandedRosters] = useState({});
-    const [rotationSource, setRotationSource] = useState(initialSettings.shiftRotation ? 'Saved' : 'Default');
+    const [rotationSource, setRotationSource] = useState(Array.isArray(initialSettings.shiftRotation) ? 'Saved' : 'Default');
     const [showDataCheck, setShowDataCheck] = useState(false);
 
     const [includeBreaks, setIncludeBreaks] = useState(initialSettings.includeBreaks !== undefined ? initialSettings.includeBreaks : true);
@@ -685,9 +772,10 @@ export default function App(props) {
                 setRawEmployees(dvEmps.rows);
 
                 // A rotation the user edited on the Setup tab wins; otherwise use the Dataverse shift table.
-                const dvRotation = buildRotationFromWorkShifts(dvShifts.rows);
-                if (dvRotation && !initialSettings.shiftRotation) {
-                    setShiftRotation(Object.assign({}, DEFAULT_SHIFT_ROTATION, dvRotation));
+                const parsedShifts = parseWorkShiftRows(dvShifts.rows);
+                setShiftTableInfo(parsedShifts);
+                if (parsedShifts && parsedShifts.slots && !Array.isArray(initialSettings.shiftRotation)) {
+                    setShiftRotation(parsedShifts.slots);
                     setRotationSource('Dataverse');
                 }
 
@@ -729,24 +817,24 @@ export default function App(props) {
 
     // ============================================================================
     // CREW ROSTERS & WORKER LANES
-    // Hourly staff from craa5__aa_employee grouped by craa5_shift. Supervisors / managers are excluded
+    // Hourly staff from craa5__aa_employee grouped by craa5_shift. Leads, supervisors and managers are excluded
     // from the cleaning headcount. Anyone marked absent on the Setup tab is dropped from the lanes.
     // ============================================================================
     const rosterInfo = useMemo(function() {
         const rosters = { A: [], B: [], C: [], D: [] };
         const unmatched = [];
-        let excluded = 0;
+        const excluded = [];
         rawEmployees.forEach(function(e, i) {
             const name = formatFullName(e.craa5_name || e.craa5_Name || e.craa5_fullname || e.fullname || '') || ('Employee ' + (i + 1));
             const shift = readEmployeeShift(e);
             const roleRaw = e.craa5_role !== undefined ? e.craa5_role : e.craa5_Role;
             const role = String(roleRaw === undefined || roleRaw === null ? '' : roleRaw) + ' ' + String(e['craa5_role@OData.Community.Display.V1.FormattedValue'] || e['craa5_Role@OData.Community.Display.V1.FormattedValue'] || '');
-            if (/256000002|256000003|super|manag/i.test(role)) { excluded++; return; }
+            // Leadership (lead 256000001, supervisor 256000002, manager 256000003) never gets a lane or tasks.
+            if (/25600000[123]|lead|super|manag/i.test(role)) { excluded.push(name); return; }
             if (!shift.crew) { unmatched.push({ name: name, raw: typeof shift.raw === 'object' ? JSON.stringify(shift.raw) : String(shift.raw) }); return; }
             rosters[shift.crew].push({
                 id: String(e.craa5__aa_employeeid || e.craa5_aa_employeeid || ('emp_' + i)),
-                name: name,
-                isLead: /256000001|lead/i.test(role)
+                name: name
             });
         });
         CREW_CODES.forEach(function(c) { rosters[c].sort(function(a, b) { return a.name.localeCompare(b.name); }); });
@@ -789,7 +877,6 @@ export default function App(props) {
                     key: person ? person.id : (crew + '#' + (k + 1)),
                     name: person ? person.name : (crew + ' Crew Seat ' + (k + 1)),
                     isPlaceholder: !person,
-                    isLead: person ? person.isLead : false,
                     windows: crewWindows
                 });
             }
@@ -802,21 +889,18 @@ export default function App(props) {
     const laneByKey = {};
     laneRoster.forEach(function(l) { laneByKey[l.key] = l.lane; });
 
-    const toggleCrewDay = function(crew, day) {
+    const removeSlot = function(slot) {
         setRotationSource('Saved');
-        setShiftRotation(function(prev) {
-            const cfg = Object.assign({}, prev[crew] || { days: [], startHour: 6, lengthHours: 12 });
-            cfg.days = cfg.days.indexOf(day) > -1 ? cfg.days.filter(function(d) { return d !== day; }) : cfg.days.concat([day]).sort();
-            return Object.assign({}, prev, { [crew]: cfg });
-        });
+        setShiftRotation(function(prev) { return prev.filter(function(s) { return s !== slot; }); });
     };
-    const handleCrewHourChange = function(crew, field, val) {
+    const addSlot = function(crew) {
+        const d = Object.assign({ day: 0, startHour: 6, endHour: 18 }, newSlot[crew] || {});
+        const len = ((Number(d.endHour) - Number(d.startHour) + 24) % 24) || 24;
         setRotationSource('Saved');
-        setShiftRotation(function(prev) {
-            const cfg = Object.assign({}, prev[crew] || { days: [], startHour: 6, lengthHours: 12 });
-            cfg[field] = field === 'startHour' ? Math.max(0, Math.min(23, Number(val) || 0)) : Math.max(1, Math.min(24, Number(val) || 12));
-            return Object.assign({}, prev, { [crew]: cfg });
-        });
+        setShiftRotation(function(prev) { return prev.concat([{ crew: crew, day: Number(d.day), startHour: Number(d.startHour), lengthHours: len }]); });
+    };
+    const setNewSlotField = function(crew, field, val) {
+        setNewSlot(function(prev) { return Object.assign({}, prev, { [crew]: Object.assign({ day: 0, startHour: 6, endHour: 18 }, prev[crew] || {}, { [field]: Number(val) }) }); });
     };
     const handleCrewHeadcountChange = function(crew, val) {
         setCrewHeadcountOverrides(function(prev) {
@@ -829,10 +913,12 @@ export default function App(props) {
     const toggleAbsent = function(empId) {
         setAbsentEmployees(function(prev) { const next = Object.assign({}, prev); if (next[empId]) delete next[empId]; else next[empId] = true; return next; });
     };
+    // Back to the Dataverse shift table if it loaded, otherwise the built-in pattern.
     const resetRotation = function() {
-        setShiftRotation(DEFAULT_SHIFT_ROTATION);
-        setRotationSource('Default');
+        if (shiftTableInfo && shiftTableInfo.slots) { setShiftRotation(shiftTableInfo.slots); setRotationSource('Dataverse'); }
+        else { setShiftRotation(DEFAULT_SHIFT_ROTATION); setRotationSource('Default'); }
     };
+    const coverage = weeklyCoverage(shiftRotation);
     const startNewPlan = function() {
         if (!window.confirm('Clear all check-offs, manual moves and downtimes for a fresh plan? Room setup, crews and custom tasks are kept.')) return;
         setOverrides({});
@@ -1830,10 +1916,14 @@ export default function App(props) {
                                 {rawEmployees.length === 0 ? (
                                     <span><AlertCircle className="w-3.5 h-3.5 inline mr-1" /> No employee rows came back from Dataverse (tried craa5__aa_employee and craa5_aa_employee). Lanes use placeholder seats until the table loads.</span>
                                 ) : (
-                                    <span><CheckCircle className="w-3.5 h-3.5 inline mr-1" /> {rawEmployees.length} employees loaded from {dataDiag.employeeTable} · A {crewRosters.A.length} · B {crewRosters.B.length} · C {crewRosters.C.length} · D {crewRosters.D.length} · {rosterInfo.excluded} supervisors/managers excluded{rosterInfo.unmatched.length > 0 ? ` · ${rosterInfo.unmatched.length} with no recognizable shift` : ''}</span>
+                                    <span><CheckCircle className="w-3.5 h-3.5 inline mr-1" /> {rawEmployees.length} employees loaded from {dataDiag.employeeTable} · A {crewRosters.A.length} · B {crewRosters.B.length} · C {crewRosters.C.length} · D {crewRosters.D.length} · <span title={rosterInfo.excluded.join(', ')} className="underline decoration-dotted">{rosterInfo.excluded.length} leads/supervisors/managers excluded</span>{rosterInfo.unmatched.length > 0 ? ` · ${rosterInfo.unmatched.length} with no recognizable shift` : ''}</span>
                                 )}
-                                <span className="text-slate-500">Equipment: {dataDiag.assetCount} ({dataDiag.source}) · Shift table rows: {dataDiag.shiftRows}</span>
-                                {(rosterInfo.unmatched.length > 0) && (
+                                <span className="text-slate-500">Equipment: {dataDiag.assetCount} ({dataDiag.source}) · Shift table: {dataDiag.shiftRows} rows{shiftTableInfo ? ` (${shiftTableInfo.hourMode})` : ''}</span>
+                                <span className={coverage.gaps.length || coverage.overlaps.length ? 'text-rose-700' : 'text-emerald-700'}>
+                                    Weekly coverage {coverage.coveredHours}/168 hrs{coverage.gaps.length ? ' · gaps: ' + coverage.gaps.join(', ') : ''}{coverage.overlaps.length ? ' · two crews at once: ' + coverage.overlaps.join(', ') : ''}
+                                </span>
+                                {shiftTableInfo && <button onClick={function() { setShowDataCheck(!showDataCheck); }} className="underline">{showDataCheck ? 'Hide' : 'Show'} shift rows</button>}
+                                {(rosterInfo.unmatched.length > 0 && !shiftTableInfo) && (
                                     <button onClick={function() { setShowDataCheck(!showDataCheck); }} className="underline">{showDataCheck ? 'Hide' : 'Show'} unmatched</button>
                                 )}
                                 <button onClick={startNewPlan} className="ml-auto underline text-rose-700">Start new plan (clear check-offs & moves)</button>
@@ -1842,10 +1932,16 @@ export default function App(props) {
                                         {rosterInfo.unmatched.slice(0, 60).map(function(u, i) { return <span key={i} className="bg-white border border-amber-200 rounded px-2 py-0.5 text-[11px]">{u.name}: shift = "{u.raw}"</span>; })}
                                     </div>
                                 )}
+                                {showDataCheck && shiftTableInfo && (
+                                    <div className="w-full mt-1 grid grid-cols-1 md:grid-cols-2 gap-x-4 gap-y-0.5 text-[11px]">
+                                        {shiftTableInfo.details.map(function(d, i) { return <span key={i} className={d.ok ? 'text-slate-700' : 'text-rose-700'}>{d.label} → {d.result}</span>; })}
+                                    </div>
+                                )}
                             </div>
                             <div className="p-4 md:p-6 grid grid-cols-1 md:grid-cols-2 gap-4 bg-slate-50/50">
                                 {CREW_CODES.map(function(crew) {
-                                    const cfg = shiftRotation[crew] || { days: [], startHour: 6, lengthHours: 12 };
+                                    const crewSlots = sortSlots(shiftRotation.filter(function(s) { return s.crew === crew; }));
+                                    const ns = Object.assign({ day: 0, startHour: 6, endHour: 18 }, newSlot[crew] || {});
                                     const style = getCrewStyle(crew);
                                     const roster = crewRosters[crew];
                                     const presentCount = roster.filter(function(p) { return !absentEmployees[p.id]; }).length;
@@ -1856,24 +1952,37 @@ export default function App(props) {
                                             <div className={`px-4 py-3 border-b flex items-center justify-between ${style.soft}`}>
                                                 <div className="flex items-center gap-2">
                                                     <span className={`w-7 h-7 rounded-md flex items-center justify-center font-black text-sm ${style.badge}`}>{crew}</span>
-                                                    <span className="font-bold text-sm">{formatHourLabel(cfg.startHour)} – {formatHourLabel(cfg.startHour + cfg.lengthHours)}</span>
+                                                    <span className="font-bold text-sm">{crewSlots.reduce(function(acc, s) { return acc + s.lengthHours; }, 0)} hrs / week</span>
                                                 </div>
                                                 <span className="text-[10px] font-black uppercase tracking-wider">{crewShifts.length} shift{crewShifts.length === 1 ? '' : 's'} in window</span>
                                             </div>
                                             <div className="p-4 space-y-3">
-                                                <div className="flex items-center gap-1">
-                                                    {DAY_LETTERS.map(function(letter, day) {
-                                                        const on = cfg.days.indexOf(day) > -1;
-                                                        return <button key={day} title={DAY_NAMES[day] + ' (shift start day)'} onClick={function() { toggleCrewDay(crew, day); }} className={`w-7 h-7 rounded text-[11px] font-black border transition-colors ${on ? style.badge + ' border-transparent' : 'bg-white text-slate-400 border-slate-200 hover:bg-slate-50'}`}>{letter}</button>;
+                                                <div className="flex flex-wrap gap-1.5">
+                                                    {crewSlots.length === 0 && <span className="text-[11px] font-bold text-slate-400">No shifts defined</span>}
+                                                    {crewSlots.map(function(s, i) {
+                                                        return (
+                                                            <span key={i} className={`text-[11px] font-bold rounded px-2 py-0.5 border flex items-center gap-1 ${style.soft}`}>
+                                                                {slotLabel(s)}
+                                                                <button onClick={function() { removeSlot(s); }} className="text-slate-400 hover:text-rose-600 font-black" title="Remove this shift">×</button>
+                                                            </span>
+                                                        );
                                                     })}
                                                 </div>
+                                                <div className="flex flex-wrap items-center gap-1.5 text-[10px] font-black text-slate-500 uppercase">
+                                                    <span>Add</span>
+                                                    <select value={ns.day} onChange={function(e) { setNewSlotField(crew, 'day', e.target.value); }} className="border border-slate-200 rounded p-1 text-xs font-bold outline-none">
+                                                        {DAY_NAMES.map(function(d, i) { return <option key={i} value={i}>{d}</option>; })}
+                                                    </select>
+                                                    <select value={ns.startHour} onChange={function(e) { setNewSlotField(crew, 'startHour', e.target.value); }} className="border border-slate-200 rounded p-1 text-xs font-bold outline-none">
+                                                        {Array.from({ length: 24 }, function(_, h) { return <option key={h} value={h}>{formatHourLabel(h)}</option>; })}
+                                                    </select>
+                                                    <span>to</span>
+                                                    <select value={ns.endHour} onChange={function(e) { setNewSlotField(crew, 'endHour', e.target.value); }} className="border border-slate-200 rounded p-1 text-xs font-bold outline-none">
+                                                        {Array.from({ length: 24 }, function(_, h) { return <option key={h} value={h}>{formatHourLabel(h)}</option>; })}
+                                                    </select>
+                                                    <Button variant="outline" size="sm" className="px-2 py-0.5 text-[10px]" onClick={function() { addSlot(crew); }}>+ Add</Button>
+                                                </div>
                                                 <div className="flex flex-wrap items-center gap-3">
-                                                    <label className="flex items-center gap-1.5 text-[10px] font-black text-slate-500 uppercase">Start
-                                                        <input type="number" min="0" max="23" value={cfg.startHour} onChange={function(e) { handleCrewHourChange(crew, 'startHour', e.target.value); }} className="w-12 text-center font-bold text-xs outline-none border border-slate-200 rounded p-1 no-pan" />
-                                                    </label>
-                                                    <label className="flex items-center gap-1.5 text-[10px] font-black text-slate-500 uppercase">Hours
-                                                        <input type="number" min="1" max="24" value={cfg.lengthHours} onChange={function(e) { handleCrewHourChange(crew, 'lengthHours', e.target.value); }} className="w-12 text-center font-bold text-xs outline-none border border-slate-200 rounded p-1 no-pan" />
-                                                    </label>
                                                     <label className="flex items-center gap-1.5 text-[10px] font-black text-indigo-600 uppercase" title="Blank = present employees from Dataverse">Headcount
                                                         <input type="number" min="0" value={isOverridden ? crewHeadcountOverrides[crew] : ''} placeholder={String(roster.length > 0 ? presentCount : FALLBACK_CREW_SIZE)} onChange={function(e) { handleCrewHeadcountChange(crew, e.target.value); }} className={`w-14 text-center font-black text-xs outline-none border rounded p-1 no-pan ${isOverridden ? 'border-indigo-400 bg-indigo-50' : 'border-slate-200'}`} />
                                                     </label>
@@ -1893,7 +2002,7 @@ export default function App(props) {
                                                                     const absent = !!absentEmployees[p.id];
                                                                     return (
                                                                         <button key={p.id} onClick={function() { toggleAbsent(p.id); }} title={absent ? 'Absent — click to mark present' : 'Present — click to mark absent'} className={`px-2 py-1 rounded-full text-[10px] font-bold border transition-colors ${absent ? 'bg-slate-100 text-slate-400 border-slate-200 line-through' : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'}`}>
-                                                                            {p.name}{p.isLead ? ' ★' : ''}
+                                                                            {p.name}
                                                                         </button>
                                                                     );
                                                                 })}
@@ -2120,7 +2229,7 @@ export default function App(props) {
                                             <div className="px-4 py-3 border-b border-slate-100 flex items-center gap-3">
                                                 <span className={`w-7 h-7 rounded-md flex items-center justify-center font-black text-xs ${style.badge}`}>{l.crew}</span>
                                                 <div className="flex-1 min-w-0">
-                                                    <div className="font-black text-slate-800 truncate">{l.name}{l.isLead ? ' ★' : ''}{l.isPlaceholder ? <span className="ml-2 text-[10px] font-bold text-amber-600">(placeholder seat)</span> : null}</div>
+                                                    <div className="font-black text-slate-800 truncate">{l.name}{l.isPlaceholder ? <span className="ml-2 text-[10px] font-bold text-amber-600">(placeholder seat)</span> : null}</div>
                                                     <div className="flex items-center gap-2 mt-1">
                                                         <div className="flex-1 h-1.5 bg-slate-100 rounded-full overflow-hidden"><div className={`h-full ${pct > 100 ? 'bg-rose-500' : style.badge}`} style={{ width: `${Math.min(100, pct)}%` }} /></div>
                                                         <span className="text-[10px] font-black text-slate-500 whitespace-nowrap">{(booked / 60).toFixed(1)}h / {(winLen / 60).toFixed(0)}h · {doneCount}/{blocks.length} done</span>
@@ -2568,7 +2677,7 @@ export default function App(props) {
                                                 <div key={l.lane} className={`flex-1 border-b border-gray-200/60 flex flex-col justify-center px-2 bg-white ${isCrewStart ? 'border-t-2 border-t-slate-400' : ''}`} style={{ height: `${LANE_HEIGHT_PX}px` }} title={`${l.name} (${l.crew} crew) — ${ws ? (ws.bookedMins / 60).toFixed(1) : 0}h assigned of ${ws ? (ws.availMins / 60).toFixed(0) : 0}h on shift`}>
                                                     <div className="flex items-center gap-1.5 min-w-0">
                                                         <span className={`text-[9px] font-black rounded px-1 py-0.5 flex-shrink-0 ${getCrewStyle(l.crew).badge}`}>{l.crew}</span>
-                                                        <span className={`text-[11px] font-bold truncate ${l.isPlaceholder ? 'text-slate-400 italic' : 'text-slate-800'}`}>{l.name}{l.isLead ? ' ★' : ''}</span>
+                                                        <span className={`text-[11px] font-bold truncate ${l.isPlaceholder ? 'text-slate-400 italic' : 'text-slate-800'}`}>{l.name}</span>
                                                     </div>
                                                     <div className="flex items-center gap-1.5 mt-1">
                                                         <div className="flex-1 h-1 bg-slate-100 rounded-full overflow-hidden"><div className={`h-full ${pct > 100 ? 'bg-rose-500' : 'bg-indigo-400'}`} style={{ width: `${Math.min(100, pct)}%` }} /></div>
