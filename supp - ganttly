@@ -230,6 +230,24 @@ function readEmployeeShift(e) {
     return { crew: '', raw: firstRaw === undefined ? '(blank)' : firstRaw };
 }
 
+// Job role from the _aa_Role lookup (craa5_RoleID). Lookups come back as _craa5_roleid_value + a formatted name,
+// or as an object / plain text depending on the API, so try each shape.
+function readEmployeeJobRole(e) {
+    const FMT = '@OData.Community.Display.V1.FormattedValue';
+    const direct = e['_craa5_roleid_value' + FMT] || e['_craa5_RoleID_value' + FMT];
+    if (direct) return String(direct).trim();
+    const key = Object.keys(e).find(function(k) { return /roleid/i.test(k) && k.indexOf(FMT) > -1; });
+    if (key && e[key]) return String(e[key]).trim();
+    const obj = e.craa5_roleid || e.craa5_RoleID;
+    if (obj && typeof obj === 'object') return String(obj.name || obj.Name || obj.craa5_name || obj.primaryName || '').trim();
+    if (typeof obj === 'string' && !/^[0-9a-f-]{36}$/i.test(obj)) return obj.trim();
+    return '';
+}
+
+// Job roles that never get cleaning tasks unless switched back on in Setup.
+const DEFAULT_NON_TASK_ROLE = /inspect|chem\w*\s*clerk/i;
+function jobRoleKey(role) { return String(role || '').trim().toLowerCase().replace(/\s+/g, ' '); }
+
 // "Doe, John" -> "John Doe" (same convention as the Manager hub)
 function formatFullName(name) {
     const parsed = String(name || '').trim();
@@ -677,6 +695,8 @@ export default function App(props) {
     const [newSlot, setNewSlot] = useState({});
     const [crewHeadcountOverrides, setCrewHeadcountOverrides] = useState(initialSettings.crewHeadcountOverrides || {});
     const [absentEmployees, setAbsentEmployees] = useState(initialSettings.absentEmployees || {});
+    // { jobRoleKey: true (gets tasks) | false (no tasks) } — only roles the user has toggled; others use DEFAULT_NON_TASK_ROLE.
+    const [jobRoleChoices, setJobRoleChoices] = useState(initialSettings.jobRoleChoices || {});
     const [handoverMins, setHandoverMins] = useState(initialSettings.handoverMins !== undefined ? initialSettings.handoverMins : 15);
     const [expandedRosters, setExpandedRosters] = useState({});
     const [rotationSource, setRotationSource] = useState(Array.isArray(initialSettings.shiftRotation) ? 'Saved' : 'Default');
@@ -736,6 +756,7 @@ export default function App(props) {
             shiftRotation: rotationSource === 'Default' || rotationSource === 'Dataverse' ? undefined : shiftRotation,
             crewHeadcountOverrides: crewHeadcountOverrides,
             absentEmployees: absentEmployees,
+            jobRoleChoices: jobRoleChoices,
             handoverMins: handoverMins,
             includeBreaks: includeBreaks,
             includeTransit: includeTransit,
@@ -744,7 +765,7 @@ export default function App(props) {
             liveReforecast: liveReforecast
         };
         try { localStorage.setItem('itp_settings_v10', JSON.stringify(s)); } catch(e) {}
-    }, [roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, roomConfigured, hiddenRooms, hideConfiguredRooms, hourlyRate, ganttStartDate, ganttStartHour, planHours, shiftRotation, rotationSource, crewHeadcountOverrides, absentEmployees, handoverMins, includeBreaks, includeTransit, includeInspection, pbMode, liveReforecast]);
+    }, [roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, roomConfigured, hiddenRooms, hideConfiguredRooms, hourlyRate, ganttStartDate, ganttStartHour, planHours, shiftRotation, rotationSource, crewHeadcountOverrides, absentEmployees, jobRoleChoices, handoverMins, includeBreaks, includeTransit, includeInspection, pbMode, liveReforecast]);
 
     useEffect(function() {
         const p = { overrides: overrides, taskStatus: taskStatus, customTasks: customTasks, assetEdits: assetEdits, downtimes: downtimes, targetDowntimes: targetDowntimes };
@@ -817,13 +838,22 @@ export default function App(props) {
 
     // ============================================================================
     // CREW ROSTERS & WORKER LANES
-    // Hourly staff from craa5__aa_employee grouped by craa5_shift. Leads, supervisors and managers are excluded
-    // from the cleaning headcount. Anyone marked absent on the Setup tab is dropped from the lanes.
+    // Hourly staff from craa5__aa_employee grouped by craa5_shift. Excluded from the cleaning headcount:
+    //  - leadership by the Role column (Lead / Supervisor / Manager)
+    //  - non-cleaning job roles from the _aa_Role lookup (Inspector, Chemical Clerk by default; toggle on Setup)
+    // Anyone marked absent on the Setup tab is dropped from the lanes.
     // ============================================================================
+    const isTaskRole = function(jobRole) {
+        const key = jobRoleKey(jobRole);
+        if (jobRoleChoices[key] !== undefined) return jobRoleChoices[key];
+        return !DEFAULT_NON_TASK_ROLE.test(key);
+    };
     const rosterInfo = useMemo(function() {
         const rosters = { A: [], B: [], C: [], D: [] };
         const unmatched = [];
         const excluded = [];
+        const roleExcluded = [];
+        const jobRoles = {};
         rawEmployees.forEach(function(e, i) {
             const name = formatFullName(e.craa5_name || e.craa5_Name || e.craa5_fullname || e.fullname || '') || ('Employee ' + (i + 1));
             const shift = readEmployeeShift(e);
@@ -831,6 +861,11 @@ export default function App(props) {
             const role = String(roleRaw === undefined || roleRaw === null ? '' : roleRaw) + ' ' + String(e['craa5_role@OData.Community.Display.V1.FormattedValue'] || e['craa5_Role@OData.Community.Display.V1.FormattedValue'] || '');
             // Leadership (lead 256000001, supervisor 256000002, manager 256000003) never gets a lane or tasks.
             if (/25600000[123]|lead|super|manag/i.test(role)) { excluded.push(name); return; }
+            const jobRole = readEmployeeJobRole(e);
+            const jrKey = jobRoleKey(jobRole) || '(no role)';
+            if (!jobRoles[jrKey]) jobRoles[jrKey] = { key: jrKey, label: jobRole || '(no role)', count: 0 };
+            jobRoles[jrKey].count++;
+            if (jobRole && !isTaskRole(jobRole)) { roleExcluded.push(name + ' (' + jobRole + ')'); return; }
             if (!shift.crew) { unmatched.push({ name: name, raw: typeof shift.raw === 'object' ? JSON.stringify(shift.raw) : String(shift.raw) }); return; }
             rosters[shift.crew].push({
                 id: String(e.craa5__aa_employeeid || e.craa5_aa_employeeid || ('emp_' + i)),
@@ -838,8 +873,11 @@ export default function App(props) {
             });
         });
         CREW_CODES.forEach(function(c) { rosters[c].sort(function(a, b) { return a.name.localeCompare(b.name); }); });
-        return { rosters: rosters, unmatched: unmatched, excluded: excluded };
-    }, [rawEmployees]);
+        return { rosters: rosters, unmatched: unmatched, excluded: excluded, roleExcluded: roleExcluded, jobRoles: Object.values(jobRoles).sort(function(a, b) { return a.label.localeCompare(b.label); }) };
+    }, [rawEmployees, jobRoleChoices]);
+    const toggleJobRole = function(key) {
+        setJobRoleChoices(function(prev) { return Object.assign({}, prev, { [key]: !isTaskRole(key) }); });
+    };
     const crewRosters = rosterInfo.rosters;
 
     // Headcount: manual override > present people on the Dataverse roster > placeholder seats (no names found).
@@ -1916,7 +1954,7 @@ export default function App(props) {
                                 {rawEmployees.length === 0 ? (
                                     <span><AlertCircle className="w-3.5 h-3.5 inline mr-1" /> No employee rows came back from Dataverse (tried craa5__aa_employee and craa5_aa_employee). Lanes use placeholder seats until the table loads.</span>
                                 ) : (
-                                    <span><CheckCircle className="w-3.5 h-3.5 inline mr-1" /> {rawEmployees.length} employees loaded from {dataDiag.employeeTable} · A {crewRosters.A.length} · B {crewRosters.B.length} · C {crewRosters.C.length} · D {crewRosters.D.length} · <span title={rosterInfo.excluded.join(', ')} className="underline decoration-dotted">{rosterInfo.excluded.length} leads/supervisors/managers excluded</span>{rosterInfo.unmatched.length > 0 ? ` · ${rosterInfo.unmatched.length} with no recognizable shift` : ''}</span>
+                                    <span><CheckCircle className="w-3.5 h-3.5 inline mr-1" /> {rawEmployees.length} employees loaded from {dataDiag.employeeTable} · A {crewRosters.A.length} · B {crewRosters.B.length} · C {crewRosters.C.length} · D {crewRosters.D.length} · <span title={rosterInfo.excluded.join(', ')} className="underline decoration-dotted">{rosterInfo.excluded.length} leads/supervisors/managers excluded</span> · <span title={rosterInfo.roleExcluded.join(', ')} className="underline decoration-dotted">{rosterInfo.roleExcluded.length} non-cleaning roles excluded</span>{rosterInfo.unmatched.length > 0 ? ` · ${rosterInfo.unmatched.length} with no recognizable shift` : ''}</span>
                                 )}
                                 <span className="text-slate-500">Equipment: {dataDiag.assetCount} ({dataDiag.source}) · Shift table: {dataDiag.shiftRows} rows{shiftTableInfo ? ` (${shiftTableInfo.hourMode})` : ''}</span>
                                 <span className={coverage.gaps.length || coverage.overlaps.length ? 'text-rose-700' : 'text-emerald-700'}>
@@ -1925,6 +1963,19 @@ export default function App(props) {
                                 {shiftTableInfo && <button onClick={function() { setShowDataCheck(!showDataCheck); }} className="underline">{showDataCheck ? 'Hide' : 'Show'} shift rows</button>}
                                 {(rosterInfo.unmatched.length > 0 && !shiftTableInfo) && (
                                     <button onClick={function() { setShowDataCheck(!showDataCheck); }} className="underline">{showDataCheck ? 'Hide' : 'Show'} unmatched</button>
+                                )}
+                                {rosterInfo.jobRoles.length > 0 && (
+                                    <div className="w-full flex flex-wrap items-center gap-1.5 mt-1">
+                                        <span className="text-slate-600">Job roles (_aa_Role) that get tasks — click to toggle:</span>
+                                        {rosterInfo.jobRoles.map(function(r) {
+                                            const on = r.key === '(no role)' || isTaskRole(r.key);
+                                            return (
+                                                <button key={r.key} disabled={r.key === '(no role)'} onClick={function() { toggleJobRole(r.key); }} title={on ? 'Gets cleaning tasks — click to exclude' : 'Excluded from tasks — click to include'} className={`text-[11px] font-bold rounded-full px-2 py-0.5 border ${on ? 'bg-white text-emerald-800 border-emerald-300' : 'bg-slate-100 text-slate-400 border-slate-200 line-through'}`}>
+                                                    {r.label} ({r.count})
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
                                 )}
                                 <button onClick={startNewPlan} className="ml-auto underline text-rose-700">Start new plan (clear check-offs & moves)</button>
                                 {showDataCheck && rosterInfo.unmatched.length > 0 && (
