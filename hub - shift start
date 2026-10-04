@@ -40,7 +40,7 @@ const ITEMS_PER_PAGE = 3;
 const AUTOSAVE_DELAY_MS = 2500;
 const ASSIGNMENT_REFRESH_MS = 5 * 60 * 1000;   // re-check task assignments so newly assigned rooms autoselect
 const PRE_SHIFT_BUFFER_MIN = 60;               // assignments made up to an hour before shift start count for this shift
-const API_TIMEOUT_MS = 8000;
+const API_TIMEOUT_MS = 20000;                  // a slow call fails over to dataApi for that call only
 const MAX_NAMES_LISTED = 15;                   // caps long "equipment complete" lists in the update
 const AREA_TABLES = ["craa5_aa_mss_area", "craa5_aa_mss_areas"];
 const ASSET_TABLES = ["craa5_aa_assets", "craa5_aa_asset", "craa5_aa_assetses"];
@@ -48,7 +48,6 @@ const TASK_TABLE = "craa5_taskassignment";
 const REPORT_TABLE = "craa5_sanitationshiftreport";
 // Pseudo-areas the assignment board uses for attendance; never rooms, never heads.
 const STATUS_AREAS = new Set(["pto", "sick", "late", "left early", "ncns", "unassigned"]);
-const DEAD_APIS = new Set<string>();
 
 type Asset = { id: string; name: string };
 type Area = { id: string; name: string; assets: Asset[] };
@@ -65,16 +64,21 @@ type ShiftState = {
 };
 type SaveState = { status: 'idle' | 'dirty' | 'saving' | 'saved' | 'error' | 'offline'; at?: Date; error?: string };
 type Notice = { kind: 'info' | 'error'; text: string } | null;
+type LoadLogEntry = { table: string; source: string; rows?: number; error?: string; ms: number };
+type LoadLogger = (entry: LoadLogEntry) => void;
 
 const emptyState = (): ShiftState => ({ selected: [], dismissed: [], progress: {}, na: {}, naReasons: {}, heads: {}, notes: {}, shiftNotes: "" });
 
 // --- UTILITIES ---
 function safeGetXrm() { if (typeof window === 'undefined') return null; if ((window as any).Xrm) return (window as any).Xrm; try { if (window.parent && (window.parent as any).Xrm) return (window.parent as any).Xrm; } catch (e) {} return null; }
 function getReadApi(props?: any) { const xrm = safeGetXrm(); if (xrm?.WebApi) return xrm.WebApi; if (props?.context?.webAPI) return props.context.webAPI; return props?.webAPI || null; }
-function getWriteApi(props?: any) {
-  const web = getReadApi(props);
-  if (web?.createRecord && web?.updateRecord) return web;
-  if (props?.dataApi?.createRecord && props?.dataApi?.updateRecord) return props.dataApi;
+// createRecord returns { id }, generative-page createRow returns the id string
+const idOf = (res: any) => { const id = typeof res === 'string' ? res : res?.id; return id ? String(id).replace(/[{}]/g, '') : null; };
+function getWriteApi(props?: any): { create: (t: string, d: any) => Promise<string | null>; update: (t: string, id: string, d: any) => Promise<any> } | null {
+  const web = getReadApi(props), dataApi = props?.dataApi;
+  if (web?.createRecord && web?.updateRecord) return { create: async (t, d) => idOf(await web.createRecord(t, d)), update: (t, id, d) => web.updateRecord(t, id, d) };
+  if (dataApi?.createRow && dataApi?.updateRow) return { create: async (t, d) => idOf(await dataApi.createRow(t, d)), update: (t, id, d) => dataApi.updateRow(t, id, d) };
+  if (dataApi?.createRecord && dataApi?.updateRecord) return { create: async (t, d) => idOf(await dataApi.createRecord(t, d)), update: (t, id, d) => dataApi.updateRecord(t, id, d) };
   return null;
 }
 const hasReadApi = (props?: any) => !!(getReadApi(props)?.retrieveMultipleRecords || props?.dataApi?.queryTable);
@@ -129,36 +133,57 @@ const reportName = (s: ShiftInfo) => `Sanitation Report - ${s.dateKey} ${s.isNig
 const shiftLetterFor = (s: ShiftInfo, now: Date) => determineShiftLetter(new Date(Math.min(now.getTime(), s.startMs + 12 * 3600000 - 60000)));
 
 // --- DATAVERSE ---
+// Tries Xrm.WebApi, then the generative page's dataApi (only sees tables added to the page).
+// A failure or timeout only affects that one call; it never disables an API for later calls.
 // Returns rows, or null when no API answered, so callers can tell "empty" from "failed".
-async function queryRecords(props: any, entityNames: string | string[], q: { select?: string[]; filter?: string; orderby?: string; top?: number } = {}): Promise<any[] | null> {
-  const webApi = getReadApi(props), names = Array.isArray(entityNames) ? entityNames : [entityNames], top = q.top ?? 5000;
+async function queryRecords(props: any, entityNames: string | string[], q: { select?: string[]; filter?: string; orderby?: string; top?: number } = {}, log?: LoadLogger): Promise<any[] | null> {
+  const webApi = getReadApi(props), dataApi = props?.dataApi, names = Array.isArray(entityNames) ? entityNames : [entityNames], top = q.top ?? 5000;
   const odata = [q.select?.length ? `$select=${q.select.join(',')}` : '', q.filter ? `$filter=${q.filter}` : '', q.orderby ? `$orderby=${q.orderby}` : '', `$top=${top}`].filter(Boolean).join('&');
   for (const en of names) {
-    if (webApi?.retrieveMultipleRecords && !DEAD_APIS.has('WebApi')) {
-      try { const res: any = await withTimeout(webApi.retrieveMultipleRecords(en, `?${odata}`), API_TIMEOUT_MS, `WebApi ${en}`); if (Array.isArray(res?.entities)) return res.entities; }
-      catch (e) { if (errMsg(e).startsWith('TIMEOUT')) DEAD_APIS.add('WebApi'); else console.warn(`[Shift Start] ${en} (WebApi):`, errMsg(e)); }
+    if (webApi?.retrieveMultipleRecords) {
+      const t0 = Date.now();
+      try {
+        const res: any = await withTimeout(webApi.retrieveMultipleRecords(en, `?${odata}`), API_TIMEOUT_MS, `Xrm.WebApi ${en}`);
+        if (!Array.isArray(res?.entities)) throw new Error("Unexpected response (no entities)");
+        log?.({ table: en, source: 'Xrm.WebApi', rows: res.entities.length, ms: Date.now() - t0 });
+        return res.entities;
+      } catch (e) { log?.({ table: en, source: 'Xrm.WebApi', error: errMsg(e), ms: Date.now() - t0 }); }
     }
-    if (props?.dataApi?.queryTable && !DEAD_APIS.has('queryTable')) {
-      try { const res: any = await withTimeout(props.dataApi.queryTable(en, { select: q.select, filter: q.filter, orderBy: q.orderby, top }), API_TIMEOUT_MS, `queryTable ${en}`); if (Array.isArray(res?.rows)) return res.rows; }
-      catch (e) { if (errMsg(e).startsWith('TIMEOUT')) DEAD_APIS.add('queryTable'); else console.warn(`[Shift Start] ${en} (queryTable):`, errMsg(e)); }
+    if (dataApi?.queryTable) {
+      const t0 = Date.now();
+      try {
+        const opts: any = { pageSize: Math.min(top, 500) };
+        if (q.select?.length) opts.select = q.select;
+        if (q.filter) opts.filter = q.filter;
+        if (q.orderby) opts.orderBy = q.orderby;
+        let page: any = await withTimeout(dataApi.queryTable(en, opts), API_TIMEOUT_MS, `dataApi ${en}`);
+        if (!Array.isArray(page?.rows)) throw new Error("Unexpected response (no rows)");
+        const rows = [...page.rows];
+        while (page?.hasMoreRows && typeof page.loadMoreRows === 'function' && rows.length < top) {
+          page = await withTimeout(page.loadMoreRows(), API_TIMEOUT_MS, `dataApi ${en} (more rows)`);
+          rows.push(...(Array.isArray(page?.rows) ? page.rows : []));
+        }
+        log?.({ table: en, source: 'dataApi', rows: Math.min(rows.length, top), ms: Date.now() - t0 });
+        return rows.slice(0, top);
+      } catch (e) { log?.({ table: en, source: 'dataApi', error: errMsg(e), ms: Date.now() - t0 }); }
     }
   }
   return null;
 }
 
-const fetchShiftTasks = (props: any, shift: ShiftInfo) => queryRecords(props, TASK_TABLE, {
+const fetchShiftTasks = (props: any, shift: ShiftInfo, log?: LoadLogger) => queryRecords(props, TASK_TABLE, {
   select: ['craa5_area', 'craa5_id', 'craa5_datetimeofassignment', 'createdon'],
   filter: `createdon ge ${new Date(shift.startMs - PRE_SHIFT_BUFFER_MIN * 60000).toISOString().replace(/\.\d{3}Z$/, 'Z')}`,
-});
+}, log);
 
 // undefined = lookup failed, null = no report saved yet this shift
-async function findSavedReport(props: any, name: string): Promise<{ id: string; json: any; modifiedon?: string } | null | undefined> {
+async function findSavedReport(props: any, name: string, log?: LoadLogger): Promise<{ id: string; json: any; modifiedon?: string } | null | undefined> {
   const rows = await queryRecords(props, REPORT_TABLE, {
     select: ['craa5_sanitationshiftreportid', 'craa5_equipmentjson', 'modifiedon'],
     filter: `craa5_name eq '${name.replace(/'/g, "''")}' and statecode eq 0`,
     orderby: 'modifiedon desc',
     top: 1,
-  });
+  }, log);
   if (!rows) return undefined;
   const r = rows[0];
   const id = r && getField(r, 'craa5_sanitationshiftreportid');
@@ -412,6 +437,7 @@ export default function AreaReportsApp(props: any) {
   const [notice, setNotice] = useState<Notice>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [now, setNow] = useState(() => Date.now());
+  const [loadLog, setLoadLog] = useState<LoadLogEntry[]>([]);
 
   // UI only
   const [tab, setTab] = useState<'rooms' | 'update'>('rooms');
@@ -438,21 +464,26 @@ export default function AreaReportsApp(props: any) {
   const boot = useCallback(async () => {
     const bootId = ++bootIdRef.current;
     const p = propsRef.current, sh = getShiftInfo();
-    setPhase('loading'); setLoadWarning(null); setNotice(null); DEAD_APIS.clear();
+    const log: LoadLogEntry[] = [], logger: LoadLogger = e => log.push(e);
+    setPhase('loading'); setLoadWarning(null); setNotice(null);
     try {
       if (!hasReadApi(p)) {
         recordIdRef.current = null;
         setConnected(false); setShift(sh); setAreas([]); setAutoIds(new Set()); setAutoHeads({}); setState(emptyState()); setDirtyTick(0);
-        setSave({ status: 'offline' });
+        setSave({ status: 'offline' }); setLoadLog([]);
         return;
       }
       const [rawAreas, rawAssets, tasks, saved] = await Promise.all([
-        queryRecords(p, AREA_TABLES, { filter: 'statecode eq 0' }),
-        queryRecords(p, ASSET_TABLES, { filter: 'statecode eq 0' }),
-        fetchShiftTasks(p, sh),
-        findSavedReport(p, reportName(sh)),
+        // Narrow $select keeps big tables fast; if a column is ever renamed, fall back to all columns.
+        queryRecords(p, AREA_TABLES, { select: ['craa5_aa_mss_areaid', 'craa5_area'], filter: 'statecode eq 0' }, logger)
+          .then(r => r ?? queryRecords(p, AREA_TABLES, { filter: 'statecode eq 0' }, logger)),
+        queryRecords(p, ASSET_TABLES, { select: ['craa5_aa_assetsid', 'craa5_equipmentidentifier', 'craa5_areaname'], filter: 'statecode eq 0' }, logger)
+          .then(r => r ?? queryRecords(p, ASSET_TABLES, { filter: 'statecode eq 0' }, logger)),
+        fetchShiftTasks(p, sh, logger),
+        findSavedReport(p, reportName(sh), logger),
       ]);
       if (bootId !== bootIdRef.current) return;
+      setLoadLog(log);
 
       const builtAreas = buildAreas(rawAreas || [], rawAssets || []);
       const assigned = summarizeAssignments(tasks || [], builtAreas);
@@ -527,14 +558,14 @@ export default function AreaReportsApp(props: any) {
         savedTick = dirtyTickRef.current;
         const payload = buildPayload();
         if (recordIdRef.current) {
-          try { await api.updateRecord(REPORT_TABLE, recordIdRef.current, payload); }
+          try { await api.update(REPORT_TABLE, recordIdRef.current, payload); }
           catch (e) { if (!/does not exist|not found|404/i.test(errMsg(e))) throw e; recordIdRef.current = null; }
         }
         if (!recordIdRef.current) {
           // Guard against duplicates if the record was created elsewhere (another device, or a create that returned no id).
           const existing = await findSavedReport(p, payload.craa5_name);
-          if (existing) { recordIdRef.current = existing.id; await api.updateRecord(REPORT_TABLE, existing.id, payload); }
-          else { const res: any = await api.createRecord(REPORT_TABLE, payload); recordIdRef.current = res?.id ? String(res.id).replace(/[{}]/g, '') : null; }
+          if (existing) { recordIdRef.current = existing.id; await api.update(REPORT_TABLE, existing.id, payload); }
+          else recordIdRef.current = await api.create(REPORT_TABLE, payload);
         }
       } while (queuedRef.current);
       // An edit made mid-save still has its autosave timer pending
@@ -561,7 +592,9 @@ export default function AreaReportsApp(props: any) {
   const refreshAssignments = async (silent: boolean) => {
     if (phase !== 'ready' || !connected || refreshing) return;
     if (!silent) setRefreshing(true);
-    const tasks = await fetchShiftTasks(propsRef.current, shiftRef.current);
+    const log: LoadLogEntry[] = [];
+    const tasks = await fetchShiftTasks(propsRef.current, shiftRef.current, e => log.push(e));
+    setLoadLog(prev => [...prev.filter(x => x.table !== TASK_TABLE), ...log]);
     if (!silent) setRefreshing(false);
     if (!tasks) { if (!silent) setNotice({ kind: 'error', text: "Couldn't reach Dataverse to refresh assignments." }); return; }
     const assigned = summarizeAssignments(tasks, areasRef.current);
@@ -635,7 +668,7 @@ export default function AreaReportsApp(props: any) {
 
   if (phase === 'loading') {
     return (
-      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center">
+      <div className="bg-slate-50 flex flex-col items-center justify-center py-24">
         <Loader className="w-12 h-12 text-blue-600 mb-4" />
         <h2 className="text-xl font-bold text-slate-700">Loading Shift Data...</h2>
         <p className="text-slate-500">Cross-referencing this shift's task assignments</p>
@@ -646,7 +679,7 @@ export default function AreaReportsApp(props: any) {
   const badge = SAVE_BADGE[save.status];
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-800 font-sans p-4 md:p-8">
+    <div className="bg-slate-50 text-slate-800 font-sans p-4 md:p-8">
       <div className="max-w-6xl mx-auto">
 
         {/* Header */}
@@ -784,9 +817,26 @@ export default function AreaReportsApp(props: any) {
                     );
                   })}
                   {visibleAreas.length === 0 && (
-                    <div className="p-4 text-center text-sm text-slate-400">{areas.length ? "No rooms match." : "No rooms found in Dataverse."}</div>
+                    <div className="p-4 text-center text-sm text-slate-400">
+                      {areas.length ? "No rooms match." : "No rooms loaded from Dataverse."}
+                      {!areas.length && connected && (
+                        <button onClick={() => boot()} className="block mx-auto mt-2 px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold">Retry</button>
+                      )}
+                    </div>
                   )}
                 </div>
+                {loadLog.length > 0 && (
+                  <details open={!areas.length || undefined} className="mt-4 text-[11px] text-slate-500">
+                    <summary className="cursor-pointer font-bold uppercase tracking-wider text-slate-400">Data connection</summary>
+                    <ul className="mt-2 flex flex-col gap-1">
+                      {loadLog.map((e, i) => (
+                        <li key={i} className={e.error ? 'text-rose-600' : ''}>
+                          <span className="font-semibold">{e.table}</span> · {e.source} · {e.error ? e.error : `${e.rows} rows`} · {e.ms} ms
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
               </div>
             </div>
 
@@ -795,8 +845,10 @@ export default function AreaReportsApp(props: any) {
               {summaries.length === 0 ? (
                 <div className="bg-white border border-dashed border-slate-300 rounded-2xl p-12 text-center flex flex-col items-center justify-center text-slate-500">
                   <AlertCircle className="w-12 h-12 mb-4 text-slate-300" />
-                  <h3 className="text-xl font-bold text-slate-700 mb-2">No Rooms Selected</h3>
-                  <p>Nobody is assigned to a room yet this shift. Pick rooms from the list, or refresh assignments.</p>
+                  <h3 className="text-xl font-bold text-slate-700 mb-2">{areas.length ? "No Rooms Selected" : "No Rooms Loaded"}</h3>
+                  <p>{areas.length
+                    ? "Nobody is assigned to a room yet this shift. Pick rooms from the list, or refresh assignments."
+                    : "Rooms couldn't be read from Dataverse. Open \"Data connection\" in the left panel to see which table failed and why."}</p>
                 </div>
               ) : (
                 <>
