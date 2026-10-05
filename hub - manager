@@ -265,6 +265,8 @@ export default function ScheduleApp({ dataApi, ...props }) {
     const [rangeIssues, setRangeIssues] = useState({});
     const [rangeBusy, setRangeBusy] = useState(0);
     const prodSchedulesRef = useRef([]);
+    const touchedRef = useRef(new Map());   // row id -> ms of the last edit made on this page
+    const touched = (id) => touchedRef.current.set(id, Date.now());
     const loadedRef = useRef({ task: [], prod: [], keys: new Set() });   // [fromMs, toMs] windows already fetched, per table
     const [notice, setNotice] = useState(null);
     const noticeTimer = useRef(null);
@@ -356,6 +358,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
             };
             try {
                 const hasApi = apiReady;
+                if (hasApi) { loadedRef.current = { task: [], prod: [], keys: new Set() }; setAllAssignments([]); setProdSchedules([]); }   // drops preview sample rows if the API arrived late
                 // Reference data only. Task assignments and production runs are loaded by date window (see ranges
                 // effect below): there are thousands of rows and nothing here should bulk-load them.
                 let [sups, todoList, areaList] = await Promise.all([
@@ -419,9 +422,9 @@ export default function ScheduleApp({ dataApi, ...props }) {
     // ========================================================================
     prodSchedulesRef.current = prodSchedules;
     const hourKey = Math.floor(currentTime / 3600000);
-    const needsCalMonth = activeTab === 'calendar', needsProdMonth = activeTab === 'prod_calendar';
+    const needsCalMonth = activeTab === 'calendar', needsProdMonth = activeTab === 'prod_calendar', needsGantt = activeTab === 'gantt';
+    const productionAreaNames = useMemo(() => areas.filter(isProductionArea).map(a => renderSafe(a.craa5_area || a.craa5_name)).filter(Boolean).sort().join('|'), [areas]);
     useEffect(() => {
-        const api = dataApiRef.current;
         if (!apiReady) return;   // preview mode keeps its sample data
         let alive = true;
         const [sy, sm, sd] = selectedDate.split('-').map(Number);
@@ -430,7 +433,12 @@ export default function ScheduleApp({ dataApi, ...props }) {
         const now = new Date();
         const todayStart = midnight(now.getFullYear(), now.getMonth(), now.getDate()), todayNext = midnight(now.getFullYear(), now.getMonth(), now.getDate() + 1);
         const isToday = selStart === todayStart;
-        const monthSpan = (m) => [midnight(m.getFullYear(), m.getMonth(), 0), midnight(m.getFullYear(), m.getMonth() + 1, 2)];
+        // A month, cut into weeks so each week is fetched (and capped) on its own: a busy month can't push its early days out.
+        const monthWeeks = (m, name) => {
+            const first = midnight(m.getFullYear(), m.getMonth(), 0), last = midnight(m.getFullYear(), m.getMonth() + 1, 2), out = [];
+            for (let i = 0, f = first; f < last; i++) { const t = Math.min(midnight(new Date(f).getFullYear(), new Date(f).getMonth(), new Date(f).getDate() + 7), last); out.push({ name: `${name}${i}`, r: [f, t] }); f = t; }
+            return out;
+        };
 
         // Daily Shifts table + Personnel Gantt window (see shiftWindowData). A task's end is the next task's start,
         // so it is padded a day either side.
@@ -442,23 +450,26 @@ export default function ScheduleApp({ dataApi, ...props }) {
                 ...(isToday ? [] : [{ name: 'today', r: [todayStart, todayNext], live: true }]),      // live current-shift assignments
                 { name: 'shifts', r: [winStart, winEnd], live: isToday },                              // Daily Shifts + Personnel Gantt (+ today when viewing today)
                 ...(isToday ? [] : [{ name: 'day', r: [selStart, selNext] }]),                          // Overview for the selected day
-                ...(needsCalMonth ? [{ name: 'month', r: monthSpan(calendarMonth) }] : []),
+                ...(needsCalMonth ? monthWeeks(calendarMonth, 'month') : []),
             ],
             prod: [
                 { name: 'runs', r: [prodFrom, prodTo], live: true },                                    // Overview, Gantt (+ neighbours for gaps), weekly runs
-                { name: 'before', before: prodFrom },                                                   // latest runs before the window: Gantt allergen-gap logic
-                ...(needsProdMonth ? [{ name: 'month', r: monthSpan(prodCalendarMonth) }] : []),
+                ...(needsProdMonth ? monthWeeks(prodCalendarMonth, 'pmonth') : []),
+                // Gantt allergen-gap logic needs each line's last run before the window: a few newest runs per production area.
+                ...(needsGantt ? productionAreaNames.split('|').filter(Boolean).map(a => ({ name: `before:${a}`, before: prodFrom, area: a })) : []),
             ],
         };
         const spec = {
             task: {
                 table: TABLE_TASK, label: 'Task assignments', id: 'craa5_taskassignmentid', set: setAllAssignments, orderby: 'createdon desc', top: RANGE_LIMIT,
                 filter: (f, t) => `statecode eq 0 and ((craa5_datetimeofassignment ge ${isoZ(f)} and craa5_datetimeofassignment lt ${isoZ(t)}) or (craa5_datetimeofassignment eq null and createdon ge ${isoZ(f)} and createdon lt ${isoZ(t)}))`,
+                inWindow: (r, f, t) => { const ms = new Date(r.craa5_datetimeofassignment || r.createdon).getTime(); return ms >= f && ms < t; },
             },
             prod: {
                 table: TABLE_PROD, label: 'Production runs', id: 'craa5__aa_prd_schdid', set: setProdSchedules, orderby: 'craa5_datestarttime desc', top: RANGE_LIMIT,
                 filter: (f, t) => `statecode eq 0 and craa5_datestarttime lt ${isoZ(t)} and craa5_dateendtime gt ${isoZ(f)}`,
-                beforeFilter: (f) => `statecode eq 0 and craa5_dateendtime le ${isoZ(f)}`,
+                inWindow: (r, f, t) => startMs(r) < t && new Date(r.craa5_dateendtime || r.craa5_endtime).getTime() > f,
+                beforeFilter: (f, area) => `statecode eq 0 and craa5_dateendtime le ${isoZ(f)} and craa5_area eq '${String(area).replace(/'/g, "''")}'`,
             },
         };
         const covered = (list, f, t) => list.some(([a, b]) => a <= f && b >= t);
@@ -468,28 +479,36 @@ export default function ScheduleApp({ dataApi, ...props }) {
             loadedRef.current[kind] = out;
         };
         const flag = (key, msg) => setRangeIssues(p => msg ? (p[key] === msg ? p : { ...p, [key]: msg }) : (key in p ? (({ [key]: _, ...rest }) => rest)(p) : p));
+        // Drop warnings for windows this view no longer needs.
+        const liveKeys = new Set(['task', 'prod'].flatMap(k => need[k].flatMap(n => [`${k}:${n.name}`, `${k}:${n.name}:cap`])));
+        setRangeIssues(p => { const keep = Object.fromEntries(Object.entries(p).filter(([k]) => liveKeys.has(k))); return Object.keys(keep).length === Object.keys(p).length ? p : keep; });
+
         const run = async (kind) => {
             const sp = spec[kind];
             for (const n of need[kind]) {
                 const key = `${kind}:${n.name}`;
-                if (n.before !== undefined) { if (loadedRef.current.keys.has(`${kind}:before:${n.before}`)) continue; }
-                else if (!n.live && covered(loadedRef.current[kind], n.r[0], n.r[1])) continue;
+                const doneKey = `${kind}:${n.name}:${n.before}`;
+                if (n.before !== undefined ? loadedRef.current.keys.has(doneKey) : (!n.live && covered(loadedRef.current[kind], n.r[0], n.r[1]))) { flag(key, null); flag(key + ':cap', null); continue; }
                 if (!alive) return;   // a newer effect run took over; its own pass fetches what it needs
                 setRangeBusy(c => c + 1);
                 try {
+                    const cap = n.before !== undefined ? 6 : sp.top;
                     const rows = await queryRecords(sp.table, dataApiRef.current, n.before !== undefined
-                        ? { filter: sp.beforeFilter(n.before), orderby: 'craa5_dateendtime desc', top: 150 }
-                        : { filter: sp.filter(n.r[0], n.r[1]), orderby: sp.orderby, top: sp.top });
-                    const cap = n.before !== undefined ? 150 : sp.top;
+                        ? { filter: sp.beforeFilter(n.before, n.area), orderby: 'craa5_dateendtime desc', top: cap }
+                        : { filter: sp.filter(n.r[0], n.r[1]), orderby: sp.orderby, top: cap });
                     if (rows === null) { flag(key, `${sp.label} (${n.name}) could not be loaded`); continue; }
                     flag(key, null);
                     const truncated = n.before === undefined && rows.length >= cap;
                     flag(key + ':cap', truncated ? `${sp.label}: only the newest ${cap} rows are shown for part of this period` : null);
-                    if (n.before !== undefined) loadedRef.current.keys.add(`${kind}:before:${n.before}`);
+                    if (n.before !== undefined) loadedRef.current.keys.add(doneKey);
                     else if (!n.live && !truncated) remember(kind, n.r[0], n.r[1]);
-                    if (rows.length) sp.set(prev => {
+                    const fresh = new Set(rows.map(x => x[sp.id]));
+                    const recent = (id) => Date.now() - (touchedRef.current.get(id) || 0) < 60000;   // edited here a moment ago: don't let a slower read overwrite it
+                    sp.set(prev => {
                         const m = new Map(prev.map(x => [x[sp.id], x]));
-                        rows.forEach(x => m.set(x[sp.id], x));
+                        // A complete window also drops rows that were deleted or moved elsewhere.
+                        if (n.before === undefined && !truncated) prev.forEach(x => { if (!fresh.has(x[sp.id]) && sp.inWindow(x, n.r[0], n.r[1]) && !recent(x[sp.id])) m.delete(x[sp.id]); });
+                        rows.forEach(x => { if (!recent(x[sp.id])) m.set(x[sp.id], x); });
                         const next = [...m.values()];
                         return kind === 'prod' ? next.sort(byStartAsc) : next;
                     });
@@ -499,9 +518,10 @@ export default function ScheduleApp({ dataApi, ...props }) {
                 } finally { setRangeBusy(c => Math.max(0, c - 1)); }
             }
         };
-        Promise.all([run('task'), run('prod')]);
-        return () => { alive = false; };
-    }, [apiReady, selectedDate, shiftLookbackHours, needsCalMonth, needsProdMonth, calendarMonth, prodCalendarMonth, ganttZoomDays, hourKey, liveTick, reloadTick]);
+        // Debounced: dragging the zoom slider or typing a lookback makes one round of requests, not one per change.
+        const timer = setTimeout(() => { Promise.all([run('task'), run('prod')]); }, 250);
+        return () => { alive = false; clearTimeout(timer); };
+    }, [apiReady, selectedDate, shiftLookbackHours, needsCalMonth, needsProdMonth, needsGantt, productionAreaNames, calendarMonth, prodCalendarMonth, ganttZoomDays, hourKey, liveTick, reloadTick]);
 
     const dailyAssignments = useMemo(() => {
         return allAssignments?.filter(t => getTaskDate(t) === selectedDate) || [];
@@ -1070,6 +1090,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
                     saved.push({ craa5__aa_prd_schdid: newId, ...run });
                 } catch (err) { failure = err; break; }
             }
+            saved.forEach(r => touched(r.craa5__aa_prd_schdid));
             if (saved.length) setProdSchedules(p => [...p, ...saved].sort(byStartAsc));
             if (failure) {
                 console.error(failure);
@@ -1112,6 +1133,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
             };
 
             await writeApi.update(TABLE_PROD, id, logicalPayload);
+            touched(id);
             
             setProdSchedules(prev => prev.map(s => {
                 const sId = s.craa5__aa_prd_schdid || s.craa5_aa_prd_schdid;
@@ -1147,6 +1169,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
         if (!writeApi) { notify("Can't move: no Dataverse write connection in this environment. Nothing was changed.", "error"); return; }
         try {
             await writeApi.update(TABLE_PROD, schId, { craa5_datestarttime: sTime, craa5_dateendtime: eTime });
+            touched(schId);
             setProdSchedules(prev => prev.map(s => {
                 const sId = s.craa5__aa_prd_schdid || s.craa5_aa_prd_schdid;
                 if (sId === schId) {
@@ -1166,6 +1189,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
         if (!writeApi) { notify("Can't delete: no Dataverse write connection in this environment. Nothing was changed.", "error"); return; }
         try {
             await writeApi.remove(TABLE_PROD, editSchData.id);
+            touched(editSchData.id);
             setProdSchedules(prev => prev.filter(s => {
                 const sId = s.craa5__aa_prd_schdid || s.craa5_aa_prd_schdid;
                 return sId !== editSchData.id;
