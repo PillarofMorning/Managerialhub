@@ -2,7 +2,9 @@ import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react'
 
 /*
   =============================================================================
-  === EXCEL-STYLE HIGH-PERFORMANCE GRID (V8) ===
+  === EXCEL-STYLE HIGH-PERFORMANCE GRID (V9) ===
+  0. Id-first matching: logs attach to equipment by Dataverse id; text matching is a fallback
+     that only runs when Sync is pressed. Amber markers = text-matched. Unmapped logs are listed in Diagnostics.
   1. Area Pagination (New): When expanded, Areas now limit equipment to 10 items.
      Individual "Next" buttons added per Area to navigate large equipment sets.
   2. Room Pagination: Main view continues to handle top-level Room pagination (5 per page).
@@ -60,21 +62,131 @@ const safeString = (val) => {
 
 const normalizeName = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, '');
 
-const isLenientMatch = (assetName, logName) => {
-  const a = normalizeName(assetName);
-  const l = normalizeName(logName);
-  if (!a || !l) return false;
-  return a === l || a.includes(l) || l.includes(a);
-};
-
 const normalizeDateStr = (d) => {
   if (!d) return "";
+  // craa5_lastcleaned is a date-only value that Dataverse returns as midnight UTC; read it as that
+  // calendar day instead of shifting it into the viewer's timezone.
+  if (typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
+  const dateOnly = typeof d === 'string' && d.match(/^(\d{4}-\d{2}-\d{2})T00:00:00(?:\.0+)?Z$/);
+  if (dateOnly) return dateOnly[1];
   const dateObj = new Date(d);
   if (isNaN(dateObj.getTime())) return "";
   const year = dateObj.getFullYear();
   const month = String(dateObj.getMonth() + 1).padStart(2, '0');
   const day = String(dateObj.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
+};
+
+// --- ID-FIRST MATCHING ---
+// Logs (craa5__log_) are attached to equipment by Dataverse id: craa5_equipmentguid holds the
+// craa5_aa_assetsid of the equipment row in craa5_aa_assets. Text matching is only a fallback, and it
+// is only computed when the user runs Sync (see computeTextLinks).
+const LOG_ASSET_ID_FIELDS = ['craa5_equipmentguid'];
+const LOG_ASSET_ID_SELECT = 'craa5_equipmentguid';
+
+const normalizeId = (v) => String(v === null || v === undefined ? '' : v).toLowerCase().replace(/[{}\s]/g, '');
+
+// Raw column value (GUIDs), unlike getProp which prefers formatted display names.
+const getRaw = (obj, key) => {
+  if (!obj) return null;
+  if (obj[key] !== undefined) return obj[key];
+  const k = Object.keys(obj).find(x => x.toLowerCase() === key.toLowerCase());
+  return k ? obj[k] : null;
+};
+
+const getAssetId = (asset) => normalizeId(getRaw(asset, 'craa5_aa_assetsid'));
+const getLogKey = (log) => normalizeId(getRaw(log, 'craa5__log_id') || getRaw(log, 'craa5_uid')) ||
+  `${normalizeName(safeString(getProp(log, 'craa5_equipment')))}|${normalizeDateStr(getRaw(log, 'craa5_lastcleaned'))}`;
+
+// Builds { byAsset: Map<assetId, Map<dateStr, {log, via}>>, unmapped, stats }.
+// textLinks (Map<logKey, assetId>) comes from the last Sync and is never recomputed here.
+const buildCompletionIndex = (assets, logs, textLinks) => {
+  const assetIds = new Set(assets.map(getAssetId));
+  const byAsset = new Map();
+  const unmapped = [];
+  const stats = { id: 0, text: 0, unmapped: 0, duplicate: 0 };  // id + text + unmapped + duplicate = distinct logs
+  const seen = new Set();
+
+  logs.forEach(log => {
+    const key = getLogKey(log);
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    let assetId = null;
+    let via = null;
+    for (const f of LOG_ASSET_ID_FIELDS) {
+      const v = normalizeId(getRaw(log, f));
+      if (v && assetIds.has(v)) { assetId = v; via = 'id'; break; }
+    }
+    if (!assetId && textLinks && textLinks.has(key) && assetIds.has(textLinks.get(key))) {
+      assetId = textLinks.get(key);
+      via = 'text';
+    }
+    if (!assetId) { unmapped.push(log); stats.unmapped++; return; }
+
+    const date = normalizeDateStr(getRaw(log, 'craa5_lastcleaned'));
+    if (!date) { unmapped.push(log); stats.unmapped++; return; }
+    if (!byAsset.has(assetId)) byAsset.set(assetId, new Map());
+    const days = byAsset.get(assetId);
+    const existing = days.get(date);
+    // One marker per equipment and day: the loser is counted as a duplicate, not silently dropped.
+    if (existing && existing.via === 'id' && via === 'text') { stats.duplicate++; return; }
+    if (existing) { stats[existing.via]--; stats.duplicate++; }
+    days.set(date, { log, via });
+    stats[via]++;
+  });
+  return { byAsset, unmapped, stats };
+};
+
+// Text fallback, run only on Sync and only for logs the id match left unmapped.
+// Exact normalized name first; containment only when it points at exactly one asset, so
+// "Oven 1" can no longer swallow "Oven 12". Ambiguous names stay unmapped.
+const computeTextLinks = (assets, logs) => {
+  const links = new Map();
+  const { unmapped } = buildCompletionIndex(assets, logs, null);
+  const named = assets.map(a => ({ id: getAssetId(a), norm: normalizeName(safeString(getProp(a, 'craa5_equipmentidentifier'))) })).filter(a => a.id && a.norm);
+  unmapped.forEach(log => {
+    const n = normalizeName(safeString(getProp(log, 'craa5_equipment')));
+    if (!n) return;
+    const exact = named.filter(a => a.norm === n);
+    if (exact.length === 1) { links.set(getLogKey(log), exact[0].id); return; }
+    if (exact.length > 1 || n.length < 3) return;
+    const loose = named.filter(a => a.norm.length >= 3 && (a.norm.includes(n) || n.includes(a.norm)));
+    if (loose.length === 1) links.set(getLogKey(log), loose[0].id);
+  });
+  return links;
+};
+
+// Page through a Dataverse query. If the id column is missing from the table, retry without it
+// so Sync still works (everything then falls back to text matching).
+const retrieveAllLogs = async (select, filter, onWarn) => {
+  const page = async (query) => Xrm.WebApi.retrieveMultipleRecords("craa5__log_", query);
+  const run = async (sel) => {
+    let res = await page(`?$select=${sel}&$filter=${filter}`);
+    let all = res.entities || [];
+    while (res.nextLink) {
+      res = await page("?" + res.nextLink.split("?")[1]);
+      all = all.concat(res.entities || []);
+    }
+    return all;
+  };
+  const withId = `${select},${LOG_ASSET_ID_SELECT}`;
+  let first;
+  try {
+    first = await page(`?$select=${withId}&$filter=${filter}`);
+  } catch (err) {
+    // Only a missing column justifies dropping the id; anything else (throttling, network) is a real failure.
+    if (!/could not find a property|0x80060888|does not exist|invalid property/i.test(String(err && err.message))) throw err;
+    if (onWarn) onWarn(`Log id column ${LOG_ASSET_ID_SELECT} unavailable (${err.message}); using text matching only.`);
+    return await run(select);
+  }
+  let all = first.entities || [];
+  let res = first;
+  while (res.nextLink) {
+    res = await page("?" + res.nextLink.split("?")[1]);
+    all = all.concat(res.entities || []);
+  }
+  return all;
 };
 
 const getWeekNumber = (d) => {
@@ -116,8 +228,11 @@ export default function App() {
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
   
   const [expandedKeys, setExpandedKeys] = useState({});
-  const [completionMap, setCompletionMap] = useState(new Map());
-  const [unmappedLogs, setUnmappedLogs] = useState([]);
+  const [textLinks, setTextLinks] = useState(new Map()); // log key -> asset id, set only by Sync
+  const [syncNotes, setSyncNotes] = useState([]);
+
+  // Id match is re-derived from loaded data; the text fallback only changes when Sync runs.
+  const completionIndex = useMemo(() => buildCompletionIndex(assets, logs, textLinks), [assets, logs, textLinks]);
 
   const today = useMemo(() => new Date(), []);
 
@@ -139,6 +254,7 @@ export default function App() {
     try {
       let fetchedAssets = [];
       let fetchedLogs = [];
+      const notes = [];
 
       if (typeof Xrm !== 'undefined') {
         const assetRes = await Xrm.WebApi.retrieveMultipleRecords("craa5_aa_assets", "?$select=craa5_aa_assetsid,craa5_equipmentidentifier,craa5_roomname,craa5_areaname");
@@ -147,20 +263,8 @@ export default function App() {
 
         const start = new Date(anchorYear, 0, 1).toISOString();
         const end = new Date(anchorYear, 11, 31, 23, 59).toISOString();
-        const logOptions = `?$select=craa5__log_id,craa5_equipment,craa5_lastcleaned,craa5_lastcleanedby,craa5_nameofemployee,craa5_uid&$filter=craa5_lastcleaned ge '${start}' and craa5_lastcleaned le '${end}'`;
-        
-        const fetchAllLogs = async (query) => {
-            const res = await Xrm.WebApi.retrieveMultipleRecords("craa5__log_", query);
-            let combined = res.entities;
-            if (res.nextLink) {
-                const nextQuery = "?" + res.nextLink.split("?")[1];
-                const nextPart = await fetchAllLogs(nextQuery);
-                combined = [...combined, ...nextPart];
-            }
-            return combined;
-        };
-
-        fetchedLogs = await fetchAllLogs(logOptions);
+        const filter = `craa5_lastcleaned ge '${start}' and craa5_lastcleaned le '${end}'`;
+        fetchedLogs = await retrieveAllLogs("craa5__log_id,craa5_equipment,craa5_lastcleaned,craa5_lastcleanedby,craa5_nameofemployee,craa5_uid,craa5_sap,craa5_hoursworked,craa5_room,craa5_area", filter, (m) => notes.push(m));
       } else {
         setLoadProgress(40);
         // Simulation with many items to test equipment pagination
@@ -170,35 +274,21 @@ export default function App() {
           craa5_roomname: i < 50 ? 'Creme' : 'Bakery',
           craa5_areaname: i < 50 ? 'IBL4' : 'Ovens'
         }));
-        fetchedLogs = [{ craa5_equipment: 'Equipment 1', craa5_lastcleaned: normalizeDateStr(today), craa5_lastcleanedby: 'EL/LH', craa5_uid: 'LOG-TEST' }];
+        fetchedLogs = [
+          { craa5__log_id: 'l-1', craa5_equipmentguid: 'a-0', craa5_equipment: 'Equipment 1', craa5_lastcleaned: normalizeDateStr(today), craa5_lastcleanedby: 'EL/LH', craa5_uid: 'LOG-ID' }, // id match
+          { craa5__log_id: 'l-2', craa5_equipment: 'Equipment 2', craa5_lastcleaned: normalizeDateStr(today), craa5_lastcleanedby: 'EL/LH', craa5_uid: 'LOG-TEXT' }, // text fallback
+          { craa5__log_id: 'l-3', craa5_equipment: 'Nothing like this', craa5_lastcleaned: normalizeDateStr(today), craa5_lastcleanedby: 'EL/LH', craa5_uid: 'LOG-ORPHAN' } // unmapped
+        ];
       }
 
       setLoadProgress(80);
-      const newMap = new Map();
-      const unmapped = [];
-      const mappedLogIds = new Set();
-
-      fetchedAssets.forEach(asset => {
-        const aName = safeString(getProp(asset, 'craa5_equipmentidentifier'));
-        const aNorm = normalizeName(aName);
-        fetchedLogs.forEach(l => {
-          const lName = safeString(getProp(l, 'craa5_equipment'));
-          const lDate = normalizeDateStr(getProp(l, 'craa5_lastcleaned'));
-          if (isLenientMatch(aName, lName)) {
-            newMap.set(`${aNorm}|${lDate}`, l);
-            mappedLogIds.add(l.craa5__log_id || l.craa5_uid);
-          }
-        });
-      });
-
-      fetchedLogs.forEach(l => {
-        if (!mappedLogIds.has(l.craa5__log_id || l.craa5_uid)) unmapped.push(l);
-      });
+      // Text fallback runs here, and only here: it is what "Sync" adds on top of the id match.
+      const links = computeTextLinks(fetchedAssets, fetchedLogs);
 
       setAssets(fetchedAssets);
       setLogs(fetchedLogs);
-      setCompletionMap(newMap);
-      setUnmappedLogs(unmapped);
+      setTextLinks(links);
+      setSyncNotes(notes);
       
       const initialExpands = {};
       fetchedAssets.forEach(a => {
@@ -377,6 +467,7 @@ export default function App() {
         .data-cells { display: flex; }
         .completion-cell { flex-shrink: 0; border-right: 1px solid #f1f5f9; display: flex; align-items: center; justify-content: center; }
         .marker { width: 14px; height: 14px; background: #10b981; border-radius: 3px; cursor: help; box-shadow: 0 1px 2px rgba(0,0,0,0.1); }
+        .marker-text { background: #f59e0b; }
         .marker-empty { width: 4px; height: 4px; background: #e2e8f0; border-radius: 50%; opacity: 0.5; }
 
         .tab-btn { padding: 12px 20px; border: none; background: transparent; color: #64748b; font-weight: bold; cursor: pointer; border-bottom: 3px solid transparent; transition: 0.2s; }
@@ -436,9 +527,12 @@ export default function App() {
       {/* HOVER TOOLTIP */}
       {hoveredLog && (
         <div className="tooltip" style={{ left: mousePos.x + 15, top: mousePos.y + 15 }}>
-          <label>Equipment</label><p>{hoveredLog.craa5_equipment}</p>
-          <label>Completed By</label><p>{hoveredLog.craa5_lastcleanedby || 'N/A'}</p>
-          <label>Timestamp</label><p style={{ marginBottom: 0 }}>{new Date(hoveredLog.craa5_lastcleaned).toLocaleString()}</p>
+          <label>Equipment</label><p>{hoveredLog.log.craa5_equipment}</p>
+          <label>Completed By</label><p>{hoveredLog.log.craa5_lastcleanedby || 'N/A'}</p>
+          <label>Date</label><p>{normalizeDateStr(hoveredLog.log.craa5_lastcleaned)}</p>
+          <label>SAP Order</label><p>{hoveredLog.log.craa5_sap || hoveredLog.log.craa5_uid || 'N/A'}</p>
+          <label>Hours</label><p>{hoveredLog.log.craa5_hoursworked ?? 'N/A'}</p>
+          <label>Matched By</label><p style={{ marginBottom: 0 }}>{hoveredLog.via === 'id' ? 'Dataverse id' : 'Text match (Sync)'}</p>
         </div>
       )}
 
@@ -486,16 +580,16 @@ export default function App() {
                               </div>
                               {filteredTreeData[room][area].map(asset => {
                                 const name = safeString(getProp(asset, 'craa5_equipmentidentifier'));
-                                const normalized = normalizeName(name);
+                                const rowLogs = completionIndex.byAsset.get(getAssetId(asset));
                                 return (
                                   <div key={asset.craa5_aa_assetsid} className="asset-row">
                                     <div className="frozen-labels" style={{ paddingLeft: '48px' }}><FileIcon /><span>{name}</span></div>
                                     <div className="data-cells">
                                       {timelineDays.map((d, di) => {
-                                        const match = completionMap.get(`${normalized}|${d.dateStr}`);
+                                        const match = rowLogs && rowLogs.get(d.dateStr);
                                         return (
                                           <div key={di} className="completion-cell" style={{ width: dayColWidth, background: d.isToday ? '#eff6ff' : 'transparent' }}>
-                                            {match ? <div className="marker" onMouseEnter={() => setHoveredLog(match)} onMouseLeave={() => setHoveredLog(null)} /> : <div className="marker-empty" />}
+                                            {match ? <div className={`marker ${match.via === 'text' ? 'marker-text' : ''}`} onMouseEnter={() => setHoveredLog(match)} onMouseLeave={() => setHoveredLog(null)} /> : <div className="marker-empty" />}
                                           </div>
                                         );
                                       })}
@@ -530,6 +624,7 @@ export default function App() {
               <span>{Math.round(zoom * 100)}%</span>
             </div>
             <button className="sync-btn" onClick={triggerSync} disabled={isLoading}><RefreshIcon style={isLoading ? { animation: 'spin 1s linear infinite' } : {}} /> Sync Dataverse</button>
+            <span data-testid="match-stats" title="Green = matched by Dataverse id. Amber = matched by text fallback (Sync only)." style={{ fontSize: '11px', fontWeight: 'bold', color: '#475569', whiteSpace: 'nowrap' }}><span style={{ color: '#10b981' }}>■</span> id {completionIndex.stats.id} · <span style={{ color: '#f59e0b' }}>■</span> text {completionIndex.stats.text} · unmapped {completionIndex.stats.unmapped}{completionIndex.stats.duplicate ? ` · duplicate ${completionIndex.stats.duplicate}` : ''}</span>
           </div>
           <div className="flex items-center" style={{ gap: '12px' }}>
             <button className="p-1 hover:bg-slate-100 rounded border" onClick={() => setAnchorYear(y => y - 1)}><ChevronLeftIcon /></button>
@@ -568,6 +663,19 @@ export default function App() {
                 <h3 style={{ fontSize: '15px', fontWeight: 'bold' }}>Sync Breakdown</h3>
                 <p>Assets: {assets.length}</p>
                 <p>Logs: {logs.length}</p>
+                <p>Matched by Dataverse id: {completionIndex.stats.id}</p>
+                <p>Matched by text (Sync only): {completionIndex.stats.text}</p>
+                <p>Unmapped: {completionIndex.stats.unmapped}</p>
+                <p>Duplicates (same equipment and day, one marker shown): {completionIndex.stats.duplicate}</p>
+                {syncNotes.map((n, i) => <p key={i} style={{ color: '#b45309' }}>{n}</p>)}
+                {completionIndex.unmapped.length > 0 && (
+                  <table style={{ marginTop: '12px', fontSize: '12px', borderCollapse: 'collapse' }}>
+                    <thead><tr><th style={{ textAlign: 'left', padding: '4px 12px 4px 0' }}>Unmapped equipment text</th><th style={{ textAlign: 'left', padding: '4px 12px' }}>Date</th><th style={{ textAlign: 'left', padding: '4px 12px' }}>UID</th></tr></thead>
+                    <tbody>{completionIndex.unmapped.slice(0, 200).map((l, i) => (
+                      <tr key={i}><td style={{ padding: '4px 12px 4px 0' }}>{safeString(getProp(l, 'craa5_equipment')) || '(blank)'}</td><td style={{ padding: '4px 12px' }}>{normalizeDateStr(getRaw(l, 'craa5_lastcleaned'))}</td><td style={{ padding: '4px 12px' }}>{safeString(l.craa5_uid)}</td></tr>
+                    ))}</tbody>
+                  </table>
+                )}
              </div>
           </main>
         ) : (
@@ -620,16 +728,16 @@ export default function App() {
                             <>
                               {pagedEquipment.map(asset => {
                                 const name = safeString(getProp(asset, 'craa5_equipmentidentifier'));
-                                const normalized = normalizeName(name);
+                                const rowLogs = completionIndex.byAsset.get(getAssetId(asset));
                                 return (
                                   <div key={asset.craa5_aa_assetsid} className="asset-row">
                                     <div className="frozen-labels" style={{ paddingLeft: '60px' }}><FileIcon /><span>{name}</span></div>
                                     <div className="data-cells">
                                       {timelineDays.map((d, di) => {
-                                        const match = completionMap.get(`${normalized}|${d.dateStr}`);
+                                        const match = rowLogs && rowLogs.get(d.dateStr);
                                         return (
                                           <div key={di} className="completion-cell" style={{ width: dayColWidth, background: d.isToday ? '#eff6ff' : 'transparent' }}>
-                                            {match ? <div className="marker" onMouseEnter={() => setHoveredLog(match)} onMouseLeave={() => setHoveredLog(null)} /> : <div className="marker-empty" />}
+                                            {match ? <div className={`marker ${match.via === 'text' ? 'marker-text' : ''}`} onMouseEnter={() => setHoveredLog(match)} onMouseLeave={() => setHoveredLog(null)} /> : <div className="marker-empty" />}
                                           </div>
                                         );
                                       })}
