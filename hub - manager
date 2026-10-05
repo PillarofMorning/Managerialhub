@@ -170,7 +170,10 @@ function safeGetXrm() {
 }
 
 const API_TIMEOUT_MS = 20000;
-const QUERY_LIMIT = 5000;
+const QUERY_LIMIT = 1000;       // small reference tables (areas, supervisors, delegated tasks)
+const RANGE_LIMIT = 2000;       // one on-screen date window of tasks or runs
+const DAY_MS = 86400000;
+const isoZ = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
 const withTimeout = (promise, ms, label) => new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`${label} timed out`)), ms);
     promise.then(v => { clearTimeout(t); resolve(v); }, e => { clearTimeout(t); reject(e); });
@@ -258,6 +261,10 @@ export default function ScheduleApp({ dataApi, ...props }) {
     const [isLoading, setIsLoading] = useState(true);
     const [loadIssues, setLoadIssues] = useState([]);
     const [reloadTick, setReloadTick] = useState(0);
+    const [liveTick, setLiveTick] = useState(0);
+    const [rangeIssues, setRangeIssues] = useState({});
+    const [rangeBusy, setRangeBusy] = useState(0);
+    const loadedRef = useRef({ task: [], prod: [] });   // [fromMs, toMs] windows already fetched, per table
     const [notice, setNotice] = useState(null);
     const noticeTimer = useRef(null);
     // On-page messages: alert() is blocked inside Power Apps frames.
@@ -289,7 +296,6 @@ export default function ScheduleApp({ dataApi, ...props }) {
 
     useEffect(() => { setGanttAreaFilter(''); }, [isGanttModalOpen, ganttShiftFilter, shiftViewMode]);
 
-    const [employees, setEmployees] = useState([]);
     const [supervisors, setSupervisors] = useState([]);
     const [areas, setAreas] = useState([]);
     const [allAssignments, setAllAssignments] = useState([]);
@@ -349,14 +355,14 @@ export default function ScheduleApp({ dataApi, ...props }) {
             };
             try {
                 const hasApi = !!(safeGetXrm()?.WebApi || api?.queryTable);
-                let [allStaff, allTasks, todoList, schList, areaList] = await Promise.all([
-                    load("Employees", TABLE_EMPLOYEE, {}),
-                    load("Task assignments", TABLE_TASK, { orderby: "createdon desc" }),
-                    load("Delegated tasks", TABLE_TODO, { orderby: "createdon desc" }),
-                    load("Production schedule", TABLE_PROD, { orderby: "craa5_datestarttime desc" }),
+                // Reference data only. Task assignments and production runs are loaded by date window (see ranges
+                // effect below): there are thousands of rows and nothing here should bulk-load them.
+                let [sups, todoList, areaList] = await Promise.all([
+                    load("Supervisors", TABLE_EMPLOYEE, { filter: "statecode eq 0 and craa5_role eq 256000002" }),
+                    load("Delegated tasks", TABLE_TODO, { orderby: "createdon desc", top: 200 }),
                     load("Areas", ["craa5__aa_areas", "craa5_aa_areas", "craa5_aa_mss_area"], {}),
                 ]);
-                const sups = allStaff.filter(e => (e.craa5_role || e.craa5_Role) === 256000002);
+                let allTasks = [], schList = [];
 
                 if (!hasApi) {
                     // Canvas preview only: no Dataverse API at all. Never used when a real API exists but a read failed.
@@ -381,12 +387,10 @@ export default function ScheduleApp({ dataApi, ...props }) {
                 }
 
                 if (isMounted) {
-                    setEmployees(allStaff);
                     setSupervisors(sups.sort((a, b) => (renderSafe(a.craa5_name) || "").localeCompare(renderSafe(b.craa5_name) || "")));
                     setAreas(areaList);
-                    setAllAssignments(allTasks);
+                    if (!hasApi) { setAllAssignments(allTasks); setProdSchedules(schList); }
                     setTodoTasks(todoList);
-                    setProdSchedules([...schList].sort(byStartAsc));
                     setLoadIssues(issues);
                 }
             } catch (err) {
@@ -400,6 +404,85 @@ export default function ScheduleApp({ dataApi, ...props }) {
         loadDashboardData();
         return () => { isMounted = false; };
     }, [reloadTick]);   // on open and on the Reload button; not on every prop change (Power Apps re-sends props often)
+
+    // Refresh the live (today) windows every 5 minutes.
+    useEffect(() => {
+        const t = setInterval(() => setLiveTick(n => n + 1), 300000);
+        return () => clearInterval(t);
+    }, []);
+
+    // ========================================================================
+    // LAZY, WINDOWED LOADING. Thousands of rows live in these tables, so only the date range a view needs is fetched
+    // (filtered in Dataverse, capped at RANGE_LIMIT), merged by id, and remembered so a window isn't fetched twice.
+    // ========================================================================
+    const hourKey = Math.floor(currentTime / 3600000);
+    useEffect(() => {
+        const api = dataApiRef.current;
+        if (!(safeGetXrm()?.WebApi || api?.queryTable)) return;   // preview mode keeps its sample data
+        let alive = true;
+        const [sy, sm, sd] = selectedDate.split('-').map(Number);
+        const selStart = new Date(sy, sm - 1, sd).getTime();
+        const todayStart = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate()).getTime();
+        const isToday = selStart === todayStart;
+        const monthSpan = (m) => [new Date(m.getFullYear(), m.getMonth(), 1).getTime() - DAY_MS, new Date(m.getFullYear(), m.getMonth() + 1, 1).getTime() + DAY_MS];
+
+        // Shifts table/Gantt window (see shiftWindowData), padded a day back so a task that started before the window
+        // still gets its end time from the next one.
+        const winEnd = isToday ? todayStart + 2 * DAY_MS : selStart + DAY_MS;
+        const winStart = (isToday ? hourKey * 3600000 : selStart + DAY_MS) - shiftLookbackHours * 3600000 - DAY_MS;
+        const need = {
+            task: [
+                { r: [todayStart, todayStart + DAY_MS], live: true },                       // live current-shift assignments
+                { r: [winStart, winEnd], live: isToday },                                   // Daily Shifts + Personnel Gantt
+                { r: [selStart, selStart + DAY_MS] },                                       // Overview for the selected day
+                ...(activeTab === 'calendar' ? [{ r: monthSpan(calendarMonth) }] : []),
+            ],
+            prod: [
+                { r: [selStart - 7 * DAY_MS, selStart + (ganttZoomDays + 7) * DAY_MS] },    // Overview, Gantt (+ neighbours for gaps), weekly runs
+                ...(activeTab === 'prod_calendar' ? [{ r: monthSpan(prodCalendarMonth) }] : []),
+            ],
+        };
+        const spec = {
+            task: {
+                table: TABLE_TASK, label: 'Task assignments', id: 'craa5_taskassignmentid', set: setAllAssignments, orderby: 'createdon desc',
+                filter: (f, t) => `statecode eq 0 and ((craa5_datetimeofassignment ge ${isoZ(f)} and craa5_datetimeofassignment lt ${isoZ(t)}) or (craa5_datetimeofassignment eq null and createdon ge ${isoZ(f)} and createdon lt ${isoZ(t)}))`,
+            },
+            prod: {
+                table: TABLE_PROD, label: 'Production runs', id: 'craa5__aa_prd_schdid', set: setProdSchedules, orderby: 'craa5_datestarttime desc',
+                filter: (f, t) => `statecode eq 0 and craa5_datestarttime lt ${isoZ(t)} and craa5_dateendtime gt ${isoZ(f)}`,
+            },
+        };
+        const covered = (list, f, t) => list.some(([a, b]) => a <= f && b >= t);
+        const remember = (kind, f, t) => {
+            const list = [...loadedRef.current[kind], [f, t]].sort((x, y) => x[0] - y[0]), out = [];
+            list.forEach(iv => { const last = out[out.length - 1]; if (last && iv[0] <= last[1]) last[1] = Math.max(last[1], iv[1]); else out.push([...iv]); });
+            loadedRef.current[kind] = out;
+        };
+        (async () => {
+            for (const kind of ['task', 'prod']) {
+                const sp = spec[kind];
+                for (const { r: [f, t], live } of need[kind]) {
+                    if (!live && covered(loadedRef.current[kind], f, t)) continue;
+                    setRangeBusy(n => n + 1);
+                    const rows = await queryRecords(sp.table, dataApiRef.current, { filter: sp.filter(f, t), orderby: sp.orderby, top: RANGE_LIMIT });
+                    if (!alive) return;
+                    setRangeBusy(n => n - 1);
+                    const key = `${kind}:${f}`;
+                    if (rows === null) { setRangeIssues(p => ({ ...p, [key]: `${sp.label} for ${new Date(f).toLocaleDateString()} could not be loaded` })); continue; }
+                    setRangeIssues(p => { if (!(key in p)) return p; const n = { ...p }; delete n[key]; return n; });
+                    if (rows.length >= RANGE_LIMIT) setRangeIssues(p => ({ ...p, [key + ':cap']: `${sp.label}: only the newest ${RANGE_LIMIT} rows are shown for ${new Date(f).toLocaleDateString()} onward; narrow the date range` }));
+                    if (!live) remember(kind, f, t);
+                    if (rows.length) sp.set(prev => {
+                        const m = new Map(prev.map(x => [x[sp.id], x]));
+                        rows.forEach(x => m.set(x[sp.id], x));
+                        const next = [...m.values()];
+                        return kind === 'prod' ? next.sort(byStartAsc) : next;
+                    });
+                }
+            }
+        })();
+        return () => { alive = false; setRangeBusy(0); };
+    }, [selectedDate, shiftLookbackHours, activeTab, calendarMonth, prodCalendarMonth, ganttZoomDays, hourKey, liveTick, reloadTick]);
 
     const dailyAssignments = useMemo(() => {
         return allAssignments?.filter(t => getTaskDate(t) === selectedDate) || [];
@@ -881,19 +964,24 @@ export default function ScheduleApp({ dataApi, ...props }) {
         setSchPayload(next);
     };
 
-    const handleProductCodeChange = (e) => {
+    const applyRecall = (match) => ({
+        product: renderSafe(match.craa5_product || match.craa5_Product),
+        allergen: match.craa5_allergen === true || match.craa5_allergen === 1,
+        typeOfAllergen: renderSafe(match.craa5_typeofallergen) || "",
+        crumbClean: match.craa5_crumbclean === true || match.craa5_crumbclean === 1 || match.craa5_CrumbClean === true,
+    });
+    // Auto-recall: reuse the product, allergen and crumb-clean settings from the newest run with this code. Checks the
+    // runs already on screen first, then asks Dataverse for just that one row (no history is loaded).
+    const handleProductCodeChange = async (e) => {
         const code = e.target.value;
-        let nextPayload = { ...schPayload, productCode: code };
-        if (code) {
-            const match = prodSchedules.find(s => (s.craa5_productcode || s.craa5_productCode || "").toString() === code);
-            if (match) {
-                nextPayload.product = renderSafe(match.craa5_product || match.craa5_Product);
-                nextPayload.allergen = match.craa5_allergen === true || match.craa5_allergen === 1;
-                nextPayload.typeOfAllergen = renderSafe(match.craa5_typeofallergen) || "";
-                nextPayload.crumbClean = match.craa5_crumbclean === true || match.craa5_crumbclean === 1 || match.craa5_CrumbClean === true;
-            }
+        setSchPayload(p => ({ ...p, productCode: code }));
+        if (!/^\d+$/.test(code)) return;
+        let match = [...prodSchedules].reverse().find(s => (s.craa5_productcode || s.craa5_productCode || "").toString() === code);
+        if (!match) {
+            const rows = await queryRecords(TABLE_PROD, dataApiRef.current, { filter: `statecode eq 0 and craa5_productcode eq ${code}`, orderby: 'craa5_datestarttime desc', top: 1 });
+            match = rows?.[0];
         }
-        setSchPayload(nextPayload);
+        if (match) setSchPayload(p => p.productCode === code ? { ...p, ...applyRecall(match) } : p);   // ignore if the box changed meanwhile
     };
 
     const handleCreateProductionSchedule = async () => {
@@ -2034,7 +2122,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
                     })}
                 </nav>
                 <div className="p-4 border-t border-gray-100">
-                    <button onClick={() => setReloadTick(t => t + 1)} disabled={isLoading} className="w-full text-sm font-medium text-gray-600 hover:text-blue-700 border border-gray-200 rounded-md py-1.5 disabled:opacity-50">Reload data</button>
+                    <button onClick={() => { loadedRef.current = { task: [], prod: [] }; setAllAssignments([]); setProdSchedules([]); setRangeIssues({}); setReloadTick(t => t + 1); }} disabled={isLoading} className="w-full text-sm font-medium text-gray-600 hover:text-blue-700 border border-gray-200 rounded-md py-1.5 disabled:opacity-50">{rangeBusy > 0 ? 'Loading…' : 'Reload data'}</button>
                 </div>
             </aside>
 
@@ -2055,9 +2143,9 @@ export default function ScheduleApp({ dataApi, ...props }) {
                         {notice.message}
                     </div>
                 )}
-                {loadIssues.length > 0 && (
+                {(loadIssues.length > 0 || Object.keys(rangeIssues).length > 0) && (
                     <div className="mx-4 md:mx-8 mt-4 px-4 py-3 rounded-lg border border-amber-300 bg-amber-50 text-amber-900 text-sm">
-                        <span className="font-bold">Data check: </span>{loadIssues.join(' · ')}
+                        <span className="font-bold">Data check: </span>{[...loadIssues, ...Object.values(rangeIssues)].join(' · ')}
                     </div>
                 )}
                 <div className="p-4 md:p-8 max-w-[1600px] mx-auto">
