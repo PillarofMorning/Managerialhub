@@ -169,26 +169,76 @@ function safeGetXrm() {
     return null;
 }
 
-async function fetchAllActiveRecords(entityName, dataApi) {
-    const xrm = safeGetXrm();
-    if (xrm?.WebApi) {
-        try {
-            const fetchXml = `<fetch top='5000'><entity name='${entityName}'><all-attributes/><filter><condition attribute='statecode' operator='eq' value='0'/></filter></entity></fetch>`;
-            const res = await xrm.WebApi.retrieveMultipleRecords(entityName, "?fetchXml=" + encodeURIComponent(fetchXml));
-            if (res && res.entities) return res.entities;
-        } catch (e) {
-            console.warn(`FetchXML failed for ${entityName}, falling back...`, e);
+const API_TIMEOUT_MS = 20000;
+const QUERY_LIMIT = 5000;
+const withTimeout = (promise, ms, label) => new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} timed out`)), ms);
+    promise.then(v => { clearTimeout(t); resolve(v); }, e => { clearTimeout(t); reject(e); });
+});
+
+// Reads active rows (newest first). Returns an array, or null when EVERY attempt failed, so a failed read is never
+// mistaken for "no data". Tries Xrm.WebApi first (model-driven), then the generative-page dataApi. A slow call falls
+// back for that call only. `entityNames` may list alternative table names to try in order.
+async function queryRecords(entityNames, dataApi, { orderby, filter = "statecode eq 0", top = QUERY_LIMIT } = {}) {
+    const web = safeGetXrm()?.WebApi;
+    const names = Array.isArray(entityNames) ? entityNames : [entityNames];
+    let emptyResult = null;   // a table that exists but is empty: keep looking, return [] if nothing better turns up
+    const odata = [`$filter=${filter}`, orderby ? `$orderby=${orderby}` : '', `$top=${top}`].filter(Boolean).join('&');
+    for (const en of names) {
+        if (web?.retrieveMultipleRecords) {
+            try {
+                const res = await withTimeout(web.retrieveMultipleRecords(en, `?${odata}`), API_TIMEOUT_MS, `Xrm.WebApi ${en}`);
+                if (Array.isArray(res?.entities)) { if (res.entities.length || names.length === 1) return res.entities; emptyResult = res.entities; continue; }
+            } catch (e) { console.warn(`[Manager] ${en} via Xrm.WebApi:`, e?.message || e); }
+        }
+        if (dataApi?.queryTable) {
+            try {
+                const opts = { pageSize: Math.min(top, 500), filter };
+                if (orderby) opts.orderBy = orderby;
+                let page = await withTimeout(dataApi.queryTable(en, opts), API_TIMEOUT_MS, `dataApi ${en}`);
+                if (!Array.isArray(page?.rows)) throw new Error("no rows");
+                const rows = [...page.rows];
+                while (page?.hasMoreRows && typeof page.loadMoreRows === 'function' && rows.length < top) {
+                    page = await withTimeout(page.loadMoreRows(), API_TIMEOUT_MS, `dataApi ${en}`);
+                    rows.push(...(Array.isArray(page?.rows) ? page.rows : []));
+                }
+                if (rows.length || names.length === 1) return rows.slice(0, top);
+                emptyResult = rows;
+            } catch (e) { console.warn(`[Manager] ${en} via dataApi:`, e?.message || e); }
         }
     }
-    if (dataApi?.queryTable) {
-        try {
-            const res = await dataApi.queryTable(entityName, { filter: "statecode eq 0", top: 5000 });
-            if (res && res.rows) return res.rows;
-        } catch (e) {
-            console.warn(`queryTable failed for ${entityName}`, e);
-        }
+    return emptyResult;
+}
+
+const idOf = (res) => { const id = typeof res === 'string' ? res : res?.id; return id ? String(id).replace(/[{}]/g, '') : null; };
+
+// Writes go through Xrm.WebApi when present, else the generative-page dataApi (createRow / updateRow / deleteRow).
+// Returns null when no write API exists, so callers can say so instead of pretending a save happened.
+function getWriteApi(dataApi) {
+    const web = safeGetXrm()?.WebApi;
+    if (web?.createRecord && web?.updateRecord && web?.deleteRecord) {
+        return {
+            create: async (t, d) => idOf(await web.createRecord(t, d)),
+            update: (t, id, d) => web.updateRecord(t, id, d),
+            remove: (t, id) => web.deleteRecord(t, id),
+        };
     }
-    return [];
+    if (dataApi?.createRow && dataApi?.updateRow) {
+        return {
+            create: async (t, d) => idOf(await dataApi.createRow(t, d)),
+            update: (t, id, d) => dataApi.updateRow(t, id, d),
+            remove: (t, id) => dataApi.deleteRow ? dataApi.deleteRow(t, id) : Promise.reject(new Error("Delete isn't available in this environment")),
+        };
+    }
+    return null;
+}
+
+// Local-calendar day arithmetic (adding 24h in ms drifts an hour across daylight-saving changes).
+const addDaysLocal = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n, d.getHours(), d.getMinutes(), d.getSeconds());
+
+function isProductionArea(a) {
+    const flags = [a.craa5_runsproduct, a.craa5_RunsProduct, a.craa5_production, a.craa5_Production, a.craa5_isproduction, a.craa5_IsProduction];
+    return flags.some(v => v === true || v === 1 || /^(yes|true)$/i.test(String(v ?? ""))) || a.craa5_type === 256000000;
 }
 
 // ============================================================================
@@ -200,7 +250,17 @@ export default function ScheduleApp({ dataApi, ...props }) {
     const TABLE_TODO = "craa5__supervisor_todo"; 
     const TABLE_PROD = "craa5__aa_prd_schd"; 
     
+    const dataApiRef = useRef(dataApi); dataApiRef.current = dataApi;
     const [isLoading, setIsLoading] = useState(true);
+    const [loadIssues, setLoadIssues] = useState([]);
+    const [notice, setNotice] = useState(null);
+    const noticeTimer = useRef(null);
+    // On-page messages: alert() is blocked inside Power Apps frames.
+    const notify = (message, type = 'info') => {
+        setNotice({ message, type });
+        clearTimeout(noticeTimer.current);
+        noticeTimer.current = setTimeout(() => setNotice(null), type === 'error' ? 10000 : 4000);
+    };
     const [activeTab, setActiveTab] = useState("overview");
     const [currentShift, setCurrentShift] = useState(determineCurrentShift());
     const [currentTime, setCurrentTime] = useState(Date.now());
@@ -274,19 +334,27 @@ export default function ScheduleApp({ dataApi, ...props }) {
         let isMounted = true;
         const loadDashboardData = async () => {
             setIsLoading(true);
+            const api = dataApiRef.current;
+            const issues = [];
+            const load = async (label, names, q) => {
+                const rows = await queryRecords(names, api, q);
+                if (rows === null) { issues.push(`${label} could not be loaded`); return []; }
+                if (rows.length >= (q?.top || QUERY_LIMIT)) issues.push(`${label}: only the newest ${rows.length} rows are shown`);
+                return rows;
+            };
             try {
-                const allStaff = await fetchAllActiveRecords(TABLE_EMPLOYEE, dataApi);
-                const sups = allStaff?.filter(e => (e.craa5_role || e.craa5_Role) === 256000002) || [];
-                
-                const allTasks = await fetchAllActiveRecords(TABLE_TASK, dataApi);
-                const todoList = await fetchAllActiveRecords(TABLE_TODO, dataApi);
-                const schList = await fetchAllActiveRecords(TABLE_PROD, dataApi);
+                const hasApi = !!(safeGetXrm()?.WebApi || api?.queryTable);
+                let [allStaff, allTasks, todoList, schList, areaList] = await Promise.all([
+                    load("Employees", TABLE_EMPLOYEE, {}),
+                    load("Task assignments", TABLE_TASK, { orderby: "createdon desc" }),
+                    load("Delegated tasks", TABLE_TODO, { orderby: "createdon desc" }),
+                    load("Production schedule", TABLE_PROD, { orderby: "craa5_datestarttime desc" }),
+                    load("Areas", ["craa5__aa_areas", "craa5_aa_areas", "craa5_aa_mss_area"], {}),
+                ]);
+                const sups = allStaff.filter(e => (e.craa5_role || e.craa5_Role) === 256000002);
 
-                let areaList = await fetchAllActiveRecords("craa5__aa_areas", dataApi);
-                if (!areaList || areaList?.length === 0) areaList = await fetchAllActiveRecords("craa5_aa_areas", dataApi);
-                if (!areaList || areaList?.length === 0) areaList = await fetchAllActiveRecords("craa5_aa_mss_area", dataApi);
-
-                if (!allStaff?.length && !areaList?.length) {
+                if (!hasApi) {
+                    // Canvas preview only: no Dataverse API at all. Never used when a real API exists but a read failed.
                     console.log("Applying Mock Data for Canvas Preview");
                     areaList = [
                         { craa5_area: 'Breading', craa5_runsproduct: true },
@@ -294,27 +362,31 @@ export default function ScheduleApp({ dataApi, ...props }) {
                         { craa5_area: 'Packaging', craa5_runsproduct: true },
                         { craa5_area: 'Maintenance', craa5_runsproduct: false },
                     ];
-                    schList.push(
+                    schList = [
                         { craa5__aa_prd_schdid: '1', craa5_area: 'Breading', craa5_line: 1, craa5_productcode: 1001, craa5_product: 'Heavy Run', craa5_datestarttime: `${selectedDate}T06:00:00Z`, craa5_dateendtime: `${selectedDate}T14:00:00Z`, craa5_allergen: true },
                         { craa5__aa_prd_schdid: '2', craa5_area: 'Breading', craa5_line: 1, craa5_productcode: 1002, craa5_product: 'Maintenance', craa5_datestarttime: `${selectedDate}T18:00:00Z`, craa5_dateendtime: `${selectedDate}T22:00:00Z`, craa5_allergen: false }
-                    );
-                    allTasks.push(
+                    ];
+                    allTasks = [
                         { craa5_taskassignmentid: 't1', craa5_id: 'Doe, John', craa5_area: 'Breading', craa5_lead: 'Smith Team', craa5_team: 'Smith', craa5_percentagecomplete: 50, createdon: new Date(Date.now() - 4*3600000).toISOString(), craa5_shift: 'A' },
                         { craa5_taskassignmentid: 't2', craa5_id: 'Doe, John', craa5_area: 'Trash', craa5_lead: 'Smith Team', craa5_team: 'Smith', craa5_percentagecomplete: 100, createdon: new Date(Date.now() - 2*3600000).toISOString(), craa5_shift: 'A' },
                         { craa5_taskassignmentid: 't3', craa5_id: 'Roe, Jane', craa5_area: 'Fryer Line 1', craa5_lead: 'Jones Team', craa5_team: 'Jones', craa5_percentagecomplete: 100, createdon: new Date(Date.now() - 6*3600000).toISOString(), craa5_shift: 'A' }
-                    );
+                    ];
+                    issues.length = 0;
+                    issues.push("Preview mode: no Dataverse connection, showing sample data");
                 }
 
                 if (isMounted) {
-                    setEmployees(allStaff || []);
+                    setEmployees(allStaff);
                     setSupervisors(sups.sort((a, b) => (renderSafe(a.craa5_name) || "").localeCompare(renderSafe(b.craa5_name) || "")));
-                    setAreas(areaList || []);
-                    setAllAssignments(allTasks || []);
-                    setTodoTasks(todoList?.sort((a,b) => new Date(b.createdon) - new Date(a.createdon)) || []);
-                    setProdSchedules(schList || []);
+                    setAreas(areaList);
+                    setAllAssignments(allTasks);
+                    setTodoTasks(todoList);
+                    setProdSchedules(schList);
+                    setLoadIssues(issues);
                 }
             } catch (err) {
                 console.error("Dashboard Hydration Error", err);
+                if (isMounted) setLoadIssues([`Loading failed: ${err?.message || err}`]);
             } finally {
                 if (isMounted) setIsLoading(false);
             }
@@ -322,7 +394,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
 
         loadDashboardData();
         return () => { isMounted = false; };
-    }, [dataApi]);
+    }, []);   // once: Power Apps re-sends props often, and a reload would wipe unsaved form input
 
     const dailyAssignments = useMemo(() => {
         return allAssignments?.filter(t => getTaskDate(t) === selectedDate) || [];
@@ -384,10 +456,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
     }, [liveCurrentShiftAssignments]);
 
     const activeProductionLines = useMemo(() => {
-        const prodFromTable = areas?.filter(a => {
-            const isProd = a.craa5_runsproduct || a.craa5_RunsProduct || a.craa5_production || a.craa5_Production || a.craa5_isproduction || a.craa5_IsProduction;
-            return isProd === true || isProd === 1 || String(isProd).toLowerCase() === 'yes' || String(isProd).toLowerCase() === 'true' || a.craa5_type === 256000000; 
-        }) || [];
+        const prodFromTable = areas?.filter(isProductionArea) || [];
 
         const todaySchedules = prodSchedules?.filter(t => {
             const sd = new Date(t.craa5_datestarttime || t.craa5_Datestarttime || t.craa5_starttime); 
@@ -607,7 +676,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
     // ========================================================================
     const handleCopyGanttImage = async () => {
         if (!ganttRef.current || typeof window.html2canvas === 'undefined') {
-            alert("Image capture library is still loading. Please try again in a moment.");
+            notify("Image capture library is still loading. Please try again in a moment.", "error");
             return;
         }
         setIsCopyingGantt(true);
@@ -622,7 +691,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
                 try {
                     const item = new ClipboardItem({ "image/png": blob });
                     await navigator.clipboard.write([item]);
-                    alert("Gantt chart copied to clipboard as an image!");
+                    notify("Gantt chart copied to clipboard as an image.", "success");
                 } catch (err) {
                     console.warn("Clipboard API blocked, falling back to download.", err);
                     const url = URL.createObjectURL(blob);
@@ -635,7 +704,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
             }, 'image/png');
         } catch (err) {
             console.error("Failed to generate image", err);
-            alert("Failed to copy image: " + err.message);
+            notify("Failed to copy image: " + err.message, "error");
         } finally {
             setIsCopyingGantt(false);
         }
@@ -652,7 +721,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
             : activeGanttModalDataRaw;
         
         if (targetData.length === 0) {
-            alert("No data available for this shift or filter.");
+            notify("No data available for this shift or filter.", "error");
             return;
         }
 
@@ -672,10 +741,10 @@ export default function ScheduleApp({ dataApi, ...props }) {
         });
 
         navigator.clipboard.writeText(tsv).then(() => {
-            alert("Data copied to clipboard! You can now press Ctrl+V to paste directly into Excel.");
+            notify("Data copied. Press Ctrl+V to paste it into Excel.", "success");
         }).catch(err => {
             console.error("Clipboard copy failed", err);
-            alert("Failed to copy text. Your browser may be blocking clipboard access.");
+            notify("Failed to copy text. Your browser may be blocking clipboard access.", "error");
         });
     };
 
@@ -735,8 +804,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
         const baseEndMs = baseStartMs + (ganttZoomDays * 24 * 3600000);
 
         areas?.forEach(a => {
-            const runsProd = a.craa5_runsproduct || a.craa5_RunsProduct || a.craa5_production || a.craa5_Production || a.craa5_isproduction || a.craa5_IsProduction;
-            if (runsProd === true || runsProd === 1 || String(runsProd).toLowerCase() === 'yes' || String(runsProd).toLowerCase() === 'true' || a.craa5_type === 256000000) {
+            if (isProductionArea(a)) {
                 const areaLineStr = getAreaLine(a); 
                 if (!map[areaLineStr]) map[areaLineStr] = [];
             }
@@ -761,10 +829,10 @@ export default function ScheduleApp({ dataApi, ...props }) {
     }, [prodSchedules, selectedDate, ganttZoomDays, areas]);
 
     const handleCreateTask = async () => {
-        if (!taskPayload.title || !taskPayload.supervisorEmail) { alert("Provide a task title and supervisor."); return; }
+        if (!taskPayload.title || !taskPayload.supervisorEmail) { notify("Provide a task title and supervisor.", "error"); return; }
+        const writeApi = getWriteApi(dataApiRef.current);
+        if (!writeApi) { notify("Can't save: no Dataverse write connection in this environment.", "error"); return; }
         setIsSubmittingTask(true);
-        const writeApi = dataApi?.createRecord ? dataApi : safeGetXrm()?.WebApi;
-        if (!writeApi) { alert("No Write API available."); setIsSubmittingTask(false); return; }
 
         try {
             const logicalPayload = {
@@ -776,13 +844,15 @@ export default function ScheduleApp({ dataApi, ...props }) {
             };
             if (taskPayload.expectationDate) logicalPayload.craa5_expectationfortimeframe = taskPayload.expectationDate;
 
-            let result = await writeApi.createRecord(TABLE_TODO, logicalPayload);
-            
-            setTodoTasks(prev => [{ craa5__supervisor_todoid: result?.id || Math.random().toString(), ...logicalPayload }, ...prev]);
+            const newId = await writeApi.create(TABLE_TODO, logicalPayload);
+            if (!newId) throw new Error("Dataverse didn't return a record id");
+
+            setTodoTasks(prev => [{ craa5__supervisor_todoid: newId, createdon: new Date().toISOString(), ...logicalPayload }, ...prev]);
+            notify("Task assigned.", "success");
             setIsTaskDialogOpen(false);
             setTaskPayload({ title: "", description: "", supervisorEmail: "", expectationDate: "" });
         } catch (err) {
-            console.error("Task Delegation Error:", err); alert(`Failed to assign task.`);
+            console.error("Task Delegation Error:", err); notify(`Failed to assign task: ${err?.message || err}`, "error");
         } finally { setIsSubmittingTask(false); }
     };
 
@@ -827,22 +897,21 @@ export default function ScheduleApp({ dataApi, ...props }) {
             return; 
         }
         setSchSubmitStatus(null);
-        setIsSubmittingSch(true);
-        const writeApi = dataApi?.createRecord ? dataApi : safeGetXrm()?.WebApi;
+        const writeApi = getWriteApi(dataApiRef.current);
         if (!writeApi) { 
-            setSchSubmitStatus({ type: 'error', message: 'No Dataverse Write API available in this environment. (Preview Mode)' });
-            setIsSubmittingSch(false); 
+            setSchSubmitStatus({ type: 'error', message: 'No Dataverse write connection in this environment (preview mode). Nothing was saved.' });
             return; 
         }
+        setIsSubmittingSch(true);
 
         try {
-            let ops = [];
+            const runs = [];
             const baseStart = new Date(`${schPayload.startDate}T${schPayload.startTime}:00`);
             const baseEnd = new Date(`${schPayload.endDate}T${schPayload.endTime}:00`);
             const durationMs = baseEnd.getTime() - baseStart.getTime();
 
-            const buildAndSendPayload = (sTime, eTime) => {
-                const logicalPayload = {
+            const buildPayload = (sTime, eTime) => {
+                return {
                     craa5_area: schPayload.area,
                     craa5_line: parseInt(schPayload.line, 10) || 1,
                     craa5_productcode: parseInt(schPayload.productCode, 10) || null,
@@ -853,16 +922,14 @@ export default function ScheduleApp({ dataApi, ...props }) {
                     craa5_crumbclean: schPayload.crumbClean,
                     craa5_typeofallergen: schPayload.allergen ? schPayload.typeOfAllergen : ""
                 };
-                return writeApi.createRecord(TABLE_PROD, logicalPayload).then(res => ({id: res?.id, ...logicalPayload}));
             };
 
             if (schPayload.isRecurring) {
                 if (schPayload.recurType === 'daily') {
                     const daysToLoop = parseInt(schPayload.recurDays, 10) || 1;
                     for (let i = 0; i < daysToLoop; i++) {
-                        const curStart = new Date(baseStart.getTime() + (i * 86400000));
-                        const curEnd = new Date(curStart.getTime() + durationMs);
-                        ops.push(buildAndSendPayload(curStart, curEnd));
+                        const curStart = addDaysLocal(baseStart, i);
+                        runs.push(buildPayload(curStart, new Date(curStart.getTime() + durationMs)));
                     }
                 } else if (schPayload.recurType === 'weekly') {
                     const targetDow = parseInt(schPayload.recurDayOfWeek, 10);
@@ -870,18 +937,32 @@ export default function ScheduleApp({ dataApi, ...props }) {
                     let curStart = new Date(baseStart);
                     while (curStart.getDay() !== targetDow) curStart.setDate(curStart.getDate() + 1);
                     while (curStart <= endOfYear) {
-                        const curEnd = new Date(curStart.getTime() + durationMs);
-                        ops.push(buildAndSendPayload(curStart, curEnd));
-                        curStart.setDate(curStart.getDate() + 7);
+                        runs.push(buildPayload(curStart, new Date(curStart.getTime() + durationMs)));
+                        curStart = addDaysLocal(curStart, 7);
                     }
                 }
             } else {
-                ops.push(buildAndSendPayload(baseStart, baseEnd));
+                runs.push(buildPayload(baseStart, baseEnd));
             }
 
-            const results = await Promise.all(ops);
-            setProdSchedules(p => [...p, ...results]);
-            setSchSubmitStatus({ type: 'success', message: `Successfully scheduled ${ops.length} production run(s).` });
+            // One at a time: every saved run is shown straight away, and a failure stops cleanly with a count
+            // instead of leaving unseen rows behind a "failed" message.
+            const saved = [];
+            let failure = null;
+            for (const run of runs) {
+                try {
+                    const newId = await writeApi.create(TABLE_PROD, run);
+                    if (!newId) throw new Error("Dataverse didn't return a record id");
+                    saved.push({ craa5__aa_prd_schdid: newId, ...run });
+                } catch (err) { failure = err; break; }
+            }
+            if (saved.length) setProdSchedules(p => [...p, ...saved]);
+            if (failure) {
+                console.error(failure);
+                setSchSubmitStatus({ type: 'error', message: `Saved ${saved.length} of ${runs.length} runs, then failed: ${failure.message || failure}. The saved runs are on the schedule; check before saving again.` });
+                return;
+            }
+            setSchSubmitStatus({ type: 'success', message: `Successfully scheduled ${saved.length} production run(s).` });
             setTimeout(() => {
                 setSchPayload({ 
                     area: "", line: "1", productCode: "", product: "", 
@@ -901,7 +982,8 @@ export default function ScheduleApp({ dataApi, ...props }) {
 
     const handleUpdateSchedule = async () => {
         if (!editSchData) return;
-        const writeApi = dataApi?.updateRecord ? dataApi : safeGetXrm()?.WebApi;
+        const writeApi = getWriteApi(dataApiRef.current);
+        if (!writeApi) { notify("Can't save: no Dataverse write connection in this environment. Nothing was changed.", "error"); return; }
         try {
             const sTime = new Date(`${editSchData.startDate}T${editSchData.startTime}:00`).toISOString();
             const eTime = new Date(`${editSchData.endDate}T${editSchData.endTime}:00`).toISOString();
@@ -915,11 +997,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
                 craa5_product: editSchData.product
             };
 
-            if (writeApi) {
-                await writeApi.updateRecord(TABLE_PROD, id, logicalPayload); 
-            } else {
-                console.warn("Preview Mode: Updating local state only.");
-            }
+            await writeApi.update(TABLE_PROD, id, logicalPayload);
             
             setProdSchedules(prev => prev.map(s => {
                 const sId = s.craa5__aa_prd_schdid || s.craa5_aa_prd_schdid;
@@ -936,7 +1014,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
             }));
             setEditSchOpen(false);
             setIsConfirmingDelete(false);
-        } catch(e) { console.error(e); alert("Failed to update schedule time: " + e.message); }
+        } catch(e) { console.error(e); notify("Failed to update schedule: " + (e?.message || e), "error"); }
     };
 
     const handleDragDropSchedule = async (schId, targetDateObj) => {
@@ -951,9 +1029,10 @@ export default function ScheduleApp({ dataApi, ...props }) {
         const newEnd = new Date(oldEnd.getTime() + diffTimeMs);
         const sTime = newStart.toISOString();
         const eTime = newEnd.toISOString();
-        const writeApi = dataApi?.updateRecord ? dataApi : safeGetXrm()?.WebApi;
+        const writeApi = getWriteApi(dataApiRef.current);
+        if (!writeApi) { notify("Can't move: no Dataverse write connection in this environment. Nothing was changed.", "error"); return; }
         try {
-            if (writeApi) await writeApi.updateRecord(TABLE_PROD, schId, { craa5_datestarttime: sTime, craa5_dateendtime: eTime });
+            await writeApi.update(TABLE_PROD, schId, { craa5_datestarttime: sTime, craa5_dateendtime: eTime });
             setProdSchedules(prev => prev.map(s => {
                 const sId = s.craa5__aa_prd_schdid || s.craa5_aa_prd_schdid;
                 if (sId === schId) {
@@ -964,21 +1043,22 @@ export default function ScheduleApp({ dataApi, ...props }) {
                 }
                 return s;
             }));
-        } catch(e) { console.error("Drag Drop Update Error", e); alert("Failed to move schedule: " + e.message); }
+        } catch(e) { console.error("Drag Drop Update Error", e); notify("Failed to move schedule: " + (e?.message || e), "error"); }
     };
 
     const handleDeleteSchedule = async () => {
         if (!editSchData) return;
-        const writeApi = dataApi?.deleteRecord ? dataApi : safeGetXrm()?.WebApi;
+        const writeApi = getWriteApi(dataApiRef.current);
+        if (!writeApi) { notify("Can't delete: no Dataverse write connection in this environment. Nothing was changed.", "error"); return; }
         try {
-            if (writeApi) await writeApi.deleteRecord(TABLE_PROD, editSchData.id); 
+            await writeApi.remove(TABLE_PROD, editSchData.id);
             setProdSchedules(prev => prev.filter(s => {
                 const sId = s.craa5__aa_prd_schdid || s.craa5_aa_prd_schdid;
                 return sId !== editSchData.id;
             }));
             setEditSchOpen(false);
             setIsConfirmingDelete(false);
-        } catch(e) { console.error("Deletion Error:", e); alert("Failed to delete record: " + e.message); }
+        } catch(e) { console.error("Deletion Error:", e); notify("Failed to delete record: " + (e?.message || e), "error"); }
     };
 
     const openEditDialog = (sch) => {
@@ -1716,10 +1796,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
                                     className="w-full border border-gray-300 rounded-md py-2 px-3 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
                                 >
                                     <option value="">Select...</option>
-                                    {areas.filter(a => {
-                                        const isP = a.craa5_runsproduct || a.craa5_RunsProduct;
-                                        return isP === true || isP === 1 || String(isP).toLowerCase() === 'yes' || String(isP).toLowerCase() === 'true';
-                                    }).map(area => (
+                                    {areas.filter(isProductionArea).map(area => (
                                         <option key={area.craa5_area || area.craa5_name || Math.random()} value={renderSafe(area.craa5_area || area.craa5_name)}>
                                             {renderSafe(area.craa5_area || area.craa5_name)}
                                         </option>
@@ -1965,6 +2042,16 @@ export default function ScheduleApp({ dataApi, ...props }) {
                    </select>
                 </div>
 
+                {notice && (
+                    <div role="status" className={`fixed top-4 right-4 z-50 max-w-sm px-4 py-3 rounded-lg shadow-lg border text-sm font-medium ${notice.type === 'error' ? 'bg-red-50 border-red-200 text-red-800' : notice.type === 'success' ? 'bg-green-50 border-green-200 text-green-800' : 'bg-blue-50 border-blue-200 text-blue-800'}`}>
+                        {notice.message}
+                    </div>
+                )}
+                {loadIssues.length > 0 && (
+                    <div className="mx-4 md:mx-8 mt-4 px-4 py-3 rounded-lg border border-amber-300 bg-amber-50 text-amber-900 text-sm">
+                        <span className="font-bold">Data check: </span>{loadIssues.join(' · ')}
+                    </div>
+                )}
                 <div className="p-4 md:p-8 max-w-[1600px] mx-auto">
                     {activeTab === 'overview' && renderOverviewTab()}
                     {activeTab === 'shifts' && renderShiftsTab()}
