@@ -3,8 +3,9 @@ import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react'
 /*
   =============================================================================
   === EXCEL-STYLE HIGH-PERFORMANCE GRID (V9) ===
-  0. Id-first matching: logs attach to equipment by Dataverse id; text matching is a fallback
-     that only runs when Sync is pressed. Amber markers = text-matched. Unmapped logs are listed in Diagnostics.
+  0. Id-first matching: logs attach to equipment by Dataverse id; logs whose stored id matches no
+     equipment row fall back to the equipment name (and room/area when names repeat). Amber markers =
+     text-matched. Logs load per visible equipment and month, never the whole table.
   1. Area Pagination (New): When expanded, Areas now limit equipment to 10 items.
      Individual "Next" buttons added per Area to navigate large equipment sets.
   2. Room Pagination: Main view continues to handle top-level Room pagination (5 per page).
@@ -79,8 +80,8 @@ const normalizeDateStr = (d) => {
 
 // --- ID-FIRST MATCHING ---
 // Logs (craa5__log_) are attached to equipment by Dataverse id: craa5_equipmentguid holds the
-// craa5_aa_assetsid of the equipment row in craa5_aa_assets. Text matching is only a fallback, and it
-// is only computed when the user runs Sync (see computeTextLinks).
+// craa5_aa_assetsid of the equipment row in craa5_aa_assets. Text matching is only a fallback, used when
+// the stored id is blank or matches no equipment row (see computeTextLinks).
 const LOG_ASSET_ID_FIELDS = ['craa5_equipmentguid'];
 const LOG_ASSET_ID_SELECT = 'craa5_equipmentguid';
 
@@ -99,7 +100,7 @@ const getLogKey = (log) => normalizeId(getRaw(log, 'craa5__log_id') || getRaw(lo
   `${normalizeName(safeString(getProp(log, 'craa5_equipment')))}|${normalizeDateStr(getRaw(log, 'craa5_lastcleaned'))}`;
 
 // Builds { byAsset: Map<assetId, Map<dateStr, {log, via}>>, unmapped, stats }.
-// textLinks (Map<logKey, assetId>) comes from the last Sync and is never recomputed here.
+// textLinks (Map<logKey, assetId>) holds the text fallback, computed once when a log is loaded.
 const buildCompletionIndex = (assets, logs, textLinks) => {
   const assetIds = new Set(assets.map(getAssetId));
   const byAsset = new Map();
@@ -138,22 +139,33 @@ const buildCompletionIndex = (assets, logs, textLinks) => {
   return { byAsset, unmapped, stats };
 };
 
-// Text fallback, run only on Sync and only for logs the id match left unmapped.
-// Exact normalized name first; containment only when it points at exactly one asset, so
-// "Oven 1" can no longer swallow "Oven 12". Ambiguous names stay unmapped.
-const computeTextLinks = (assets, logs) => {
-  const links = new Map();
-  const { unmapped } = buildCompletionIndex(assets, logs, null);
-  const named = assets.map(a => ({ id: getAssetId(a), norm: normalizeName(safeString(getProp(a, 'craa5_equipmentidentifier'))) })).filter(a => a.id && a.norm);
+// Text fallback for logs whose equipment id matches no equipment row (for example ids copied from an
+// older equipment table). Exact normalized name first, then a name contained in exactly one equipment
+// name; when several equipment share a name ("Floors"), the log's own room and area text decides.
+// Ambiguous names stay unmapped, so "Oven 1" can no longer swallow "Oven 12".
+const buildTextIndex = (assets) => {
+  const named = assets.map(a => ({
+    id: getAssetId(a),
+    norm: normalizeName(safeString(getProp(a, 'craa5_equipmentidentifier'))),
+    where: `${normalizeName(safeString(getProp(a, 'craa5_roomname')))}|${normalizeName(safeString(getProp(a, 'craa5_areaname')))}`
+  })).filter(a => a.id && a.norm);
   const byName = new Map();
   named.forEach(a => byName.set(a.norm, (byName.get(a.norm) || []).concat(a)));
-  unmapped.forEach(log => {
+  return { named, byName, ids: new Set(assets.map(getAssetId)) };
+};
+
+const computeTextLinks = (index, logs) => {
+  const links = new Map();
+  logs.forEach(log => {
+    if (LOG_ASSET_ID_FIELDS.some(f => index.ids.has(normalizeId(getRaw(log, f))))) return; // matched by id
     const n = normalizeName(safeString(getProp(log, 'craa5_equipment')));
     if (!n) return;
-    const exact = byName.get(n) || [];
+    const where = `${normalizeName(safeString(getProp(log, 'craa5_room')))}|${normalizeName(safeString(getProp(log, 'craa5_area')))}`;
+    const narrow = (list) => { if (list.length <= 1) return list; const same = list.filter(a => a.where === where); return same.length === 1 ? same : list; };
+    const exact = narrow(index.byName.get(n) || []);
     if (exact.length === 1) { links.set(getLogKey(log), exact[0].id); return; }
     if (exact.length > 1 || n.length < 3) return;
-    const loose = named.filter(a => a.norm.length >= 3 && (a.norm.includes(n) || n.includes(a.norm)));
+    const loose = narrow(index.named.filter(a => a.norm.length >= 3 && (a.norm.includes(n) || n.includes(a.norm))));
     if (loose.length === 1) links.set(getLogKey(log), loose[0].id);
   });
   return links;
@@ -185,19 +197,25 @@ const writeBackTextLinks = async (logs, links) => {
 
 // --- ON-DEMAND LOADING ---
 // There are thousands of pieces of equipment, so nothing here loads the whole log table. Sync loads the
-// equipment directory (four small columns) plus the few logs that have no equipment id yet; the logs that
-// do have an id are fetched only for the equipment rows and months currently on screen.
+// equipment directory (four small columns); logs are fetched only for the equipment rows and months
+// currently on screen: by equipment name (which also finds logs whose stored id is stale) and, once the
+// stored ids are seen to match, by equipment id.
 const LOG_SELECT = "craa5__log_id,craa5_equipment,craa5_lastcleaned,craa5_lastcleanedby,craa5_nameofemployee,craa5_uid,craa5_sap,craa5_hoursworked,craa5_room,craa5_area";
 const ASSET_SELECT = "craa5_aa_assetsid,craa5_equipmentidentifier,craa5_roomname,craa5_areaname";
 const PAGE_SIZE = 1000;          // rows per Dataverse page
 const ID_CHUNK = 15;             // equipment ids per log request
+const NAME_CHUNK = 20;           // equipment names per log request
 const MAX_PARALLEL_REQUESTS = 3; // log requests in flight at once
-const MAX_ASSETS = 50000;        // safety caps; a truncated load is reported, never silent
-const MAX_UNLINKED_LOGS = 10000;
+const MAX_ASSETS = 50000;        // safety cap; a truncated load is reported, never silent
+const MAX_LOGS_PER_REQUEST = 20000;
 const MODAL_PAGE_SIZE = 25;      // equipment rows per area in the focused dialog
 
 const isMissingColumnError = (err) => /could not find a property|0x80060888|does not exist|invalid property/i.test(String(err && err.message));
 const isGuid = (v) => /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(v);
+// Quote-escape, and percent-encode the characters that would otherwise cut the query string short.
+const odataString = (v) => String(v).replace(/'/g, "''").replace(/%/g, '%25').replace(/&/g, '%26').replace(/#/g, '%23').replace(/\+/g, '%2B');
+// "Gyro Mixer (+)" -> "Gyro Mixer": a log may carry the name without the trailing note in brackets.
+const nameBase = (name) => { let n = String(name || '').trim(); let prev; do { prev = n; n = n.replace(/\s*\([^)]*\)\s*$/, '').trim(); } while (n !== prev); return n; };
 
 const retrievePaged = async (entity, query, maxRows) => {
   let res = await Xrm.WebApi.retrieveMultipleRecords(entity, query, PAGE_SIZE);
@@ -221,23 +239,19 @@ const fetchLogsForAssets = async (assetIds, year, firstMonth, lastMonth) => {
   const ids = assetIds.filter(isGuid);
   if (!ids.length) return [];
   const idFilter = ids.map(id => `${LOG_ASSET_ID_SELECT} eq '${id}'`).join(' or ');
-  const { rows } = await retrievePaged("craa5__log_", `?$select=${LOG_SELECT},${LOG_ASSET_ID_SELECT}&$filter=(${idFilter}) and ${monthsFilter(year, firstMonth, lastMonth)}`, 20000);
+  const { rows } = await retrievePaged("craa5__log_", `?$select=${LOG_SELECT},${LOG_ASSET_ID_SELECT}&$filter=(${idFilter}) and ${monthsFilter(year, firstMonth, lastMonth)}`, MAX_LOGS_PER_REQUEST);
   return rows;
 };
 
-// Logs with no equipment id yet: the only ones the text fallback can help. When the id column does not
-// exist at all, every log in the window is a candidate (text matching only).
-const fetchUnlinkedLogs = async (year, firstMonth, lastMonth) => {
-  const window = monthsFilter(year, firstMonth, lastMonth);
-  try {
-    const { rows, truncated } = await retrievePaged("craa5__log_", `?$select=${LOG_SELECT},${LOG_ASSET_ID_SELECT}&$filter=${LOG_ASSET_ID_SELECT} eq null and ${window}`, MAX_UNLINKED_LOGS);
-    return { rows, truncated, idColumn: true };
-  } catch (err) {
-    // Only a missing column justifies dropping the id; anything else (throttling, network) is a real failure.
-    if (!isMissingColumnError(err)) throw err;
-    const { rows, truncated } = await retrievePaged("craa5__log_", `?$select=${LOG_SELECT}&$filter=${window}`, MAX_UNLINKED_LOGS);
-    return { rows, truncated, idColumn: false, error: err.message };
-  }
+// Logs whose equipment text equals one of these names (case-insensitive, exact: a prefix match would
+// pull in "Oven 12" for "Oven 1") in the given month run. Matching to equipment (id first, then name)
+// happens afterwards on the client.
+const fetchLogsByName = async (names, year, firstMonth, lastMonth, withId) => {
+  if (!names.length) return [];
+  const nameFilter = names.map(n => `craa5_equipment eq '${odataString(n)}'`).join(' or ');
+  const select = withId ? `${LOG_SELECT},${LOG_ASSET_ID_SELECT}` : LOG_SELECT;
+  const { rows } = await retrievePaged("craa5__log_", `?$select=${select}&$filter=(${nameFilter}) and ${monthsFilter(year, firstMonth, lastMonth)}`, MAX_LOGS_PER_REQUEST);
+  return rows;
 };
 
 // Contiguous runs of month indexes: [3,4,5,8] -> [[3,5],[8,8]].
@@ -289,24 +303,30 @@ export default function App() {
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
   
   const [expandedKeys, setExpandedKeys] = useState({});
-  const [textLinks, setTextLinks] = useState(new Map()); // log key -> asset id, set only by Sync
+  const [textLinks, setTextLinks] = useState(new Map()); // log key -> asset id, for logs matched by name
   const [syncNotes, setSyncNotes] = useState([]);
   const [canWriteBack, setCanWriteBack] = useState(false); // false when the log id column is missing
   const [isSaving, setIsSaving] = useState(false);
   const [idColumn, setIdColumn] = useState(true);       // false when craa5_equipmentguid does not exist on the log table
-  const [syncWindow, setSyncWindow] = useState(null);   // { year, firstMonth, lastMonth } the last Sync text-matched
+  const [idHealthy, setIdHealthy] = useState(false);       // true once a loaded log's stored id matches an equipment row
   const [logsLoading, setLogsLoading] = useState(false);
   const [loadErrors, setLoadErrors] = useState([]);
   const [modalPages, setModalPages] = useState({});     // "room|area" -> page in the focused dialog
   const epochRef = useRef(0);                           // bumped by Sync so late responses are ignored
-  const loadedRef = useRef(new Set());                  // "year|month|assetId" already fetched
+  const loadedRef = useRef(new Set());                  // "kind|year|month|item" already fetched
   const inflightRef = useRef(new Set());
   const logKeysRef = useRef(new Set());
   const pendingLogsRef = useRef([]);                    // loaded rows waiting for one batched state update
+  const pendingLinksRef = useRef(new Map());            // their text links
   const flushTimerRef = useRef(null);
 
   // Id match is re-derived from loaded data; the text fallback only changes when Sync runs.
   const completionIndex = useMemo(() => buildCompletionIndex(assets, logs, textLinks), [assets, logs, textLinks]);
+  const textIndex = useMemo(() => buildTextIndex(assets), [assets]);
+  const assetsById = useMemo(() => new Map(assets.map(a => [getAssetId(a), a])), [assets]);
+  const latestRef = useRef({});
+  latestRef.current = { textIndex, idColumn };
+  const idHealthyRef = useRef(false);
 
   const today = useMemo(() => new Date(), []);
 
@@ -355,23 +375,26 @@ export default function App() {
   // re-renders the grid, and doing that once per request is what makes a large grid stutter.
   const flushLogs = useCallback(() => {
     if (flushTimerRef.current) { clearTimeout(flushTimerRef.current); flushTimerRef.current = null; }
-    const batch = pendingLogsRef.current;
+    const batch = pendingLogsRef.current, links = pendingLinksRef.current;
     pendingLogsRef.current = [];
+    pendingLinksRef.current = new Map();
+    if (links.size) setTextLinks(prev => { const next = new Map(prev); links.forEach((v, k) => next.set(k, v)); return next; });
     if (batch.length) setLogs(prev => prev.concat(batch));
   }, []);
 
-  const addLogs = useCallback((rows) => {
+  const addLogs = useCallback((rows, links) => {
     rows.forEach(l => {
       const k = getLogKey(l);
       if (logKeysRef.current.has(k)) return;
       logKeysRef.current.add(k);
       pendingLogsRef.current.push(l);
+      if (links && links.has(k)) pendingLinksRef.current.set(k, links.get(k));
     });
     if (pendingLogsRef.current.length && !flushTimerRef.current) flushTimerRef.current = setTimeout(flushLogs, 250);
   }, [flushLogs]);
 
-  // Sync loads the equipment directory and the logs that still have no equipment id (the only ones the
-  // text fallback can help), for the months on screen. Id-matched logs are loaded per visible equipment.
+  // Sync loads the equipment directory only (four small columns) and checks the log table has the id column.
+  // Logs are then loaded per visible equipment and month by the loader below.
   const triggerSync = async () => {
     if (isLoading) return;
     setIsLoading(true);
@@ -382,21 +405,20 @@ export default function App() {
       let fetchedLogs = [];
       const notes = [];
       let hasIdColumn = typeof Xrm !== 'undefined';
-      const months = visibleMonths.length ? visibleMonths : [today.getMonth()];
-      const firstMonth = Math.min(...months);
-      const lastMonth = Math.max(...months);
-
       if (typeof Xrm !== 'undefined') {
         const a = await retrievePaged("craa5_aa_assets", `?$select=${ASSET_SELECT}`, MAX_ASSETS);
         fetchedAssets = a.rows;
         if (a.truncated) notes.push(`Only the first ${fetchedAssets.length} equipment rows were loaded.`);
-        setLoadProgress(40);
+        setLoadProgress(50);
 
-        const u = await fetchUnlinkedLogs(anchorYear, firstMonth, lastMonth);
-        fetchedLogs = u.rows;
-        hasIdColumn = u.idColumn;
-        if (u.truncated) notes.push(`Only the first ${fetchedLogs.length} logs without an equipment id were loaded for text matching.`);
-        if (!u.idColumn) notes.push(`Log id column ${LOG_ASSET_ID_SELECT} unavailable (${u.error}); using text matching only for ${MONTHS[firstMonth]} to ${MONTHS[lastMonth]}.`);
+        // Does the log table have the equipment id column at all? (One row, no data used.)
+        try {
+          await Xrm.WebApi.retrieveMultipleRecords("craa5__log_", `?$select=${LOG_ASSET_ID_SELECT}&$top=1`);
+        } catch (err) {
+          if (!isMissingColumnError(err)) throw err;
+          hasIdColumn = false;
+          notes.push(`Log id column ${LOG_ASSET_ID_SELECT} unavailable (${err.message}); logs are matched by equipment name only.`);
+        }
       } else {
         setLoadProgress(40);
         // Simulation with many items to test equipment pagination
@@ -414,8 +436,8 @@ export default function App() {
       }
 
       setLoadProgress(80);
-      // Text fallback runs here, and only here: it is what "Sync" adds on top of the id match.
-      const links = computeTextLinks(fetchedAssets, fetchedLogs);
+      // Simulation only: with a real Dataverse, logs (and their text matches) arrive per visible equipment below.
+      const links = computeTextLinks(buildTextIndex(fetchedAssets), fetchedLogs);
 
       // Swap the loader state together with the data. Requests started before this point finish into the
       // old sets and are ignored (epoch), so nothing half-loaded survives a Sync.
@@ -424,6 +446,7 @@ export default function App() {
       inflightRef.current = new Set();
       queueRef.current = [];
       pendingLogsRef.current = [];
+      pendingLinksRef.current = new Map();
       if (flushTimerRef.current) { clearTimeout(flushTimerRef.current); flushTimerRef.current = null; }
       logKeysRef.current = new Set(fetchedLogs.map(getLogKey));
       setLogsLoading(false);
@@ -434,7 +457,8 @@ export default function App() {
       setLoadErrors([]);
       setCanWriteBack(hasIdColumn);
       setIdColumn(hasIdColumn);
-      setSyncWindow({ year: anchorYear, firstMonth, lastMonth });
+      idHealthyRef.current = false;
+      setIdHealthy(false);
 
       const initialExpands = {};
       fetchedAssets.forEach(a => {
@@ -532,7 +556,7 @@ export default function App() {
     return () => clearTimeout(t);
   });
 
-  const jobKeys = (job) => job.ids.flatMap(id => { const k = []; for (let m = job.m0; m <= job.m1; m++) k.push(`${job.year}|${m}|${id}`); return k; });
+  const jobKeys = (job) => job.items.flatMap(item => { const k = []; for (let m = job.m0; m <= job.m1; m++) k.push(`${job.kind}|${job.year}|${m}|${item}`); return k; });
 
   // One global pump: at most MAX_PARALLEL_REQUESTS log requests in flight no matter how often the view changes.
   pumpRef.current = () => {
@@ -541,10 +565,22 @@ export default function App() {
       activeRef.current += 1;
       (async () => {
         try {
-          const rows = await fetchLogsForAssets(job.ids, job.year, job.m0, job.m1);
+          const rows = job.kind === 'name'
+            ? await fetchLogsByName(job.items, job.year, job.m0, job.m1, latestRef.current.idColumn)
+            : await fetchLogsForAssets(job.items, job.year, job.m0, job.m1);
           if (epochRef.current === job.epoch) {
             jobKeys(job).forEach(k => job.loaded.add(k));
-            addLogs(rows);
+            let links = null;
+            if (job.kind === 'name') {
+              const { textIndex: index } = latestRef.current;
+              links = computeTextLinks(index, rows);
+              // As soon as one stored id matches an equipment row, ids can be trusted and are queried directly too.
+              if (!idHealthyRef.current && rows.some(r => index.ids.has(normalizeId(getRaw(r, LOG_ASSET_ID_SELECT))))) {
+                idHealthyRef.current = true;
+                setIdHealthy(true);
+              }
+            }
+            addLogs(rows, links);
           }
         } catch (err) {
           if (epochRef.current === job.epoch) setLoadErrors(prev => prev.concat(String(err && err.message)).slice(-5));
@@ -562,38 +598,50 @@ export default function App() {
   };
 
   // Fetch logs for the equipment on screen, for the visible months only, and never twice.
+  //  - 'name' jobs always run: they find logs by the equipment name written on them, which also catches
+  //    logs whose stored id is blank or stale (matched to equipment on the client, id first).
+  //  - 'id' jobs run once stored ids are seen to match equipment rows, to catch renamed equipment.
   useEffect(() => {
     // Requests that have not started are dropped and recomputed from what is on screen now.
     queueRef.current.forEach(j => jobKeys(j).forEach(k => j.inflight.delete(k)));
     queueRef.current = [];
-    if (typeof Xrm === 'undefined' || !idColumn || isLoading) { pumpRef.current(); return; }
+    if (typeof Xrm === 'undefined' || isLoading) { pumpRef.current(); return; }
     const ids = visibleKey ? visibleKey.split(',') : [];
     if (ids.length && visibleMonths.length) {
       const loaded = loadedRef.current, inflight = inflightRef.current, epoch = epochRef.current, year = anchorYear;
-      const keyOf = (id, m) => `${year}|${m}|${id}`;
-      // Group equipment by which months they are missing, so cached months are never requested again.
-      const bySignature = new Map();
-      ids.forEach(id => {
-        const missing = visibleMonths.filter(m => !loaded.has(keyOf(id, m)) && !inflight.has(keyOf(id, m)));
-        if (missing.length) {
-          const sig = [...missing].sort((a, b) => a - b).join(',');
-          bySignature.set(sig, (bySignature.get(sig) || []).concat(id));
-        }
-      });
-      bySignature.forEach((sigIds, sig) => {
-        monthRuns(sig.split(',').map(Number)).forEach(([m0, m1]) => {
-          for (let i = 0; i < sigIds.length; i += ID_CHUNK) {
-            const job = { ids: sigIds.slice(i, i + ID_CHUNK), m0, m1, year, epoch, loaded, inflight };
-            jobKeys(job).forEach(k => inflight.add(k));
-            queueRef.current.push(job);
+      const queueKind = (kind, items, chunk) => {
+        const keyOf = (item, m) => `${kind}|${year}|${m}|${item}`;
+        // Group items by which months they are missing, so cached months are never requested again.
+        const bySignature = new Map();
+        items.forEach(item => {
+          const missing = visibleMonths.filter(m => !loaded.has(keyOf(item, m)) && !inflight.has(keyOf(item, m)));
+          if (missing.length) {
+            const sig = [...missing].sort((x, y) => x - y).join(',');
+            bySignature.set(sig, (bySignature.get(sig) || []).concat(item));
           }
         });
+        bySignature.forEach((sigItems, sig) => {
+          monthRuns(sig.split(',').map(Number)).forEach(([m0, m1]) => {
+            for (let i = 0; i < sigItems.length; i += chunk) {
+              const job = { kind, items: sigItems.slice(i, i + chunk), m0, m1, year, epoch, loaded, inflight };
+              jobKeys(job).forEach(k => inflight.add(k));
+              queueRef.current.push(job);
+            }
+          });
+        });
+      };
+      const names = new Map();
+      ids.forEach(id => {
+        const full = safeString(getProp(assetsById.get(id), 'craa5_equipmentidentifier')).trim();
+        [full, nameBase(full)].forEach(n => { if (n && !names.has(n.toLowerCase())) names.set(n.toLowerCase(), n); });
       });
+      queueKind('name', [...names.values()], NAME_CHUNK);
+      if (idColumn && idHealthy) queueKind('id', ids, ID_CHUNK);
       if (queueRef.current.length) setLogsLoading(true);
     }
     pumpRef.current();
     // eslint-disable-next-line
-  }, [visibleKey, visibleMonths, anchorYear, idColumn, assets, isLoading, retryTick]);
+  }, [visibleKey, visibleMonths, anchorYear, idColumn, idHealthy, assets, isLoading, retryTick]);
 
   const retryLoads = () => { setLoadErrors([]); setRetryTick(t => t + 1); };
 
@@ -755,7 +803,7 @@ export default function App() {
           <label>Date</label><p>{normalizeDateStr(hoveredLog.log.craa5_lastcleaned)}</p>
           <label>SAP Order</label><p>{hoveredLog.log.craa5_sap || hoveredLog.log.craa5_uid || 'N/A'}</p>
           <label>Hours</label><p>{hoveredLog.log.craa5_hoursworked ?? 'N/A'}</p>
-          <label>Matched By</label><p style={{ marginBottom: 0 }}>{hoveredLog.via === 'id' ? 'Dataverse id' : 'Text match (Sync)'}</p>
+          <label>Matched By</label><p style={{ marginBottom: 0 }}>{hoveredLog.via === 'id' ? 'Dataverse id' : 'Equipment name'}</p>
         </div>
       )}
 
@@ -847,7 +895,7 @@ export default function App() {
       {/* TOP HEADER */}
       <header className="bg-white border-b px-6 pt-4 flex flex-col shrink-0 z-[1000] shadow-sm relative">
         <div className="flex items-center justify-between mb-2">
-          <div className="flex items-center" style={{ gap: '15px' }}>
+          <div className="flex items-center" style={{ gap: '15px', flexWrap: 'wrap', rowGap: '6px', flex: 1, minWidth: 0 }}>
             <h1 className="flex items-center" style={{ fontSize: '18px', fontWeight: '900', letterSpacing: '-0.5px' }}>
               <ClockIcon style={{ marginRight: '10px', color: '#2563eb' }} /> MSS Matrix
             </h1>
@@ -862,11 +910,8 @@ export default function App() {
             {canWriteBack && textLinks.size > 0 && (
               <button className="sync-btn" style={{ background: '#d97706' }} onClick={saveTextMatches} disabled={isSaving || isLoading} title="Writes craa5_equipmentguid on the text-matched logs in Dataverse">{isSaving ? 'Saving...' : `Save ${textLinks.size} text match${textLinks.size === 1 ? '' : 'es'} to Dataverse`}</button>
             )}
-            <span data-testid="match-stats" title="Green = matched by Dataverse id. Amber = matched by text fallback (Sync only). Counts cover the logs loaded so far for the equipment and months you have viewed since the last Sync." style={{ fontSize: '11px', fontWeight: 'bold', color: '#475569', whiteSpace: 'nowrap' }}><span style={{ color: '#10b981' }}>■</span> id {completionIndex.stats.id} · <span style={{ color: '#f59e0b' }}>■</span> text {completionIndex.stats.text} · unmapped {completionIndex.stats.unmapped}{completionIndex.stats.duplicate ? ` · duplicate ${completionIndex.stats.duplicate}` : ''}{logsLoading ? ' · loading…' : ''}</span>
+            <span data-testid="match-stats" title="Green = matched by Dataverse id. Amber = matched by equipment name (the stored id was blank or matched no equipment row). Counts cover the logs loaded so far for the equipment and months you have viewed since the last Sync." style={{ fontSize: '11px', fontWeight: 'bold', color: '#475569', whiteSpace: 'nowrap' }}><span style={{ color: '#10b981' }}>■</span> id {completionIndex.stats.id} · <span style={{ color: '#f59e0b' }}>■</span> text {completionIndex.stats.text} · unmapped {completionIndex.stats.unmapped}{completionIndex.stats.duplicate ? ` · duplicate ${completionIndex.stats.duplicate}` : ''}{logsLoading ? ' · loading…' : ''}</span>
             {loadErrors.length > 0 && <button className="page-btn" style={{ color: '#b91c1c' }} onClick={retryLoads} title={loadErrors[loadErrors.length - 1]}>Some logs failed to load · Retry</button>}
-            {syncWindow && visibleMonths.some(m => syncWindow.year !== anchorYear || m < syncWindow.firstMonth || m > syncWindow.lastMonth) && (
-              <span data-testid="sync-window-note" title="Text matching only covers the months that were on screen at the last Sync. Press Sync to include the others." style={{ fontSize: '11px', color: '#b45309', whiteSpace: 'nowrap' }}>Text match covers {MONTHS[syncWindow.firstMonth]}–{MONTHS[syncWindow.lastMonth]} {syncWindow.year}; Sync to refresh</span>
-            )}
           </div>
           <div className="flex items-center" style={{ gap: '12px' }}>
             <button className="p-1 hover:bg-slate-100 rounded border" onClick={() => setAnchorYear(y => y - 1)}><ChevronLeftIcon /></button>
@@ -906,12 +951,12 @@ export default function App() {
                 <p>Equipment loaded: {assets.length}</p>
                 <p>Logs loaded: {logs.length}</p>
                 <p>Matched by Dataverse id: {completionIndex.stats.id}</p>
-                <p>Matched by text (Sync only): {completionIndex.stats.text}</p>
+                <p>Matched by equipment name: {completionIndex.stats.text}</p>
                 <p>Unmapped: {completionIndex.stats.unmapped}</p>
                 <p>Duplicates (same equipment and day, one marker shown): {completionIndex.stats.duplicate}</p>
                 {syncNotes.map((n, i) => <p key={i} style={{ color: '#b45309' }}>{n}</p>)}
                 {loadErrors.map((n, i) => <p key={i} style={{ color: '#b91c1c' }}>Log load failed: {n}</p>)}
-                <p style={{ color: '#64748b' }}>Logs load per visible equipment and month, never the whole table. Logs whose equipment id matches no equipment row are not loaded.</p>
+                <p style={{ color: '#64748b' }}>Logs load per visible equipment and month, never the whole table. Logs are found by the equipment name written on them and, once stored ids match equipment rows, by id; the id wins when both exist. Unmapped logs carry a name that matches no equipment (or several).</p>
                 {completionIndex.unmapped.length > 0 && (
                   <table style={{ marginTop: '12px', fontSize: '12px', borderCollapse: 'collapse' }}>
                     <thead><tr><th style={{ textAlign: 'left', padding: '4px 12px 4px 0' }}>Unmapped equipment text</th><th style={{ textAlign: 'left', padding: '4px 12px' }}>Date</th><th style={{ textAlign: 'left', padding: '4px 12px' }}>UID</th></tr></thead>
