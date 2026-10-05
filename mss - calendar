@@ -205,6 +205,7 @@ const LOG_CORE = "craa5__log_id,craa5_equipment,craa5_lastcleaned,craa5_lastclea
 const LOG_OPTIONAL = ["craa5_sap", "craa5_hoursworked", "craa5_room", "craa5_area"]; // each is dropped on its own if the table lacks it
 const missingLogColumns = new Set();
 const logSelect = (withId) => [LOG_CORE, ...LOG_OPTIONAL.filter(c => !missingLogColumns.has(c)), withId ? LOG_ASSET_ID_SELECT : ''].filter(Boolean).join(',');
+const BUILD = 'id loader r4';    // shown on Payload Diagnostics so a pasted version can be told apart
 const ASSET_SELECT = "craa5_aa_assetsid,craa5_equipmentidentifier,craa5_roomname,craa5_areaname";
 const PAGE_SIZE = 1000;          // rows per Dataverse page
 const ID_CHUNK = 15;             // equipment ids per log request
@@ -216,8 +217,9 @@ const MODAL_PAGE_SIZE = 25;      // equipment rows per area in the focused dialo
 
 const isMissingColumnError = (err) => /could not find a property|0x80060888|does not exist|invalid property/i.test(String(err && err.message));
 const isGuid = (v) => /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(v);
-// Quote-escape, and percent-encode the characters that would otherwise cut the query string short.
-const odataString = (v) => String(v).replace(/'/g, "''").replace(/%/g, '%25').replace(/&/g, '%26').replace(/#/g, '%23').replace(/\+/g, '%2B');
+// OData string literal: quotes doubled, then percent-encoded. Xrm.WebApi sends the query as given and Microsoft
+// says special characters (& # + % , / : ; = ? @ $) must be encoded; encodeURIComponent keeps the doubled quotes.
+const odataString = (v) => encodeURIComponent(String(v).replace(/'/g, "''"));
 // "Gyro Mixer (+)" -> "Gyro Mixer": a log may carry the name without the trailing note in brackets.
 const nameBase = (name) => { let n = String(name || '').trim(); let prev; do { prev = n; n = n.replace(/\s*\([^)]*\)\s*$/, '').trim(); } while (n !== prev); return n; };
 
@@ -236,12 +238,24 @@ const retrievePaged = async (entity, query, maxRows) => {
 // so requests that were already in flight with the old select recover too. Errors about any other column
 // are thrown.
 const retrieveLogs = async (queryFor, withId, maxRows) => {
+  let style = dateStyle;
+  let dateError = null;   // the first error of a request whose date filter was retried
   for (let attempt = 0; ; attempt++) {
     const select = logSelect(withId);
     try {
-      return await retrievePaged("craa5__log_", queryFor(select), maxRows);
+      const res = await retrievePaged("craa5__log_", queryFor(select, style), maxRows);
+      if (style > dateStyle) dateStyle = style;   // a style that worked is kept for the next requests
+      return res;
     } catch (err) {
-      if (!isMissingColumnError(err) || attempt > LOG_OPTIONAL.length) throw err;
+      if (attempt > LOG_OPTIONAL.length + DATE_STYLES) throw dateError || err;
+      if (!isMissingColumnError(err)) {
+        // A rejected date filter is retried in the next style, per request: a failure that has another cause
+        // (a bad name, throttling) never changes the style for everyone else.
+        const hasDate = /craa5_lastcleaned ge/.test(decodeURIComponent(queryFor(select, style)));
+        if (hasDate && isDateFilterError(err)) dateError = dateError || err;
+        if (hasDate && isDateFilterError(err) && style < DATE_STYLES - 1) { style += 1; continue; }
+        throw dateError || err;
+      }
       const msg = String(err && err.message);
       const inSelect = LOG_OPTIONAL.filter(c => select.split(',').includes(c));
       let bad = inSelect.filter(c => new RegExp(`\\b${c}\\b`, 'i').test(msg));
@@ -253,19 +267,29 @@ const retrieveLogs = async (queryFor, withId, maxRows) => {
   }
 };
 
-// Date-only values are stored as midnight UTC, so the window is built in UTC.
-const monthsFilter = (year, firstMonth, lastMonth) => {
-  const start = new Date(Date.UTC(year, firstMonth, 1)).toISOString();
-  const end = new Date(Date.UTC(year, lastMonth + 1, 0, 23, 59, 59)).toISOString();
-  return `craa5_lastcleaned ge '${start}' and craa5_lastcleaned le '${end}'`;
+// Date-only values are stored as midnight UTC, so the window is built in UTC. Style 0 is what the original
+// calendar sent (quoted ISO datetimes). If Dataverse rejects it for this column, retrieveLogs moves on to
+// an unquoted date, then an unquoted datetime, and keeps the first style that works.
+let dateStyle = 0;
+const DATE_STYLES = 3;
+const monthsFilter = (year, firstMonth, lastMonth, style = dateStyle) => {
+  const start = new Date(Date.UTC(year, firstMonth, 1));
+  const end = new Date(Date.UTC(year, lastMonth + 1, 0, 23, 59, 59));
+  const lit = [
+    (d) => `'${d.toISOString()}'`,
+    (d) => d.toISOString().slice(0, 10),
+    (d) => d.toISOString().slice(0, 19) + 'Z'
+  ][style];
+  return `craa5_lastcleaned ge ${lit(start)} and craa5_lastcleaned le ${lit(end)}`;
 };
+const isDateFilterError = (err) => /date|time|literal|operand|convert|parse|invalid|filter/i.test(String(err && err.message)) && !/429|throttl|timed? ?out|network|failed to fetch|unauthor|forbidden|privilege/i.test(String(err && err.message));
 
 // Logs stored against these equipment ids in the given month run.
 const fetchLogsForAssets = async (assetIds, year, firstMonth, lastMonth) => {
   const ids = assetIds.filter(isGuid);
   if (!ids.length) return { rows: [], truncated: false };
   const idFilter = ids.map(id => `${LOG_ASSET_ID_SELECT} eq '${id}'`).join(' or ');
-  return retrieveLogs(select => `?$select=${select}&$filter=(${idFilter}) and ${monthsFilter(year, firstMonth, lastMonth)}`, true, MAX_LOGS_PER_REQUEST);
+  return retrieveLogs((select, style) => `?$select=${select}&$filter=(${idFilter}) and ${monthsFilter(year, firstMonth, lastMonth, style)}`, true, MAX_LOGS_PER_REQUEST);
 };
 
 // Logs whose equipment text equals one of these names (case-insensitive, exact: a prefix match would pull in
@@ -275,7 +299,7 @@ const fetchLogsForAssets = async (assetIds, year, firstMonth, lastMonth) => {
 const fetchLogsByName = async (names, year, firstMonth, lastMonth, withId) => {
   if (!names.length) return { rows: [], truncated: false };
   const nameFilter = names.map(n => `craa5_equipment eq '${odataString(n)}'`).join(' or ');
-  return retrieveLogs(select => `?$select=${select}&$filter=(${nameFilter}) and ${monthsFilter(year, firstMonth, lastMonth)}`, withId, MAX_LOGS_PER_REQUEST);
+  return retrieveLogs((select, style) => `?$select=${select}&$filter=(${nameFilter}) and ${monthsFilter(year, firstMonth, lastMonth, style)}`, withId, MAX_LOGS_PER_REQUEST);
 };
 
 // Contiguous runs of month indexes: [3,4,5,8] -> [[3,5],[8,8]].
@@ -352,21 +376,13 @@ export default function App() {
 
   const today = useMemo(() => new Date(), []);
 
-  // Every equipment row that renders reports its id here, so logs are fetched for exactly what is on
-  // screen (main grid and focused dialog), whatever the expand/collapse and paging state is.
-  const renderedIdsRef = useRef([]);
-  renderedIdsRef.current = [];
-  const rowLogsFor = (asset) => {
-    const id = getAssetId(asset);
-    renderedIdsRef.current.push(id);
-    return completionIndex.byAsset.get(id);
-  };
-  const [visibleKey, setVisibleKey] = useState('');
-  const visibleKeyRef = useRef('');
+  const rowLogsFor = (asset) => completionIndex.byAsset.get(getAssetId(asset));
+  const [visibleKey, setVisibleKey] = useState('');   // visibleKeyNow, once it has stopped changing for 150 ms
   const [retryTick, setRetryTick] = useState(0);
   const queueRef = useRef([]);   // log requests waiting to start
   const activeRef = useRef(0);   // log requests in flight, across every run of the loader
   const pumpRef = useRef(null);
+  const [reqLog, setReqLog] = useState([]);   // the last few log requests, shown on the Diagnostics tab
 
   // Initialize Slicer with Previous, Current, and Next month
   useEffect(() => {
@@ -467,8 +483,10 @@ export default function App() {
       // Swap the loader state together with the data. Requests started before this point finish into the
       // old sets and are ignored (epoch), so nothing half-loaded survives a Sync.
       epochRef.current += 1;
+      setReqLog([]);
       diagSeqRef.current = { check: diagSeqRef.current.check + 1, lookup: diagSeqRef.current.lookup + 1 };
       missingLogColumns.clear();
+      dateStyle = 0;
       setLogCheck(null);
       setLookup(null);
       loadedRef.current = new Set();
@@ -575,20 +593,40 @@ export default function App() {
   const totalPages = Math.ceil(roomKeys.length / pageSize);
   const pagedRoomKeys = roomKeys.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
 
-  // Settle the set of rendered equipment (debounced) into state; the loader below reacts to it.
-  // Runs after every render (mouse moves re-render this component), so a pending timer is only restarted
-  // when the rendered set actually changes; otherwise loading would wait until the pointer rests.
-  const settleTimerRef = useRef(null);
-  const pendingKeyRef = useRef(null);
+  // The equipment on screen, worked out from state (open rooms and areas, their pages, the focused dialog),
+  // not from what happened to render, so it cannot be disturbed by re-renders such as mouse moves. It mirrors
+  // the two render paths below: the main grid and the focused dialog.
+  const visibleKeyNow = useMemo(() => {
+    const ids = new Set();
+    if (activeTab === 'master') {
+      pagedRoomKeys.forEach(room => {
+        if (!expandedKeys[room]) return;
+        Object.keys(filteredTreeData[room]).forEach(area => {
+          const ak = `${room}|${area}`;
+          if (!expandedKeys[ak]) return;
+          const page = areaPages[ak] || 0;
+          filteredTreeData[room][area].slice(page * equipmentPageSize, (page + 1) * equipmentPageSize).forEach(a => ids.add(getAssetId(a)));
+        });
+      });
+    }
+    if (modalContext) {
+      Object.keys(filteredTreeData)
+        .filter(r => modalContext.type === 'room' ? r === modalContext.value : filteredTreeData[r][modalContext.value])
+        .forEach(room => Object.keys(filteredTreeData[room])
+          .filter(a => modalContext.type === 'area' ? a === modalContext.value : true)
+          .forEach(area => {
+            const page = modalPages[`${room}|${area}`] || 0;
+            filteredTreeData[room][area].slice(page * MODAL_PAGE_SIZE, (page + 1) * MODAL_PAGE_SIZE).forEach(a => ids.add(getAssetId(a)));
+          }));
+    }
+    return [...ids].join(',');
+  }, [activeTab, pagedRoomKeys, expandedKeys, areaPages, filteredTreeData, modalContext, modalPages]);
+  // Only restarts when the set itself changes, so quick clicks through areas become one request round.
   useEffect(() => {
-    const key = [...new Set(renderedIdsRef.current)].join(',');
-    if (key === visibleKeyRef.current) { clearTimeout(settleTimerRef.current); pendingKeyRef.current = null; return; }
-    if (key === pendingKeyRef.current) return;
-    clearTimeout(settleTimerRef.current);
-    pendingKeyRef.current = key;
-    settleTimerRef.current = setTimeout(() => { pendingKeyRef.current = null; visibleKeyRef.current = key; setVisibleKey(key); }, 150);
-  });
-  useEffect(() => () => clearTimeout(settleTimerRef.current), []);
+    if (visibleKeyNow === visibleKey) return;
+    const t = setTimeout(() => setVisibleKey(visibleKeyNow), 150);
+    return () => clearTimeout(t);
+  }, [visibleKeyNow, visibleKey]);
 
   const jobKeys = (job) => job.items.flatMap(item => { const k = []; for (let m = job.m0; m <= job.m1; m++) k.push(`${job.kind}|${job.year}|${m}|${item}`); return k; });
 
@@ -598,6 +636,8 @@ export default function App() {
       const job = queueRef.current.shift();
       activeRef.current += 1;
       (async () => {
+        const started = performance.now();
+        const entry = { kind: job.kind, items: job.items.length, months: `${MONTHS[job.m0].slice(0, 3)}${job.m1 > job.m0 ? '–' + MONTHS[job.m1].slice(0, 3) : ''} ${job.year}` };
         try {
           const { rows, truncated } = job.kind === 'name'
             ? await fetchLogsByName(job.items, job.year, job.m0, job.m1, latestRef.current.idColumn)
@@ -610,9 +650,13 @@ export default function App() {
             jobKeys(job).forEach(k => job.loaded.add(k));
             addLogs(rows, job.kind === 'name' ? computeTextLinks(latestRef.current.textIndex, rows) : null);
           }
+          entry.rows = rows.length;
         } catch (err) {
+          entry.error = String(err && err.message);
           if (epochRef.current === job.epoch) setLoadErrors(prev => prev.concat(String(err && err.message)).slice(-5));
         } finally {
+          entry.ms = Math.round(performance.now() - started);
+          if (epochRef.current === job.epoch) setReqLog(prev => prev.concat(entry).slice(-8));
           jobKeys(job).forEach(k => job.inflight.delete(k)); // the sets this job was created with, even after a Sync swapped them
           activeRef.current -= 1;
           pumpRef.current();
@@ -711,12 +755,22 @@ export default function App() {
         return { rows };
       } catch (err) { return { error: String(err && err.message) }; }
     };
-    const [byId, byName] = await Promise.all([
+    // The same request the matrix sends for this equipment and the months on screen.
+    const matrixQuery = async () => {
+      if (!idColumn || !isGuid(id) || !visibleMonths.length) return { skipped: true };
+      try {
+        let rows = [];
+        for (const [m0, m1] of monthRuns(visibleMonths)) rows = rows.concat((await fetchLogsForAssets([id], anchorYear, m0, m1)).rows);
+        return { rows, months: `${visibleMonths.map(m => MONTHS[m].slice(0, 3)).join(', ')} ${anchorYear}` };
+      } catch (err) { return { error: String(err && err.message) }; }
+    };
+    const [byId, byName, byMatrix] = await Promise.all([
       idColumn && isGuid(id) ? one(`${LOG_ASSET_ID_SELECT} eq '${id}'`) : Promise.resolve({ skipped: true }),
-      one(`craa5_equipment eq '${odataString(name)}'`)
+      one(`craa5_equipment eq '${odataString(name)}'`),
+      matrixQuery()
     ]);
     if (my !== diagSeqRef.current.lookup) return;
-    setLookup({ id, name, room: safeString(getProp(asset, 'craa5_roomname')), area: safeString(getProp(asset, 'craa5_areaname')), byId, byName });
+    setLookup({ id, name, room: safeString(getProp(asset, 'craa5_roomname')), area: safeString(getProp(asset, 'craa5_areaname')), byId, byName, byMatrix });
   };
 
   useEffect(() => () => { if (flushTimerRef.current) clearTimeout(flushTimerRef.current); }, []);
@@ -985,7 +1039,7 @@ export default function App() {
               <button className="sync-btn" style={{ background: '#d97706' }} onClick={saveTextMatches} disabled={isSaving || isLoading} title="Writes craa5_equipmentguid on the text-matched logs in Dataverse">{isSaving ? 'Saving...' : `Save ${textLinks.size} text match${textLinks.size === 1 ? '' : 'es'} to Dataverse`}</button>
             )}
             <span data-testid="match-stats" title="Green = matched by Dataverse id. Amber = matched by equipment name (the stored id was blank or matched no equipment row). Counts cover the logs loaded so far for the equipment and months you have viewed since the last Sync." style={{ fontSize: '11px', fontWeight: 'bold', color: '#475569', whiteSpace: 'nowrap' }}><span style={{ color: '#10b981' }}>■</span> id {completionIndex.stats.id} · <span style={{ color: '#f59e0b' }}>■</span> text {completionIndex.stats.text} · unmapped {completionIndex.stats.unmapped}{completionIndex.stats.duplicate ? ` · duplicate ${completionIndex.stats.duplicate}` : ''}{logsLoading ? ' · loading…' : ''}</span>
-            {loadErrors.length > 0 && <button className="page-btn" style={{ color: '#b91c1c' }} onClick={retryLoads} title={loadErrors[loadErrors.length - 1]}>Some logs failed to load · Retry</button>}
+            {loadErrors.length > 0 && <button className="page-btn" style={{ color: '#b91c1c', whiteSpace: 'normal', textAlign: 'left', maxWidth: '420px' }} onClick={retryLoads} title={loadErrors[loadErrors.length - 1]}>Some logs failed to load: {loadErrors[loadErrors.length - 1].slice(0, 140)} · Retry</button>}
           </div>
           <div className="flex items-center" style={{ gap: '12px' }}>
             <button className="p-1 hover:bg-slate-100 rounded border" onClick={() => setAnchorYear(y => y - 1)}><ChevronLeftIcon /></button>
@@ -1015,7 +1069,7 @@ export default function App() {
           </div>
       )}
 
-      {activeTab === 'master' && assets.length > 0 && roomKeys.length > 0 && !visibleKey && !isLoading && typeof Xrm !== 'undefined' && (
+      {activeTab === 'master' && assets.length > 0 && roomKeys.length > 0 && !visibleKeyNow && !isLoading && typeof Xrm !== 'undefined' && (
         <div data-testid="expand-hint" style={{ padding: '6px 24px', fontSize: '12px', color: '#475569', background: '#eff6ff', borderBottom: '1px solid #dbeafe' }}>Click an area name to open it. Completions are read from the log for the equipment you open, so nothing shows until an area is open.</div>
       )}
 
@@ -1025,7 +1079,7 @@ export default function App() {
           <main className="flex-1 p-8 bg-white overflow-auto">
              <h2 style={{ fontSize: '20px', fontWeight: '900', marginBottom: '20px' }}>Diagnostic Explorer</h2>
              <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '12px', padding: '20px' }}>
-                <h3 style={{ fontSize: '15px', fontWeight: 'bold' }}>Sync Breakdown</h3>
+                <h3 style={{ fontSize: '15px', fontWeight: 'bold' }}>Sync Breakdown <span style={{ fontSize: '11px', fontWeight: 'normal', color: '#94a3b8' }}>· {BUILD}</span></h3>
                 <p>Equipment loaded: {assets.length}</p>
                 <p>Logs loaded: {logs.length}</p>
                 <p>Matched by Dataverse id: {completionIndex.stats.id}</p>
@@ -1034,9 +1088,18 @@ export default function App() {
                 <p>Duplicates (same equipment and day, one marker shown): {completionIndex.stats.duplicate}</p>
                 {syncNotes.map((n, i) => <p key={i} style={{ color: '#b45309' }}>{n}</p>)}
                 {loadErrors.map((n, i) => <p key={i} style={{ color: '#b91c1c' }}>Log load failed: {n}</p>)}
+                {dateStyle > 0 && <p style={{ color: '#b45309' }}>Dataverse rejected the quoted date filter on craa5_lastcleaned, so month filters are sent as {dateStyle === 1 ? 'plain dates (2026-09-01)' : 'unquoted datetimes (2026-09-01T00:00:00Z)'}.</p>}
                 {missingLogColumns.size > 0 && <p style={{ color: '#b45309' }}>These log columns do not exist in this table and are left out: {[...missingLogColumns].join(', ')}. SAP order and hours only fill the tooltip; room and area also help tell apart equipment that share a name.</p>}
                 <p style={{ color: '#64748b' }}>Logs load per visible equipment and month, never the whole table: a log is shown on the equipment whose id is stored in its craa5_equipmentguid. Old entries whose id is blank or matches no equipment are matched by equipment name (amber). Nothing loads until an area is expanded on the Compliance Matrix tab.</p>
-                <p>Equipment-month slices read from the log: {loadedRef.current.size}</p>
+                <p>Equipment on screen: {visibleKeyNow ? visibleKeyNow.split(',').length : 0} · equipment-month slices read from the log: {loadedRef.current.size}</p>
+                {reqLog.length > 0 && (
+                  <table data-testid="req-log" style={{ fontSize: '12px', borderCollapse: 'collapse', marginBottom: '8px' }}>
+                    <thead><tr>{['Recent log requests', 'Items', 'Months', 'Rows', 'ms'].map(h => <th key={h} style={{ textAlign: 'left', padding: '2px 12px 2px 0' }}>{h}</th>)}</tr></thead>
+                    <tbody>{reqLog.map((r, i) => (
+                      <tr key={i} style={{ color: r.error ? '#b91c1c' : undefined }}><td style={{ padding: '2px 12px 2px 0' }}>{r.kind === 'name' ? 'by equipment name' : 'by equipment id'}</td><td style={{ padding: '2px 12px 2px 0' }}>{r.items}</td><td style={{ padding: '2px 12px 2px 0' }}>{r.months}</td><td style={{ padding: '2px 12px 2px 0' }}>{r.error ? `failed: ${r.error.slice(0, 160)}` : r.rows}</td><td style={{ padding: '2px 12px 2px 0' }}>{r.ms}</td></tr>
+                    ))}</tbody>
+                  </table>
+                )}
                 {loadedRef.current.size === 0 && <p style={{ color: '#64748b' }}>No area has been opened since the last Sync, so no logs have been requested yet.</p>}
                 {loadedRef.current.size > 0 && logs.length === 0 && <p style={{ color: '#b45309' }}>Log requests ran but returned no rows. Use Log check and Equipment lookup below to see what the log table holds and which ids it stores.</p>}
                 {typeof Xrm !== 'undefined' && (
@@ -1081,7 +1144,7 @@ export default function App() {
                     {lookup && (
                       <div style={{ marginTop: '10px' }}>
                         <p><b>{lookup.name}</b>{lookup.room ? ` · ${lookup.room} / ${lookup.area}` : ''} · equipment id <span style={{ fontFamily: 'monospace' }}>{lookup.id}</span>{lookup.busy ? ' · reading…' : ''}</p>
-                        {[['By equipment id', lookup.byId], ['By equipment name', lookup.byName]].map(([label, r]) => r && (
+                        {[['By equipment id', lookup.byId], ['Same query the matrix sends (' + (lookup.byMatrix && lookup.byMatrix.months || 'months on screen') + ')', lookup.byMatrix], ['By equipment name', lookup.byName]].map(([label, r]) => r && (
                           <div key={label} style={{ marginBottom: '8px' }}>
                             <p>{label}: {r.skipped ? 'not available (no id column)' : r.error ? <span style={{ color: '#b91c1c' }}>failed: {r.error}</span> : `${r.rows.length}${r.rows.length >= 25 ? '+' : ''} log row(s)`}</p>
                             {r.rows && r.rows.length > 0 && (
