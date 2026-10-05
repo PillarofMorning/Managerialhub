@@ -270,7 +270,8 @@ const WORK_KINDS = [
     { id: 'janitorial', label: 'Janitorial area' },
     { id: 'none', label: 'No tasks' }
 ];
-const WORK_KIND_SHORT = { general: '', pic: 'PIC', inspector: 'PIC', chemical: 'Chem', admin: 'Admin', janitorial: 'Jan', none: '' };
+const WORK_KIND_SHORT = { general: '', pic: 'PIC', inspector: 'PIC', chemical: 'Chem', admin: 'Admin', janitorial: 'Jan', leadership: 'Lead', none: '' };
+const TEAM_COLORS = ['#0ea5e9', '#8b5cf6', '#f59e0b', '#10b981', '#ef4444', '#ec4899', '#14b8a6', '#6366f1'];
 const NIGHT_START_HOUR = 18;
 const NIGHT_END_HOUR = 6;
 function defaultWorkKind(roleKey) {
@@ -302,6 +303,37 @@ function workerCanDo(workKind, taskKindId, night) {
     return wk === taskKindId;
 }
 function isNightHour(hour) { return hour >= NIGHT_START_HOUR || hour < NIGHT_END_HOUR; }
+
+// ============================================================================
+// SHIFT START LINK
+// 🚨 ARCHITECTURE NOTE: Shift Start saves every team board as a craa5_sanitationshiftreport row named
+//   "Board · <supervisor> · <crew> · <yyyy-mm-dd> <hh>:00"   with the board JSON in craa5_equipmentjson:
+//   { leads: [employeeId], members: { employeeId: leadId }, overtime: [employeeId], out: { employeeId: reason },
+//     downLines: [lineId], manualLines: [{ id, name }], ... }
+// Ganttly can use those boards as its roster (leads, their teams, who is out) and as its list of rooms. A shift in the
+// plan that has no board yet (a future weekend) falls back to the employee table, so planning ahead still works.
+// ============================================================================
+const SPECIALIST_KINDS = ['chemical', 'admin', 'janitorial', 'inspector'];
+const BOARD_PREFIX = 'Board · ';
+const BOARD_MATCH_TOLERANCE_MS = 90 * 60000;
+function parseBoardRow(row) {
+    const name = String(getRowField(row, 'craa5_name') || '');
+    if (name.indexOf(BOARD_PREFIX) !== 0) return null;
+    const parts = name.slice(BOARD_PREFIX.length).split(' · ');
+    if (parts.length < 3) return null;
+    const when = parts[parts.length - 1].trim().match(/^(\d{4})-(\d{2})-(\d{2}) (\d{1,2}):(\d{2})$/);
+    const crew = normalizeShift(parts[parts.length - 2]);
+    if (!when || !crew) return null;
+    let board = null;
+    try { board = JSON.parse(String(getRowField(row, 'craa5_equipmentjson') || '')); } catch (e) {}
+    if (!board || typeof board !== 'object') return null;
+    return {
+        supervisor: parts.slice(0, -2).join(' · '),
+        crew: crew,
+        startMs: new Date(Number(when[1]), Number(when[2]) - 1, Number(when[3]), Number(when[4]), Number(when[5])).getTime(),
+        board: board
+    };
+}
 
 // "Doe, John" -> "John Doe" (same convention as the Manager hub)
 function formatFullName(name) {
@@ -623,6 +655,25 @@ async function fetchFirstAvailable(entityNames, dataApi) {
     return { rows: [], table: '' };
 }
 
+// Shift Start's saved team boards (see SHIFT START LINK). Quietly returns [] when the table can't be read.
+async function fetchBoardRows(dataApi) {
+    const xrm = safeGetXrm();
+    if (xrm && xrm.WebApi && typeof xrm.WebApi.retrieveMultipleRecords === 'function') {
+        try {
+            const fetchXml = "<fetch top='400'><entity name='craa5_sanitationshiftreport'><attribute name='craa5_name'/><attribute name='craa5_equipmentjson'/><attribute name='modifiedon'/><filter><condition attribute='statecode' operator='eq' value='0'/><condition attribute='craa5_name' operator='like' value='" + BOARD_PREFIX + "%'/></filter><order attribute='modifiedon' descending='true'/></entity></fetch>";
+            const res = await xrm.WebApi.retrieveMultipleRecords('craa5_sanitationshiftreport', "?fetchXml=" + encodeURIComponent(fetchXml));
+            if (res && res.entities) return res.entities;
+        } catch (e) {}
+    }
+    if (dataApi && typeof dataApi === 'object' && typeof dataApi.queryTable === 'function') {
+        try {
+            const res = await dataApi.queryTable('craa5_sanitationshiftreport', { select: ['craa5_name', 'craa5_equipmentjson', 'modifiedon'], filter: "statecode eq 0 and startswith(craa5_name,'" + BOARD_PREFIX + "')", top: 400 });
+            if (res && res.rows) return res.rows;
+        } catch (e) {}
+    }
+    return [];
+}
+
 const MOCK_ASSETS = [
     { id: 'eq1', name: 'Freezer Deep Clean', area: 'CUSTARD', minutesRequired: 1440, heads: 1, priority: 1, isComplete: false },
     { id: 'eq2', name: 'Norman Area', area: 'CUSTARD', minutesRequired: 720, heads: 1, priority: 2, isComplete: false },
@@ -752,6 +803,11 @@ export default function App(props) {
     const [absentEmployees, setAbsentEmployees] = useState(initialSettings.absentEmployees || {});
     // { jobRoleKey: true (gets tasks) | false (no tasks) } — only roles the user has toggled; others use DEFAULT_NON_TASK_ROLE.
     const [jobRoleChoices, setJobRoleChoices] = useState(initialSettings.jobRoleChoices || {});
+    // 'table' = employee table (plan ahead); 'shiftstart' = Shift Start's saved team boards (falls back to the table where a shift has no board).
+    const [rosterSource, setRosterSource] = useState(initialSettings.rosterSource === 'shiftstart' ? 'shiftstart' : 'table');
+    const [roomSource, setRoomSource] = useState(initialSettings.roomSource === 'shiftstart' ? 'shiftstart' : 'all');
+    const [boardRows, setBoardRows] = useState([]);
+    const [lineRows, setLineRows] = useState([]);
     const [handoverMins, setHandoverMins] = useState(initialSettings.handoverMins !== undefined ? initialSettings.handoverMins : 15);
     const [expandedRosters, setExpandedRosters] = useState({});
     const [rotationSource, setRotationSource] = useState(Array.isArray(initialSettings.shiftRotation) ? 'Saved' : 'Default');
@@ -812,6 +868,8 @@ export default function App(props) {
             crewHeadcountOverrides: crewHeadcountOverrides,
             absentEmployees: absentEmployees,
             jobRoleChoices: jobRoleChoices,
+            rosterSource: rosterSource,
+            roomSource: roomSource,
             handoverMins: handoverMins,
             includeBreaks: includeBreaks,
             includeTransit: includeTransit,
@@ -820,7 +878,7 @@ export default function App(props) {
             liveReforecast: liveReforecast
         };
         try { localStorage.setItem('itp_settings_v10', JSON.stringify(s)); } catch(e) {}
-    }, [roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, roomConfigured, hiddenRooms, hideConfiguredRooms, hourlyRate, ganttStartDate, ganttStartHour, planHours, shiftRotation, rotationSource, crewHeadcountOverrides, absentEmployees, jobRoleChoices, handoverMins, includeBreaks, includeTransit, includeInspection, pbMode, liveReforecast]);
+    }, [roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, roomConfigured, hiddenRooms, hideConfiguredRooms, hourlyRate, ganttStartDate, ganttStartHour, planHours, shiftRotation, rotationSource, crewHeadcountOverrides, absentEmployees, jobRoleChoices, handoverMins, includeBreaks, includeTransit, includeInspection, pbMode, liveReforecast, rosterSource, roomSource]);
 
     useEffect(function() {
         const p = { overrides: overrides, taskStatus: taskStatus, customTasks: customTasks, assetEdits: assetEdits, downtimes: downtimes, targetDowntimes: targetDowntimes };
@@ -839,13 +897,17 @@ export default function App(props) {
         };
         async function loadAssets() {
             try {
-                const [dvAssets, dvEmps, dvShifts] = await Promise.all([
+                const [dvAssets, dvEmps, dvShifts, dvBoards, dvLines] = await Promise.all([
                     fetchAllActiveRecords("craa5_aa_assets", props.dataApi),
                     fetchFirstAvailable(["craa5__aa_employee", "craa5_aa_employee"], props.dataApi),
-                    fetchFirstAvailable(["craa5_workshift"], props.dataApi)
+                    fetchFirstAvailable(["craa5_workshift"], props.dataApi),
+                    fetchBoardRows(props.dataApi),
+                    fetchAllActiveRecords("craa5_aa_mss_area", props.dataApi)
                 ]);
 
                 setRawEmployees(dvEmps.rows);
+                setBoardRows(dvBoards);
+                setLineRows(dvLines);
 
                 // A rotation the user edited on the Setup tab wins; otherwise use the Dataverse shift table.
                 const parsedShifts = parseWorkShiftRows(dvShifts.rows);
@@ -911,6 +973,8 @@ export default function App(props) {
     };
     const rosterInfo = useMemo(function() {
         const rosters = { A: [], B: [], C: [], D: [] };
+        const leadRosters = { A: [], B: [], C: [], D: [] };
+        const empById = {};
         const unmatched = [];
         const excluded = [];
         const roleExcluded = [];
@@ -921,8 +985,19 @@ export default function App(props) {
             const shift = readEmployeeShift(e);
             const roleRaw = e.craa5_role !== undefined ? e.craa5_role : e.craa5_Role;
             const role = String(roleRaw === undefined || roleRaw === null ? '' : roleRaw) + ' ' + String(e['craa5_role@OData.Community.Display.V1.FormattedValue'] || e['craa5_Role@OData.Community.Display.V1.FormattedValue'] || '');
-            // Leadership (lead 256000001, supervisor 256000002, manager 256000003) never gets a lane or tasks.
-            if (/25600000[123]|lead|super|manag/i.test(role)) { excluded.push(name); return; }
+            // Supervisors (256000002) and managers (256000003) never get a lane. Leads (256000001) are shown as leadership:
+            // a lane marked "Leadership" for their whole shift, with their team beneath, and never any tasks.
+            const empId = String(e.craa5__aa_employeeid || e.craa5_aa_employeeid || ('emp_' + i));
+            const isLeadRole = /256000001|\blead\b/i.test(role) && !/25600000[23]|super|manag/i.test(role);
+            if (!isLeadRole && /25600000[123]|lead|super|manag/i.test(role)) { excluded.push(name); return; }
+            if (isLeadRole) {
+                if (!shift.crew && shift.raw === '(blank)') { inactive.push(name); return; }
+                const leadRec = { id: empId, name: name, kind: 'leadership', jobRole: 'Lead', isLead: true, teamId: String(e._craa5_leadershipteamid_value || e.craa5_leadershipteamid || '') };
+                empById[empId] = leadRec;
+                if (shift.crew) leadRosters[shift.crew].push(leadRec);
+                else unmatched.push({ name: name + ' (lead)', raw: typeof shift.raw === 'object' ? JSON.stringify(shift.raw) : String(shift.raw) });
+                return;
+            }
             const jobRole = readEmployeeJobRole(e);
             const jrKey = jobRoleKey(jobRole) || '(no role)';
             if (!jobRoles[jrKey]) jobRoles[jrKey] = { key: jrKey, label: jobRole || '(no role)', count: 0 };
@@ -932,37 +1007,38 @@ export default function App(props) {
             if (workKind === 'none') { roleExcluded.push(name + ' (' + (jobRole || 'no role') + ')'); return; }
             // A blank Shift means the person has left the company (marking them inactive in Dataverse does nothing), so they are ignored, not flagged.
             if (!shift.crew && shift.raw === '(blank)') { inactive.push(name); return; }
+            const workerRec = { id: empId, name: name, kind: workKind, jobRole: jobRole, teamId: String(e._craa5_leadershipteamid_value || e.craa5_leadershipteamid || '') };
+            empById[empId] = workerRec;   // Shift Start boards can pull someone onto another crew, so keep everyone who may get tasks
             if (!shift.crew) { unmatched.push({ name: name, raw: typeof shift.raw === 'object' ? JSON.stringify(shift.raw) : String(shift.raw) }); return; }
-            rosters[shift.crew].push({
-                id: String(e.craa5__aa_employeeid || e.craa5_aa_employeeid || ('emp_' + i)),
-                name: name,
-                kind: workKind,
-                jobRole: jobRole
-            });
+            rosters[shift.crew].push(workerRec);
         });
-        CREW_CODES.forEach(function(c) { rosters[c].sort(function(a, b) { return a.name.localeCompare(b.name); }); });
-        return { rosters: rosters, unmatched: unmatched, inactive: inactive, excluded: excluded, roleExcluded: roleExcluded, jobRoles: Object.values(jobRoles).sort(function(a, b) { return a.label.localeCompare(b.label); }) };
+        CREW_CODES.forEach(function(c) { rosters[c].sort(function(a, b) { return a.name.localeCompare(b.name); }); leadRosters[c].sort(function(a, b) { return a.name.localeCompare(b.name); }); });
+        return { rosters: rosters, leadRosters: leadRosters, empById: empById, unmatched: unmatched, inactive: inactive, excluded: excluded, roleExcluded: roleExcluded, jobRoles: Object.values(jobRoles).sort(function(a, b) { return a.label.localeCompare(b.label); }) };
     }, [rawEmployees, jobRoleChoices]);
     const setJobRoleKind = function(key, kind) {
         setJobRoleChoices(function(prev) { return Object.assign({}, prev, { [key]: kind }); });
     };
     const crewRosters = rosterInfo.rosters;
-    // How many tasks fall in each kind of work, so Setup shows whether PIC / chemical / janitorial are being picked up.
-    const taskKindCounts = useMemo(function() {
-        const c = { general: 0, pic: 0, chemical: 0, admin: 0, janitorial: 0 };
-        assets.forEach(function(a) { if (!hiddenRooms[a.area]) c[a.kind || taskKind(a)]++; });
-        return c;
-    }, [assets, hiddenRooms]);
+    const leadRosters = rosterInfo.leadRosters;
+    const empById = rosterInfo.empById;
+    const leadCount = CREW_CODES.reduce(function(n, c) { return n + leadRosters[c].length; }, 0);
     const roleTag = function(l) {
         const t = WORK_KIND_SHORT[l && l.kind];
         return t ? <span className="ml-1.5 text-[9px] font-black uppercase tracking-wider rounded px-1 py-0.5 bg-slate-100 text-slate-600 border border-slate-200 align-middle flex-shrink-0 whitespace-nowrap" title={(l.jobRole || 'Role') + ' — ' + (WORK_KINDS.find(function(k) { return k.id === l.kind; }) || {}).label}>{t}</span> : null;
     };
 
     // Headcount: manual override > present people on the Dataverse roster > placeholder seats (no names found).
+    // Working headcount (leads are shown but not counted): manual override > people for this crew > placeholder seats.
+    const defaultCrewCount = function(crew) {
+        const cp = crewPeople[crew];
+        if (!cp) return 0;
+        if (cp.workers.length > 0) return cp.workers.length;
+        const anyone = cp.everyone.some(function(x) { return !x.rec.isLead && x.rec.kind !== 'none'; });
+        return anyone || cp.boardWindows > 0 ? 0 : FALLBACK_CREW_SIZE;   // placeholder seats only when no names were found at all
+    };
     const getCrewHeadcount = function(crew) {
         if (crewHeadcountOverrides[crew] !== undefined) return crewHeadcountOverrides[crew];
-        if (crewRosters[crew].length === 0) return FALLBACK_CREW_SIZE;
-        return crewRosters[crew].filter(function(p) { return !absentEmployees[p.id]; }).length;
+        return defaultCrewCount(crew);
     };
 
     const planHorizonMins = Math.max(60, Math.round(Number(planHours) || 12) * 60);
@@ -976,33 +1052,172 @@ export default function App(props) {
             .map(function(w) { return Object.assign({}, w, { key: w.crew + '|' + w.start }); });
     }, [shiftRotation, ganttStartDate, ganttStartHour, planHorizonMins]);
 
+    // Shift Start boards that line up with each shift in the plan (same crew, started within 90 min of the shift).
+    const windowBoards = useMemo(function() {
+        const parsed = boardRows.map(parseBoardRow).filter(Boolean);
+        const map = {};
+        shiftWindows.forEach(function(w) {
+            const abs = globalStartMs + w.shiftStart * 60000;   // the real clock-in, even when the plan window cuts the shift short
+            const bySup = {};
+            parsed.forEach(function(b) {
+                if (b.crew !== w.crew) return;
+                const d = Math.abs(b.startMs - abs);
+                if (d > BOARD_MATCH_TOLERANCE_MS) return;
+                if (!bySup[b.supervisor] || d < bySup[b.supervisor].d) bySup[b.supervisor] = { d: d, b: b };
+            });
+            map[w.key] = Object.keys(bySup).map(function(k) { return bySup[k].b; });
+        });
+        return map;
+    }, [boardRows, shiftWindows, globalStartMs]);
+    const boardWindowCount = shiftWindows.filter(function(w) { return (windowBoards[w.key] || []).length > 0; }).length;
+
+    // Rooms the supervisors picked in Shift Start (lines being cleaned) for the shifts in this plan; null when no board exists.
+    const shiftStartRooms = useMemo(function() {
+        const lineName = {};
+        lineRows.forEach(function(r) { const id = String(getRowField(r, 'craa5_aa_mss_areaid') || ''); if (id) lineName[id] = String(getRowField(r, 'craa5_area') || '').trim(); });
+        let any = false;
+        const rooms = {};
+        shiftWindows.forEach(function(w) {
+            (windowBoards[w.key] || []).forEach(function(b) {
+                any = true;
+                (b.board.downLines || []).forEach(function(id) { const n = lineName[id]; if (n) rooms[n.toLowerCase()] = true; });
+                (b.board.manualLines || []).forEach(function(l) { if (l && l.name) rooms[String(l.name).trim().toLowerCase()] = true; });
+            });
+        });
+        return any ? rooms : null;
+    }, [lineRows, shiftWindows, windowBoards]);
+    const roomHidden = function(area) {
+        if (hiddenRooms[area]) return true;
+        return roomSource === 'shiftstart' && !!shiftStartRooms && !shiftStartRooms[String(area || '').trim().toLowerCase()];
+    };
+    // How many tasks fall in each kind of work, so Setup shows whether PIC / chemical / janitorial are being picked up.
+    const taskKindCounts = useMemo(function() {
+        const c = { general: 0, pic: 0, chemical: 0, admin: 0, janitorial: 0 };
+        assets.forEach(function(a) { if (!roomHidden(a.area)) c[a.kind || taskKind(a)]++; });
+        return c;
+    }, [assets, hiddenRooms, roomSource, shiftStartRooms]);
+
+    // Who works each crew, when, and which lead they sit under.
+    //  - 'table': the employee table (workers by Shift, leads by Role). A lead's team = people on the same Leadership Team.
+    //  - 'shiftstart': for a shift that has a Shift Start board, that board's leads, teams, overtime and who is out; a shift
+    //    with no board yet uses the employee table, so a future weekend can still be planned.
+    const crewPeople = useMemo(function() {
+        const out = {};
+        CREW_CODES.forEach(function(crew) {
+            const wins = shiftWindows.filter(function(w) { return w.crew === crew; }).map(function(w) { return { start: w.start, end: w.end, key: w.key }; });
+            const people = {};
+            const addPerson = function(rec, win) {
+                if (!people[rec.id]) people[rec.id] = { rec: rec, windows: [], absent: !!absentEmployees[rec.id] };
+                people[rec.id].windows.push({ start: win.start, end: win.end });
+            };
+            let teams = null;
+            let boardWins = 0;
+            wins.forEach(function(win) {
+                const boards = rosterSource === 'shiftstart' ? (windowBoards[win.key] || []) : [];
+                if (boards.length === 0) {
+                    crewRosters[crew].forEach(function(p) { addPerson(p, win); });
+                    leadRosters[crew].forEach(function(p) { addPerson(p, win); });
+                    return;
+                }
+                boardWins++;
+                const theseTeams = [];
+                boards.forEach(function(b) {
+                    const bd = b.board;
+                    const leadsB = Array.isArray(bd.leads) ? bd.leads : [];
+                    const members = bd.members && typeof bd.members === 'object' ? bd.members : {};
+                    const outB = bd.out && typeof bd.out === 'object' ? bd.out : {};
+                    const ids = leadsB.concat(Object.keys(members), Array.isArray(bd.overtime) ? bd.overtime : []);
+                    const seen = {};
+                    ids.forEach(function(id) {
+                        if (seen[id] || outB[id]) return;
+                        seen[id] = true;
+                        const rec = empById[id];
+                        if (!rec) return;
+                        addPerson(leadsB.indexOf(id) > -1 ? Object.assign({}, rec, { kind: 'leadership', isLead: true, jobRole: 'Lead' }) : rec, win);
+                    });
+                    leadsB.forEach(function(leadId) {
+                        if (outB[leadId] || !empById[leadId]) return;
+                        theseTeams.push({ leadId: leadId, memberIds: Object.keys(members).filter(function(id) { return members[id] === leadId && !outB[id]; }) });
+                    });
+                });
+                // Chemical clerk, admin, janitorial and inspectors work their own area rather than under a lead, so Shift Start
+                // doesn't need to place them: keep the ones from this crew unless the board marks them out.
+                const outAny = {};
+                boards.forEach(function(b) { if (b.board.out && typeof b.board.out === 'object') Object.assign(outAny, b.board.out); });
+                crewRosters[crew].forEach(function(p) { if (SPECIALIST_KINDS.indexOf(p.kind) > -1 && !outAny[p.id]) addPerson(p, win); });
+                if (!teams) teams = theseTeams;   // the first shift with a board decides the grouping
+            });
+            if (!teams) {
+                // No board: leads own the people on their Leadership Team (if any).
+                teams = leadRosters[crew].map(function(l) {
+                    return { leadId: l.id, memberIds: l.teamId ? crewRosters[crew].filter(function(p) { return p.teamId === l.teamId; }).map(function(p) { return p.id; }) : [] };
+                });
+            }
+            const all = Object.keys(people).map(function(id) { return people[id]; });
+            const byName = function(a, b) { return a.rec.name.localeCompare(b.rec.name); };
+            out[crew] = {
+                everyone: all.slice().sort(byName),   // includes people marked absent, so Setup can un-mark them
+                workers: all.filter(function(x) { return !x.absent && !x.rec.isLead && x.rec.kind !== 'none'; }).sort(byName),
+                leads: all.filter(function(x) { return !x.absent && x.rec.isLead; }).sort(byName),
+                teams: teams,
+                boardWindows: boardWins
+            };
+        });
+        return out;
+    }, [shiftWindows, windowBoards, rosterSource, crewRosters, leadRosters, empById, absentEmployees]);
+
     // One lane per person per crew working inside the plan window, ordered by when the crew first clocks in.
+    // Inside a crew: each lead (marked Leadership) followed by their team, then anyone not on a team, then placeholder seats.
     const laneRoster = useMemo(function() {
         const crewOrder = [];
         shiftWindows.forEach(function(w) { if (crewOrder.indexOf(w.crew) === -1) crewOrder.push(w.crew); });
         const lanes = [];
+        const usedKeys = {};
         crewOrder.forEach(function(crew) {
+            const cp = crewPeople[crew] || { everyone: [], workers: [], leads: [], teams: [], boardWindows: 0 };
             const crewWindows = shiftWindows.filter(function(w) { return w.crew === crew; }).map(function(w) { return { start: w.start, end: w.end }; });
-            const present = crewRosters[crew].filter(function(p) { return !absentEmployees[p.id]; });
             const n = Math.max(0, Math.round(getCrewHeadcount(crew)));
-            for (let k = 0; k < n; k++) {
-                const person = present[k];
+            const workers = cp.workers.slice(0, n);
+            const workerById = {};
+            workers.forEach(function(x) { workerById[x.rec.id] = x; });
+            const leadById = {};
+            cp.leads.forEach(function(x) { leadById[x.rec.id] = x; });
+            const placed = {};
+            const pushPerson = function(x, extra) {
+                let key = x.rec.id;
+                if (usedKeys[key]) key = x.rec.id + '@' + crew;
+                usedKeys[key] = true;
+                const lane = Object.assign({
+                    lane: lanes.length, crew: crew, key: key, name: x.rec.name, isPlaceholder: false,
+                    kind: x.rec.kind, jobRole: x.rec.jobRole, isLead: !!x.rec.isLead,
+                    windows: x.windows.length ? x.windows : crewWindows
+                }, extra || {});
+                lanes.push(lane);
+                return lane;
+            };
+            let groupIdx = 0;
+            (cp.teams || []).forEach(function(t) {
+                const lead = leadById[t.leadId];
+                if (!lead || placed[t.leadId]) return;
+                const members = t.memberIds.filter(function(id) { return workerById[id] && !placed[id]; }).map(function(id) { return workerById[id]; });
+                const leadLane = pushPerson(lead, { groupIdx: groupIdx, teamNames: members.map(function(m) { return m.rec.name; }) });
+                placed[t.leadId] = true;
+                members.forEach(function(m) { placed[m.rec.id] = true; pushPerson(m, { groupIdx: groupIdx, leadKey: leadLane.key }); });
+                groupIdx++;
+            });
+            cp.leads.forEach(function(x) { if (!placed[x.rec.id]) { placed[x.rec.id] = true; pushPerson(x, { groupIdx: groupIdx++, teamNames: [] }); } });
+            workers.forEach(function(x) { if (!placed[x.rec.id]) { placed[x.rec.id] = true; pushPerson(x, { groupIdx: -1 }); } });
+            for (let k = workers.length; k < n; k++) {
                 lanes.push({
-                    lane: lanes.length,
-                    crew: crew,
-                    key: person ? person.id : (crew + '#' + (k + 1)),
-                    name: person ? person.name : (crew + ' Crew Seat ' + (k + 1)),
-                    isPlaceholder: !person,
-                    kind: person ? person.kind : 'general',
-                    jobRole: person ? person.jobRole : '',
-                    windows: crewWindows
+                    lane: lanes.length, crew: crew, key: crew + '#' + (k + 1), name: crew + ' Crew Seat ' + (k + 1), isPlaceholder: true,
+                    kind: 'general', jobRole: '', isLead: false, groupIdx: -1, windows: crewWindows
                 });
             }
         });
         return lanes;
-    }, [shiftWindows, crewRosters, absentEmployees, crewHeadcountOverrides]);
+    }, [shiftWindows, crewPeople, crewHeadcountOverrides]);
 
-    const globalHeadcount = laneRoster.length;
+    const globalHeadcount = laneRoster.filter(function(l) { return !l.isLead; }).length;   // leads are shown, not counted as cleaners
     const maxCrewSize = CREW_CODES.reduce(function(m, c) { return laneRoster.some(function(l) { return l.crew === c; }) ? Math.max(m, getCrewHeadcount(c)) : m; }, 0) || 1;
     const laneByKey = {};
     laneRoster.forEach(function(l) { laneByKey[l.key] = l.lane; });
@@ -1061,7 +1276,7 @@ export default function App(props) {
     const allUniqueRooms = Array.from(new Set(assets.map(function(a) { return String(a.area); }))).sort();
 
     // Filtered list strictly omitting skipped rooms to clean up UI rendering loops downstream
-    const activeRooms = allUniqueRooms.filter(function(r) { return !hiddenRooms[r]; });
+    const activeRooms = allUniqueRooms.filter(function(r) { return !roomHidden(r); });
 
     const activeBreaks = useMemo(function() {
         let breaks = [];
@@ -1259,7 +1474,7 @@ export default function App(props) {
         };
 
         // Ensure strictly omitted (hidden) rooms do not enter the mathematical queue
-        assets.filter(function(a) { return !hiddenRooms[a.area]; }).forEach(function(rawT) {
+        assets.filter(function(a) { return !roomHidden(a.area); }).forEach(function(rawT) {
             const area = rawT.area;
             const isCleanTogether = roomCleanTogether[area];
             const vRoomKey = isCleanTogether ? CLEAN_TOGETHER_KEY : area;
@@ -1625,7 +1840,7 @@ export default function App(props) {
             parents: parents,
             taskById: taskById
         };
-    }, [assets, roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, overrides, taskStatus, targetDowntimes, allInterrupts, includeTransit, includeInspection, pbMode, hiddenRooms, laneRoster, maxCrewSize, planHorizonMins, handoverMins, reforecastFrom, ganttStartDate, ganttStartHour]);
+    }, [assets, roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, overrides, taskStatus, targetDowntimes, allInterrupts, includeTransit, includeInspection, pbMode, hiddenRooms, roomSource, shiftStartRooms, laneRoster, maxCrewSize, planHorizonMins, handoverMins, reforecastFrom, ganttStartDate, ganttStartHour]);
 
     // ============================================================================
     // LIVE TRACKING ACTIONS (check-off, start, reassign, move)
@@ -1666,6 +1881,7 @@ export default function App(props) {
 
     // Move a block to an exact start + exact workers (planned → manual override, frozen → edit the record).
     const moveBlock = function(task, startMin, lanes) {
+        if (lanes.some(function(l) { return laneRoster[l] && laneRoster[l].isLead; })) return;   // leads don't take tasks
         const keys = laneKeysOf(lanes);
         if (task.isFrozen) {
             setTaskStatus(function(prev) {
@@ -1699,7 +1915,7 @@ export default function App(props) {
         scheduleData.groups.forEach(function(g) {
             g.tasks.forEach(function(t) { allTasks.push(t); });
         });
-        for (let i = 0; i < globalHeadcount; i++) {
+        for (let i = 0; i < laneRoster.length; i++) {
             const wName = laneRoster[i].name.replace(/"/g, '""');
             const wCrew = laneRoster[i].crew;
             const workerTasks = allTasks.filter(function(t) { return t.assignedLanes && t.assignedLanes.indexOf(i) > -1; });
@@ -1742,7 +1958,7 @@ export default function App(props) {
     // a shift filter is on). Started / done blocks can be dragged too (corrects where the work happened).
     // ============================================================================
     const visibleLaneLo = ganttWindow ? (laneRoster.find(function(l) { return l.crew === ganttWindow.crew; }) || { lane: 0 }).lane : 0;
-    const visibleLaneCount = ganttWindow ? laneRoster.filter(function(l) { return l.crew === ganttWindow.crew; }).length : globalHeadcount;
+    const visibleLaneCount = ganttWindow ? laneRoster.filter(function(l) { return l.crew === ganttWindow.crew; }).length : laneRoster.length;
 
     useEffect(function() {
         const handlePointerMove = function(e) {
@@ -1787,7 +2003,7 @@ export default function App(props) {
             window.removeEventListener('pointerup', handlePointerUp);
             window.removeEventListener('pointercancel', handlePointerUp);
         };
-    }, [dragState, isPanning, panStartX, panScrollLeft, zoomLevel, hasDragged, globalHeadcount, visibleLaneLo, visibleLaneCount, scheduleData]);
+    }, [dragState, isPanning, panStartX, panScrollLeft, zoomLevel, hasDragged, laneRoster.length, visibleLaneLo, visibleLaneCount, scheduleData]);
 
     const onPanDown = function(e) {
         if (e.target && typeof e.target.closest === 'function' && (e.target.closest('.gantt-block-anim') || e.target.closest('.no-pan') || e.target.closest('input') || e.target.closest('button') || e.target.closest('select'))) return;
@@ -1872,12 +2088,13 @@ export default function App(props) {
             if (t && t.isComplete) { done++; doneMins += (s.end - s.start); }
             if (t && isLate(t)) late++;
         });
-        return { lane: l.lane, crew: l.crew, name: l.name, isPlaceholder: l.isPlaceholder, availMins: availMins, bookedMins: bookedMins, doneMins: doneMins, tasks: tasks, done: done, late: late };
+        return { lane: l.lane, crew: l.crew, name: l.name, isLead: l.isLead, isPlaceholder: l.isPlaceholder, availMins: availMins, bookedMins: bookedMins, doneMins: doneMins, tasks: tasks, done: done, late: late };
     });
 
     // Per-crew utilization inside the plan window.
+    // Leads are shown on the Gantt but are not cleaners, so they stay out of crew load and payroll.
     const crewStats = [];
-    workerStats.forEach(function(ws) {
+    workerStats.filter(function(ws) { return !ws.isLead; }).forEach(function(ws) {
         let cs = crewStats.find(function(c) { return c.crew === ws.crew; });
         if (!cs) {
             cs = { crew: ws.crew, heads: 0, availMins: 0, bookedMins: 0, doneMins: 0, shifts: shiftWindows.filter(function(w) { return w.crew === ws.crew; }) };
@@ -1945,6 +2162,8 @@ export default function App(props) {
         else last.count += 1;
     });
     const visibleLanes = laneRoster.slice(visibleLaneLo, visibleLaneLo + visibleLaneCount);
+    // Lines picked in Shift Start that no equipment area is named after (so their rooms can't be shown).
+    const shiftStartUnmatchedLines = shiftStartRooms ? Object.keys(shiftStartRooms).filter(function(n) { return !allUniqueRooms.some(function(r) { return String(r).trim().toLowerCase() === n; }); }) : [];
 
     const liveLeftPx = (nowMin / 60) * zoomLevel;
 
@@ -2045,6 +2264,49 @@ export default function App(props) {
                             </div>
                         </div>
 
+                        {/* SHIFT START LINK */}
+                        <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden flex-shrink-0">
+                            <div className="bg-slate-50 border-b border-gray-200 px-6 py-4 flex flex-wrap items-center justify-between gap-3">
+                                <h2 className="font-black text-slate-800 uppercase tracking-widest text-sm flex items-center"><ClipboardList className="w-5 h-5 mr-2 text-indigo-500" /> Shift Start Link</h2>
+                                <span className="text-[10px] font-bold normal-case tracking-normal text-slate-500 bg-white border border-slate-200 rounded px-2 py-0.5">{boardRows.length} Shift Start board{boardRows.length === 1 ? '' : 's'} loaded · {lineRows.length} lines</span>
+                            </div>
+                            <div className="p-4 md:p-6 grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Employees &amp; teams come from</label>
+                                    <select value={rosterSource} onChange={function(e) { setRosterSource(e.target.value); }} className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none no-pan bg-white cursor-pointer">
+                                        <option value="table">Employee table (Shift + Role columns)</option>
+                                        <option value="shiftstart">Shift Start boards (leads, their teams, who is out)</option>
+                                    </select>
+                                    <p className="text-[11px] font-bold text-slate-500 mt-1.5">{rosterSource === 'shiftstart' ? 'A shift with a saved board uses that board. A shift with no board yet (a future weekend) falls back to the employee table, so you can still plan ahead.' : 'Leads own the people on their Leadership Team; everyone else comes from the Shift column.'}</p>
+                                </div>
+                                <div>
+                                    <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Rooms come from</label>
+                                    <select value={roomSource} onChange={function(e) { setRoomSource(e.target.value); }} className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none no-pan bg-white cursor-pointer">
+                                        <option value="all">All rooms that have equipment</option>
+                                        <option value="shiftstart">Rooms the supervisors picked in Shift Start</option>
+                                    </select>
+                                    <p className="text-[11px] font-bold text-slate-500 mt-1.5">{roomSource === 'shiftstart' ? (shiftStartRooms ? `${Object.keys(shiftStartRooms).length} line${Object.keys(shiftStartRooms).length === 1 ? '' : 's'} on the boards · ${allUniqueRooms.filter(function(r) { return shiftStartRooms[String(r).trim().toLowerCase()]; }).length} match an equipment area${shiftStartUnmatchedLines.length ? ' · no equipment area named: ' + shiftStartUnmatchedLines.join(', ') : ''}` : 'No board falls inside this plan yet, so every room is shown.') : 'Turn rooms off in the Room Configuration list below.'}</p>
+                                </div>
+                            </div>
+                            <div className="px-4 md:px-6 pb-5 flex flex-wrap gap-2">
+                                {shiftWindows.length === 0 && <span className="text-[11px] font-bold text-slate-400">No shifts fall inside the plan window.</span>}
+                                {shiftWindows.map(function(w) {
+                                    const bs = windowBoards[w.key] || [];
+                                    const isFuture = w.shiftStart > nowMin;
+                                    const style = getCrewStyle(w.crew);
+                                    const leadsN = bs.reduce(function(n, b) { return n + (Array.isArray(b.board.leads) ? b.board.leads.length : 0); }, 0);
+                                    const memN = bs.reduce(function(n, b) { return n + (b.board.members ? Object.keys(b.board.members).filter(function(id) { return !(b.board.out && b.board.out[id]); }).length : 0); }, 0);
+                                    return (
+                                        <span key={w.key} className={`text-[11px] font-bold rounded-lg px-2.5 py-1 border flex items-center gap-1.5 ${bs.length ? 'bg-emerald-50 border-emerald-300 text-emerald-900' : 'bg-slate-50 border-slate-200 text-slate-500'}`} title={bs.map(function(b) { return b.supervisor; }).join(', ')}>
+                                            <span className={`text-[9px] font-black rounded px-1 py-0.5 ${style.badge}`}>{w.crew}</span>
+                                            {w.dayLabel} {formatHourLabel(w.startHour)}:
+                                            {bs.length ? ` board found · ${leadsN} lead${leadsN === 1 ? '' : 's'} · ${memN} on teams` : (isFuture ? ' future shift — no board yet, using employee table' : ' no board saved — using employee table')}
+                                        </span>
+                                    );
+                                })}
+                            </div>
+                        </div>
+
                         {/* CREW ROTATION & HEADCOUNT */}
                         <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden flex-shrink-0">
                             <div className="bg-slate-50 border-b border-gray-200 px-6 py-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
@@ -2066,7 +2328,7 @@ export default function App(props) {
                                 {rawEmployees.length === 0 ? (
                                     <span><AlertCircle className="w-3.5 h-3.5 inline mr-1" /> No employee rows came back from Dataverse (tried craa5__aa_employee and craa5_aa_employee). Lanes use placeholder seats until the table loads.</span>
                                 ) : (
-                                    <span><CheckCircle className="w-3.5 h-3.5 inline mr-1" /> {rawEmployees.length} employees loaded from {dataDiag.employeeTable} · A {crewRosters.A.length} · B {crewRosters.B.length} · C {crewRosters.C.length} · D {crewRosters.D.length} · <span title={rosterInfo.excluded.join(', ')} className="underline decoration-dotted">{rosterInfo.excluded.length} leads/supervisors/managers excluded</span> · <span title={rosterInfo.roleExcluded.join(', ')} className="underline decoration-dotted">{rosterInfo.roleExcluded.length} non-cleaning roles excluded</span>{rosterInfo.inactive.length > 0 && <span> · <span title={rosterInfo.inactive.join(', ')} className="underline decoration-dotted text-slate-500">{rosterInfo.inactive.length} blank-shift (left company) ignored</span></span>}{rosterInfo.unmatched.length > 0 ? ` · ${rosterInfo.unmatched.length} with an unreadable shift` : ''}</span>
+                                    <span><CheckCircle className="w-3.5 h-3.5 inline mr-1" /> {rawEmployees.length} employees loaded from {dataDiag.employeeTable} · A {crewRosters.A.length} · B {crewRosters.B.length} · C {crewRosters.C.length} · D {crewRosters.D.length} · <span title={CREW_CODES.map(function(c) { return leadRosters[c].map(function(l) { return l.name; }).join(', '); }).filter(Boolean).join(', ')} className="underline decoration-dotted">{leadCount} lead{leadCount === 1 ? '' : 's'} shown as Leadership</span> · <span title={rosterInfo.excluded.join(', ')} className="underline decoration-dotted">{rosterInfo.excluded.length} supervisors/managers excluded</span> · <span title={rosterInfo.roleExcluded.join(', ')} className="underline decoration-dotted">{rosterInfo.roleExcluded.length} non-cleaning roles excluded</span>{rosterInfo.inactive.length > 0 && <span> · <span title={rosterInfo.inactive.join(', ')} className="underline decoration-dotted text-slate-500">{rosterInfo.inactive.length} blank-shift (left company) ignored</span></span>}{rosterInfo.unmatched.length > 0 ? ` · ${rosterInfo.unmatched.length} with an unreadable shift` : ''}</span>
                                 )}
                                 <span className="text-slate-500">Equipment: {dataDiag.assetCount} ({dataDiag.source}) · Shift table: {dataDiag.shiftRows} rows{shiftTableInfo ? ` (${shiftTableInfo.hourMode})` : ''}</span>
                                 <span className={coverage.gaps.length || coverage.overlaps.length ? 'text-rose-700' : 'text-emerald-700'}>
@@ -2112,7 +2374,11 @@ export default function App(props) {
                                     const crewSlots = sortSlots(shiftRotation.filter(function(s) { return s.crew === crew; }));
                                     const ns = Object.assign({ day: 0, startHour: 6, endHour: 18 }, newSlot[crew] || {});
                                     const style = getCrewStyle(crew);
-                                    const roster = crewRosters[crew];
+                                    const cp = crewPeople[crew];
+                                    const useCp = !!cp && cp.everyone.length > 0;
+                                    const rosterList = useCp ? cp.everyone.map(function(x) { return x.rec; }) : leadRosters[crew].concat(crewRosters[crew]);
+                                    const roster = rosterList.filter(function(p) { return !p.isLead; });
+                                    const crewLeadList = rosterList.filter(function(p) { return p.isLead; });
                                     const presentCount = roster.filter(function(p) { return !absentEmployees[p.id]; }).length;
                                     const crewShifts = shiftWindows.filter(function(w) { return w.crew === crew; });
                                     const isOverridden = crewHeadcountOverrides[crew] !== undefined;
@@ -2153,25 +2419,25 @@ export default function App(props) {
                                                 </div>
                                                 <div className="flex flex-wrap items-center gap-3">
                                                     <label className="flex items-center gap-1.5 text-[10px] font-black text-indigo-600 uppercase" title="Blank = present employees from Dataverse">Headcount
-                                                        <input type="number" min="0" value={isOverridden ? crewHeadcountOverrides[crew] : ''} placeholder={String(roster.length > 0 ? presentCount : FALLBACK_CREW_SIZE)} onChange={function(e) { handleCrewHeadcountChange(crew, e.target.value); }} className={`w-14 text-center font-black text-xs outline-none border rounded p-1 no-pan ${isOverridden ? 'border-indigo-400 bg-indigo-50' : 'border-slate-200'}`} />
+                                                        <input type="number" min="0" value={isOverridden ? crewHeadcountOverrides[crew] : ''} placeholder={String(useCp ? defaultCrewCount(crew) : (roster.length > 0 ? presentCount : FALLBACK_CREW_SIZE))} onChange={function(e) { handleCrewHeadcountChange(crew, e.target.value); }} className={`w-14 text-center font-black text-xs outline-none border rounded p-1 no-pan ${isOverridden ? 'border-indigo-400 bg-indigo-50' : 'border-slate-200'}`} />
                                                     </label>
                                                 </div>
                                                 <div className="text-[11px] font-bold text-slate-500">
-                                                    {roster.length > 0 ? `${presentCount} of ${roster.length} on roster available` : 'No employees matched this crew — using placeholder seats'}
+                                                    {useCp && cp.boardWindows > 0 ? `Shift Start: ${cp.boardWindows} of ${crewShifts.length} shift${crewShifts.length === 1 ? '' : 's'} ${cp.boardWindows === 1 ? 'has' : 'have'} a board · ${presentCount} of ${roster.length} available` : roster.length > 0 ? `${presentCount} of ${roster.length} on roster available` : 'No employees matched this crew — using placeholder seats'}{crewLeadList.length > 0 ? ` · ${crewLeadList.length} lead${crewLeadList.length === 1 ? '' : 's'}` : ''}
                                                     {crewShifts.length > 0 && <span className="text-slate-400"> · {crewShifts.map(function(w) { return w.dayLabel; }).join(', ')}</span>}
                                                 </div>
-                                                {roster.length > 0 && (
+                                                {rosterList.length > 0 && (
                                                     <div>
                                                         <button onClick={function() { setExpandedRosters(function(prev) { return Object.assign({}, prev, { [crew]: !prev[crew] }); }); }} className="text-[11px] font-black text-indigo-600 hover:text-indigo-800 flex items-center gap-1">
                                                             {expandedRosters[crew] ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />} Roster / mark absent
                                                         </button>
                                                         {expandedRosters[crew] && (
                                                             <div className="mt-2 flex flex-wrap gap-1.5">
-                                                                {roster.map(function(p) {
+                                                                {rosterList.map(function(p) {
                                                                     const absent = !!absentEmployees[p.id];
                                                                     return (
                                                                         <button key={p.id} onClick={function() { toggleAbsent(p.id); }} title={absent ? 'Absent — click to mark present' : 'Present — click to mark absent'} className={`px-2 py-1 rounded-full text-[10px] font-bold border transition-colors ${absent ? 'bg-slate-100 text-slate-400 border-slate-200 line-through' : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'}`}>
-                                                                            {p.name}{WORK_KIND_SHORT[p.kind] ? ' · ' + WORK_KIND_SHORT[p.kind] : ''}
+                                                                            {p.name}{p.isLead ? ' · Lead' : WORK_KIND_SHORT[p.kind] ? ' · ' + WORK_KIND_SHORT[p.kind] : ''}
                                                                         </button>
                                                                     );
                                                                 })}
@@ -2198,7 +2464,8 @@ export default function App(props) {
                                     <p className="text-center text-slate-400 mt-10 text-sm font-medium">No areas active.</p>
                                 ) : allUniqueRooms.map(function(room) {
                                     
-                                    const isSkipped = hiddenRooms[room];
+                                    const isSkipped = roomHidden(room);
+                                    const skippedByShiftStart = isSkipped && !hiddenRooms[room];
                                     if (hideConfiguredRooms && roomConfigured[room] && !isSkipped) return null;
 
                                     return (
@@ -2218,8 +2485,8 @@ export default function App(props) {
                                                         </label>
                                                     )}
                                                     
-                                                    <button onClick={function() { handleToggleRoom(room); }} className={`px-3 py-1 flex items-center gap-1.5 rounded-full text-[11px] font-bold transition-colors whitespace-nowrap border shadow-sm touch-none ${!isSkipped ? 'bg-indigo-600 text-white border-indigo-700 hover:bg-indigo-700' : 'bg-white text-slate-500 border-slate-300 hover:bg-slate-50'}`}>
-                                                        {!isSkipped ? <CheckCircle className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />} {isSkipped ? 'Skipped' : 'Active'}
+                                                    <button onClick={function() { if (!skippedByShiftStart) handleToggleRoom(room); }} title={skippedByShiftStart ? 'Not picked in Shift Start. Change "Rooms come from" above to turn it back on.' : ''} className={`px-3 py-1 flex items-center gap-1.5 rounded-full text-[11px] font-bold transition-colors whitespace-nowrap border shadow-sm touch-none ${!isSkipped ? 'bg-indigo-600 text-white border-indigo-700 hover:bg-indigo-700' : 'bg-white text-slate-500 border-slate-300 hover:bg-slate-50'}`}>
+                                                        {!isSkipped ? <CheckCircle className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />} {skippedByShiftStart ? 'Not in Shift Start' : isSkipped ? 'Skipped' : 'Active'}
                                                     </button>
                                                     
                                                     {!isSkipped && <Button variant="outline" size="sm" onClick={function() { openRoomDowntime(room); }} className="text-rose-600 border-rose-200 hover:bg-rose-50 hidden sm:flex">Add Room Downtime</Button>}
@@ -2382,7 +2649,7 @@ export default function App(props) {
                                     })}
                                 </select>
                                 <span className={`text-xs font-black rounded px-2 py-1 ${style.badge}`}>{win.crew} · {win.dayLabel} {formatHourLabel(win.startHour)}</span>
-                                <span className="text-sm font-bold text-slate-600">{crewLanes.length} people · {shiftDone}/{shiftTotal} tasks done{shiftLate > 0 ? ` · ${shiftLate} late` : ''}</span>
+                                <span className="text-sm font-bold text-slate-600">{crewLanes.filter(function(l) { return !l.isLead; }).length} people{crewLanes.some(function(l) { return l.isLead; }) ? ' · ' + crewLanes.filter(function(l) { return l.isLead; }).length + ' lead' + (crewLanes.filter(function(l) { return l.isLead; }).length === 1 ? '' : 's') : ''} · {shiftDone}/{shiftTotal} tasks done{shiftLate > 0 ? ` · ${shiftLate} late` : ''}</span>
                                 <Button variant="outline" size="sm" onClick={function() { window.print(); }} className="ml-auto no-print"><Printer className="w-3.5 h-3.5 mr-1" /> Print Schedules</Button>
                             </div>
 
@@ -2393,8 +2660,22 @@ export default function App(props) {
                                     blocks.forEach(function(t) { booked += Math.min(win.end, t.startMin + t.finalDuration) - Math.max(win.start, t.startMin); });
                                     const pct = winLen > 0 ? Math.round((booked / winLen) * 100) : 0;
                                     const doneCount = blocks.filter(function(t) { return t.isComplete; }).length;
+                                    const gc = l.groupIdx >= 0 ? TEAM_COLORS[l.groupIdx % TEAM_COLORS.length] : null;
+                                    if (l.isLead) {
+                                        return (
+                                            <div key={l.lane} className="lg:col-span-2 self-start rounded-xl shadow-sm border border-slate-200 overflow-hidden break-inside-avoid bg-white" style={{ borderLeft: `6px solid ${gc || '#475569'}` }}>
+                                                <div className="px-4 py-3 flex items-center gap-3">
+                                                    <span className={`w-7 h-7 rounded-md flex items-center justify-center font-black text-xs ${style.badge}`}>{l.crew}</span>
+                                                    <div className="flex-1 min-w-0">
+                                                        <div className="font-black text-slate-800 truncate">{l.name}{roleTag(l)}</div>
+                                                        <div className="text-[11px] font-bold text-slate-500 mt-0.5">Leadership for the whole shift · {l.teamNames.length ? 'Team of ' + l.teamNames.length + ': ' + l.teamNames.join(', ') : 'no team assigned yet'}</div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        );
+                                    }
                                     return (
-                                        <div key={l.lane} className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden break-inside-avoid">
+                                        <div key={l.lane} className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden break-inside-avoid" style={gc ? { borderLeft: `6px solid ${gc}` } : undefined}>
                                             <div className="px-4 py-3 border-b border-slate-100 flex items-center gap-3">
                                                 <span className={`w-7 h-7 rounded-md flex items-center justify-center font-black text-xs ${style.badge}`}>{l.crew}</span>
                                                 <div className="flex-1 min-w-0">
@@ -2659,7 +2940,7 @@ export default function App(props) {
                                         </tr>
                                     </thead>
                                     <tbody className="divide-y divide-slate-100">
-                                        {workerStats.map(function(ws) {
+                                        {workerStats.filter(function(ws) { return !ws.isLead; }).map(function(ws) {
                                             const pct = ws.availMins > 0 ? Math.round((ws.bookedMins / ws.availMins) * 100) : 0;
                                             return (
                                                 <tr key={ws.lane} className="hover:bg-slate-50">
@@ -2707,7 +2988,7 @@ export default function App(props) {
                         })}
                         <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest ml-4 mr-1">Crews:</span>
                         {crewBlocks.map(function(b) {
-                            return <span key={b.crew + b.firstLane} className={`text-[10px] font-black rounded px-1.5 py-0.5 ${getCrewStyle(b.crew).badge}`}>{b.crew} · {b.count}</span>;
+                            return <span key={b.crew + b.firstLane} className={`text-[10px] font-black rounded px-1.5 py-0.5 ${getCrewStyle(b.crew).badge}`}>{b.crew} · {laneRoster.filter(function(l) { return l.crew === b.crew && !l.isLead; }).length}{laneRoster.some(function(l) { return l.crew === b.crew && l.isLead; }) ? ' + ' + laneRoster.filter(function(l) { return l.crew === b.crew && l.isLead; }).length + ' lead' : ''}</span>;
                         })}
                         <span className="ml-auto text-[10px] font-bold text-slate-500 flex items-center gap-3">
                             <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm bg-slate-400 inline-block opacity-60" /> Done</span>
@@ -2843,16 +3124,23 @@ export default function App(props) {
                                                 const isCrewStart = crewBlocks.some(function(b) { return b.firstLane === l.lane && l.lane > visibleLaneLo; });
                                                 const ws = workerStats[l.lane];
                                                 const pct = ws && ws.availMins > 0 ? Math.round((ws.bookedMins / ws.availMins) * 100) : 0;
+                                                const gc = l.groupIdx >= 0 ? TEAM_COLORS[l.groupIdx % TEAM_COLORS.length] : null;
+                                                const isMember = !l.isLead && !!l.leadKey;
+                                                const teamTxt = l.isLead ? (l.teamNames.length ? 'Team of ' + l.teamNames.length + ' · ' + l.teamNames.join(', ') : 'No team assigned') : '';
                                                 return (
-                                                <div key={l.lane} className={`border-b border-gray-200/60 flex flex-col justify-center px-2 bg-white overflow-hidden ${isCrewStart ? 'border-t-2 border-t-slate-400' : ''}`} style={{ height: `${LANE_HEIGHT_PX}px`, minHeight: `${LANE_HEIGHT_PX}px`, maxHeight: `${LANE_HEIGHT_PX}px`, flex: `0 0 ${LANE_HEIGHT_PX}px`, boxSizing: 'border-box' }} title={`${l.name} (${l.crew} crew) — ${ws ? (ws.bookedMins / 60).toFixed(1) : 0}h assigned of ${ws ? (ws.availMins / 60).toFixed(0) : 0}h on shift`}>
+                                                <div key={l.lane} className={`border-b border-gray-200/60 flex flex-col justify-center px-2 overflow-hidden ${l.isLead ? '' : 'bg-white'} ${isCrewStart ? 'border-t-2 border-t-slate-400' : ''}`} style={{ height: `${LANE_HEIGHT_PX}px`, minHeight: `${LANE_HEIGHT_PX}px`, maxHeight: `${LANE_HEIGHT_PX}px`, flex: `0 0 ${LANE_HEIGHT_PX}px`, boxSizing: 'border-box', borderLeft: gc ? `4px solid ${gc}` : undefined, paddingLeft: isMember ? '16px' : undefined, backgroundColor: l.isLead && gc ? gc + '1f' : l.isLead ? '#f1f5f9' : undefined }} title={l.isLead ? `${l.name} — Lead (${l.crew} crew)${l.teamNames.length ? '\nTeam: ' + l.teamNames.join(', ') : ''}` : `${l.name} (${l.crew} crew)${l.leadKey ? ' — team of ' + (laneRoster.find(function(x) { return x.key === l.leadKey; }) || {}).name : ''} — ${ws ? (ws.bookedMins / 60).toFixed(1) : 0}h assigned of ${ws ? (ws.availMins / 60).toFixed(0) : 0}h on shift`}>
                                                     <div className="flex items-center gap-1.5 min-w-0">
                                                         <span className={`text-[9px] font-black rounded px-1 py-0.5 flex-shrink-0 ${getCrewStyle(l.crew).badge}`}>{l.crew}</span>
-                                                        <span className={`text-[11px] font-bold truncate min-w-0 ${l.isPlaceholder ? 'text-slate-400 italic' : 'text-slate-800'}`}>{l.name}</span>{roleTag(l)}
+                                                        <span className={`text-[11px] ${l.isLead ? 'font-black' : 'font-bold'} truncate min-w-0 ${l.isPlaceholder ? 'text-slate-400 italic' : 'text-slate-800'}`}>{l.name}</span>{roleTag(l)}
                                                     </div>
-                                                    <div className="flex items-center gap-1.5 mt-1">
-                                                        <div className="flex-1 min-w-0 h-1 bg-slate-100 rounded-full overflow-hidden"><div className={`h-full ${pct > 100 ? 'bg-rose-500' : 'bg-indigo-400'}`} style={{ width: `${Math.min(100, pct)}%` }} /></div>
-                                                        <span className="text-[9px] font-black text-slate-400 text-right whitespace-nowrap flex-shrink-0">{ws ? (ws.bookedMins / 60).toFixed(1) : 0}h · {ws ? ws.done : 0}/{ws ? ws.tasks : 0}</span>
-                                                    </div>
+                                                    {l.isLead ? (
+                                                        <div className="mt-1 text-[9px] font-bold truncate whitespace-nowrap" style={{ color: gc || '#64748b' }}>{teamTxt}</div>
+                                                    ) : (
+                                                        <div className="flex items-center gap-1.5 mt-1">
+                                                            <div className="flex-1 min-w-0 h-1 bg-slate-100 rounded-full overflow-hidden"><div className={`h-full ${pct > 100 ? 'bg-rose-500' : 'bg-indigo-400'}`} style={{ width: `${Math.min(100, pct)}%` }} /></div>
+                                                            <span className="text-[9px] font-black text-slate-400 text-right whitespace-nowrap flex-shrink-0">{ws ? (ws.bookedMins / 60).toFixed(1) : 0}h · {ws ? ws.done : 0}/{ws ? ws.tasks : 0}</span>
+                                                        </div>
+                                                    )}
                                                 </div>
                                                 );
                                             })}
@@ -2865,6 +3153,22 @@ export default function App(props) {
                                             {visibleLanes.map(function(l, row) {
                                                 return laneOffShift[l.lane].map(function(g, gi) {
                                                     return <div key={`off-${l.lane}-${gi}`} className="absolute bg-slate-300/40 off-shift-stripes pointer-events-none" style={{ left: `${(g.start / 60) * zoomLevel}px`, width: `${((g.end - g.start) / 60) * zoomLevel}px`, top: `${row * LANE_HEIGHT_PX}px`, height: `${LANE_HEIGHT_PX}px` }} />;
+                                                });
+                                            })}
+
+                                            {/* Leads have no tasks: their lane is one "Leadership" bar for each shift they work */}
+                                            {visibleLanes.map(function(l, row) {
+                                                if (!l.isLead) return null;
+                                                const gc = l.groupIdx >= 0 ? TEAM_COLORS[l.groupIdx % TEAM_COLORS.length] : '#475569';
+                                                return l.windows.map(function(w, wi) {
+                                                    const leftPx = (w.start / 60) * zoomLevel;
+                                                    if (leftPx >= GANTT_TOTAL_WIDTH_PX) return null;
+                                                    const widthPx = Math.min(((w.end - w.start) / 60) * zoomLevel, GANTT_TOTAL_WIDTH_PX - leftPx);
+                                                    return (
+                                                        <div key={`lead-${l.lane}-${wi}`} className="absolute z-10 rounded-md border border-black/20 shadow-sm flex items-center justify-center overflow-hidden pointer-events-none" style={{ left: `${leftPx}px`, width: `${widthPx}px`, top: `${row * LANE_HEIGHT_PX + 2}px`, height: `${LANE_HEIGHT_PX - 4}px`, backgroundColor: gc }} title={`${l.name} — Leadership for the whole shift`}>
+                                                            <span className="text-white font-black text-[11px] uppercase tracking-[0.25em] drop-shadow-md truncate px-2">Leadership</span>
+                                                        </div>
+                                                    );
                                                 });
                                             })}
 
