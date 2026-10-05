@@ -145,10 +145,12 @@ const computeTextLinks = (assets, logs) => {
   const links = new Map();
   const { unmapped } = buildCompletionIndex(assets, logs, null);
   const named = assets.map(a => ({ id: getAssetId(a), norm: normalizeName(safeString(getProp(a, 'craa5_equipmentidentifier'))) })).filter(a => a.id && a.norm);
+  const byName = new Map();
+  named.forEach(a => byName.set(a.norm, (byName.get(a.norm) || []).concat(a)));
   unmapped.forEach(log => {
     const n = normalizeName(safeString(getProp(log, 'craa5_equipment')));
     if (!n) return;
-    const exact = named.filter(a => a.norm === n);
+    const exact = byName.get(n) || [];
     if (exact.length === 1) { links.set(getLogKey(log), exact[0].id); return; }
     if (exact.length > 1 || n.length < 3) return;
     const loose = named.filter(a => a.norm.length >= 3 && (a.norm.includes(n) || n.includes(a.norm)));
@@ -181,36 +183,71 @@ const writeBackTextLinks = async (logs, links) => {
   return { remaining, written, failed };
 };
 
-// Page through a Dataverse query. If the id column is missing from the table, retry without it
-// so Sync still works (everything then falls back to text matching).
-const retrieveAllLogs = async (select, filter, onWarn) => {
-  const page = async (query) => Xrm.WebApi.retrieveMultipleRecords("craa5__log_", query);
-  const run = async (sel) => {
-    let res = await page(`?$select=${sel}&$filter=${filter}`);
-    let all = res.entities || [];
-    while (res.nextLink) {
-      res = await page("?" + res.nextLink.split("?")[1]);
-      all = all.concat(res.entities || []);
-    }
-    return all;
-  };
-  const withId = `${select},${LOG_ASSET_ID_SELECT}`;
-  let first;
+// --- ON-DEMAND LOADING ---
+// There are thousands of pieces of equipment, so nothing here loads the whole log table. Sync loads the
+// equipment directory (four small columns) plus the few logs that have no equipment id yet; the logs that
+// do have an id are fetched only for the equipment rows and months currently on screen.
+const LOG_SELECT = "craa5__log_id,craa5_equipment,craa5_lastcleaned,craa5_lastcleanedby,craa5_nameofemployee,craa5_uid,craa5_sap,craa5_hoursworked,craa5_room,craa5_area";
+const ASSET_SELECT = "craa5_aa_assetsid,craa5_equipmentidentifier,craa5_roomname,craa5_areaname";
+const PAGE_SIZE = 1000;          // rows per Dataverse page
+const ID_CHUNK = 15;             // equipment ids per log request
+const MAX_PARALLEL_REQUESTS = 3; // log requests in flight at once
+const MAX_ASSETS = 50000;        // safety caps; a truncated load is reported, never silent
+const MAX_UNLINKED_LOGS = 10000;
+const MODAL_PAGE_SIZE = 25;      // equipment rows per area in the focused dialog
+
+const isMissingColumnError = (err) => /could not find a property|0x80060888|does not exist|invalid property/i.test(String(err && err.message));
+const isGuid = (v) => /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(v);
+
+const retrievePaged = async (entity, query, maxRows) => {
+  let res = await Xrm.WebApi.retrieveMultipleRecords(entity, query, PAGE_SIZE);
+  let rows = res.entities || [];
+  while (res.nextLink && rows.length < maxRows) {
+    res = await Xrm.WebApi.retrieveMultipleRecords(entity, "?" + res.nextLink.split("?")[1], PAGE_SIZE);
+    rows = rows.concat(res.entities || []);
+  }
+  return { rows, truncated: !!res.nextLink };
+};
+
+// Date-only values are stored as midnight UTC, so the window is built in UTC.
+const monthsFilter = (year, firstMonth, lastMonth) => {
+  const start = new Date(Date.UTC(year, firstMonth, 1)).toISOString();
+  const end = new Date(Date.UTC(year, lastMonth + 1, 0, 23, 59, 59)).toISOString();
+  return `craa5_lastcleaned ge '${start}' and craa5_lastcleaned le '${end}'`;
+};
+
+// Logs stored against these equipment ids in the given month run.
+const fetchLogsForAssets = async (assetIds, year, firstMonth, lastMonth) => {
+  const ids = assetIds.filter(isGuid);
+  if (!ids.length) return [];
+  const idFilter = ids.map(id => `${LOG_ASSET_ID_SELECT} eq '${id}'`).join(' or ');
+  const { rows } = await retrievePaged("craa5__log_", `?$select=${LOG_SELECT},${LOG_ASSET_ID_SELECT}&$filter=(${idFilter}) and ${monthsFilter(year, firstMonth, lastMonth)}`, 20000);
+  return rows;
+};
+
+// Logs with no equipment id yet: the only ones the text fallback can help. When the id column does not
+// exist at all, every log in the window is a candidate (text matching only).
+const fetchUnlinkedLogs = async (year, firstMonth, lastMonth) => {
+  const window = monthsFilter(year, firstMonth, lastMonth);
   try {
-    first = await page(`?$select=${withId}&$filter=${filter}`);
+    const { rows, truncated } = await retrievePaged("craa5__log_", `?$select=${LOG_SELECT},${LOG_ASSET_ID_SELECT}&$filter=${LOG_ASSET_ID_SELECT} eq null and ${window}`, MAX_UNLINKED_LOGS);
+    return { rows, truncated, idColumn: true };
   } catch (err) {
     // Only a missing column justifies dropping the id; anything else (throttling, network) is a real failure.
-    if (!/could not find a property|0x80060888|does not exist|invalid property/i.test(String(err && err.message))) throw err;
-    if (onWarn) onWarn(`Log id column ${LOG_ASSET_ID_SELECT} unavailable (${err.message}); using text matching only.`);
-    return await run(select);
+    if (!isMissingColumnError(err)) throw err;
+    const { rows, truncated } = await retrievePaged("craa5__log_", `?$select=${LOG_SELECT}&$filter=${window}`, MAX_UNLINKED_LOGS);
+    return { rows, truncated, idColumn: false, error: err.message };
   }
-  let all = first.entities || [];
-  let res = first;
-  while (res.nextLink) {
-    res = await page("?" + res.nextLink.split("?")[1]);
-    all = all.concat(res.entities || []);
-  }
-  return all;
+};
+
+// Contiguous runs of month indexes: [3,4,5,8] -> [[3,5],[8,8]].
+const monthRuns = (months) => {
+  const runs = [];
+  [...months].sort((a, b) => a - b).forEach(m => {
+    const last = runs[runs.length - 1];
+    if (last && m === last[1] + 1) last[1] = m; else runs.push([m, m]);
+  });
+  return runs;
 };
 
 const getWeekNumber = (d) => {
@@ -256,11 +293,38 @@ export default function App() {
   const [syncNotes, setSyncNotes] = useState([]);
   const [canWriteBack, setCanWriteBack] = useState(false); // false when the log id column is missing
   const [isSaving, setIsSaving] = useState(false);
+  const [idColumn, setIdColumn] = useState(true);       // false when craa5_equipmentguid does not exist on the log table
+  const [syncWindow, setSyncWindow] = useState(null);   // { year, firstMonth, lastMonth } the last Sync text-matched
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [loadErrors, setLoadErrors] = useState([]);
+  const [modalPages, setModalPages] = useState({});     // "room|area" -> page in the focused dialog
+  const epochRef = useRef(0);                           // bumped by Sync so late responses are ignored
+  const loadedRef = useRef(new Set());                  // "year|month|assetId" already fetched
+  const inflightRef = useRef(new Set());
+  const logKeysRef = useRef(new Set());
+  const pendingLogsRef = useRef([]);                    // loaded rows waiting for one batched state update
+  const flushTimerRef = useRef(null);
 
   // Id match is re-derived from loaded data; the text fallback only changes when Sync runs.
   const completionIndex = useMemo(() => buildCompletionIndex(assets, logs, textLinks), [assets, logs, textLinks]);
 
   const today = useMemo(() => new Date(), []);
+
+  // Every equipment row that renders reports its id here, so logs are fetched for exactly what is on
+  // screen (main grid and focused dialog), whatever the expand/collapse and paging state is.
+  const renderedIdsRef = useRef([]);
+  renderedIdsRef.current = [];
+  const rowLogsFor = (asset) => {
+    const id = getAssetId(asset);
+    renderedIdsRef.current.push(id);
+    return completionIndex.byAsset.get(id);
+  };
+  const [visibleKey, setVisibleKey] = useState('');
+  const visibleKeyRef = useRef('');
+  const [retryTick, setRetryTick] = useState(0);
+  const queueRef = useRef([]);   // log requests waiting to start
+  const activeRef = useRef(0);   // log requests in flight, across every run of the loader
+  const pumpRef = useRef(null);
 
   // Initialize Slicer with Previous, Current, and Next month
   useEffect(() => {
@@ -287,26 +351,52 @@ export default function App() {
     }
   };
 
+  // Rows from several requests are applied in one state update (at most every 250 ms): every update
+  // re-renders the grid, and doing that once per request is what makes a large grid stutter.
+  const flushLogs = useCallback(() => {
+    if (flushTimerRef.current) { clearTimeout(flushTimerRef.current); flushTimerRef.current = null; }
+    const batch = pendingLogsRef.current;
+    pendingLogsRef.current = [];
+    if (batch.length) setLogs(prev => prev.concat(batch));
+  }, []);
+
+  const addLogs = useCallback((rows) => {
+    rows.forEach(l => {
+      const k = getLogKey(l);
+      if (logKeysRef.current.has(k)) return;
+      logKeysRef.current.add(k);
+      pendingLogsRef.current.push(l);
+    });
+    if (pendingLogsRef.current.length && !flushTimerRef.current) flushTimerRef.current = setTimeout(flushLogs, 250);
+  }, [flushLogs]);
+
+  // Sync loads the equipment directory and the logs that still have no equipment id (the only ones the
+  // text fallback can help), for the months on screen. Id-matched logs are loaded per visible equipment.
   const triggerSync = async () => {
     if (isLoading) return;
     setIsLoading(true);
     setLoadProgress(5);
-    
+
     try {
       let fetchedAssets = [];
       let fetchedLogs = [];
       const notes = [];
-      let idColumn = typeof Xrm !== 'undefined';
+      let hasIdColumn = typeof Xrm !== 'undefined';
+      const months = visibleMonths.length ? visibleMonths : [today.getMonth()];
+      const firstMonth = Math.min(...months);
+      const lastMonth = Math.max(...months);
 
       if (typeof Xrm !== 'undefined') {
-        const assetRes = await Xrm.WebApi.retrieveMultipleRecords("craa5_aa_assets", "?$select=craa5_aa_assetsid,craa5_equipmentidentifier,craa5_roomname,craa5_areaname");
-        fetchedAssets = assetRes.entities || [];
-        setLoadProgress(30);
+        const a = await retrievePaged("craa5_aa_assets", `?$select=${ASSET_SELECT}`, MAX_ASSETS);
+        fetchedAssets = a.rows;
+        if (a.truncated) notes.push(`Only the first ${fetchedAssets.length} equipment rows were loaded.`);
+        setLoadProgress(40);
 
-        const start = new Date(anchorYear, 0, 1).toISOString();
-        const end = new Date(anchorYear, 11, 31, 23, 59).toISOString();
-        const filter = `craa5_lastcleaned ge '${start}' and craa5_lastcleaned le '${end}'`;
-        fetchedLogs = await retrieveAllLogs("craa5__log_id,craa5_equipment,craa5_lastcleaned,craa5_lastcleanedby,craa5_nameofemployee,craa5_uid,craa5_sap,craa5_hoursworked,craa5_room,craa5_area", filter, (m) => { notes.push(m); idColumn = false; });
+        const u = await fetchUnlinkedLogs(anchorYear, firstMonth, lastMonth);
+        fetchedLogs = u.rows;
+        hasIdColumn = u.idColumn;
+        if (u.truncated) notes.push(`Only the first ${fetchedLogs.length} logs without an equipment id were loaded for text matching.`);
+        if (!u.idColumn) notes.push(`Log id column ${LOG_ASSET_ID_SELECT} unavailable (${u.error}); using text matching only for ${MONTHS[firstMonth]} to ${MONTHS[lastMonth]}.`);
       } else {
         setLoadProgress(40);
         // Simulation with many items to test equipment pagination
@@ -327,12 +417,25 @@ export default function App() {
       // Text fallback runs here, and only here: it is what "Sync" adds on top of the id match.
       const links = computeTextLinks(fetchedAssets, fetchedLogs);
 
+      // Swap the loader state together with the data. Requests started before this point finish into the
+      // old sets and are ignored (epoch), so nothing half-loaded survives a Sync.
+      epochRef.current += 1;
+      loadedRef.current = new Set();
+      inflightRef.current = new Set();
+      queueRef.current = [];
+      pendingLogsRef.current = [];
+      if (flushTimerRef.current) { clearTimeout(flushTimerRef.current); flushTimerRef.current = null; }
+      logKeysRef.current = new Set(fetchedLogs.map(getLogKey));
+      setLogsLoading(false);
       setAssets(fetchedAssets);
       setLogs(fetchedLogs);
       setTextLinks(links);
       setSyncNotes(notes);
-      setCanWriteBack(idColumn);
-      
+      setLoadErrors([]);
+      setCanWriteBack(hasIdColumn);
+      setIdColumn(hasIdColumn);
+      setSyncWindow({ year: anchorYear, firstMonth, lastMonth });
+
       const initialExpands = {};
       fetchedAssets.forEach(a => {
         const r = safeString(getProp(a, 'craa5_roomname')) || '[Unassigned Room]';
@@ -342,6 +445,7 @@ export default function App() {
       setLoadProgress(100);
     } catch (err) {
       console.error("Sync Failure:", err);
+      setSyncNotes([`Sync failed: ${err && err.message}`]);
     } finally {
       setTimeout(() => {
         setIsLoading(false);
@@ -420,6 +524,81 @@ export default function App() {
   const totalPages = Math.ceil(roomKeys.length / pageSize);
   const pagedRoomKeys = roomKeys.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
 
+  // Settle the set of rendered equipment (debounced) into state; the loader below reacts to it.
+  useEffect(() => {
+    const key = [...new Set(renderedIdsRef.current)].join(',');
+    if (key === visibleKeyRef.current) return;
+    const t = setTimeout(() => { visibleKeyRef.current = key; setVisibleKey(key); }, 150);
+    return () => clearTimeout(t);
+  });
+
+  const jobKeys = (job) => job.ids.flatMap(id => { const k = []; for (let m = job.m0; m <= job.m1; m++) k.push(`${job.year}|${m}|${id}`); return k; });
+
+  // One global pump: at most MAX_PARALLEL_REQUESTS log requests in flight no matter how often the view changes.
+  pumpRef.current = () => {
+    while (activeRef.current < MAX_PARALLEL_REQUESTS && queueRef.current.length) {
+      const job = queueRef.current.shift();
+      activeRef.current += 1;
+      (async () => {
+        try {
+          const rows = await fetchLogsForAssets(job.ids, job.year, job.m0, job.m1);
+          if (epochRef.current === job.epoch) {
+            jobKeys(job).forEach(k => job.loaded.add(k));
+            addLogs(rows);
+          }
+        } catch (err) {
+          if (epochRef.current === job.epoch) setLoadErrors(prev => prev.concat(String(err && err.message)).slice(-5));
+        } finally {
+          jobKeys(job).forEach(k => job.inflight.delete(k)); // the sets this job was created with, even after a Sync swapped them
+          activeRef.current -= 1;
+          pumpRef.current();
+        }
+      })();
+    }
+    if (!activeRef.current && !queueRef.current.length) {
+      flushLogs();
+      setLogsLoading(false);
+    }
+  };
+
+  // Fetch logs for the equipment on screen, for the visible months only, and never twice.
+  useEffect(() => {
+    // Requests that have not started are dropped and recomputed from what is on screen now.
+    queueRef.current.forEach(j => jobKeys(j).forEach(k => j.inflight.delete(k)));
+    queueRef.current = [];
+    if (typeof Xrm === 'undefined' || !idColumn || isLoading) { pumpRef.current(); return; }
+    const ids = visibleKey ? visibleKey.split(',') : [];
+    if (ids.length && visibleMonths.length) {
+      const loaded = loadedRef.current, inflight = inflightRef.current, epoch = epochRef.current, year = anchorYear;
+      const keyOf = (id, m) => `${year}|${m}|${id}`;
+      // Group equipment by which months they are missing, so cached months are never requested again.
+      const bySignature = new Map();
+      ids.forEach(id => {
+        const missing = visibleMonths.filter(m => !loaded.has(keyOf(id, m)) && !inflight.has(keyOf(id, m)));
+        if (missing.length) {
+          const sig = [...missing].sort((a, b) => a - b).join(',');
+          bySignature.set(sig, (bySignature.get(sig) || []).concat(id));
+        }
+      });
+      bySignature.forEach((sigIds, sig) => {
+        monthRuns(sig.split(',').map(Number)).forEach(([m0, m1]) => {
+          for (let i = 0; i < sigIds.length; i += ID_CHUNK) {
+            const job = { ids: sigIds.slice(i, i + ID_CHUNK), m0, m1, year, epoch, loaded, inflight };
+            jobKeys(job).forEach(k => inflight.add(k));
+            queueRef.current.push(job);
+          }
+        });
+      });
+      if (queueRef.current.length) setLogsLoading(true);
+    }
+    pumpRef.current();
+    // eslint-disable-next-line
+  }, [visibleKey, visibleMonths, anchorYear, idColumn, assets, isLoading, retryTick]);
+
+  const retryLoads = () => { setLoadErrors([]); setRetryTick(t => t + 1); };
+
+  useEffect(() => () => { if (flushTimerRef.current) clearTimeout(flushTimerRef.current); }, []);
+
   const toggleMonthSlicer = (idx) => {
       setVisibleMonths(prev => 
         prev.includes(idx) ? prev.filter(i => i !== idx) : [...prev, idx].sort((a,b) => a-b)
@@ -428,6 +607,7 @@ export default function App() {
 
   const openScopedModal = (type, value) => {
       setModalContext({ type, value });
+      setModalPages({});
       setIsModalMaximized(false);
   };
 
@@ -621,9 +801,9 @@ export default function App() {
                                 </div>
                                 <div className="data-cells"></div>
                               </div>
-                              {filteredTreeData[room][area].map(asset => {
+                              {filteredTreeData[room][area].slice((modalPages[`${room}|${area}`] || 0) * MODAL_PAGE_SIZE, ((modalPages[`${room}|${area}`] || 0) + 1) * MODAL_PAGE_SIZE).map(asset => {
                                 const name = safeString(getProp(asset, 'craa5_equipmentidentifier'));
-                                const rowLogs = completionIndex.byAsset.get(getAssetId(asset));
+                                const rowLogs = rowLogsFor(asset);
                                 return (
                                   <div key={asset.craa5_aa_assetsid} className="asset-row">
                                     <div className="frozen-labels" style={{ paddingLeft: '48px' }}><FileIcon /><span>{name}</span></div>
@@ -640,6 +820,18 @@ export default function App() {
                                   </div>
                                 );
                               })}
+                              {filteredTreeData[room][area].length > MODAL_PAGE_SIZE && (() => {
+                                const mk = `${room}|${area}`;
+                                const mp = modalPages[mk] || 0;
+                                const total = filteredTreeData[room][area].length;
+                                return (
+                                  <div className="area-pagination-bar">
+                                    <button className="page-btn" disabled={mp === 0} onClick={() => setModalPages(p => ({ ...p, [mk]: mp - 1 }))}>Prev {MODAL_PAGE_SIZE}</button>
+                                    <span style={{ fontSize: '10px' }}>Items {mp * MODAL_PAGE_SIZE + 1} - {Math.min((mp + 1) * MODAL_PAGE_SIZE, total)} of {total}</span>
+                                    <button className="page-btn" disabled={(mp + 1) * MODAL_PAGE_SIZE >= total} onClick={() => setModalPages(p => ({ ...p, [mk]: mp + 1 }))}>Next {MODAL_PAGE_SIZE}</button>
+                                  </div>
+                                );
+                              })()}
                             </React.Fragment>
                           ))}
                         </React.Fragment>
@@ -670,7 +862,11 @@ export default function App() {
             {canWriteBack && textLinks.size > 0 && (
               <button className="sync-btn" style={{ background: '#d97706' }} onClick={saveTextMatches} disabled={isSaving || isLoading} title="Writes craa5_equipmentguid on the text-matched logs in Dataverse">{isSaving ? 'Saving...' : `Save ${textLinks.size} text match${textLinks.size === 1 ? '' : 'es'} to Dataverse`}</button>
             )}
-            <span data-testid="match-stats" title="Green = matched by Dataverse id. Amber = matched by text fallback (Sync only)." style={{ fontSize: '11px', fontWeight: 'bold', color: '#475569', whiteSpace: 'nowrap' }}><span style={{ color: '#10b981' }}>■</span> id {completionIndex.stats.id} · <span style={{ color: '#f59e0b' }}>■</span> text {completionIndex.stats.text} · unmapped {completionIndex.stats.unmapped}{completionIndex.stats.duplicate ? ` · duplicate ${completionIndex.stats.duplicate}` : ''}</span>
+            <span data-testid="match-stats" title="Green = matched by Dataverse id. Amber = matched by text fallback (Sync only). Counts cover the logs loaded so far for the equipment and months you have viewed since the last Sync." style={{ fontSize: '11px', fontWeight: 'bold', color: '#475569', whiteSpace: 'nowrap' }}><span style={{ color: '#10b981' }}>■</span> id {completionIndex.stats.id} · <span style={{ color: '#f59e0b' }}>■</span> text {completionIndex.stats.text} · unmapped {completionIndex.stats.unmapped}{completionIndex.stats.duplicate ? ` · duplicate ${completionIndex.stats.duplicate}` : ''}{logsLoading ? ' · loading…' : ''}</span>
+            {loadErrors.length > 0 && <button className="page-btn" style={{ color: '#b91c1c' }} onClick={retryLoads} title={loadErrors[loadErrors.length - 1]}>Some logs failed to load · Retry</button>}
+            {syncWindow && visibleMonths.some(m => syncWindow.year !== anchorYear || m < syncWindow.firstMonth || m > syncWindow.lastMonth) && (
+              <span data-testid="sync-window-note" title="Text matching only covers the months that were on screen at the last Sync. Press Sync to include the others." style={{ fontSize: '11px', color: '#b45309', whiteSpace: 'nowrap' }}>Text match covers {MONTHS[syncWindow.firstMonth]}–{MONTHS[syncWindow.lastMonth]} {syncWindow.year}; Sync to refresh</span>
+            )}
           </div>
           <div className="flex items-center" style={{ gap: '12px' }}>
             <button className="p-1 hover:bg-slate-100 rounded border" onClick={() => setAnchorYear(y => y - 1)}><ChevronLeftIcon /></button>
@@ -707,13 +903,15 @@ export default function App() {
              <h2 style={{ fontSize: '20px', fontWeight: '900', marginBottom: '20px' }}>Diagnostic Explorer</h2>
              <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '12px', padding: '20px' }}>
                 <h3 style={{ fontSize: '15px', fontWeight: 'bold' }}>Sync Breakdown</h3>
-                <p>Assets: {assets.length}</p>
-                <p>Logs: {logs.length}</p>
+                <p>Equipment loaded: {assets.length}</p>
+                <p>Logs loaded: {logs.length}</p>
                 <p>Matched by Dataverse id: {completionIndex.stats.id}</p>
                 <p>Matched by text (Sync only): {completionIndex.stats.text}</p>
                 <p>Unmapped: {completionIndex.stats.unmapped}</p>
                 <p>Duplicates (same equipment and day, one marker shown): {completionIndex.stats.duplicate}</p>
                 {syncNotes.map((n, i) => <p key={i} style={{ color: '#b45309' }}>{n}</p>)}
+                {loadErrors.map((n, i) => <p key={i} style={{ color: '#b91c1c' }}>Log load failed: {n}</p>)}
+                <p style={{ color: '#64748b' }}>Logs load per visible equipment and month, never the whole table. Logs whose equipment id matches no equipment row are not loaded.</p>
                 {completionIndex.unmapped.length > 0 && (
                   <table style={{ marginTop: '12px', fontSize: '12px', borderCollapse: 'collapse' }}>
                     <thead><tr><th style={{ textAlign: 'left', padding: '4px 12px 4px 0' }}>Unmapped equipment text</th><th style={{ textAlign: 'left', padding: '4px 12px' }}>Date</th><th style={{ textAlign: 'left', padding: '4px 12px' }}>UID</th></tr></thead>
@@ -774,7 +972,7 @@ export default function App() {
                             <>
                               {pagedEquipment.map(asset => {
                                 const name = safeString(getProp(asset, 'craa5_equipmentidentifier'));
-                                const rowLogs = completionIndex.byAsset.get(getAssetId(asset));
+                                const rowLogs = rowLogsFor(asset);
                                 return (
                                   <div key={asset.craa5_aa_assetsid} className="asset-row">
                                     <div className="frozen-labels" style={{ paddingLeft: '60px' }}><FileIcon /><span>{name}</span></div>
