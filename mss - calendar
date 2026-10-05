@@ -3,9 +3,10 @@ import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react'
 /*
   =============================================================================
   === EXCEL-STYLE HIGH-PERFORMANCE GRID (V9) ===
-  0. Id-first matching: logs attach to equipment by Dataverse id; logs whose stored id matches no
-     equipment row fall back to the equipment name (and room/area when names repeat). Amber markers =
-     text-matched. Logs load per visible equipment and month, never the whole table.
+  0. Id matching: the log's craa5_equipmentguid is the equipment's craa5_aa_assetsid, and the calendar
+     shows every log entry stored against an equipment id. Old entries whose id is blank or matches no
+     equipment are matched by equipment name (amber markers). Logs load per visible equipment and month, never the whole table.
+     Payload Diagnostics has a log check and an equipment lookup that show what Dataverse returns.
   1. Area Pagination (New): When expanded, Areas now limit equipment to 10 items.
      Individual "Next" buttons added per Area to navigate large equipment sets.
   2. Room Pagination: Main view continues to handle top-level Room pagination (5 per page).
@@ -80,8 +81,8 @@ const normalizeDateStr = (d) => {
 
 // --- ID-FIRST MATCHING ---
 // Logs (craa5__log_) are attached to equipment by Dataverse id: craa5_equipmentguid holds the
-// craa5_aa_assetsid of the equipment row in craa5_aa_assets. Text matching is only a fallback, used when
-// the stored id is blank or matches no equipment row (see computeTextLinks).
+// craa5_aa_assetsid of the equipment row in craa5_aa_assets. Text matching is only a fallback, for old
+// entries whose id is blank or matches no equipment (see computeTextLinks).
 const LOG_ASSET_ID_FIELDS = ['craa5_equipmentguid'];
 const LOG_ASSET_ID_SELECT = 'craa5_equipmentguid';
 
@@ -139,9 +140,9 @@ const buildCompletionIndex = (assets, logs, textLinks) => {
   return { byAsset, unmapped, stats };
 };
 
-// Text fallback for logs whose equipment id matches no equipment row (for example ids copied from an
-// older equipment table). Exact normalized name first, then a name contained in exactly one equipment
-// name; when several equipment share a name ("Floors"), the log's own room and area text decides.
+// Text fallback for logs whose equipment id is blank or matches no equipment row.
+// Exact normalized name first, then a name contained in exactly one equipment name; when several
+// equipment share a name ("Floors"), the log's own room and area text decides.
 // Ambiguous names stay unmapped, so "Oven 1" can no longer swallow "Oven 12".
 const buildTextIndex = (assets) => {
   const named = assets.map(a => ({
@@ -198,9 +199,12 @@ const writeBackTextLinks = async (logs, links) => {
 // --- ON-DEMAND LOADING ---
 // There are thousands of pieces of equipment, so nothing here loads the whole log table. Sync loads the
 // equipment directory (four small columns); logs are fetched only for the equipment rows and months
-// currently on screen: by equipment name (which also finds logs whose stored id is stale) and, once the
-// stored ids are seen to match, by equipment id.
-const LOG_SELECT = "craa5__log_id,craa5_equipment,craa5_lastcleaned,craa5_lastcleanedby,craa5_nameofemployee,craa5_uid,craa5_sap,craa5_hoursworked,craa5_room,craa5_area";
+// currently on screen: by equipment id (the main path) and, for old entries whose id is blank or matches
+// no equipment, by equipment name.
+const LOG_CORE = "craa5__log_id,craa5_equipment,craa5_lastcleaned,craa5_lastcleanedby,craa5_nameofemployee,craa5_uid";
+const LOG_OPTIONAL = "craa5_sap,craa5_hoursworked,craa5_room,craa5_area"; // dropped if the table lacks one of them
+const logColumns = { optional: true };
+const logSelect = (withId) => [LOG_CORE, logColumns.optional ? LOG_OPTIONAL : '', withId ? LOG_ASSET_ID_SELECT : ''].filter(Boolean).join(',');
 const ASSET_SELECT = "craa5_aa_assetsid,craa5_equipmentidentifier,craa5_roomname,craa5_areaname";
 const PAGE_SIZE = 1000;          // rows per Dataverse page
 const ID_CHUNK = 15;             // equipment ids per log request
@@ -227,6 +231,18 @@ const retrievePaged = async (entity, query, maxRows) => {
   return { rows, truncated: !!res.nextLink };
 };
 
+// Reads log rows; queryFor(select) builds the query. If Dataverse says one of the optional columns does not
+// exist, they are dropped for the rest of the session (tooltip details only) instead of failing every load.
+const retrieveLogs = async (queryFor, withId, maxRows) => {
+  try {
+    return await retrievePaged("craa5__log_", queryFor(logSelect(withId)), maxRows);
+  } catch (err) {
+    if (!logColumns.optional || !isMissingColumnError(err) || new RegExp(LOG_ASSET_ID_SELECT, 'i').test(String(err.message))) throw err;
+    logColumns.optional = false;
+    return retrievePaged("craa5__log_", queryFor(logSelect(withId)), maxRows);
+  }
+};
+
 // Date-only values are stored as midnight UTC, so the window is built in UTC.
 const monthsFilter = (year, firstMonth, lastMonth) => {
   const start = new Date(Date.UTC(year, firstMonth, 1)).toISOString();
@@ -237,21 +253,19 @@ const monthsFilter = (year, firstMonth, lastMonth) => {
 // Logs stored against these equipment ids in the given month run.
 const fetchLogsForAssets = async (assetIds, year, firstMonth, lastMonth) => {
   const ids = assetIds.filter(isGuid);
-  if (!ids.length) return [];
+  if (!ids.length) return { rows: [], truncated: false };
   const idFilter = ids.map(id => `${LOG_ASSET_ID_SELECT} eq '${id}'`).join(' or ');
-  const { rows } = await retrievePaged("craa5__log_", `?$select=${LOG_SELECT},${LOG_ASSET_ID_SELECT}&$filter=(${idFilter}) and ${monthsFilter(year, firstMonth, lastMonth)}`, MAX_LOGS_PER_REQUEST);
-  return rows;
+  return retrieveLogs(select => `?$select=${select}&$filter=(${idFilter}) and ${monthsFilter(year, firstMonth, lastMonth)}`, true, MAX_LOGS_PER_REQUEST);
 };
 
-// Logs whose equipment text equals one of these names (case-insensitive, exact: a prefix match would
-// pull in "Oven 12" for "Oven 1") in the given month run. Matching to equipment (id first, then name)
-// happens afterwards on the client.
+// Logs whose equipment text equals one of these names (case-insensitive, exact: a prefix match would pull in
+// "Oven 12" for "Oven 1") in the given month run. This is for old entries whose id is blank or matches no
+// equipment: computeTextLinks links those afterwards on the client, and rows whose id matches equipment
+// are left to the id path.
 const fetchLogsByName = async (names, year, firstMonth, lastMonth, withId) => {
-  if (!names.length) return [];
+  if (!names.length) return { rows: [], truncated: false };
   const nameFilter = names.map(n => `craa5_equipment eq '${odataString(n)}'`).join(' or ');
-  const select = withId ? `${LOG_SELECT},${LOG_ASSET_ID_SELECT}` : LOG_SELECT;
-  const { rows } = await retrievePaged("craa5__log_", `?$select=${select}&$filter=(${nameFilter}) and ${monthsFilter(year, firstMonth, lastMonth)}`, MAX_LOGS_PER_REQUEST);
-  return rows;
+  return retrieveLogs(select => `?$select=${select}&$filter=(${nameFilter}) and ${monthsFilter(year, firstMonth, lastMonth)}`, withId, MAX_LOGS_PER_REQUEST);
 };
 
 // Contiguous runs of month indexes: [3,4,5,8] -> [[3,5],[8,8]].
@@ -308,7 +322,6 @@ export default function App() {
   const [canWriteBack, setCanWriteBack] = useState(false); // false when the log id column is missing
   const [isSaving, setIsSaving] = useState(false);
   const [idColumn, setIdColumn] = useState(true);       // false when craa5_equipmentguid does not exist on the log table
-  const [idHealthy, setIdHealthy] = useState(false);       // true once a loaded log's stored id matches an equipment row
   const [logsLoading, setLogsLoading] = useState(false);
   const [loadErrors, setLoadErrors] = useState([]);
   const [modalPages, setModalPages] = useState({});     // "room|area" -> page in the focused dialog
@@ -326,7 +339,6 @@ export default function App() {
   const assetsById = useMemo(() => new Map(assets.map(a => [getAssetId(a), a])), [assets]);
   const latestRef = useRef({});
   latestRef.current = { textIndex, idColumn };
-  const idHealthyRef = useRef(false);
 
   const today = useMemo(() => new Date(), []);
 
@@ -457,8 +469,6 @@ export default function App() {
       setLoadErrors([]);
       setCanWriteBack(hasIdColumn);
       setIdColumn(hasIdColumn);
-      idHealthyRef.current = false;
-      setIdHealthy(false);
 
       const initialExpands = {};
       fetchedAssets.forEach(a => {
@@ -565,22 +575,16 @@ export default function App() {
       activeRef.current += 1;
       (async () => {
         try {
-          const rows = job.kind === 'name'
+          const { rows, truncated } = job.kind === 'name'
             ? await fetchLogsByName(job.items, job.year, job.m0, job.m1, latestRef.current.idColumn)
             : await fetchLogsForAssets(job.items, job.year, job.m0, job.m1);
           if (epochRef.current === job.epoch) {
-            jobKeys(job).forEach(k => job.loaded.add(k));
-            let links = null;
-            if (job.kind === 'name') {
-              const { textIndex: index } = latestRef.current;
-              links = computeTextLinks(index, rows);
-              // As soon as one stored id matches an equipment row, ids can be trusted and are queried directly too.
-              if (!idHealthyRef.current && rows.some(r => index.ids.has(normalizeId(getRaw(r, LOG_ASSET_ID_SELECT))))) {
-                idHealthyRef.current = true;
-                setIdHealthy(true);
-              }
+            if (truncated) {
+              const note = `More than ${MAX_LOGS_PER_REQUEST.toLocaleString()} log rows matched one request, so only the first ${rows.length.toLocaleString()} were loaded. Narrow the months on screen.`;
+              setSyncNotes(prev => prev.includes(note) ? prev : prev.concat(note));
             }
-            addLogs(rows, links);
+            jobKeys(job).forEach(k => job.loaded.add(k));
+            addLogs(rows, job.kind === 'name' ? computeTextLinks(latestRef.current.textIndex, rows) : null);
           }
         } catch (err) {
           if (epochRef.current === job.epoch) setLoadErrors(prev => prev.concat(String(err && err.message)).slice(-5));
@@ -598,9 +602,10 @@ export default function App() {
   };
 
   // Fetch logs for the equipment on screen, for the visible months only, and never twice.
-  //  - 'name' jobs always run: they find logs by the equipment name written on them, which also catches
-  //    logs whose stored id is blank or stale (matched to equipment on the client, id first).
-  //  - 'id' jobs run once stored ids are seen to match equipment rows, to catch renamed equipment.
+  //  - 'id' jobs are the main path: every log stored against the equipment id (craa5_equipmentguid).
+  //  - 'name' jobs catch old entries whose id is blank or matches no equipment, by the equipment name
+  //    written on them (linked to equipment on the client, room and area deciding when several equipment
+  //    share a name; an entry whose id matches an equipment row always goes to that equipment).
   useEffect(() => {
     // Requests that have not started are dropped and recomputed from what is on screen now.
     queueRef.current.forEach(j => jobKeys(j).forEach(k => j.inflight.delete(k)));
@@ -635,15 +640,55 @@ export default function App() {
         const full = safeString(getProp(assetsById.get(id), 'craa5_equipmentidentifier')).trim();
         [full, nameBase(full)].forEach(n => { if (n && !names.has(n.toLowerCase())) names.set(n.toLowerCase(), n); });
       });
+      if (idColumn) queueKind('id', ids, ID_CHUNK);
       queueKind('name', [...names.values()], NAME_CHUNK);
-      if (idColumn && idHealthy) queueKind('id', ids, ID_CHUNK);
       if (queueRef.current.length) setLogsLoading(true);
     }
     pumpRef.current();
     // eslint-disable-next-line
-  }, [visibleKey, visibleMonths, anchorYear, idColumn, idHealthy, assets, isLoading, retryTick]);
+  }, [visibleKey, visibleMonths, anchorYear, idColumn, assets, isLoading, retryTick]);
 
   const retryLoads = () => { setLoadErrors([]); setRetryTick(t => t + 1); };
+
+  // --- Diagnostics checks (bounded: 200 newest log rows, or 25 rows for one equipment) ---
+  const [logCheck, setLogCheck] = useState(null);
+  const [lookupQuery, setLookupQuery] = useState('');
+  const [lookup, setLookup] = useState(null);
+
+  // Does the log table read at all, and do its stored equipment ids match equipment rows?
+  const runLogCheck = async () => {
+    if (typeof Xrm === 'undefined') return;
+    setLogCheck({ busy: true });
+    try {
+      const { rows } = await retrieveLogs(select => `?$select=${select}&$orderby=craa5_lastcleaned desc&$top=200`, idColumn, 200);
+      const sample = rows.map(l => {
+        const id = normalizeId(getRaw(l, LOG_ASSET_ID_SELECT));
+        const asset = id ? assetsById.get(id) : null;
+        return { l, id, asset, state: !id ? 'no id' : asset ? 'matches equipment' : 'matches no equipment' };
+      });
+      setLogCheck({ count: rows.length, noId: sample.filter(r => r.state === 'no id').length, matched: sample.filter(r => r.asset).length, orphan: sample.filter(r => r.state === 'matches no equipment').length, sample, assetsLoaded: assets.length });
+    } catch (err) {
+      setLogCheck({ error: String(err && err.message) });
+    }
+  };
+
+  // What Dataverse returns for one equipment: log rows stored against its id, and rows with its name.
+  const runLookup = async (asset) => {
+    const id = getAssetId(asset);
+    const name = safeString(getProp(asset, 'craa5_equipmentidentifier')).trim();
+    setLookup({ busy: true, id, name });
+    const one = async (filter) => {
+      try {
+        const { rows } = await retrieveLogs(select => `?$select=${select}&$filter=${filter}&$orderby=craa5_lastcleaned desc&$top=25`, idColumn, 25);
+        return { rows };
+      } catch (err) { return { error: String(err && err.message) }; }
+    };
+    const [byId, byName] = await Promise.all([
+      idColumn && isGuid(id) ? one(`${LOG_ASSET_ID_SELECT} eq '${id}'`) : Promise.resolve({ skipped: true }),
+      one(`craa5_equipment eq '${odataString(name)}'`)
+    ]);
+    setLookup({ id, name, room: safeString(getProp(asset, 'craa5_roomname')), area: safeString(getProp(asset, 'craa5_areaname')), byId, byName });
+  };
 
   useEffect(() => () => { if (flushTimerRef.current) clearTimeout(flushTimerRef.current); }, []);
 
@@ -941,6 +986,10 @@ export default function App() {
           </div>
       )}
 
+      {activeTab === 'master' && assets.length > 0 && !visibleKey && !isLoading && typeof Xrm !== 'undefined' && (
+        <div data-testid="expand-hint" style={{ padding: '6px 24px', fontSize: '12px', color: '#475569', background: '#eff6ff', borderBottom: '1px solid #dbeafe' }}>Click an area name to open it. Completions are read from the log for the equipment you open, so nothing shows until an area is open.</div>
+      )}
+
       {/* MAIN CONTENT AREA */}
       <div className="flex-1 flex flex-col min-height-0 overflow-hidden">
         {activeTab === 'payloads' ? (
@@ -956,7 +1005,64 @@ export default function App() {
                 <p>Duplicates (same equipment and day, one marker shown): {completionIndex.stats.duplicate}</p>
                 {syncNotes.map((n, i) => <p key={i} style={{ color: '#b45309' }}>{n}</p>)}
                 {loadErrors.map((n, i) => <p key={i} style={{ color: '#b91c1c' }}>Log load failed: {n}</p>)}
-                <p style={{ color: '#64748b' }}>Logs load per visible equipment and month, never the whole table. Logs are found by the equipment name written on them and, once stored ids match equipment rows, by id; the id wins when both exist. Unmapped logs carry a name that matches no equipment (or several).</p>
+                {!logColumns.optional && <p style={{ color: '#b45309' }}>Some optional log columns (SAP order, hours, room, area) do not exist in this table, so they are left out of the tooltip.</p>}
+                <p style={{ color: '#64748b' }}>Logs load per visible equipment and month, never the whole table: a log is shown on the equipment whose id is stored in its craa5_equipmentguid. Old entries whose id is blank or matches no equipment are matched by equipment name (amber). Nothing loads until an area is expanded on the Compliance Matrix tab, so "Logs loaded: 0" here only means nothing has been opened yet.</p>
+                {typeof Xrm !== 'undefined' && (
+                  <div data-testid="log-check" style={{ marginTop: '16px', paddingTop: '12px', borderTop: '1px solid #e2e8f0' }}>
+                    <h3 style={{ fontSize: '15px', fontWeight: 'bold' }}>Log check</h3>
+                    <p style={{ color: '#64748b' }}>Reads the 200 newest log rows and shows whether each stored equipment id matches an equipment row.</p>
+                    <button className="page-btn" onClick={runLogCheck} disabled={!assets.length || (logCheck && logCheck.busy)}>{logCheck && logCheck.busy ? 'Reading…' : 'Check log'}</button>
+                    {!assets.length && <span style={{ marginLeft: '8px', color: '#b45309' }}>Press Sync Dataverse first.</span>}
+                    {logCheck && logCheck.error && <p style={{ color: '#b91c1c' }}>Could not read the log: {logCheck.error}</p>}
+                    {logCheck && logCheck.sample && (
+                      <div>
+                        <p data-testid="log-check-summary">{logCheck.count} newest log rows read: {logCheck.matched} with an id that matches equipment · {logCheck.orphan} with an id that matches no equipment · {logCheck.noId} with no id stored.</p>
+                        <table style={{ fontSize: '12px', borderCollapse: 'collapse' }}>
+                          <thead><tr>{['Date', 'Equipment text', 'Stored equipment id', 'Result'].map(h => <th key={h} style={{ textAlign: 'left', padding: '4px 12px 4px 0' }}>{h}</th>)}</tr></thead>
+                          <tbody>{logCheck.sample.slice(0, 15).map((r, i) => (
+                            <tr key={i}>
+                              <td style={{ padding: '4px 12px 4px 0' }}>{normalizeDateStr(getRaw(r.l, 'craa5_lastcleaned'))}</td>
+                              <td style={{ padding: '4px 12px 4px 0' }}>{safeString(getProp(r.l, 'craa5_equipment')) || '(blank)'}</td>
+                              <td style={{ padding: '4px 12px 4px 0', fontFamily: 'monospace' }}>{r.id || '—'}</td>
+                              <td style={{ padding: '4px 12px 4px 0', color: r.asset ? '#047857' : '#b45309' }}>{r.asset ? `${safeString(getProp(r.asset, 'craa5_equipmentidentifier'))} (${safeString(getProp(r.asset, 'craa5_roomname'))} / ${safeString(getProp(r.asset, 'craa5_areaname'))})` : r.state}</td>
+                            </tr>
+                          ))}</tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                )}
+                {typeof Xrm !== 'undefined' && assets.length > 0 && (
+                  <div data-testid="lookup-check" style={{ marginTop: '16px', paddingTop: '12px', borderTop: '1px solid #e2e8f0' }}>
+                    <h3 style={{ fontSize: '15px', fontWeight: 'bold' }}>Equipment lookup</h3>
+                    <p style={{ color: '#64748b' }}>Pick one equipment to see the log rows stored against its id and, separately, rows that carry its name.</p>
+                    <input style={{ border: '1px solid #cbd5e1', borderRadius: '6px', padding: '6px 10px', fontSize: '12px', width: '280px' }} placeholder="Type an equipment name…" value={lookupQuery} onChange={e => setLookupQuery(e.target.value)} />
+                    {lookupQuery.trim().length >= 2 && (
+                      <div style={{ marginTop: '6px', display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                        {assets.filter(a => safeString(getProp(a, 'craa5_equipmentidentifier')).toLowerCase().includes(lookupQuery.trim().toLowerCase())).slice(0, 8).map(a => (
+                          <button key={getAssetId(a)} className="page-btn" onClick={() => { setLookupQuery(''); runLookup(a); }}>{safeString(getProp(a, 'craa5_equipmentidentifier'))} · {safeString(getProp(a, 'craa5_roomname'))} / {safeString(getProp(a, 'craa5_areaname'))}</button>
+                        ))}
+                      </div>
+                    )}
+                    {lookup && (
+                      <div style={{ marginTop: '10px' }}>
+                        <p><b>{lookup.name}</b>{lookup.room ? ` · ${lookup.room} / ${lookup.area}` : ''} · equipment id <span style={{ fontFamily: 'monospace' }}>{lookup.id}</span>{lookup.busy ? ' · reading…' : ''}</p>
+                        {[['By equipment id', lookup.byId], ['By equipment name', lookup.byName]].map(([label, r]) => r && (
+                          <div key={label} style={{ marginBottom: '8px' }}>
+                            <p>{label}: {r.skipped ? 'not available (no id column)' : r.error ? <span style={{ color: '#b91c1c' }}>failed: {r.error}</span> : `${r.rows.length}${r.rows.length >= 25 ? '+' : ''} log row(s)`}</p>
+                            {r.rows && r.rows.length > 0 && (
+                              <table style={{ fontSize: '12px', borderCollapse: 'collapse' }}>
+                                <tbody>{r.rows.slice(0, 8).map((l, i) => (
+                                  <tr key={i}><td style={{ padding: '2px 12px 2px 0' }}>{normalizeDateStr(getRaw(l, 'craa5_lastcleaned'))}</td><td style={{ padding: '2px 12px 2px 0' }}>{safeString(getProp(l, 'craa5_equipment'))}</td><td style={{ padding: '2px 12px 2px 0' }}>{safeString(getProp(l, 'craa5_lastcleanedby'))}</td><td style={{ padding: '2px 12px 2px 0', fontFamily: 'monospace' }}>{normalizeId(getRaw(l, LOG_ASSET_ID_SELECT)) || 'no id'}</td></tr>
+                                ))}</tbody>
+                              </table>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
                 {completionIndex.unmapped.length > 0 && (
                   <table style={{ marginTop: '12px', fontSize: '12px', borderCollapse: 'collapse' }}>
                     <thead><tr><th style={{ textAlign: 'left', padding: '4px 12px 4px 0' }}>Unmapped equipment text</th><th style={{ textAlign: 'left', padding: '4px 12px' }}>Date</th><th style={{ textAlign: 'left', padding: '4px 12px' }}>UID</th></tr></thead>
