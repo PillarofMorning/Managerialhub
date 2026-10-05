@@ -335,6 +335,77 @@ function parseBoardRow(row) {
     };
 }
 
+// ---- Lines (craa5_aa_mss_area) and the equipment split, done the way Shift Start does it so the two screens agree ----
+const STATUS_LINE_NAMES = ['pto', 'sick', 'late', 'left early', 'ncns', 'unassigned'];
+const FIXED_AREA_KINDS = ['chemical', 'admin', 'janitorial'];
+function normS(v) { return String(v === undefined || v === null ? '' : v).toLowerCase().trim(); }
+function wordsOf(v) { return normS(v).split(/[^a-z0-9]+/).filter(Boolean); }
+function hasWords(hay, needle) {
+    return needle.length > 0 && hay.some(function(_, i) { return needle.every(function(w, j) { return hay[i + j] === w; }); });
+}
+function byNameNum(a, b) { return String(a.name).localeCompare(String(b.name), undefined, { numeric: true, sensitivity: 'base' }); }
+function buildLineIndex(lineRows) {
+    return lineRows.map(function(r) {
+        return { id: String(getRowField(r, 'craa5_aa_mss_areaid') || ''), name: String(getRowField(r, 'craa5_area') || '').trim() };
+    }).filter(function(l) { return l.id && l.name && STATUS_LINE_NAMES.indexOf(normS(l.name)) === -1; });
+}
+// Which line an equipment area belongs to: exact name, else the longest line name it contains as whole words.
+// Chemical / admin / janitorial areas also match a line like "Chemical Clerk".
+function lineForArea(lines, area) {
+    const label = String(area === undefined || area === null ? '' : area);
+    let line = lines.find(function(l) { return normS(l.name) === normS(label); });
+    if (!line && label) {
+        const w = wordsOf(label);
+        line = lines.filter(function(l) { return hasWords(w, wordsOf(l.name)); }).sort(function(a, b) { return wordsOf(b.name).length - wordsOf(a.name).length; })[0];
+    }
+    if (!line && FIXED_AREA_KINDS.indexOf(normS(label)) > -1) {
+        const re = new RegExp('\\b' + normS(label));
+        line = lines.find(function(l) { return re.test(normS(l.name)); });
+    }
+    return line || null;
+}
+// People working a line on a board (leads first, then team members), minus anyone marked out.
+function boardWorkersOn(board, lineId) {
+    const members = board.members && typeof board.members === 'object' ? board.members : {};
+    const wl = board.workerLine && typeof board.workerLine === 'object' ? board.workerLine : {};
+    const out = board.out && typeof board.out === 'object' ? board.out : {};
+    const seen = {};
+    return (Array.isArray(board.leads) ? board.leads : []).concat(Object.keys(members)).filter(function(id) {
+        if (seen[id]) return false;
+        seen[id] = true;
+        return wl[id] === lineId && !out[id];
+    });
+}
+// Who gets which equipment on one line: hand-placed lines keep their placement; otherwise Shift Start deals the equipment
+// out evenly by role (a fixed area goes to the people whose role belongs there; PIC items to PIC-only roles; the rest to
+// Sanitation Techs). Leads never take equipment here. kindOf(id) is a person's work kind. Returns { assetId: personId }.
+function splitLineEquipment(board, line, lineAssets, kindOf, night) {
+    const people = boardWorkersOn(board, line.id);
+    const leads = Array.isArray(board.leads) ? board.leads : [];
+    const out = {};
+    const manual = Array.isArray(board.equipManual) ? board.equipManual : [];
+    if (manual.indexOf(line.id) > -1) {
+        const eq = board.equip && typeof board.equip === 'object' ? board.equip : {};
+        lineAssets.forEach(function(a) { if (eq[a.id] && people.indexOf(eq[a.id]) > -1) out[a.id] = eq[a.id]; });
+        return out;
+    }
+    const crew = people.filter(function(id) { return leads.indexOf(id) === -1; });
+    const name = normS(line.name);
+    const fixed = FIXED_AREA_KINDS.filter(function(k) { return name === k || new RegExp('\\b' + k).test(name); })[0];
+    if (fixed) {
+        const who = crew.filter(function(id) { return workerCanDo(kindOf(id), fixed, night); });
+        if (who.length) { lineAssets.forEach(function(a, i) { out[a.id] = who[i % who.length]; }); return out; }
+    }
+    const regs = crew.filter(function(id) { return kindOf(id) === 'general'; });
+    const pics = crew.filter(function(id) { return kindOf(id) === 'pic' || kindOf(id) === 'inspector'; });
+    let r = 0, q = 0;
+    lineAssets.forEach(function(a) {
+        if (a.kind === 'pic' && pics.length) out[a.id] = pics[q++ % pics.length];
+        else if (regs.length) out[a.id] = regs[r++ % regs.length];
+    });
+    return out;
+}
+
 // "Doe, John" -> "John Doe" (same convention as the Manager hub)
 function formatFullName(name) {
     const parsed = String(name || '').trim();
@@ -747,7 +818,7 @@ export default function App(props) {
     const initialSettings = savedRef.current.settings;
     const initialPlan = savedRef.current.plan;
 
-    const [activeTab, setActiveTab] = useState('setup');
+    const [activeTab, setActiveTab] = useState('gantt');   // opens on the Gantt chart; Setup is one tab away
 
     const [assets, setAssets] = useState([]);
     const [rawEmployees, setRawEmployees] = useState([]);
@@ -808,8 +879,12 @@ export default function App(props) {
     const [roomSource, setRoomSource] = useState(initialSettings.roomSource === 'shiftstart' ? 'shiftstart' : 'all');
     const [boardRows, setBoardRows] = useState([]);
     const [lineRows, setLineRows] = useState([]);
+    // Every equipment row's id / name / area / subcategory (including ones with no minutes, which never become tasks) so the
+    // per-line equipment split matches what Shift Start shows.
+    const [assetStubs, setAssetStubs] = useState([]);
     const [handoverMins, setHandoverMins] = useState(initialSettings.handoverMins !== undefined ? initialSettings.handoverMins : 15);
     const [expandedRosters, setExpandedRosters] = useState({});
+    const [collapsedPlans, setCollapsedPlans] = useState({});
     const [rotationSource, setRotationSource] = useState(Array.isArray(initialSettings.shiftRotation) ? 'Saved' : 'Default');
     const [showDataCheck, setShowDataCheck] = useState(false);
 
@@ -919,6 +994,9 @@ export default function App(props) {
 
                 let parsed = MOCK_ASSETS;
                 if (dvAssets && dvAssets.length > 0) {
+                    setAssetStubs(dvAssets.map(function(a, i) {
+                        return { id: String(a.craa5_aa_assetsid || ('temp_' + i)), name: String(a.craa5_equipmentidentifier || 'Unnamed Equipment'), area: String(a.craa5_areaname || 'General Area'), subcategory: String(a.craa5_subcategory || a.craa5_Subcategory || '').trim() };
+                    }));
                     parsed = dvAssets.map(function(a, i) {
                         return {
                             id: a.craa5_aa_assetsid || `temp_${i}`,
@@ -980,6 +1058,7 @@ export default function App(props) {
         const roleExcluded = [];
         const inactive = [];
         const jobRoles = {};
+        const namesById = {};
         rawEmployees.forEach(function(e, i) {
             const name = formatFullName(e.craa5_name || e.craa5_Name || e.craa5_fullname || e.fullname || '') || ('Employee ' + (i + 1));
             const shift = readEmployeeShift(e);
@@ -988,6 +1067,7 @@ export default function App(props) {
             // Supervisors (256000002) and managers (256000003) never get a lane. Leads (256000001) are shown as leadership:
             // a lane marked "Leadership" for their whole shift, with their team beneath, and never any tasks.
             const empId = String(e.craa5__aa_employeeid || e.craa5_aa_employeeid || ('emp_' + i));
+            namesById[empId] = name;
             const isLeadRole = /256000001|\blead\b/i.test(role) && !/25600000[23]|super|manag/i.test(role);
             if (!isLeadRole && /25600000[123]|lead|super|manag/i.test(role)) { excluded.push(name); return; }
             if (isLeadRole) {
@@ -1013,7 +1093,7 @@ export default function App(props) {
             rosters[shift.crew].push(workerRec);
         });
         CREW_CODES.forEach(function(c) { rosters[c].sort(function(a, b) { return a.name.localeCompare(b.name); }); leadRosters[c].sort(function(a, b) { return a.name.localeCompare(b.name); }); });
-        return { rosters: rosters, leadRosters: leadRosters, empById: empById, unmatched: unmatched, inactive: inactive, excluded: excluded, roleExcluded: roleExcluded, jobRoles: Object.values(jobRoles).sort(function(a, b) { return a.label.localeCompare(b.label); }) };
+        return { rosters: rosters, leadRosters: leadRosters, empById: empById, namesById: namesById, unmatched: unmatched, inactive: inactive, excluded: excluded, roleExcluded: roleExcluded, jobRoles: Object.values(jobRoles).sort(function(a, b) { return a.label.localeCompare(b.label); }) };
     }, [rawEmployees, jobRoleChoices]);
     const setJobRoleKind = function(key, kind) {
         setJobRoleChoices(function(prev) { return Object.assign({}, prev, { [key]: kind }); });
@@ -1071,31 +1151,129 @@ export default function App(props) {
     }, [boardRows, shiftWindows, globalStartMs]);
     const boardWindowCount = shiftWindows.filter(function(w) { return (windowBoards[w.key] || []).length > 0; }).length;
 
-    // Rooms the supervisors picked in Shift Start (lines being cleaned) for the shifts in this plan; null when no board exists.
-    const shiftStartRooms = useMemo(function() {
-        const lineName = {};
-        lineRows.forEach(function(r) { const id = String(getRowField(r, 'craa5_aa_mss_areaid') || ''); if (id) lineName[id] = String(getRowField(r, 'craa5_area') || '').trim(); });
-        let any = false;
-        const rooms = {};
-        shiftWindows.forEach(function(w) {
-            (windowBoards[w.key] || []).forEach(function(b) {
-                any = true;
-                (b.board.downLines || []).forEach(function(id) { const n = lineName[id]; if (n) rooms[n.toLowerCase()] = true; });
-                (b.board.manualLines || []).forEach(function(l) { if (l && l.name) rooms[String(l.name).trim().toLowerCase()] = true; });
-            });
+    // ---- Shift Start rooms: which room each person is set up on, and which equipment goes to whom ----
+    const lineIndex = useMemo(function() { return buildLineIndex(lineRows); }, [lineRows]);
+    // Equipment area -> line id ('' when no line matches). Areas that only hold custom tasks are never hidden by Shift Start.
+    const areaLine = useMemo(function() {
+        const m = {};
+        assets.forEach(function(a) { const k = String(a.area); if (!(k in m)) { const l = lineForArea(lineIndex, k); m[k] = l ? l.id : ''; } });
+        return m;
+    }, [assets, lineIndex]);
+    const customOnlyAreas = useMemo(function() {
+        const real = {}, custom = {};
+        assets.forEach(function(a) { if (String(a.id).indexOf('custom_') === 0) custom[String(a.area)] = true; else real[String(a.area)] = true; });
+        const out = {};
+        Object.keys(custom).forEach(function(k) { if (!real[k]) out[k] = true; });
+        return out;
+    }, [assets]);
+    // Every equipment row on each line, in name order like Shift Start (rows with no minutes count too, so the split matches).
+    const lineAssets = useMemo(function() {
+        const m = {}, cache = {};
+        (assetStubs.length ? assetStubs : assets).forEach(function(a) {
+            const k = String(a.area);
+            if (!(k in cache)) { const l = lineForArea(lineIndex, k); cache[k] = l ? l.id : ''; }
+            if (!cache[k]) return;
+            (m[cache[k]] = m[cache[k]] || []).push({ id: String(a.id), name: String(a.name), kind: a.kind || taskKind(a) });
         });
-        return any ? rooms : null;
-    }, [lineRows, shiftWindows, windowBoards]);
+        Object.keys(m).forEach(function(k) { m[k].sort(byNameNum); });
+        return m;
+    }, [assetStubs, assets, lineIndex]);
+
+    // For each shift with a Shift Start board: who is on which room, which equipment each person gets, and a read-only view
+    // of the board's columns for Setup. Needs the lines table to tell which room a line is.
+    const windowPlans = useMemo(function() {
+        const out = {};
+        if (lineIndex.length === 0) return out;
+        const lineById = {};
+        lineIndex.forEach(function(l) { lineById[l.id] = l; });
+        const kindOf = function(id) { const r = empById[id]; return r ? r.kind : 'none'; };
+        const nameOf = function(id) { return rosterInfo.namesById[id] || 'Unknown'; };
+        shiftWindows.forEach(function(w) {
+            const boards = windowBoards[w.key] || [];
+            if (boards.length === 0) return;
+            const night = isNightHour(new Date(globalStartMs + w.shiftStart * 60000).getHours());
+            const plan = { assign: {}, lineWorkers: {}, lineTeam: {}, personRoom: {}, views: [] };
+            boards.forEach(function(bd) {
+                const board = bd.board;
+                const wl = board.workerLine && typeof board.workerLine === 'object' ? board.workerLine : {};
+                const members = board.members && typeof board.members === 'object' ? board.members : {};
+                const outB = board.out && typeof board.out === 'object' ? board.out : {};
+                const teamLines = board.teamLines && typeof board.teamLines === 'object' ? board.teamLines : {};
+                const leadIds = Array.isArray(board.leads) ? board.leads : [];
+                const onBoard = [];
+                leadIds.concat(Object.keys(members)).forEach(function(id) { if (onBoard.indexOf(id) === -1 && !outB[id]) onBoard.push(id); });
+                // Lines in play on this board: someone is set up on them, or a team was dropped on them.
+                const lineIds = {};
+                onBoard.forEach(function(id) { if (wl[id] && lineById[wl[id]]) lineIds[wl[id]] = true; });
+                Object.keys(teamLines).forEach(function(l) { (Array.isArray(teamLines[l]) ? teamLines[l] : []).forEach(function(lid) { if (lineById[lid]) lineIds[lid] = true; }); });
+                const eqByLine = {};
+                Object.keys(lineIds).forEach(function(lid) {
+                    const people = boardWorkersOn(board, lid);
+                    if (people.length === 0) return;
+                    const have = plan.lineWorkers[lid] || (plan.lineWorkers[lid] = []);
+                    people.forEach(function(id) { if (have.indexOf(id) === -1) have.push(id); if (!plan.personRoom[id]) plan.personRoom[id] = lineById[lid].name; });
+                    const split = splitLineEquipment(board, lineById[lid], lineAssets[lid] || [], kindOf, night);
+                    eqByLine[lid] = split;
+                    Object.keys(split).forEach(function(aid) { if (!plan.assign[aid]) plan.assign[aid] = split[aid]; });
+                });
+                // Columns like Shift Start: one per lead (their team), plus one for anyone under the supervisor directly.
+                const cols = leadIds.map(function(id) { return { ownerId: id, isLead: true, name: nameOf(id), ids: [] }; });
+                let supCol = null;
+                onBoard.forEach(function(id) {
+                    const owner = leadIds.indexOf(id) > -1 ? id : members[id];
+                    let col = cols.find(function(c) { return c.ownerId === owner; });
+                    if (!col) { if (!supCol) { supCol = { ownerId: '', isLead: false, name: bd.supervisor, ids: [] }; cols.unshift(supCol); } col = supCol; }
+                    col.ids.push(id);
+                });
+                cols.forEach(function(col) {
+                    const byLine = {}, order = [], noRoom = [];
+                    const lineCard = function(lid) { if (!byLine[lid]) { byLine[lid] = { lineId: lid, name: lineById[lid].name, assetCount: (lineAssets[lid] || []).length, people: [] }; order.push(lid); } return byLine[lid]; };
+                    col.ids.forEach(function(id) {
+                        const lid = wl[id] && lineById[wl[id]] ? wl[id] : '';
+                        const split = lid ? (eqByLine[lid] || {}) : {};
+                        const equipCount = Object.keys(split).filter(function(aid) { return split[aid] === id; }).length;
+                        const person = { id: id, name: nameOf(id), isLead: leadIds.indexOf(id) > -1, kind: kindOf(id), equipCount: equipCount };
+                        if (lid) lineCard(lid).people.push(person); else noRoom.push(person);
+                    });
+                    (Array.isArray(teamLines[col.ownerId]) ? teamLines[col.ownerId] : []).forEach(function(lid) { if (lineById[lid]) lineCard(lid); });
+                    col.lines = order.map(function(lid) { return byLine[lid]; }).sort(byNameNum);
+                    col.noRoom = noRoom;
+                    // Anyone on the same team can help on the team's rooms (used when equipment has no one assigned).
+                    col.lines.forEach(function(l) {
+                        if (l.people.length === 0) return;
+                        const t = plan.lineTeam[l.lineId] || (plan.lineTeam[l.lineId] = []);
+                        col.ids.forEach(function(id) { if (t.indexOf(id) === -1) t.push(id); });
+                    });
+                });
+                plan.views.push({
+                    supervisor: bd.supervisor,
+                    columns: cols,
+                    out: Object.keys(outB).map(function(id) { return { name: nameOf(id), reason: String(outB[id] || '') }; })
+                });
+            });
+            out[w.key] = plan;
+        });
+        return out;
+    }, [lineIndex, lineAssets, shiftWindows, windowBoards, empById, rosterInfo, globalStartMs]);
+    // Lines with someone set up on them in any board of this plan; null when nobody is set up on a room yet (then every room is shown).
+    const shiftStartLines = useMemo(function() {
+        const set = {};
+        let n = 0;
+        Object.keys(windowPlans).forEach(function(k) { Object.keys(windowPlans[k].lineWorkers).forEach(function(lid) { if (!set[lid]) n++; set[lid] = true; }); });
+        return n > 0 ? set : null;
+    }, [windowPlans]);
     const roomHidden = function(area) {
         if (hiddenRooms[area]) return true;
-        return roomSource === 'shiftstart' && !!shiftStartRooms && !shiftStartRooms[String(area || '').trim().toLowerCase()];
+        if (roomSource !== 'shiftstart' || !shiftStartLines || customOnlyAreas[String(area)]) return false;
+        const lid = areaLine[String(area)];
+        return !(lid && shiftStartLines[lid]);
     };
     // How many tasks fall in each kind of work, so Setup shows whether PIC / chemical / janitorial are being picked up.
     const taskKindCounts = useMemo(function() {
         const c = { general: 0, pic: 0, chemical: 0, admin: 0, janitorial: 0 };
         assets.forEach(function(a) { if (!roomHidden(a.area)) c[a.kind || taskKind(a)]++; });
         return c;
-    }, [assets, hiddenRooms, roomSource, shiftStartRooms]);
+    }, [assets, hiddenRooms, roomSource, shiftStartLines, areaLine, customOnlyAreas]);
 
     // Who works each crew, when, and which lead they sit under.
     //  - 'table': the employee table (workers by Shift, leads by Role). A lead's team = people on the same Leadership Team.
@@ -1183,12 +1361,19 @@ export default function App(props) {
             const leadById = {};
             cp.leads.forEach(function(x) { leadById[x.rec.id] = x; });
             const placed = {};
+            // The room Shift Start has this person on (first shift of this crew with a board that places them).
+            const crewWins = shiftWindows.filter(function(w) { return w.crew === crew; });
+            const roomOf = function(empId) {
+                if (rosterSource !== 'shiftstart' && roomSource !== 'shiftstart') return '';
+                for (let i = 0; i < crewWins.length; i++) { const pl = windowPlans[crewWins[i].key]; if (pl && pl.personRoom[empId]) return pl.personRoom[empId]; }
+                return '';
+            };
             const pushPerson = function(x, extra) {
                 let key = x.rec.id;
                 if (usedKeys[key]) key = x.rec.id + '@' + crew;
                 usedKeys[key] = true;
                 const lane = Object.assign({
-                    lane: lanes.length, crew: crew, key: key, name: x.rec.name, isPlaceholder: false,
+                    lane: lanes.length, crew: crew, key: key, empId: x.rec.id, room: roomOf(x.rec.id), name: x.rec.name, isPlaceholder: false,
                     kind: x.rec.kind, jobRole: x.rec.jobRole, isLead: !!x.rec.isLead,
                     windows: x.windows.length ? x.windows : crewWindows
                 }, extra || {});
@@ -1199,7 +1384,11 @@ export default function App(props) {
             (cp.teams || []).forEach(function(t) {
                 const lead = leadById[t.leadId];
                 if (!lead || placed[t.leadId]) return;
-                const members = t.memberIds.filter(function(id) { return workerById[id] && !placed[id]; }).map(function(id) { return workerById[id]; });
+                const members = t.memberIds.filter(function(id) { return workerById[id] && !placed[id]; }).map(function(id) { return workerById[id]; })
+                    .sort(function(a, b) {   // team members sit together by room, then by name
+                        const ra = roomOf(a.rec.id) || '\uffff', rb = roomOf(b.rec.id) || '\uffff';
+                        return ra.localeCompare(rb, undefined, { numeric: true, sensitivity: 'base' }) || a.rec.name.localeCompare(b.rec.name);
+                    });
                 const leadLane = pushPerson(lead, { groupIdx: groupIdx, teamNames: members.map(function(m) { return m.rec.name; }) });
                 placed[t.leadId] = true;
                 members.forEach(function(m) { placed[m.rec.id] = true; pushPerson(m, { groupIdx: groupIdx, leadKey: leadLane.key }); });
@@ -1209,13 +1398,19 @@ export default function App(props) {
             workers.forEach(function(x) { if (!placed[x.rec.id]) { placed[x.rec.id] = true; pushPerson(x, { groupIdx: -1 }); } });
             for (let k = workers.length; k < n; k++) {
                 lanes.push({
-                    lane: lanes.length, crew: crew, key: crew + '#' + (k + 1), name: crew + ' Crew Seat ' + (k + 1), isPlaceholder: true,
+                    lane: lanes.length, crew: crew, key: crew + '#' + (k + 1), empId: '', room: '', name: crew + ' Crew Seat ' + (k + 1), isPlaceholder: true,
                     kind: 'general', jobRole: '', isLead: false, groupIdx: -1, windows: crewWindows
                 });
             }
         });
         return lanes;
-    }, [shiftWindows, crewPeople, crewHeadcountOverrides]);
+    }, [shiftWindows, crewPeople, crewHeadcountOverrides, windowPlans, rosterSource, roomSource]);
+    // Lane of a person in a crew's shift (the same person can have a lane in more than one crew when pulled in on overtime).
+    const laneByEmpCrew = useMemo(function() {
+        const m = {};
+        laneRoster.forEach(function(l) { if (l.empId && !l.isPlaceholder) m[l.empId + '|' + l.crew] = l.lane; });
+        return m;
+    }, [laneRoster]);
 
     const globalHeadcount = laneRoster.filter(function(l) { return !l.isLead; }).length;   // leads are shown, not counted as cleaners
     const maxCrewSize = CREW_CODES.reduce(function(m, c) { return laneRoster.some(function(l) { return l.crew === c; }) ? Math.max(m, getCrewHeadcount(c)) : m; }, 0) || 1;
@@ -1464,6 +1659,38 @@ export default function App(props) {
             return Object.keys(per).reduce(function(m, c) { return Math.max(m, per[c]); }, 0);
         };
 
+        // Shift Start link: for a shift with a board, the person each piece of equipment was given to, and everyone set up on its room.
+        const planWins = shiftWindows.filter(function(w) { return windowPlans[w.key]; }).map(function(w) { return { start: w.start, end: w.end, crew: w.crew, plan: windowPlans[w.key] }; });
+        const planAt = function(t) {
+            for (let i = 0; i < planWins.length; i++) { if (t >= planWins[i].start && t < planWins[i].end) return planWins[i]; }
+            return null;
+        };
+        const lanesOfEmps = function(ids, crew) {
+            const out = [];
+            (ids || []).forEach(function(id) { const l = laneByEmpCrew[id + '|' + crew]; if (l !== undefined && out.indexOf(l) === -1) out.push(l); });
+            return out;
+        };
+        // Lane that must do this task if it starts at t ([] when Shift Start didn't give it to anyone).
+        const mustLanesAt = function(task, t) {
+            if (roomSource !== 'shiftstart') return [];
+            const pw = planAt(t);
+            const emp = pw && pw.plan.assign[task.parentId];
+            return emp ? lanesOfEmps([emp], pw.crew) : [];
+        };
+        // Everyone Shift Start put on this task's room in the shift running at t, then the rest of their team: preferred for any
+        // seat the assignment doesn't fill (a spare head, or equipment Shift Start left unassigned).
+        const roomLanesAt = function(task, t) {
+            const none = { room: [], team: [] };
+            if (roomSource !== 'shiftstart') return none;
+            const pw = planAt(t);
+            const lid = areaLine[String(task.originalArea)];
+            if (!pw || !lid) return none;
+            return { room: lanesOfEmps(pw.plan.lineWorkers[lid], pw.crew), team: lanesOfEmps(pw.plan.lineTeam[lid], pw.crew) };
+        };
+        const hasPlanFor = function(task) {
+            return roomSource === 'shiftstart' && planWins.some(function(pw) { return !!pw.plan.assign[task.parentId]; });
+        };
+
         const resolveLanes = function(keys, heads, kind) {
             const lanes = (keys || []).map(function(k) { return laneIndex[k]; }).filter(function(l) { return l !== undefined; });
             if (lanes.length >= heads || lanes.length === 0) return lanes.slice(0, heads);
@@ -1690,14 +1917,20 @@ export default function App(props) {
             if (task.kind === 'pic') return w.kind === 'pic' || w.kind === 'inspector';
             return w.kind === task.kind;
         };
-        const pickLanes = function(options, H, task, preferLongest) {
+        const pickLanes = function(options, H, task, preferLongest, must, room) {
             const crewCount = {};
             options.forEach(function(o) { crewCount[o.w.crew] = (crewCount[o.w.crew] || 0) + 1; });
             return options.slice().sort(function(a, b) {
+                // The person Shift Start assigned comes first, then the specialists, then everyone set up on this room.
+                const ma = must && must.indexOf(a.w.id) > -1 ? 1 : 0, mb = must && must.indexOf(b.w.id) > -1 ? 1 : 0;
+                if (ma !== mb) return mb - ma;
                 // The people whose role is built for this kind of work go first (PIC → Inspector / Tech 3, chemical → Clerk, admin → Admin),
                 // so Sanitation Tech 1 / 2 stay free for regular cleaning and Inspectors only cover admin when there is no admin on shift.
                 const sa = isSpecialist(a.w, task) ? 1 : 0, sb = isSpecialist(b.w, task) ? 1 : 0;
                 if (sa !== sb) return sb - sa;
+                const ra = room ? (room.room.indexOf(a.w.id) > -1 ? 2 : room.team.indexOf(a.w.id) > -1 ? 1 : 0) : 0;
+                const rb = room ? (room.room.indexOf(b.w.id) > -1 ? 2 : room.team.indexOf(b.w.id) > -1 ? 1 : 0) : 0;
+                if (ra !== rb) return rb - ra;
                 const ca = crewCount[a.w.crew] >= H ? 1 : 0, cb = crewCount[b.w.crew] >= H ? 1 : 0;
                 if (ca !== cb) return cb - ca;
                 const affA = a.w.schedule.some(function(s) { return s.area === task.originalArea; }) ? 1 : 0;
@@ -1730,7 +1963,7 @@ export default function App(props) {
             while (queue.length > 0) {
                 const task = queue.shift();
                 if (totalLanes === 0) { unscheduled.push(task); continue; }
-                if (eligibleFor(task.kind).length === 0 && !overrides[task.id]) { task.noEligible = true; unscheduled.push(task); continue; }
+                if (eligibleFor(task.kind).length === 0 && !overrides[task.id] && !hasPlanFor(task)) { task.noEligible = true; unscheduled.push(task); continue; }
                 if (overrides[task.id]) { const cont = placePinned(task, vRoom); if (cont) queue.unshift(cont); continue; }
 
                 const H = capHeads(task, vRoom);
@@ -1742,13 +1975,25 @@ export default function App(props) {
                 for (let ci = 0; ci < times.length && !placed; ci++) {
                     const t = times[ci];
                     const dur = task.calculateDuration(t, task.customInterrupts, H);
-                    const options = workers.filter(function(w) { return w.canDo(task.kind, isNightAt(t)); }).map(function(w) { return { w: w, r: w.runFrom(t) }; }).filter(function(o) { return o.r.run > 0; });
+                    const must = mustLanesAt(task, t);
+                    const room = roomLanesAt(task, t);
+                    // Equipment Shift Start left with no one (e.g. nobody on the room can take it): the room's team does it when
+                    // enough of them are allowed to; otherwise anyone eligible.
+                    let restrict = null;
+                    if (must.length === 0 && (room.room.length || room.team.length)) {
+                        const teamOk = room.room.concat(room.team.filter(function(l) { return room.room.indexOf(l) === -1; })).filter(function(l) { return workers[l].canDo(task.kind, isNightAt(t)); });
+                        if (teamOk.length >= H) restrict = teamOk;
+                    }
+                    const options = workers.filter(function(w) { return restrict ? restrict.indexOf(w.id) > -1 : (w.canDo(task.kind, isNightAt(t)) || must.indexOf(w.id) > -1); }).map(function(w) { return { w: w, r: w.runFrom(t) }; }).filter(function(o) { return o.r.run > 0; });
                     if (options.length < H) continue;
+                    // The person Shift Start gave this equipment to has to be the one who does it: wait until they are free.
+                    const hasMust = function(list) { return must.every(function(l) { return list.some(function(o) { return o.w.id === l; }); }); };
+                    if (!hasMust(options)) continue;
 
                     // (a) Whole task fits before these workers clock out / get booked.
                     const fits = options.filter(function(o) { return o.r.run >= dur - 0.01; });
-                    if (fits.length >= H) {
-                        const chosen = pickLanes(fits, H, task, false);
+                    if (fits.length >= H && hasMust(fits)) {
+                        const chosen = pickLanes(fits, H, task, false, must, room);
                         const ids = chosen.map(function(o) { return o.w.id; });
                         if (busyInRoom(vRoom, t, t + dur, ids) + H <= vRoom.limit) {
                             placeTask(task, H, ids, t, dur);
@@ -1759,8 +2004,8 @@ export default function App(props) {
 
                     // (b) Shift handover: the outgoing crew works until clock-out, the rest carries over.
                     const handoverReady = options.filter(function(o) { return o.r.freeToShiftEnd; });
-                    if (handoverReady.length >= H && task.splitIndex < 40) {
-                        const chosen = pickLanes(handoverReady, H, task, true);
+                    if (handoverReady.length >= H && task.splitIndex < 40 && hasMust(handoverReady)) {
+                        const chosen = pickLanes(handoverReady, H, task, true, must, room);
                         const ids = chosen.map(function(o) { return o.w.id; });
                         const usable = Math.min.apply(null, chosen.map(function(o) { return o.r.run; }));
                         const done = netWorkingMins(t, t + usable, task.customInterrupts) * H;
@@ -1840,7 +2085,7 @@ export default function App(props) {
             parents: parents,
             taskById: taskById
         };
-    }, [assets, roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, overrides, taskStatus, targetDowntimes, allInterrupts, includeTransit, includeInspection, pbMode, hiddenRooms, roomSource, shiftStartRooms, laneRoster, maxCrewSize, planHorizonMins, handoverMins, reforecastFrom, ganttStartDate, ganttStartHour]);
+    }, [assets, roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, overrides, taskStatus, targetDowntimes, allInterrupts, includeTransit, includeInspection, pbMode, hiddenRooms, roomSource, shiftStartLines, areaLine, customOnlyAreas, windowPlans, laneByEmpCrew, shiftWindows, laneRoster, maxCrewSize, planHorizonMins, handoverMins, reforecastFrom, ganttStartDate, ganttStartHour]);
 
     // ============================================================================
     // LIVE TRACKING ACTIONS (check-off, start, reassign, move)
@@ -2163,7 +2408,7 @@ export default function App(props) {
     });
     const visibleLanes = laneRoster.slice(visibleLaneLo, visibleLaneLo + visibleLaneCount);
     // Lines picked in Shift Start that no equipment area is named after (so their rooms can't be shown).
-    const shiftStartUnmatchedLines = shiftStartRooms ? Object.keys(shiftStartRooms).filter(function(n) { return !allUniqueRooms.some(function(r) { return String(r).trim().toLowerCase() === n; }); }) : [];
+    const shiftStartNoEquipLines = shiftStartLines ? lineIndex.filter(function(l) { return shiftStartLines[l.id] && !(lineAssets[l.id] || []).length; }).map(function(l) { return l.name; }) : [];
 
     const liveLeftPx = (nowMin / 60) * zoomLevel;
 
@@ -2283,9 +2528,9 @@ export default function App(props) {
                                     <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Rooms come from</label>
                                     <select value={roomSource} onChange={function(e) { setRoomSource(e.target.value); }} className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none no-pan bg-white cursor-pointer">
                                         <option value="all">All rooms that have equipment</option>
-                                        <option value="shiftstart">Rooms the supervisors picked in Shift Start</option>
+                                        <option value="shiftstart">Rooms with crew set up in Shift Start (equipment goes to the assigned person)</option>
                                     </select>
-                                    <p className="text-[11px] font-bold text-slate-500 mt-1.5">{roomSource === 'shiftstart' ? (shiftStartRooms ? `${Object.keys(shiftStartRooms).length} line${Object.keys(shiftStartRooms).length === 1 ? '' : 's'} on the boards · ${allUniqueRooms.filter(function(r) { return shiftStartRooms[String(r).trim().toLowerCase()]; }).length} match an equipment area${shiftStartUnmatchedLines.length ? ' · no equipment area named: ' + shiftStartUnmatchedLines.join(', ') : ''}` : 'No board falls inside this plan yet, so every room is shown.') : 'Turn rooms off in the Room Configuration list below.'}</p>
+                                    <p className="text-[11px] font-bold text-slate-500 mt-1.5">{roomSource !== 'shiftstart' ? 'Turn rooms off in the Room Configuration list below.' : Object.keys(windowPlans).length === 0 ? (lineIndex.length === 0 && boardWindowCount > 0 ? "The Shift Start lines table (craa5_aa_mss_area) returned no rows, so rooms can't be matched yet." : 'No board falls inside this plan yet, so every room is shown.') : !shiftStartLines ? 'Nobody is set up on a room in Shift Start yet, so every room is shown until they are.' : `${Object.keys(shiftStartLines).length} room${Object.keys(shiftStartLines).length === 1 ? '' : 's'} have crew set up. Their equipment is in the plan and goes to the person Shift Start assigned it to; other rooms are left out.${shiftStartNoEquipLines.length ? ' No equipment found for: ' + shiftStartNoEquipLines.join(', ') + '.' : ''}`}</p>
                                 </div>
                             </div>
                             <div className="px-4 md:px-6 pb-5 flex flex-wrap gap-2">
@@ -2305,6 +2550,71 @@ export default function App(props) {
                                     );
                                 })}
                             </div>
+                            {(rosterSource === 'shiftstart' || roomSource === 'shiftstart') && Object.keys(windowPlans).length > 0 && (
+                                <div className="border-t border-gray-200 bg-slate-50/60 px-4 md:px-6 py-4 space-y-3">
+                                    <div className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Teams &amp; rooms in Shift Start <span className="normal-case tracking-normal font-bold text-slate-400">(read only — change them in Shift Start)</span></div>
+                                    {shiftWindows.filter(function(w) { return windowPlans[w.key]; }).map(function(w) {
+                                        const plan = windowPlans[w.key];
+                                        const collapsed = !!collapsedPlans[w.key];
+                                        const style = getCrewStyle(w.crew);
+                                        return (
+                                            <div key={w.key} className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+                                                <div className="px-4 py-2.5 flex flex-wrap items-center gap-2 border-b border-slate-100">
+                                                    <span className={`text-[10px] font-black rounded px-1.5 py-0.5 ${style.badge}`}>{w.crew}</span>
+                                                    <span className="font-black text-sm text-slate-800">{w.dayLabel} {formatHourLabel(w.startHour)}</span>
+                                                    <span className="text-xs font-bold text-slate-500">{plan.views.map(function(v) { return v.supervisor; }).join(' · ')}</span>
+                                                    <button onClick={function() { setCollapsedPlans(function(prev) { return Object.assign({}, prev, { [w.key]: !prev[w.key] }); }); }} className="ml-auto text-[11px] font-black text-indigo-600 hover:text-indigo-800 underline">{collapsed ? 'Expand' : 'Collapse'}</button>
+                                                </div>
+                                                {!collapsed && plan.views.map(function(v, vi) {
+                                                    return (
+                                                        <div key={vi} className="p-3">
+                                                            {plan.views.length > 1 && <div className="text-[11px] font-black text-slate-500 mb-2">Supervisor {v.supervisor}</div>}
+                                                            <div className="flex gap-3 overflow-x-auto pb-2 no-pan">
+                                                                {v.columns.map(function(col, ci) {
+                                                                    return (
+                                                                        <div key={ci} className="min-w-[230px] w-[230px] flex-shrink-0 bg-slate-50 rounded-xl border border-slate-200 p-2.5">
+                                                                            <div className="flex items-baseline justify-between gap-2">
+                                                                                <div className="font-black text-slate-800 text-sm truncate">{col.name}</div>
+                                                                                <span className="text-[10px] font-bold text-slate-400 flex-shrink-0">{col.isLead ? 'Lead' : 'Supervisor'}</span>
+                                                                            </div>
+                                                                            {col.lines.map(function(line) {
+                                                                                return (
+                                                                                    <div key={line.lineId} className="mt-2 bg-white border border-slate-200 rounded-lg p-2">
+                                                                                        <div className="flex items-center justify-between gap-2">
+                                                                                            <span className="text-[12px] font-black text-slate-700 truncate">{line.name}</span>
+                                                                                            <span className="text-[10px] font-bold text-slate-400 whitespace-nowrap flex-shrink-0">{line.assetCount} equipment</span>
+                                                                                        </div>
+                                                                                        {line.people.length === 0 ? (
+                                                                                            <div className="text-[11px] font-bold text-amber-600 mt-1">No crew set up yet</div>
+                                                                                        ) : line.people.map(function(p) {
+                                                                                            return (
+                                                                                                <div key={p.id} className="flex items-center justify-between gap-2 text-[12px] mt-1 border border-dashed border-slate-200 rounded px-1.5 py-1">
+                                                                                                    <span className="truncate font-bold text-slate-700">{p.name}{p.isLead ? <span className="ml-1 text-[9px] font-black uppercase text-sky-600">Lead</span> : null}</span>
+                                                                                                    <span className="text-[10px] font-black text-indigo-600 whitespace-nowrap flex-shrink-0">{p.isLead ? '—' : p.equipCount + ' to do'}</span>
+                                                                                                </div>
+                                                                                            );
+                                                                                        })}
+                                                                                    </div>
+                                                                                );
+                                                                            })}
+                                                                            {col.noRoom.length > 0 && (
+                                                                                <div className="mt-2 text-[11px] font-bold text-slate-500 border border-dashed border-amber-300 bg-amber-50/50 rounded-lg p-2">
+                                                                                    No room yet: {col.noRoom.map(function(p) { return p.name; }).join(', ')}
+                                                                                </div>
+                                                                            )}
+                                                                        </div>
+                                                                    );
+                                                                })}
+                                                            </div>
+                                                            {v.out.length > 0 && <div className="text-[11px] font-bold text-slate-500 mt-1">Out: {v.out.map(function(o) { return o.name + (o.reason ? ' (' + o.reason + ')' : ''); }).join(', ')}</div>}
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
                         </div>
 
                         {/* CREW ROTATION & HEADCOUNT */}
@@ -2485,8 +2795,8 @@ export default function App(props) {
                                                         </label>
                                                     )}
                                                     
-                                                    <button onClick={function() { if (!skippedByShiftStart) handleToggleRoom(room); }} title={skippedByShiftStart ? 'Not picked in Shift Start. Change "Rooms come from" above to turn it back on.' : ''} className={`px-3 py-1 flex items-center gap-1.5 rounded-full text-[11px] font-bold transition-colors whitespace-nowrap border shadow-sm touch-none ${!isSkipped ? 'bg-indigo-600 text-white border-indigo-700 hover:bg-indigo-700' : 'bg-white text-slate-500 border-slate-300 hover:bg-slate-50'}`}>
-                                                        {!isSkipped ? <CheckCircle className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />} {skippedByShiftStart ? 'Not in Shift Start' : isSkipped ? 'Skipped' : 'Active'}
+                                                    <button onClick={function() { if (!skippedByShiftStart) handleToggleRoom(room); }} title={skippedByShiftStart ? 'Nobody is set up on this room in Shift Start. Change "Rooms come from" above to turn it back on.' : ''} className={`px-3 py-1 flex items-center gap-1.5 rounded-full text-[11px] font-bold transition-colors whitespace-nowrap border shadow-sm touch-none ${!isSkipped ? 'bg-indigo-600 text-white border-indigo-700 hover:bg-indigo-700' : 'bg-white text-slate-500 border-slate-300 hover:bg-slate-50'}`}>
+                                                        {!isSkipped ? <CheckCircle className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />} {skippedByShiftStart ? 'No crew in Shift Start' : isSkipped ? 'Skipped' : 'Active'}
                                                     </button>
                                                     
                                                     {!isSkipped && <Button variant="outline" size="sm" onClick={function() { openRoomDowntime(room); }} className="text-rose-600 border-rose-200 hover:bg-rose-50 hidden sm:flex">Add Room Downtime</Button>}
@@ -2680,6 +2990,7 @@ export default function App(props) {
                                                 <span className={`w-7 h-7 rounded-md flex items-center justify-center font-black text-xs ${style.badge}`}>{l.crew}</span>
                                                 <div className="flex-1 min-w-0">
                                                     <div className="font-black text-slate-800 truncate">{l.name}{roleTag(l)}{l.isPlaceholder ? <span className="ml-2 text-[10px] font-bold text-amber-600">(placeholder seat)</span> : null}</div>
+                                                    {l.room && <div className="text-[11px] font-bold text-slate-500 truncate">Room: {l.room}</div>}
                                                     <div className="flex items-center gap-2 mt-1">
                                                         <div className="flex-1 h-1.5 bg-slate-100 rounded-full overflow-hidden"><div className={`h-full ${pct > 100 ? 'bg-rose-500' : style.badge}`} style={{ width: `${Math.min(100, pct)}%` }} /></div>
                                                         <span className="text-[10px] font-black text-slate-500 whitespace-nowrap">{(booked / 60).toFixed(1)}h / {(winLen / 60).toFixed(0)}h · {doneCount}/{blocks.length} done</span>
@@ -3128,7 +3439,7 @@ export default function App(props) {
                                                 const isMember = !l.isLead && !!l.leadKey;
                                                 const teamTxt = l.isLead ? (l.teamNames.length ? 'Team of ' + l.teamNames.length + ' · ' + l.teamNames.join(', ') : 'No team assigned') : '';
                                                 return (
-                                                <div key={l.lane} className={`border-b border-gray-200/60 flex flex-col justify-center px-2 overflow-hidden ${l.isLead ? '' : 'bg-white'} ${isCrewStart ? 'border-t-2 border-t-slate-400' : ''}`} style={{ height: `${LANE_HEIGHT_PX}px`, minHeight: `${LANE_HEIGHT_PX}px`, maxHeight: `${LANE_HEIGHT_PX}px`, flex: `0 0 ${LANE_HEIGHT_PX}px`, boxSizing: 'border-box', borderLeft: gc ? `4px solid ${gc}` : undefined, paddingLeft: isMember ? '16px' : undefined, backgroundColor: l.isLead && gc ? gc + '1f' : l.isLead ? '#f1f5f9' : undefined }} title={l.isLead ? `${l.name} — Lead (${l.crew} crew)${l.teamNames.length ? '\nTeam: ' + l.teamNames.join(', ') : ''}` : `${l.name} (${l.crew} crew)${l.leadKey ? ' — team of ' + (laneRoster.find(function(x) { return x.key === l.leadKey; }) || {}).name : ''} — ${ws ? (ws.bookedMins / 60).toFixed(1) : 0}h assigned of ${ws ? (ws.availMins / 60).toFixed(0) : 0}h on shift`}>
+                                                <div key={l.lane} className={`border-b border-gray-200/60 flex flex-col justify-center px-2 overflow-hidden ${l.isLead ? '' : 'bg-white'} ${isCrewStart ? 'border-t-2 border-t-slate-400' : ''}`} style={{ height: `${LANE_HEIGHT_PX}px`, minHeight: `${LANE_HEIGHT_PX}px`, maxHeight: `${LANE_HEIGHT_PX}px`, flex: `0 0 ${LANE_HEIGHT_PX}px`, boxSizing: 'border-box', borderLeft: gc ? `4px solid ${gc}` : undefined, paddingLeft: isMember ? '16px' : undefined, backgroundColor: l.isLead && gc ? gc + '1f' : l.isLead ? '#f1f5f9' : undefined }} title={l.isLead ? `${l.name} — Lead (${l.crew} crew)${l.teamNames.length ? '\nTeam: ' + l.teamNames.join(', ') : ''}` : `${l.name} (${l.crew} crew)${l.room ? ' — room: ' + l.room : ''}${l.leadKey ? ' — team of ' + (laneRoster.find(function(x) { return x.key === l.leadKey; }) || {}).name : ''} — ${ws ? (ws.bookedMins / 60).toFixed(1) : 0}h assigned of ${ws ? (ws.availMins / 60).toFixed(0) : 0}h on shift`}>
                                                     <div className="flex items-center gap-1.5 min-w-0">
                                                         <span className={`text-[9px] font-black rounded px-1 py-0.5 flex-shrink-0 ${getCrewStyle(l.crew).badge}`}>{l.crew}</span>
                                                         <span className={`text-[11px] ${l.isLead ? 'font-black' : 'font-bold'} truncate min-w-0 ${l.isPlaceholder ? 'text-slate-400 italic' : 'text-slate-800'}`}>{l.name}</span>{roleTag(l)}
