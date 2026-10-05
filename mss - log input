@@ -1,30 +1,75 @@
-import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from 'react';
+import {
+  FluentProvider,
+  createLightTheme,
+  Button,
+  Input,
+  Text,
+  DataGrid,
+  DataGridHeader,
+  DataGridBody,
+  DataGridRow,
+  DataGridCell,
+  DataGridHeaderCell,
+  createTableColumn,
+  TabList,
+  Tab,
+  makeStyles,
+  mergeClasses,
+  Select,
+  Checkbox,
+} from '@fluentui/react-components';
 
 /*
   =============================================================================
   === MSS LOG INPUT (SAP ORDER FORM) ===
-  Admins type a SAP order code. The form looks it up in craa5_aa_ms_assets
-  (the SAP-code store, one row per equipment with one column per frequency),
-  resolves each row to its craa5_aa_assets record, and shows the equipment to
-  be logged. The admin enters who completed it (initials for now) and the hours;
-  one craa5__log_ row is written per equipment, which `mss - calendar` reads.
+  Layout follows the original MSS log app: tab bar (Add Log Entries, Log Table,
+  Dashboard, Calendar), recent-entries sidebar, one card per entry row, a log
+  table with batch edit/delete, and a dashboard. Colors are the company blue,
+  yellow and red; the logo sits top right (set LOGO_URL to use the official art).
 
-  Log payload (craa5__log_), no new Dataverse columns:
-    craa5_equipmentguid     = craa5_aa_assetsid  (the key the calendar matches on)
-    craa5_equipment         = equipment name     (display copy only)
-    craa5_room / craa5_area = copied from the asset (display copy only)
-    craa5_sap               = the SAP code that was entered
+  ADD LOG ENTRIES
+  An admin types a SAP order. All SAP orders are cached when the app opens and
+  searched as the admin types (not case sensitive). Selecting an order fills in
+  the equipment from craa5_aa_ms_assets (one row per equipment, one column per
+  frequency) resolved to craa5_aa_assets. Missing equipment can be searched for
+  or created, and the SAP order is then stored on that equipment's SAP row.
+  One craa5__log_ row is written per equipment:
+    craa5_equipmentguid     = craa5_aa_assetsid (what mss - calendar matches on)
+    craa5_equipment/room/area = display copies taken from the asset
+    craa5_sap               = SAP order entered (upper case)
     craa5_lastcleaned       = completion date, midnight UTC
-    craa5_lastcleanedby     = initials, upper-case, "/" separated
-    craa5_hoursworked       = number (total hours split across the equipment)
+    craa5_lastcleanedby     = initials, upper case, "/" separated
+    craa5_hoursworked       = number (the order's hours split across equipment)
 
-  All SAP codes are cached when the form opens and searched as the admin types
-  (not case sensitive). Equipment populates once a code is selected. Missing
-  equipment is added by searching assets or creating a new one (craa5_aa_assets);
-  the SAP code is then written to that equipment's craa5_aa_ms_assets row (the
-  frequency column), or a row is created, so it appears on the order next time.
+  FIX MISSING IDS
+  Scans the log for entries whose craa5_equipmentguid is empty or points at an
+  asset that no longer exists, ranks the closest assets (SAP order first, then
+  name/room/area similarity that respects equipment numbers), lets the admin
+  confirm or change each suggestion, and writes the guid back.
   =============================================================================
 */
+
+// --- BRAND ---
+// Sampled from the company site: blue bar #006ECD, logo blue #2D6EB6, yellow-orange #FF9700, red #EC2127.
+const BRAND = { blue: '#006ECD', logoBlue: '#2D6EB6', yellow: '#FF9700', red: '#EC2127', navy: '#0B3C73', ink: '#10233A', bg: '#F2F6FB', line: '#CBD9EA' };
+// Paste an https or data URL of the official logo here to replace the drawn mark.
+const LOGO_URL = '';
+
+const hslToHex = (h, s, l) => {
+  s /= 100; l /= 100;
+  const k = (n) => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n) => Math.round(255 * (l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)))));
+  return `#${[f(0), f(8), f(4)].map(v => v.toString(16).padStart(2, '0')).join('')}`;
+};
+const BRAND_RAMP = (() => {
+  const L = [8, 14, 19, 24, 29, 34, 38, 40, 45, 50, 56, 62, 69, 76, 84, 92];
+  const o = {};
+  L.forEach((l, i) => { o[(i + 1) * 10] = hslToHex(208, 100, l); });
+  return o; // shade 80 is the company blue
+})();
+const THEME = createLightTheme(BRAND_RAMP);
 
 // --- SCHEMA CONSTANTS ---
 const LOG_TABLE = 'craa5__log_';
@@ -44,12 +89,14 @@ const FREQUENCIES = [
 ];
 const CODE_COLS = [...FREQUENCIES.map(f => f.col), 'craa5_title', 'craa5_olduid'];
 const freqLabel = (col) => (FREQUENCIES.find(f => f.col === col) || {}).label || 'ID';
+const LOG_SELECT = ['craa5__log_id', 'craa5_equipment', 'craa5_equipmentguid', 'craa5_sap', 'craa5_room', 'craa5_area', 'craa5_lastcleaned', 'craa5_lastcleanedby', 'craa5_hoursworked'];
 
 // --- HELPERS ---
 const safeString = (v) => (v === null || v === undefined ? '' : String(v).trim());
 const normCode = (s) => safeString(s).toUpperCase().replace(/\s+/g, '');
 const normName = (s) => safeString(s).toLowerCase().replace(/[^a-z0-9]/g, '');
 const escOData = (s) => String(s).replace(/'/g, "''");
+const errText = (e) => (e && (e.message || (e.raw && e.raw.message) || (e.error && e.error.message))) || 'Unknown error';
 
 const toDateInput = (d) => {
   const y = d.getFullYear();
@@ -57,7 +104,13 @@ const toDateInput = (d) => {
   const day = String(d.getDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
 };
-// Date-only value stored as midnight UTC, the same shape as the existing log rows.
+// Log dates are date-only values stored as midnight UTC. Read them as that calendar day, never shifted by time zone.
+const dayKey = (v) => {
+  const s = safeString(v);
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? '' : d.toISOString().slice(0, 10);
+};
 const toLogDate = (dateStr) => `${dateStr}T00:00:00Z`;
 const nextDay = (dateStr) => {
   const d = new Date(`${dateStr}T00:00:00Z`);
@@ -77,7 +130,58 @@ const splitHours = (total, n) => {
   return out;
 };
 
-const errText = (e) => (e && (e.message || e.raw?.message || e.error?.message)) || 'Unknown error';
+// Run fn over items with a small concurrency limit; never rejects, returns [{ok, value|error}].
+const pool = async (items, limit, fn) => {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      try { out[i] = { ok: true, value: await fn(items[i], i) }; } catch (e) { out[i] = { ok: false, error: e }; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+};
+
+// --- EQUIPMENT NAME SIMILARITY (digit aware: "Mixer 1" = "Mixer 01", "Mixer 1" != "Mixer 2") ---
+const tokenize = (s) => safeString(s).toLowerCase()
+  .replace(/([a-z])(\d)/g, '$1 $2').replace(/(\d)([a-z])/g, '$1 $2')
+  .split(/[^a-z0-9]+/).filter(Boolean);
+const bigrams = (s) => {
+  const t = ` ${s} `;
+  const m = new Map();
+  for (let i = 0; i < t.length - 1; i++) { const g = t.slice(i, i + 2); m.set(g, (m.get(g) || 0) + 1); }
+  return m;
+};
+const dice = (a, b) => {
+  if (!a.size || !b.size) return 0;
+  let inter = 0, ta = 0, tb = 0;
+  a.forEach(v => { ta += v; });
+  b.forEach(v => { tb += v; });
+  a.forEach((v, g) => { if (b.has(g)) inter += Math.min(v, b.get(g)); });
+  return (2 * inter) / (ta + tb);
+};
+const nameProfile = (name) => {
+  const t = tokenize(name);
+  const nums = t.filter(x => /^\d+$/.test(x)).map(x => String(parseInt(x, 10)));
+  const words = t.filter(x => !/^\d+$/.test(x));
+  const key = words.join('');
+  return { words, nums: nums.join(','), hasNums: nums.length > 0, key, full: normName(name), grams: bigrams(key) };
+};
+const nameSimilarity = (p, q) => {
+  if (p.full && p.full === q.full) return 1;
+  const w = p.key && q.key ? (p.key === q.key ? 1 : dice(p.grams, q.grams)) : 0;
+  let n;
+  if (!p.hasNums && !q.hasNums) n = 1;
+  else if (p.nums === q.nums) n = 1;
+  else if (!p.hasNums || !q.hasNums) n = 0.75;
+  else n = 0.4;
+  return w * n;
+};
+const tierOf = (score) => (score >= 0.95 ? 'high' : score >= 0.8 ? 'medium' : score >= 0.6 ? 'low' : 'none');
+const TIER_LABEL = { high: 'High', medium: 'Medium', low: 'Low', none: 'No match' };
+const downTier = (t) => (t === 'high' ? 'medium' : t === 'medium' ? 'low' : t);
 
 // --- DATA ACCESS (Xrm.WebApi, Power Apps dataApi, or an in-memory preview) ---
 const makeMock = () => {
@@ -89,6 +193,8 @@ const makeMock = () => {
       { craa5_aa_assetsid: 'a-3', craa5_equipmentidentifier: 'Slicer 12', craa5_roomname: 'Deli', craa5_areaname: 'Front' },
       { craa5_aa_assetsid: 'a-4', craa5_equipmentidentifier: 'Pallets', craa5_roomname: 'Creme', craa5_areaname: 'IBL4' },
       { craa5_aa_assetsid: 'a-5', craa5_equipmentidentifier: 'Racking', craa5_roomname: 'Creme', craa5_areaname: 'IBL4' },
+      { craa5_aa_assetsid: 'a-6', craa5_equipmentidentifier: 'Mixer 02', craa5_roomname: 'Kitchen', craa5_areaname: 'South' },
+      { craa5_aa_assetsid: 'a-7', craa5_equipmentidentifier: 'Gyro Mixer (+)', craa5_roomname: 'Bakery', craa5_areaname: 'Dough' },
     ],
     [MS_TABLE]: [
       { craa5_aa_ms_assetsid: 'm-1', craa5_title: 'SSANKSMIX', craa5_sapdaily: 'SSANKSMIX', craa5_sapw: 'SSANKSMIXW', craa5_equipment: 'Mixer 01', craa5_textroom: 'Kitchen', craa5_textarea: 'South', _craa5_asset_value: 'a-1' },
@@ -97,34 +203,45 @@ const makeMock = () => {
       { craa5_aa_ms_assetsid: 'm-4', craa5_title: 'SSANTEMPRW', craa5_sapw: 'SSANTEMPRW', craa5_equipment: 'Floors', craa5_textroom: 'Temp', craa5_textarea: 'Hall', _craa5_asset_value: null },
     ],
     [LOG_TABLE]: [
-      { craa5__log_id: 'l-0', craa5_equipmentguid: 'a-1', craa5_equipment: 'Mixer 01', craa5_sap: 'SSANKSMIX', craa5_lastcleaned: `${today}T00:00:00Z`, craa5_lastcleanedby: 'ES', craa5_hoursworked: 1 },
+      { craa5__log_id: 'l-0', craa5_equipmentguid: 'a-1', craa5_equipment: 'Mixer 01', craa5_sap: 'SSANKSMIX', craa5_room: 'Kitchen', craa5_area: 'South', craa5_lastcleaned: `${today}T00:00:00Z`, craa5_lastcleanedby: 'ES', craa5_hoursworked: 1 },
+      { craa5__log_id: 'l-1', craa5_equipmentguid: null, craa5_equipment: 'mixer-1', craa5_sap: '', craa5_room: 'Kitchen', craa5_area: 'South', craa5_lastcleaned: '2026-03-02T00:00:00Z', craa5_lastcleanedby: 'EL', craa5_hoursworked: 2 },
+      { craa5__log_id: 'l-2', craa5_equipmentguid: '', craa5_equipment: 'Mixer 1', craa5_sap: '', craa5_room: 'Kitchen', craa5_area: 'South', craa5_lastcleaned: '2026-03-09T00:00:00Z', craa5_lastcleanedby: 'EL', craa5_hoursworked: 2 },
+      { craa5__log_id: 'l-3', craa5_equipmentguid: null, craa5_equipment: 'Pallet', craa5_sap: 'SSANIBL4PSW', craa5_room: 'Creme', craa5_area: 'IBL4', craa5_lastcleaned: '2026-04-01T00:00:00Z', craa5_lastcleanedby: 'LH', craa5_hoursworked: 1.5 },
+      { craa5__log_id: 'l-4', craa5_equipmentguid: 'dead-guid', craa5_equipment: 'Oven #5', craa5_sap: '', craa5_room: 'Kitchen', craa5_area: 'South', craa5_lastcleaned: '2026-04-02T00:00:00Z', craa5_lastcleanedby: 'LH', craa5_hoursworked: 1 },
+      { craa5__log_id: 'l-5', craa5_equipmentguid: null, craa5_equipment: 'Gyro Mixer', craa5_sap: '', craa5_room: '', craa5_area: '', craa5_lastcleaned: '2026-04-03T00:00:00Z', craa5_lastcleanedby: 'AB', craa5_hoursworked: 1 },
+      { craa5__log_id: 'l-6', craa5_equipmentguid: null, craa5_equipment: 'Unknown thing', craa5_sap: '', craa5_room: 'Nowhere', craa5_area: '', craa5_lastcleaned: '2026-04-04T00:00:00Z', craa5_lastcleanedby: 'AB', craa5_hoursworked: 1 },
     ],
   };
+  const idKeys = { [LOG_TABLE]: 'craa5__log_id', [ASSET_TABLE]: 'craa5_aa_assetsid', [MS_TABLE]: 'craa5_aa_ms_assetsid' };
   let n = 100;
   return {
     mode: 'preview',
-    async query(table, { filter } = {}) {
+    async query(table, { filter, top } = {}) {
       let rows = db[table] || [];
       if (table === LOG_TABLE && filter && /craa5_sap eq '([^']*)'/.test(filter)) {
         const sap = filter.match(/craa5_sap eq '([^']*)'/)[1];
         const d = filter.match(/ge (\d{4}-\d{2}-\d{2})/)[1];
         rows = rows.filter(r => r.craa5_sap === sap && String(r.craa5_lastcleaned).startsWith(d));
       }
-      return rows.map(r => ({ ...r }));
+      if (table === LOG_TABLE) rows = [...rows].sort((a, b) => String(b.craa5_lastcleaned).localeCompare(String(a.craa5_lastcleaned)));
+      return rows.slice(0, top || 100000).map(r => ({ ...r }));
     },
     async create(table, payload) {
-      const idKey = table === LOG_TABLE ? 'craa5__log_id' : table === ASSET_TABLE ? 'craa5_aa_assetsid' : 'craa5_aa_ms_assetsid';
       const id = `new-${n++}`;
-      const row = { ...payload, [idKey]: id };
+      const row = { ...payload, [idKeys[table]]: id };
       const bind = payload['craa5_asset@odata.bind'];
       if (bind) row._craa5_asset_value = bind.match(/\(([^)]+)\)/)[1];
       db[table].push(row);
       return id;
     },
     async update(table, id, payload) {
-      const row = (db[table] || []).find(r => Object.values(r).includes(id));
-      if (row) Object.assign(row, payload);
+      const row = (db[table] || []).find(r => r[idKeys[table]] === id);
+      if (!row) throw new Error('Row not found');
+      Object.assign(row, payload);
+      const bind = payload['craa5_asset@odata.bind'];
+      if (bind) row._craa5_asset_value = bind.match(/\(([^)]+)\)/)[1];
     },
+    async remove(table, id) { db[table] = (db[table] || []).filter(r => r[idKeys[table]] !== id); },
   };
 };
 
@@ -132,10 +249,11 @@ const makeApi = (dataApi) => {
   if (typeof Xrm !== 'undefined' && Xrm.WebApi) {
     return {
       mode: 'dataverse',
-      async query(table, { select, filter, top } = {}) {
+      async query(table, { select, filter, top, orderBy } = {}) {
         const parts = [];
         if (select) parts.push(`$select=${select.join(',')}`);
         if (filter) parts.push(`$filter=${filter}`);
+        if (orderBy) parts.push(`$orderby=${orderBy}`);
         if (top) parts.push(`$top=${top}`);
         let res = await Xrm.WebApi.retrieveMultipleRecords(table, parts.length ? `?${parts.join('&')}` : '');
         let all = res.entities || [];
@@ -147,20 +265,22 @@ const makeApi = (dataApi) => {
       },
       async create(table, payload) { return (await Xrm.WebApi.createRecord(table, payload)).id; },
       async update(table, id, payload) { await Xrm.WebApi.updateRecord(table, id, payload); },
+      async remove(table, id) { await Xrm.WebApi.deleteRecord(table, id); },
     };
   }
   if (dataApi) {
     return {
       mode: 'dataverse',
-      async query(table, { select, filter, top } = {}) {
-        const res = await dataApi.queryTable(table, { select, filter, pageSize: top || 5000 });
-        return res?.rows ?? [];
+      async query(table, { select, filter, top, orderBy } = {}) {
+        const res = await dataApi.queryTable(table, { select, filter, orderBy, pageSize: top || 5000 });
+        return (res && res.rows) || [];
       },
       async create(table, payload) {
         const res = await dataApi.createRow(table, payload);
-        return res?.id ?? res?.[`${table}id`] ?? res;
+        return (res && (res.id || res[`${table}id`])) || res;
       },
       async update(table, id, payload) { await dataApi.updateRow(table, id, payload); },
+      async remove(table, id) { await dataApi.deleteRow(table, id); },
     };
   }
   return makeMock();
@@ -185,99 +305,103 @@ const compressImage = (file) => new Promise((resolve) => {
   reader.readAsDataURL(file);
 });
 
-// --- COMPONENT ---
-export default function App({ dataApi } = {}) {
-  const api = useMemo(() => makeApi(dataApi), [dataApi]);
-  const maxDate = useMemo(() => toDateInput(new Date()), []);
-  const minDate = useMemo(() => { const d = new Date(); d.setFullYear(d.getFullYear() - 1); return toDateInput(d); }, []);
+// --- STYLES ---
+const useStyles = makeStyles({
+  root: { display: 'flex', flexDirection: 'column', minHeight: '100vh', height: '100%', backgroundColor: BRAND.bg, boxSizing: 'border-box', padding: '12px', gap: '10px', color: BRAND.ink },
+  header: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '16px', backgroundColor: '#FFFFFF', borderRadius: '8px', padding: '8px 16px', borderBottom: `4px solid ${BRAND.yellow}`, boxShadow: '0 1px 4px rgba(16,35,58,.12)' },
+  title: { display: 'flex', flexDirection: 'column' },
+  titleMain: { fontSize: '20px', fontWeight: 800, color: BRAND.navy, lineHeight: '24px' },
+  titleSub: { fontSize: '12px', color: '#5B6F86' },
+  logo: { display: 'flex', alignItems: 'center', flexShrink: 0 },
+  navBar: { display: 'flex', backgroundColor: BRAND.blue, borderRadius: '8px', padding: '6px', gap: '6px', flexWrap: 'wrap' },
+  tab: { backgroundColor: '#E6F1FC', color: BRAND.ink, borderRadius: '4px', fontWeight: 600 },
+  activeTab: { backgroundColor: BRAND.yellow },
+  mainContent: { display: 'flex', flex: 1, minHeight: 0, gap: '12px', flexWrap: 'wrap' },
+  sidebar: { width: '280px', backgroundColor: BRAND.navy, padding: '12px', borderRadius: '8px', overflowY: 'auto', color: '#FFFFFF', flexShrink: 0, boxSizing: 'border-box', '@media (max-width: 800px)': { width: '100%' } },
+  sidebarTitle: { color: BRAND.yellow, fontWeight: 700, marginBottom: '8px' },
+  contentArea: { flex: 1, minWidth: '300px', backgroundColor: '#FFFFFF', borderRadius: '8px', padding: '12px', overflowY: 'auto', minHeight: 0, boxShadow: '0 1px 4px rgba(16,35,58,.12)', boxSizing: 'border-box' },
+  sectionTitle: { marginBottom: '8px', color: BRAND.navy },
+  errorText: { color: BRAND.red, fontWeight: 700, marginTop: '8px' },
+  okText: { color: '#0A7A3B', fontWeight: 700, marginTop: '8px' },
+  warnText: { color: '#8A5300', fontWeight: 700, marginTop: '8px' },
+  filterBar: { display: 'flex', gap: '8px', marginBottom: '12px', flexWrap: 'wrap', alignItems: 'center', paddingBottom: '12px', borderBottom: `1px solid ${BRAND.line}` },
+  actionBar: { display: 'flex', gap: '8px', marginBottom: '12px', alignItems: 'center', flexWrap: 'wrap' },
+  rowCard: { border: `1px solid ${BRAND.line}`, borderLeft: `4px solid ${BRAND.blue}`, padding: '12px', borderRadius: '8px', backgroundColor: '#FFFFFF' },
+  rowFields: { display: 'flex', flexDirection: 'row', gap: '12px', alignItems: 'flex-start', flexWrap: 'wrap' },
+  field: { display: 'flex', flexDirection: 'column', position: 'relative', minWidth: 0 },
+  label: { fontSize: '12px', fontWeight: 700, color: '#41566E' },
+  suggest: { position: 'absolute', top: '100%', left: 0, minWidth: '280px', zIndex: 30, backgroundColor: '#FFFFFF', border: `1px solid ${BRAND.line}`, borderRadius: '6px', marginTop: '2px', boxShadow: '0 8px 16px rgba(16,35,58,.18)', maxHeight: '260px', overflowY: 'auto' },
+  suggestItem: { display: 'flex', justifyContent: 'space-between', gap: '12px', width: '100%', padding: '8px 10px', border: 'none', backgroundColor: 'transparent', cursor: 'pointer', textAlign: 'left', fontSize: '13px', ':hover': { backgroundColor: '#E6F1FC' } },
+  linesTable: { width: '100%', borderCollapse: 'collapse', fontSize: '13px', marginTop: '10px' },
+  th: { textAlign: 'left', fontSize: '11px', textTransform: 'uppercase', color: '#5B6F86', fontWeight: 700, padding: '6px 8px', borderBottom: `2px solid ${BRAND.line}`, whiteSpace: 'nowrap' },
+  td: { padding: '6px 8px', borderBottom: `1px solid #E4ECF6`, verticalAlign: 'middle' },
+  tag: { display: 'inline-block', fontSize: '11px', fontWeight: 700, padding: '2px 8px', borderRadius: '10px', backgroundColor: '#E4ECF6', color: '#41566E', whiteSpace: 'nowrap' },
+  tagOk: { backgroundColor: '#D6F0DF', color: '#0A6A33' },
+  tagWarn: { backgroundColor: '#FFE6BF', color: '#8A5300' },
+  tagBad: { backgroundColor: '#FDD9DA', color: '#A5161B' },
+  addPanel: { marginTop: '12px', padding: '10px', backgroundColor: '#FFF6E6', border: `1px dashed ${BRAND.yellow}`, borderRadius: '6px' },
+  hint: { fontSize: '12px', color: '#5B6F86' },
+  dashboardGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px', marginBottom: '16px' },
+  metricCard: { backgroundColor: '#FFFFFF', padding: '16px', borderRadius: '10px', boxShadow: '0 2px 8px rgba(16,35,58,.15)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' },
+  metricValue: { fontSize: '34px', fontWeight: 800, color: BRAND.navy, marginTop: '6px' },
+  metricLabel: { color: '#5B6F86', fontWeight: 700, textTransform: 'uppercase', fontSize: '12px', letterSpacing: '0.5px' },
+  listCard: { backgroundColor: '#FFFFFF', padding: '16px', borderRadius: '10px', boxShadow: '0 2px 8px rgba(16,35,58,.15)', borderTop: `4px solid ${BRAND.blue}` },
+  listItem: { display: 'flex', justifyContent: 'space-between', padding: '6px 0', borderBottom: `1px solid #E4ECF6` },
+  calHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' },
+  calGrid: { display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: '4px' },
+  dayCell: { border: `1px solid ${BRAND.line}`, borderRadius: '4px', minHeight: '80px', padding: '4px', display: 'flex', flexDirection: 'column', fontSize: '12px', backgroundColor: '#FAFCFE', minWidth: 0 },
+  dayCellToday: { borderColor: BRAND.yellow, backgroundColor: '#FFF6E6' },
+  weekday: { textAlign: 'center', fontWeight: 700, padding: '4px', backgroundColor: '#E6F1FC', borderRadius: '4px' },
+  entryText: { fontSize: '11px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+});
 
-  const [assets, setAssets] = useState([]);
-  const [msRows, setMsRows] = useState([]);
-  const [recent, setRecent] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [loadError, setLoadError] = useState('');
+const primaryStyle = { backgroundColor: BRAND.blue, color: '#FFFFFF', border: `1px solid ${BRAND.blue}` };
+const ctaStyle = { backgroundColor: BRAND.yellow, color: BRAND.ink, border: `1px solid ${BRAND.yellow}`, fontWeight: 700 };
+const dangerStyle = { backgroundColor: BRAND.red, color: '#FFFFFF', border: `1px solid ${BRAND.red}` };
+
+// --- LOGO ---
+const BrandLogo = () => {
+  if (LOGO_URL) return <img src={LOGO_URL} alt="Company logo" style={{ height: 44, display: 'block' }} />;
+  return (
+    <svg role="img" aria-label="Company logo" width="192" height="48" viewBox="0 0 192 48" style={{ display: 'block' }}>
+      <ellipse cx="17" cy="11" rx="8" ry="9.5" fill={BRAND.logoBlue} transform="rotate(-25 17 11)" />
+      <ellipse cx="36" cy="22" rx="8.5" ry="8.5" fill="#F89721" />
+      <ellipse cx="21" cy="35" rx="8" ry="9.5" fill={BRAND.red} transform="rotate(15 21 35)" />
+      <text x="52" y="31" fontFamily="Segoe UI, Arial, sans-serif" fontWeight="900" fontSize="22" fill={BRAND.ink}>CJ</text>
+      <text x="86" y="31" fontFamily="Segoe UI, Arial, sans-serif" fontWeight="500" fontSize="19" fill={BRAND.ink} letterSpacing="0.5">SCHWAN’S</text>
+    </svg>
+  );
+};
+
+// --- ENTRY ROW: one SAP order, one or more equipment ---
+const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initialInitials, onRemove, onEnter, canRemove }, ref) {
+  const styles = useStyles();
+  const { api, assets, assetById, assetsByName, codeIndex, rooms, areas, dataRef, maxDate, minDate } = ctx;
 
   const [code, setCode] = useState('');
   const [showSuggest, setShowSuggest] = useState(false);
-  const [dateStr, setDateStr] = useState(maxDate);
-  const [initials, setInitials] = useState('');
+  const [hi, setHi] = useState(0);
+  const [dateStr, setDateStr] = useState(initialDate || maxDate);
+  const [initials, setInitials] = useState(initialInitials || '');
   const [totalHours, setTotalHours] = useState('');
   const [photo, setPhoto] = useState(null);
   const [photoName, setPhotoName] = useState('');
-
-  const [excluded, setExcluded] = useState({});       // lineKey -> true
-  const [pickedAsset, setPickedAsset] = useState({});  // lineKey -> assetId (manual match)
-  const [hoursOverride, setHoursOverride] = useState({}); // lineKey -> number
-  const [dupes, setDupes] = useState(new Set());       // assetIds already logged for code+date
-
-  // Missing equipment added to the order (searched or newly created)
-  const [extras, setExtras] = useState([]);            // [{ key, asset, col }]
+  const [excluded, setExcluded] = useState({});
+  const [pickedAsset, setPickedAsset] = useState({});
+  const [hoursOverride, setHoursOverride] = useState({});
+  const [editMode, setEditMode] = useState(false);
+  const [edits, setEdits] = useState({});            // lineKey -> { name, room, area }
+  const [dupes, setDupes] = useState(new Set());
+  const [extras, setExtras] = useState([]);
   const [addOpen, setAddOpen] = useState(false);
-  const [addMode, setAddMode] = useState('search');    // search | new
+  const [addMode, setAddMode] = useState('search');
   const [addFreq, setAddFreq] = useState('craa5_sapw');
   const [assetSearch, setAssetSearch] = useState('');
   const [newRoom, setNewRoom] = useState('');
   const [newArea, setNewArea] = useState('');
   const [newName, setNewName] = useState('');
-  const [hi, setHi] = useState(0);                     // highlighted suggestion
-  const newSeq = useRef(0);
-
-  const [saving, setSaving] = useState(false);
-  const [message, setMessage] = useState(null); // { kind: 'ok' | 'warn' | 'error', text }
-  const codeRef = useRef(null);
-
-  // --- LOAD ---
-  const loadAll = useCallback(async () => {
-    setLoading(true);
-    setLoadError('');
-    try {
-      const [a, m, l] = await Promise.all([
-        api.query(ASSET_TABLE, { select: ['craa5_aa_assetsid', 'craa5_equipmentidentifier', 'craa5_roomname', 'craa5_areaname'] }),
-        api.query(MS_TABLE),
-        api.query(LOG_TABLE, { select: ['craa5__log_id', 'craa5_equipment', 'craa5_sap', 'craa5_lastcleaned', 'craa5_lastcleanedby', 'craa5_hoursworked'], top: 15 }),
-      ]);
-      setAssets(a.map(r => ({
-        id: r.craa5_aa_assetsid,
-        name: safeString(r.craa5_equipmentidentifier),
-        room: safeString(r.craa5_roomname),
-        area: safeString(r.craa5_areaname),
-      })));
-      setMsRows(m.map(r => ({
-        id: r.craa5_aa_ms_assetsid,
-        equipment: safeString(r.craa5_equipment),
-        room: safeString(r.craa5_textroom),
-        area: safeString(r.craa5_textarea),
-        assetId: r._craa5_asset_value || null,
-        codes: CODE_COLS.map(col => ({ col, code: normCode(r[col]) })).filter(c => c.code),
-      })));
-      setRecent(l);
-    } catch (e) {
-      setLoadError(errText(e));
-    } finally {
-      setLoading(false);
-    }
-  }, [api]);
-
-  useEffect(() => { loadAll(); }, [loadAll]);
-
-  // --- INDEXES ---
-  const assetById = useMemo(() => new Map(assets.map(a => [a.id, a])), [assets]);
-  const assetsByName = useMemo(() => {
-    const m = new Map();
-    assets.forEach(a => { const k = normName(a.name); if (!m.has(k)) m.set(k, []); m.get(k).push(a); });
-    return m;
-  }, [assets]);
-  const codeIndex = useMemo(() => {
-    const m = new Map();
-    msRows.forEach(r => r.codes.forEach(c => {
-      if (!m.has(c.code)) m.set(c.code, []);
-      m.get(c.code).push({ row: r, col: c.col });
-    }));
-    return m;
-  }, [msRows]);
-
-  const rooms = useMemo(() => [...new Set(assets.map(a => a.room).filter(Boolean))].sort(), [assets]);
-  const areas = useMemo(() => [...new Set(assets.map(a => a.area).filter(Boolean))].sort(), [assets]);
+  const [note, setNote] = useState('');
+  const seq = useRef(0);
 
   const normalizedCode = normCode(code);
   const matches = normalizedCode ? codeIndex.get(normalizedCode) || [] : [];
@@ -296,7 +420,13 @@ export default function App({ dataApi } = {}) {
     return [...starts, ...contains].slice(0, 10);
   }, [normalizedCode, codeIndex]);
 
-  // --- LINES: one per equipment on the order ---
+  const clearOrderState = () => {
+    setExcluded({}); setPickedAsset({}); setHoursOverride({}); setExtras([]); setEdits({});
+    setAddOpen(false); setEditMode(false); setNote('');
+  };
+  const selectCode = (c) => { setCode(c); setShowSuggest(false); clearOrderState(); };
+
+  // Lines: one per equipment on the order
   const lines = useMemo(() => {
     const seen = new Set();
     const out = [];
@@ -314,44 +444,38 @@ export default function App({ dataApi } = {}) {
         if (seen.has(asset.id)) return;
         seen.add(asset.id);
       }
-      out.push({
-        key, msId: row.id, col, how,
-        asset,
-        name: asset ? asset.name : row.equipment,
-        room: asset ? asset.room : row.room,
-        area: asset ? asset.area : row.area,
-      });
+      out.push({ key, msId: row.id, col, how, asset, name: asset ? asset.name : row.equipment, room: asset ? asset.room : row.room, area: asset ? asset.area : row.area });
     });
     extras.forEach(x => {
-      if (x.asset.id && seen.has(x.asset.id)) return;
-      if (x.asset.id) seen.add(x.asset.id);
+      if (!x.asset.isNew && seen.has(x.asset.id)) return;
+      if (!x.asset.isNew) seen.add(x.asset.id);
       out.push({ key: x.key, msId: null, col: x.col, how: x.asset.isNew ? 'new equipment' : 'added', asset: x.asset, name: x.asset.name, room: x.asset.room, area: x.asset.area, extra: true });
     });
-    return out;
-  }, [matches, assetById, assetsByName, pickedAsset, extras]);
+    // Apply "edit pre-filled details" overrides
+    return out.map(l => (edits[l.key] ? { ...l, name: edits[l.key].name, room: edits[l.key].room, area: edits[l.key].area } : l));
+  }, [matches, assetById, assetsByName, pickedAsset, extras, edits]);
 
   const included = lines.filter(l => !excluded[l.key] && l.asset);
   const evenHours = useMemo(() => {
     const free = included.filter(l => hoursOverride[l.key] === undefined);
-    const fixed = included.reduce((s, l) => s + (hoursOverride[l.key] ?? 0), 0);
+    const fixed = included.reduce((s, l) => s + (hoursOverride[l.key] || 0), 0);
     const split = splitHours((parseFloat(totalHours) || 0) - fixed, free.length);
     const map = {};
-    free.forEach((l, i) => { map[l.key] = split[i] ?? 0; });
+    free.forEach((l, i) => { map[l.key] = split[i] || 0; });
     return map;
   }, [included, hoursOverride, totalHours]);
-  const lineHours = (l) => hoursOverride[l.key] ?? evenHours[l.key] ?? 0;
+  const lineHours = (l) => (hoursOverride[l.key] !== undefined ? hoursOverride[l.key] : evenHours[l.key] || 0);
   const hoursSum = Math.round(included.reduce((s, l) => s + lineHours(l), 0) * 100) / 100;
 
-  // Duplicate check: same code + date + asset already in the log
+  // Skip equipment already logged for the same order and date
   useEffect(() => {
     setDupes(new Set());
-    if (!matches.length || !dateStr) return;
+    if (!matches.length || !dateStr) return undefined;
     let cancelled = false;
     api.query(LOG_TABLE, {
       select: ['craa5_equipmentguid'],
       filter: `craa5_sap eq '${escOData(normalizedCode)}' and craa5_lastcleaned ge ${dateStr}T00:00:00Z and craa5_lastcleaned lt ${nextDay(dateStr)}T00:00:00Z`,
-    }).then(rows => { if (!cancelled) setDupes(new Set(rows.map(r => r.craa5_equipmentguid))); })
-      .catch(() => {});
+    }).then(rows => { if (!cancelled) setDupes(new Set(rows.map(r => r.craa5_equipmentguid))); }).catch(() => {});
     return () => { cancelled = true; };
   }, [api, normalizedCode, dateStr, matches.length]);
 
@@ -361,30 +485,27 @@ export default function App({ dataApi } = {}) {
     const q = normName(assetSearch);
     if (q.length < 2) return [];
     const taken = new Set(lines.map(l => l.asset && l.asset.id));
-    return assets
-      .filter(a => !taken.has(a.id) && normName(`${a.room}${a.area}${a.name}`).includes(q))
-      .slice(0, 20);
+    return assets.filter(a => !taken.has(a.id) && normName(`${a.room}${a.area}${a.name}`).includes(q)).slice(0, 20);
   }, [assets, assetSearch, lines]);
 
   const addExtra = (asset) => {
-    newSeq.current += 1;
-    setExtras(p => [...p, { key: `x-${newSeq.current}`, asset, col: addFreq }]);
+    seq.current += 1;
+    setExtras(p => [...p, { key: `x-${seq.current}`, asset, col: addFreq }]);
     setAssetSearch(''); setNewName('');
   };
   const addNew = () => {
-    if (!newRoom.trim() || !newArea.trim() || !newName.trim()) { setMessage({ kind: 'error', text: 'Enter room, area and equipment name for the new equipment.' }); return; }
-    setMessage(null);
-    newSeq.current += 1;
-    addExtra({ id: `new:${newSeq.current}`, isNew: true, name: newName.trim(), room: newRoom.trim(), area: newArea.trim() });
+    if (!newRoom.trim() || !newArea.trim() || !newName.trim()) { setNote('Enter room, area and equipment name for the new equipment.'); return; }
+    setNote('');
+    seq.current += 1;
+    addExtra({ id: `new:${seq.current}`, isNew: true, name: newName.trim(), room: newRoom.trim(), area: newArea.trim() });
   };
-  const removeExtra = (key) => setExtras(p => p.filter(x => x.key !== key));
-  const clearOrderState = () => { setExcluded({}); setPickedAsset({}); setHoursOverride({}); setExtras([]); setAddOpen(false); };
-  const selectCode = (c) => { setCode(c); setShowSuggest(false); clearOrderState(); };
 
-  const resetOrder = () => {
-    setCode(''); setTotalHours(''); setPhoto(null); setPhotoName('');
-    clearOrderState(); setAssetSearch(''); setNewName('');
-    setTimeout(() => codeRef.current && codeRef.current.focus(), 0);
+  const startEdit = (on) => {
+    setEditMode(on);
+    if (!on) { setEdits({}); return; }
+    const e = {};
+    lines.forEach(l => { if (l.asset && !l.asset.isNew) e[l.key] = { name: l.name, room: l.room, area: l.area }; });
+    setEdits(e);
   };
 
   const onPhoto = async (file) => {
@@ -393,375 +514,924 @@ export default function App({ dataApi } = {}) {
     setPhoto(await compressImage(file));
   };
 
-  // --- VALIDATION ---
   const validate = () => {
     if (!normalizedCode) return 'Enter a SAP order.';
     if (!dateStr || dateStr > maxDate || dateStr < minDate) return 'Date must be within the last year and not in the future.';
-    const ini = normalizeInitials(initials);
-    if (!INITIALS_RE.test(ini)) return 'Initials: letters only, up to 4 per person, separate people with "/" (e.g. EL/LH).';
+    if (!INITIALS_RE.test(normalizeInitials(initials))) return 'Initials: letters only, up to 4 per person, separate people with "/" (e.g. EL/LH).';
     const total = parseFloat(totalHours);
     if (!(total > 0) || total > 200) return 'Enter the hours it took (greater than 0).';
-    if (isUnknown && lines.length === 0) return 'This SAP order is not in the list. Add the equipment it covers.';
+    if (lines.length === 0) return 'This SAP order is not in the list. Add the equipment it covers.';
     if (lines.some(l => !excluded[l.key] && !l.asset)) return 'Pick the equipment for the highlighted line(s), or remove them.';
+    if (lines.some(l => !excluded[l.key] && (!safeString(l.name) || !safeString(l.room) || !safeString(l.area)))) return 'Every equipment line needs a name, room and area.';
     if (included.length === 0) return 'Nothing to log: no equipment selected.';
     if (included.every(l => dupes.has(l.asset.id))) return 'Every selected equipment already has this order logged for that date.';
     if (Math.abs(hoursSum - total) > 0.01) return `Line hours add up to ${hoursSum} but the order total is ${total}.`;
     return '';
   };
 
-  // --- SAVE ---
-  const linkMsRow = async (msPayload, assetId) => {
-    try {
-      await api.create(MS_TABLE, { ...msPayload, 'craa5_asset@odata.bind': `/${ASSET_SET}(${assetId})` });
-      return true;
-    } catch (_) {
-      await api.create(MS_TABLE, msPayload);
-      return 'unlinked';
+  // Write the SAP order onto an equipment's SAP row (update its frequency column, or create the row)
+  const storeCode = async (asset, col, notes) => {
+    const data = dataRef.current;
+    const row = data.msRows.find(r => r.assetId === asset.id)
+      || data.msRows.find(r => !r.assetId && normName(r.equipment) === normName(asset.name) && (!r.room || normName(r.room) === normName(asset.room)));
+    const existing = row && (row.codes.find(c => c.col === col) || {}).code;
+    if (row && existing === normalizedCode) return;
+    if (row && existing && !window.confirm(`${asset.name} already has ${existing} as its ${freqLabel(col)} code. Replace it with ${normalizedCode}?`)) {
+      notes.push(`${asset.name}: kept ${existing}; ${normalizedCode} was not stored on it.`);
+      return;
     }
+    if (row) {
+      await api.update(MS_TABLE, row.id, { [col]: normalizedCode, ...(row.assetId ? {} : { 'craa5_asset@odata.bind': `/${ASSET_SET}(${asset.id})` }) });
+      ctx.upsertMs({ ...row, assetId: asset.id, codes: [...row.codes.filter(c => c.col !== col), { col, code: normalizedCode }] });
+      return;
+    }
+    const payload = { craa5_title: normalizedCode, [col]: normalizedCode, craa5_equipment: asset.name, craa5_textroom: asset.room, craa5_textarea: asset.area };
+    let id;
+    let linked = true;
+    try { id = await api.create(MS_TABLE, { ...payload, 'craa5_asset@odata.bind': `/${ASSET_SET}(${asset.id})` }); }
+    catch (_) { id = await api.create(MS_TABLE, payload); linked = false; }
+    if (!linked) notes.push(`${asset.name}: SAP order saved without its equipment lookup (craa5_asset).`);
+    ctx.upsertMs({ id, equipment: asset.name, room: asset.room, area: asset.area, assetId: linked ? asset.id : null, codes: [{ col, code: normalizedCode }] });
   };
 
-  const submit = async () => {
-    const problem = validate();
-    if (problem) { setMessage({ kind: 'error', text: problem }); return; }
-    setSaving(true);
-    setMessage(null);
+  const commit = async () => {
     const notes = [];
-    try {
-      const ini = normalizeInitials(initials);
-      const total = parseFloat(totalHours);
-      // 1. Equipment added by hand: create new assets, then store this SAP code on each one's ms row.
-      const resolved = {};
-      for (const l of included.filter(x => x.extra)) {
-        let asset = l.asset;
-        if (asset.isNew) {
-          const id = await api.create(ASSET_TABLE, {
-            craa5_equipmentidentifier: asset.name,
-            craa5_roomname: asset.room,
-            craa5_areaname: asset.area,
-          });
-          asset = { ...asset, id, isNew: false };
-        }
-        resolved[l.key] = asset;
-        const row = msRows.find(r => r.assetId === asset.id)
-          || msRows.find(r => normName(r.equipment) === normName(asset.name) && (!r.room || normName(r.room) === normName(asset.room)));
-        const existing = row && (row.codes.find(c => c.col === l.col) || {}).code;
+    const ini = normalizeInitials(initials);
+    // 1. Equipment edits made through "Edit pre-filled details"
+    for (const l of lines) {
+      if (excluded[l.key] || !l.asset || l.asset.isNew || !edits[l.key]) continue;
+      const a = l.asset;
+      if (a.name !== l.name || a.room !== l.room || a.area !== l.area) {
         try {
-          if (row && existing === normalizedCode) {
-            // already on this equipment
-          } else if (row && existing && !window.confirm(`${asset.name} already has ${existing} as its ${freqLabel(l.col)} code. Replace it with ${normalizedCode}?`)) {
-            notes.push(`${asset.name}: kept ${existing}; ${normalizedCode} was not stored on it.`);
-          } else if (row) {
-            await api.update(MS_TABLE, row.id, { [l.col]: normalizedCode, ...(row.assetId ? {} : { 'craa5_asset@odata.bind': `/${ASSET_SET}(${asset.id})` }) });
-          } else {
-            const linked = await linkMsRow({
-              craa5_title: normalizedCode,
-              [l.col]: normalizedCode,
-              craa5_equipment: asset.name,
-              craa5_textroom: asset.room,
-              craa5_textarea: asset.area,
-            }, asset.id);
-            if (linked === 'unlinked') notes.push(`${asset.name}: SAP code saved without its equipment lookup (craa5_asset).`);
-          }
-        } catch (e) {
-          notes.push(`${asset.name}: could not store the SAP code (${errText(e)}).`);
-        }
+          await api.update(ASSET_TABLE, a.id, { craa5_equipmentidentifier: l.name, craa5_roomname: l.room, craa5_areaname: l.area });
+          ctx.patchAsset({ ...a, name: l.name, room: l.room, area: l.area });
+        } catch (e) { return { saved: 0, notes, error: `Could not update ${a.name}: ${errText(e)}` }; }
       }
-
-      // 2. Existing SAP rows that were matched by name or picked by hand get their asset link written back.
-      const toLog = included
-        .filter(l => !dupes.has((resolved[l.key] || l.asset).id))
-        .map(l => ({ asset: resolved[l.key] || l.asset, hours: lineHours(l), msId: l.msId, how: l.how }));
-      const skipped = included.length - toLog.length;
-      if (skipped) notes.push(`${skipped} equipment skipped: already logged for this order and date.`);
-      for (const l of toLog) {
-        if (l.msId && (l.how === 'matched by name' || l.how === 'picked')) {
-          try { await api.update(MS_TABLE, l.msId, { 'craa5_asset@odata.bind': `/${ASSET_SET}(${l.asset.id})` }); }
-          catch (_) { notes.push(`Could not store the equipment link for ${l.asset.name} on the SAP code row.`); }
-        }
-      }
-
-      const results = await Promise.allSettled(toLog.map(l => api.create(LOG_TABLE, {
-        craa5_equipmentguid: l.asset.id,
-        craa5_equipment: l.asset.name,
-        craa5_room: l.asset.room,
-        craa5_area: l.asset.area,
-        craa5_sap: normalizedCode,
-        craa5_lastcleaned: toLogDate(dateStr),
-        craa5_lastcleanedby: ini,
-        craa5_hoursworked: l.hours,
-      })));
-      const failed = results.filter(r => r.status === 'rejected');
-      const savedIds = results.map(r => (r.status === 'fulfilled' ? r.value : null));
-
-      if (photo && savedIds.some(Boolean)) {
-        try {
-          await Promise.all(savedIds.filter(Boolean).map(id => api.update(LOG_TABLE, id, { craa5_pictureorfileofpaperwork: photo })));
-        } catch (_) {
-          notes.push('Entries saved, but the paperwork photo could not be attached.');
-        }
-      }
-
-      if (failed.length) {
-        setMessage({ kind: 'error', text: `${results.length - failed.length} of ${results.length} saved. Failed: ${errText(failed[0].reason)}. Review the order and submit again; saved equipment is skipped as already logged.` });
-      } else {
-        setMessage({ kind: notes.length ? 'warn' : 'ok', text: `Logged ${results.length} equipment for ${normalizedCode} on ${dateStr}.${notes.length ? ' ' + notes.join(' ') : ''}` });
-        resetOrder();
-      }
-      await loadAll();
-    } catch (e) {
-      setMessage({ kind: 'error', text: `Save failed: ${errText(e)}` });
-    } finally {
-      setSaving(false);
     }
+    // 2. Create new equipment, then store the SAP order on every added equipment
+    const resolved = {};
+    for (const l of included.filter(x => x.extra)) {
+      let asset = { ...l.asset, name: l.name, room: l.room, area: l.area };
+      if (l.asset.isNew) {
+        const dupKey = `${normName(asset.name)}|${normName(asset.room)}|${normName(asset.area)}`;
+        const reuse = dataRef.current.assets.find(a => `${normName(a.name)}|${normName(a.room)}|${normName(a.area)}` === dupKey);
+        if (reuse) asset = reuse;
+        else {
+          try {
+            const id = await api.create(ASSET_TABLE, { craa5_equipmentidentifier: asset.name, craa5_roomname: asset.room, craa5_areaname: asset.area });
+            asset = { id, name: asset.name, room: asset.room, area: asset.area };
+            ctx.addAsset(asset);
+          } catch (e) { return { saved: 0, notes, error: `Could not create ${asset.name}: ${errText(e)}` }; }
+        }
+      }
+      resolved[l.key] = asset;
+      try { await storeCode(asset, l.col, notes); } catch (e) { notes.push(`${asset.name}: could not store the SAP order (${errText(e)}).`); }
+    }
+    // 3. Existing SAP rows matched by name or picked by hand get their asset link written back
+    const toLog = included.filter(l => !dupes.has((resolved[l.key] || l.asset).id))
+      .map(l => ({ asset: resolved[l.key] || l.asset, name: l.name, room: l.room, area: l.area, hours: lineHours(l), msId: l.msId, how: l.how }));
+    const skipped = included.length - toLog.length;
+    if (skipped) notes.push(`${skipped} equipment skipped: already logged for this order and date.`);
+    for (const l of toLog) {
+      if (l.msId && (l.how === 'matched by name' || l.how === 'picked')) {
+        try {
+          await api.update(MS_TABLE, l.msId, { 'craa5_asset@odata.bind': `/${ASSET_SET}(${l.asset.id})` });
+          const row = dataRef.current.msRows.find(r => r.id === l.msId);
+          if (row) ctx.upsertMs({ ...row, assetId: l.asset.id });
+        } catch (_) { notes.push(`Could not store the equipment link for ${l.asset.name} on the SAP row.`); }
+      }
+    }
+    // 4. One log row per equipment
+    const results = await pool(toLog, 6, (l) => api.create(LOG_TABLE, {
+      craa5_equipmentguid: l.asset.id,
+      craa5_equipment: l.name,
+      craa5_room: l.room,
+      craa5_area: l.area,
+      craa5_sap: normalizedCode,
+      craa5_lastcleaned: toLogDate(dateStr),
+      craa5_lastcleanedby: ini,
+      craa5_hoursworked: l.hours,
+    }));
+    const failed = results.filter(r => !r.ok);
+    const savedIds = results.filter(r => r.ok).map(r => r.value);
+    if (photo && savedIds.length) {
+      const pr = await pool(savedIds, 4, (id) => api.update(LOG_TABLE, id, { craa5_pictureorfileofpaperwork: photo }));
+      if (pr.some(r => !r.ok)) notes.push('Entries saved, but the paperwork photo could not be attached.');
+    }
+    if (failed.length) {
+      return { saved: savedIds.length, notes, error: `${savedIds.length} of ${results.length} saved. Failed: ${errText(failed[0].error)}. Submit again; saved equipment is skipped as already logged.` };
+    }
+    return { saved: savedIds.length, notes, code: normalizedCode, date: dateStr };
   };
 
-  // --- RENDER ---
-  const ini = normalizeInitials(initials);
-  const toLogCount = included.filter(l => !dupes.has(l.asset.id)).length;
-  return (
-    <div className="mli">
-      <style>{`
-        .mli { font-family: "Segoe UI", system-ui, sans-serif; color: #0f172a; background: #f1f5f9; min-height: 100vh; box-sizing: border-box; padding: 16px; }
-        .mli * { box-sizing: border-box; }
-        .mli-wrap { max-width: 980px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
-        .mli-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-        .mli-head h1 { margin: 0; font-size: 20px; font-weight: 800; }
-        .mli-sub { font-size: 12px; color: #64748b; }
-        .mli-card { background: #fff; border: 1px solid #cbd5e1; border-radius: 10px; padding: 16px; box-shadow: 0 2px 6px rgba(0,0,0,.05); }
-        .mli-grid { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: 12px; align-items: end; }
-        .mli-field { display: flex; flex-direction: column; gap: 4px; position: relative; min-width: 0; }
-        .mli-field label { font-size: 11px; font-weight: 700; color: #475569; text-transform: uppercase; letter-spacing: .4px; }
-        .mli input[type=text], .mli input[type=date], .mli input[type=number], .mli select { font: inherit; font-size: 14px; padding: 8px 10px; border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; width: 100%; min-width: 0; }
-        .mli input:focus, .mli select:focus { outline: 2px solid #2563eb; outline-offset: -1px; border-color: #2563eb; }
-        .mli-code { font-size: 16px !important; font-weight: 700; letter-spacing: .5px; }
-        .mli-suggest { position: absolute; top: 100%; left: 0; right: 0; z-index: 20; background: #fff; border: 1px solid #cbd5e1; border-radius: 6px; margin-top: 2px; box-shadow: 0 8px 16px rgba(0,0,0,.12); max-height: 260px; overflow: auto; }
-        .mli-suggest button { display: flex; justify-content: space-between; width: 100%; padding: 8px 10px; border: 0; background: none; font: inherit; font-size: 13px; cursor: pointer; text-align: left; }
-        .mli-suggest button:hover, .mli-suggest button:focus { background: #eff6ff; }
-        .mli-suggest small { color: #64748b; }
-        .mli table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        .mli th { text-align: left; font-size: 11px; text-transform: uppercase; color: #64748b; font-weight: 700; padding: 6px 8px; border-bottom: 2px solid #e2e8f0; white-space: nowrap; }
-        .mli td { padding: 6px 8px; border-bottom: 1px solid #e2e8f0; vertical-align: middle; }
-        .mli tr.mli-warn td { background: #fffbeb; }
-        .mli tr.mli-off td { color: #94a3b8; }
-        .mli td input[type=number] { width: 80px; padding: 4px 6px; }
-        .mli-tag { display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 10px; background: #e2e8f0; color: #475569; white-space: nowrap; }
-        .mli-tag.ok { background: #d1fae5; color: #065f46; }
-        .mli-tag.warn { background: #fef3c7; color: #92400e; }
-        .mli-btn { font: inherit; font-size: 14px; font-weight: 700; padding: 10px 20px; border-radius: 6px; border: 1px solid #2563eb; background: #2563eb; color: #fff; cursor: pointer; }
-        .mli-btn:disabled { background: #94a3b8; border-color: #94a3b8; cursor: not-allowed; }
-        .mli-btn.ghost { background: #fff; color: #2563eb; padding: 6px 12px; font-size: 12px; }
-        .mli-msg { padding: 10px 12px; border-radius: 6px; font-size: 13px; font-weight: 600; }
-        .mli-msg.ok { background: #d1fae5; color: #065f46; }
-        .mli-msg.warn { background: #fef3c7; color: #92400e; }
-        .mli-msg.error { background: #fee2e2; color: #991b1b; }
-        .mli-section { margin-top: 16px; }
-        .mli-section h2 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: #475569; }
-        .mli-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
-        .mli-row > .mli-field { flex: 1 1 160px; }
-        .mli-foot { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-top: 16px; }
-        .mli-hint { font-size: 12px; color: #64748b; }
-        @media (max-width: 720px) { .mli-grid { grid-template-columns: 1fr 1fr; } .mli-grid > .mli-field:first-child { grid-column: 1 / -1; } }
-      `}</style>
+  useImperativeHandle(ref, () => ({ validate, commit, getShared: () => ({ date: dateStr, initials: normalizeInitials(initials) }) }));
 
-      <div className="mli-wrap">
-        <div className="mli-head">
-          <h1>MSS Log Input</h1>
-          <div className="mli-sub">
-            {loading ? 'Loading…' : `${assets.length} equipment · ${codeIndex.size} SAP orders cached`}
-            {api.mode === 'preview' && ' · preview data (no Dataverse connection)'}
-            {' '}<button className="mli-btn ghost" onClick={loadAll} disabled={loading}>Reload</button>
-          </div>
+  // Summary values for the read-only Room / Area / Equipment fields
+  const live = lines.filter(l => !excluded[l.key]);
+  const summarize = (k) => { const v = [...new Set(live.map(l => l[k]).filter(Boolean))]; return v.length === 0 ? '' : v.length === 1 ? v[0] : `Multiple (${v.length})`; };
+
+  return (
+    <div className={styles.rowCard}>
+      <div className={styles.rowFields}>
+        <div className={styles.field}>
+          <Text className={styles.label}>SAP Order (Req)</Text>
+          <Input
+            data-row={index}
+            data-col="sap"
+            aria-label="SAP order"
+            autoComplete="off"
+            placeholder="Start typing the SAP order…"
+            value={code}
+            style={{ minWidth: '210px' }}
+            onChange={(e, d) => { setCode(d.value); setShowSuggest(true); setHi(0); clearOrderState(); }}
+            onFocus={() => setShowSuggest(true)}
+            onBlur={() => setTimeout(() => setShowSuggest(false), 150)}
+            onKeyDown={(e) => {
+              const open = showSuggest && suggestions.length > 0 && !(suggestions.length === 1 && suggestions[0].code === normalizedCode);
+              if (open && e.key === 'ArrowDown') { e.preventDefault(); setHi(h => Math.min(h + 1, suggestions.length - 1)); }
+              else if (open && e.key === 'ArrowUp') { e.preventDefault(); setHi(h => Math.max(h - 1, 0)); }
+              else if (open && e.key === 'Enter') { e.preventDefault(); selectCode(suggestions[Math.min(hi, suggestions.length - 1)].code); }
+              else if (e.key === 'Escape') setShowSuggest(false);
+              else if (e.key === 'Enter') { e.preventDefault(); onEnter(index); }
+            }}
+          />
+          {showSuggest && suggestions.length > 0 && !(suggestions.length === 1 && suggestions[0].code === normalizedCode) && (
+            <div className={styles.suggest} role="listbox">
+              {suggestions.map((s, i) => (
+                <button key={s.code} type="button" role="option" aria-selected={i === hi} className={styles.suggestItem}
+                  style={i === hi ? { backgroundColor: '#E6F1FC' } : undefined}
+                  onMouseDown={(e) => e.preventDefault()} onClick={() => selectCode(s.code)}>
+                  <span><strong>{s.code}</strong>{s.names && <span className={styles.hint}> · {s.names}{s.count > 2 ? '…' : ''}</span>}</span>
+                  <span className={styles.hint}>{s.count} equipment</span>
+                </button>
+              ))}
+            </div>
+          )}
+          {matches.length > 0 && lines.length > 0 && (
+            <Checkbox label={<Text size={200}>Edit pre-filled details</Text>} checked={editMode} onChange={(e, d) => startEdit(!!d.checked)} />
+          )}
         </div>
 
-        {loadError && <div className="mli-msg error">Could not load Dataverse data: {loadError}</div>}
+        <div className={styles.field}>
+          <Text className={styles.label}>Room</Text>
+          <Input aria-label="Room" value={summarize('room')} readOnly disabled placeholder={code ? 'Auto-filled' : ''} style={{ minWidth: '110px' }} />
+        </div>
+        <div className={styles.field}>
+          <Text className={styles.label}>Area</Text>
+          <Input aria-label="Area" value={summarize('area')} readOnly disabled placeholder={code ? 'Auto-filled' : ''} style={{ minWidth: '110px' }} />
+        </div>
+        <div className={styles.field}>
+          <Text className={styles.label}>Equipment</Text>
+          <Input aria-label="Equipment" value={live.length > 1 ? `${live.length} equipment` : summarize('name')} readOnly disabled placeholder={code ? 'Auto-filled' : ''} style={{ minWidth: '140px' }} />
+        </div>
+        <div className={styles.field}>
+          <Text className={styles.label}>Date (Req)</Text>
+          <Input aria-label="Date completed" type="date" value={dateStr} min={minDate} max={maxDate} onChange={(e, d) => setDateStr(d.value)} style={{ minWidth: '140px' }} />
+        </div>
+        <div className={styles.field}>
+          <Text className={styles.label}>Total Hours (Req)</Text>
+          <Input aria-label="Total hours" type="number" placeholder="Ex: 2.5" value={totalHours} onChange={(e, d) => setTotalHours(d.value)} style={{ width: '100px' }} />
+        </div>
+        <div className={styles.field}>
+          <Text className={styles.label}>Initials (Req)</Text>
+          <Input aria-label="Initials" placeholder="Ex: EL/LH" value={initials} onChange={(e, d) => setInitials(d.value)} style={{ minWidth: '90px' }} />
+        </div>
+        <div className={styles.field}>
+          <Text className={styles.label}>Paperwork Picture</Text>
+          <input type="file" accept="image/*" aria-label="Paperwork picture" onChange={(e) => onPhoto(e.target.files && e.target.files[0])} style={{ minWidth: '150px', padding: '4px' }} />
+          {photoName && <span className={styles.hint}>{photoName}</span>}
+        </div>
+        <Button appearance="subtle" style={{ alignSelf: 'flex-start', marginTop: '16px' }} disabled={!canRemove} onClick={onRemove}>Remove</Button>
+      </div>
 
-        <div className="mli-card">
-          <div className="mli-grid">
-            <div className="mli-field">
-              <label htmlFor="mli-code">SAP order</label>
-              <input id="mli-code" ref={codeRef} type="text" className="mli-code" autoComplete="off" autoFocus
-                placeholder="Type or paste the SAP order"
-                value={code}
-                onChange={e => { setCode(e.target.value); setShowSuggest(true); setHi(0); clearOrderState(); }}
-                onKeyDown={e => {
-                  if (!showSuggest || !suggestions.length) return;
-                  if (e.key === 'ArrowDown') { e.preventDefault(); setHi(h => Math.min(h + 1, suggestions.length - 1)); }
-                  else if (e.key === 'ArrowUp') { e.preventDefault(); setHi(h => Math.max(h - 1, 0)); }
-                  else if (e.key === 'Enter' && !(suggestions.length === 1 && suggestions[0].code === normalizedCode)) { e.preventDefault(); selectCode(suggestions[Math.min(hi, suggestions.length - 1)].code); }
-                  else if (e.key === 'Escape') setShowSuggest(false);
-                }}
-                onFocus={() => setShowSuggest(true)}
-                onBlur={() => setTimeout(() => setShowSuggest(false), 150)} />
-              {showSuggest && suggestions.length > 0 && !(suggestions.length === 1 && suggestions[0].code === normalizedCode) && (
-                <div className="mli-suggest">
-                  {suggestions.map((s, i) => (
-                    <button key={s.code} type="button" style={i === hi ? { background: '#eff6ff' } : undefined} onMouseDown={e => e.preventDefault()} onClick={() => selectCode(s.code)}>
-                      <span><strong>{s.code}</strong>{s.names && <small> · {s.names}{s.count > 2 ? '…' : ''}</small>}</span><small>{s.count} equipment</small>
-                    </button>
-                  ))}
+      {isUnknown && (
+        <Text size={200} weight="semibold" block style={{ color: '#8A5300', marginTop: '8px' }}>
+          {normalizedCode} is not in the cached SAP orders. Add the equipment it covers below and it will be saved against that equipment.
+        </Text>
+      )}
+
+      {lines.length > 0 && (
+        <table className={styles.linesTable}>
+          <thead><tr>
+            <th className={styles.th}></th><th className={styles.th}>Equipment</th><th className={styles.th}>Room</th><th className={styles.th}>Area</th>
+            <th className={styles.th}>Frequency</th><th className={styles.th}>Hours</th><th className={styles.th}>Status</th>
+          </tr></thead>
+          <tbody>
+            {lines.map(l => {
+              const off = !!excluded[l.key];
+              const dupe = l.asset && dupes.has(l.asset.id);
+              const editing = editMode && edits[l.key];
+              return (
+                <tr key={l.key} style={off ? { color: '#94A3B8' } : !l.asset ? { backgroundColor: '#FFF6E6' } : undefined}>
+                  <td className={styles.td}><input type="checkbox" aria-label={`Include ${l.name}`} checked={!off} onChange={(e) => setExcluded(p => ({ ...p, [l.key]: !e.target.checked }))} /></td>
+                  <td className={styles.td}>
+                    {editing ? (
+                      <Input size="small" value={edits[l.key].name} onChange={(e, d) => setEdits(p => ({ ...p, [l.key]: { ...p[l.key], name: d.value } }))} />
+                    ) : <strong>{l.name || '(unnamed)'}</strong>}
+                    {l.extra && <Button size="small" appearance="subtle" style={{ marginLeft: 6 }} onClick={() => setExtras(p => p.filter(x => x.key !== l.key))}>Remove</Button>}
+                    {!l.asset && (
+                      <div style={{ marginTop: 4 }}>
+                        <Select aria-label={`Pick equipment for ${l.name}`} value="" onChange={(e, d) => setPickedAsset(p => ({ ...p, [l.key]: d.value }))}>
+                          <option value="">Pick equipment…</option>
+                          {assets.filter(a => !l.room || normName(a.room) === normName(l.room)).slice(0, 300).map(a => (
+                            <option key={a.id} value={a.id}>{a.room} / {a.area} / {a.name}</option>
+                          ))}
+                        </Select>
+                      </div>
+                    )}
+                  </td>
+                  <td className={styles.td}>{editing ? <Input size="small" list="mss-rooms" value={edits[l.key].room} onChange={(e, d) => setEdits(p => ({ ...p, [l.key]: { ...p[l.key], room: d.value } }))} /> : l.room}</td>
+                  <td className={styles.td}>{editing ? <Input size="small" list="mss-areas" value={edits[l.key].area} onChange={(e, d) => setEdits(p => ({ ...p, [l.key]: { ...p[l.key], area: d.value } }))} /> : l.area}</td>
+                  <td className={styles.td}>{l.col ? freqLabel(l.col) : ''}</td>
+                  <td className={styles.td}>
+                    {l.asset && !off ? (
+                      <Input size="small" aria-label={`Hours for ${l.name}`} type="number" style={{ width: 90 }} value={String(lineHours(l))}
+                        onChange={(e, d) => setHoursOverride(p => ({ ...p, [l.key]: parseFloat(d.value) || 0 }))} />
+                    ) : '–'}
+                  </td>
+                  <td className={styles.td}>
+                    {dupe ? <span className={mergeClasses(styles.tag, styles.tagWarn)}>already logged</span>
+                      : !l.asset ? <span className={mergeClasses(styles.tag, styles.tagWarn)}>needs equipment</span>
+                      : <span className={mergeClasses(styles.tag, styles.tagOk)}>{l.how || 'ready'}</span>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+      {lines.length > 0 && <Text className={styles.hint} block style={{ marginTop: 6 }}>Total hours are split evenly across the selected equipment; edit a line to override it. Lines sum to {hoursSum}.</Text>}
+
+      {showAdd && (
+        <div className={styles.addPanel}>
+          {!addOpen && !isUnknown ? (
+            <Button size="small" appearance="secondary" onClick={() => setAddOpen(true)}>+ Equipment missing from this order?</Button>
+          ) : (
+            <>
+              <Text weight="semibold" block style={{ marginBottom: 8 }}>Add equipment to {normalizedCode}</Text>
+              <div className={styles.rowFields} style={{ alignItems: 'center', marginBottom: 8 }}>
+                <label><input type="radio" name={`addmode-${index}`} checked={addMode === 'search'} onChange={() => setAddMode('search')} /> Search existing equipment</label>
+                <label><input type="radio" name={`addmode-${index}`} checked={addMode === 'new'} onChange={() => setAddMode('new')} /> Create new equipment</label>
+                <div className={styles.field}>
+                  <Text className={styles.label}>Store SAP order as</Text>
+                  <Select aria-label="Frequency" value={addFreq} onChange={(e, d) => setAddFreq(d.value)}>
+                    {FREQUENCIES.map(f => <option key={f.col} value={f.col}>{f.label}</option>)}
+                  </Select>
+                </div>
+              </div>
+              {addMode === 'search' ? (
+                <div>
+                  <div className={styles.field} style={{ maxWidth: 420 }}>
+                    <Text className={styles.label}>Search by room, area or name</Text>
+                    <Input aria-label="Search equipment" autoComplete="off" placeholder="Start typing…" value={assetSearch} onChange={(e, d) => setAssetSearch(d.value)} />
+                  </div>
+                  {assetSearch.trim().length >= 2 && assetChoices.length === 0 && <Text className={styles.hint} block style={{ marginTop: 6 }}>No matching equipment. Use “Create new equipment”.</Text>}
+                  {assetChoices.length > 0 && (
+                    <table className={styles.linesTable}>
+                      <tbody>
+                        {assetChoices.map(a => (
+                          <tr key={a.id}>
+                            <td className={styles.td}><strong>{a.name}</strong></td><td className={styles.td}>{a.room}</td><td className={styles.td}>{a.area}</td>
+                            <td className={styles.td} style={{ textAlign: 'right' }}><Button size="small" appearance="primary" style={primaryStyle} onClick={() => addExtra(a)}>Add</Button></td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              ) : (
+                <div className={styles.rowFields} style={{ alignItems: 'flex-end' }}>
+                  <div className={styles.field}><Text className={styles.label}>Room</Text><Input aria-label="New equipment room" list="mss-rooms" value={newRoom} onChange={(e, d) => setNewRoom(d.value)} /></div>
+                  <div className={styles.field}><Text className={styles.label}>Area</Text><Input aria-label="New equipment area" list="mss-areas" value={newArea} onChange={(e, d) => setNewArea(d.value)} /></div>
+                  <div className={styles.field}><Text className={styles.label}>Equipment name</Text><Input aria-label="New equipment name" value={newName} onChange={(e, d) => setNewName(d.value)} /></div>
+                  <Button size="small" appearance="primary" style={primaryStyle} onClick={addNew}>Add</Button>
                 </div>
               )}
-            </div>
-            <div className="mli-field">
-              <label htmlFor="mli-date">Date completed</label>
-              <input id="mli-date" type="date" value={dateStr} min={minDate} max={maxDate} onChange={e => setDateStr(e.target.value)} />
-            </div>
-            <div className="mli-field">
-              <label htmlFor="mli-ini">Completed by (initials)</label>
-              <input id="mli-ini" type="text" placeholder="EL/LH" value={initials} onChange={e => setInitials(e.target.value)} />
-            </div>
-            <div className="mli-field">
-              <label htmlFor="mli-hours">Total hours</label>
-              <input id="mli-hours" type="number" min="0" step="0.25" placeholder="2.5" value={totalHours} onChange={e => setTotalHours(e.target.value)} />
-            </div>
-          </div>
-
-          {/* KNOWN ORDER: equipment lines */}
-          {isUnknown && (
-            <div className="mli-hint" style={{ marginTop: 12 }}>
-              {normalizedCode} is not in the cached SAP orders. Add the equipment it covers below and it will be saved against that equipment.
-            </div>
+            </>
           )}
-          {lines.length > 0 && (
-            <div className="mli-section">
-              <h2>Equipment on this order ({lines.length})</h2>
-              <table>
-                <thead><tr><th></th><th>Equipment</th><th>Room</th><th>Area</th><th>Frequency</th><th>Hours</th><th>Status</th></tr></thead>
-                <tbody>
-                  {lines.map(l => {
-                    const off = !!excluded[l.key];
-                    const dupe = l.asset && dupes.has(l.asset.id);
-                    return (
-                      <tr key={l.key} className={off ? 'mli-off' : !l.asset ? 'mli-warn' : ''}>
-                        <td><input type="checkbox" aria-label={`Include ${l.name}`} checked={!off} onChange={e => setExcluded(p => ({ ...p, [l.key]: !e.target.checked }))} /></td>
-                        <td>
-                          <strong>{l.name || '(unnamed)'}</strong>
-                          {l.extra && <button type="button" className="mli-btn ghost" style={{ marginLeft: 8, padding: '2px 8px' }} onClick={() => removeExtra(l.key)}>Remove</button>}
-                          {!l.asset && (
-                            <div style={{ marginTop: 4 }}>
-                              <select aria-label={`Pick equipment for ${l.name}`} value="" onChange={e => setPickedAsset(p => ({ ...p, [l.key]: e.target.value }))}>
-                                <option value="">Pick equipment…</option>
-                                {assets.filter(a => !l.room || normName(a.room) === normName(l.room)).slice(0, 300).map(a => (
-                                  <option key={a.id} value={a.id}>{a.room} / {a.area} / {a.name}</option>
-                                ))}
-                              </select>
-                            </div>
-                          )}
-                        </td>
-                        <td>{l.room}</td>
-                        <td>{l.area}</td>
-                        <td>{l.col ? freqLabel(l.col) : ''}</td>
-                        <td>
-                          {l.asset && !off ? (
-                            <input type="number" min="0" step="0.25" value={lineHours(l)}
-                              onChange={e => setHoursOverride(p => ({ ...p, [l.key]: parseFloat(e.target.value) || 0 }))} />
-                          ) : '–'}
-                        </td>
-                        <td>
-                          {dupe ? <span className="mli-tag warn">already logged</span>
-                            : !l.asset ? <span className="mli-tag warn">needs equipment</span>
-                            : <span className="mli-tag ok">{l.how || 'ready'}</span>}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-              <div className="mli-hint" style={{ marginTop: 6 }}>
-                Total hours are split evenly across the selected equipment; edit a line to override it. Lines sum to {hoursSum}.
-              </div>
-            </div>
-          )}
-
-          {/* MISSING EQUIPMENT: search or create */}
-          {showAdd && (
-            <div className="mli-section">
-              {!addOpen && !isUnknown ? (
-                <button type="button" className="mli-btn ghost" onClick={() => setAddOpen(true)}>+ Equipment missing from this order?</button>
-              ) : (
-                <>
-                  <h2>Add equipment to {normalizedCode}</h2>
-                  <div className="mli-row" style={{ marginBottom: 12 }}>
-                    <label><input type="radio" name="addmode" checked={addMode === 'search'} onChange={() => setAddMode('search')} /> Search existing equipment</label>
-                    <label><input type="radio" name="addmode" checked={addMode === 'new'} onChange={() => setAddMode('new')} /> Create new equipment</label>
-                    <div className="mli-field">
-                      <label htmlFor="mli-freq">Store code as</label>
-                      <select id="mli-freq" value={addFreq} onChange={e => setAddFreq(e.target.value)}>
-                        {FREQUENCIES.map(f => <option key={f.col} value={f.col}>{f.label}</option>)}
-                      </select>
-                    </div>
-                  </div>
-                  {addMode === 'search' ? (
-                    <div>
-                      <div className="mli-field" style={{ maxWidth: 420 }}>
-                        <label htmlFor="mli-asearch">Search by room, area or name</label>
-                        <input id="mli-asearch" type="text" autoComplete="off" placeholder="Start typing…" value={assetSearch} onChange={e => setAssetSearch(e.target.value)} />
-                      </div>
-                      {assetSearch.trim().length >= 2 && assetChoices.length === 0 && <div className="mli-hint" style={{ marginTop: 6 }}>No matching equipment. Use “Create new equipment”.</div>}
-                      {assetChoices.length > 0 && (
-                        <table style={{ marginTop: 8 }}>
-                          <tbody>
-                            {assetChoices.map(a => (
-                              <tr key={a.id}>
-                                <td><strong>{a.name}</strong></td><td>{a.room}</td><td>{a.area}</td>
-                                <td style={{ textAlign: 'right' }}><button type="button" className="mli-btn ghost" onClick={() => addExtra(a)}>Add</button></td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="mli-row">
-                      <div className="mli-field"><label htmlFor="mli-room">Room</label>
-                        <input id="mli-room" type="text" list="mli-rooms" value={newRoom} onChange={e => setNewRoom(e.target.value)} />
-                        <datalist id="mli-rooms">{rooms.map(r => <option key={r} value={r} />)}</datalist></div>
-                      <div className="mli-field"><label htmlFor="mli-area">Area</label>
-                        <input id="mli-area" type="text" list="mli-areas" value={newArea} onChange={e => setNewArea(e.target.value)} />
-                        <datalist id="mli-areas">{areas.map(r => <option key={r} value={r} />)}</datalist></div>
-                      <div className="mli-field"><label htmlFor="mli-name">Equipment name</label>
-                        <input id="mli-name" type="text" value={newName} onChange={e => setNewName(e.target.value)} /></div>
-                      <button type="button" className="mli-btn ghost" onClick={addNew}>Add</button>
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-          )}
-
-          <div className="mli-foot">
-            <div className="mli-field" style={{ flex: '0 1 280px' }}>
-              <label htmlFor="mli-photo">Paperwork photo (optional)</label>
-              <input id="mli-photo" type="file" accept="image/*" onChange={e => onPhoto(e.target.files && e.target.files[0])} />
-              {photoName && <span className="mli-hint">{photoName}</span>}
-            </div>
-            <button className="mli-btn" onClick={submit} disabled={saving || loading || !normalizedCode}>
-              {saving ? 'Saving…' : `Log ${toLogCount} equipment${ini ? ` as ${ini}` : ''}`}
-            </button>
-          </div>
-          {message && <div className={`mli-msg ${message.kind}`} role="status" style={{ marginTop: 12 }}>{message.text}</div>}
         </div>
+      )}
+      {note && <Text className={styles.errorText} block>{note}</Text>}
+      <datalist id="mss-rooms">{rooms.map(r => <option key={r} value={r} />)}</datalist>
+      <datalist id="mss-areas">{areas.map(r => <option key={r} value={r} />)}</datalist>
+    </div>
+  );
+});
 
-        <div className="mli-card">
-          <h2 style={{ margin: '0 0 8px', fontSize: 13, textTransform: 'uppercase', letterSpacing: .5, color: '#475569' }}>Recently logged</h2>
-          {recent.length === 0 ? <div className="mli-hint">No entries yet.</div> : (
-            <table>
-              <thead><tr><th>Date</th><th>SAP order</th><th>Equipment</th><th>By</th><th>Hours</th></tr></thead>
-              <tbody>
-                {recent.map(r => (
-                  <tr key={r.craa5__log_id}>
-                    <td>{safeString(r.craa5_lastcleaned).slice(0, 10)}</td>
-                    <td>{safeString(r.craa5_sap)}</td>
-                    <td>{safeString(r.craa5_equipment)}</td>
-                    <td>{safeString(r.craa5_lastcleanedby)}</td>
-                    <td>{r.craa5_hoursworked ?? ''}</td>
+// --- FIX MISSING IDS ---
+const FixIdsTab = ({ ctx, onScanned, onApplied }) => {
+  const styles = useStyles();
+  const { api, assets, assetById, codeIndex } = ctx;
+  const [scope, setScope] = useState('all');
+  const [scanning, setScanning] = useState(false);
+  const [scanError, setScanError] = useState('');
+  const [logs, setLogs] = useState(null);
+  const [choice, setChoice] = useState({});     // groupKey -> assetId | ''
+  const [apply, setApply] = useState({});       // groupKey -> bool
+  const [search, setSearch] = useState({});     // groupKey -> text
+  const [showAll, setShowAll] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [result, setResult] = useState(null);
+
+  const scan = useCallback(async (keepResult) => {
+    setScanning(true); setScanError('');
+    if (keepResult !== true) setResult(null);
+    try {
+      const filter = scope === 'year'
+        ? `craa5_lastcleaned ge ${toDateInput(new Date(Date.now() - 366 * 86400000))}T00:00:00Z`
+        : undefined;
+      const rows = await api.query(LOG_TABLE, { select: LOG_SELECT.filter(c => c !== 'craa5_hoursworked'), filter });
+      setLogs(rows.map(r => ({
+        id: r.craa5__log_id, equipment: safeString(r.craa5_equipment), guid: safeString(r.craa5_equipmentguid),
+        sap: normCode(r.craa5_sap), room: safeString(r.craa5_room), area: safeString(r.craa5_area),
+      })));
+    } catch (e) { setScanError(errText(e)); } finally { setScanning(false); }
+  }, [api, scope]);
+
+  useEffect(() => { scan(); }, [scan]);
+
+  const profiles = useMemo(() => assets.map(a => ({ asset: a, p: nameProfile(a.name), room: normName(a.room), area: normName(a.area) })), [assets]);
+  const tokenIndex = useMemo(() => {
+    const m = new Map();
+    profiles.forEach((x, i) => x.p.words.forEach(w => { if (!m.has(w)) m.set(w, new Set()); m.get(w).add(i); }));
+    return m;
+  }, [profiles]);
+
+  // SAP order -> candidate asset ids (via the SAP rows)
+  const assetsForCode = useCallback((sap) => {
+    const ids = new Set();
+    (codeIndex.get(sap) || []).forEach(({ row }) => {
+      if (row.assetId && assetById.has(row.assetId)) ids.add(row.assetId);
+      else {
+        const hits = assets.filter(a => normName(a.name) === normName(row.equipment) && (!row.room || normName(a.room) === normName(row.room)));
+        if (hits.length === 1) ids.add(hits[0].id);
+      }
+    });
+    return [...ids];
+  }, [codeIndex, assetById, assets]);
+
+  const groups = useMemo(() => {
+    if (!logs) return [];
+    const map = new Map();
+    logs.forEach(l => {
+      const stale = l.guid && !assetById.has(l.guid);
+      if (l.guid && !stale) return;
+      const key = [normName(l.equipment), normName(l.room), normName(l.area), l.sap, stale ? l.guid : ''].join('|');
+      if (!map.has(key)) map.set(key, { key, equipment: l.equipment, room: l.room, area: l.area, sap: l.sap, kind: stale ? 'unknown id' : 'missing id', ids: [] });
+      map.get(key).ids.push(l.id);
+    });
+    const out = [];
+    map.forEach(g => {
+      const p = nameProfile(g.equipment);
+      const roomN = normName(g.room), areaN = normName(g.area);
+      const cand = new Map(); // assetId -> { score, reason }
+      const bump = (asset, score, reason) => { const c = cand.get(asset.id); if (!c || score > c.score) cand.set(asset.id, { asset, score, reason }); };
+      // 1. SAP order
+      const sapIds = g.sap ? assetsForCode(g.sap) : [];
+      if (sapIds.length === 1 && assetById.get(sapIds[0])) {
+        const a = assetById.get(sapIds[0]);
+        const sim = p.key || p.full ? nameSimilarity(p, nameProfile(a.name)) : 0;
+        if (!g.equipment || sim >= 0.5) bump(a, 0.97, 'SAP order');
+        else bump(a, 0.7, 'SAP order (name differs)');
+      } else if (sapIds.length > 1) {
+        sapIds.forEach(id => { const a = assetById.get(id); const sim = nameSimilarity(p, nameProfile(a.name)); if (sim >= 0.6) bump(a, sim >= 0.8 ? Math.max(sim, 0.96) : Math.max(sim, 0.9), 'SAP order + name'); });
+      }
+      // 2. Name / room / area similarity
+      if (p.full) {
+        let pool_ = null;
+        p.words.forEach(w => { const s = tokenIndex.get(w); if (s) { pool_ = pool_ || new Set(); s.forEach(i => pool_.add(i)); } });
+        (pool_ ? [...pool_].map(i => profiles[i]) : profiles).forEach(x => {
+          let s = nameSimilarity(p, x.p);
+          if (s < 0.5) return;
+          if (roomN && x.room === roomN) s = Math.min(1, s + 0.05);
+          if (areaN && x.area === areaN) s = Math.min(1, s + 0.03);
+          if (roomN && x.room && x.room !== roomN) s *= 0.9;
+          bump(x.asset, s, s >= 0.999 ? 'same name' : 'similar name');
+        });
+      }
+      const ranked = [...cand.values()].sort((a, b) => b.score - a.score).slice(0, 5);
+      let tier = ranked.length ? tierOf(ranked[0].score) : 'none';
+      const ambiguous = ranked.length > 1 && ranked[0].score - ranked[1].score < 0.02 && ranked[0].score < 0.999;
+      if (ambiguous && tier !== 'none') tier = downTier(tier);
+      out.push({ ...g, ranked, tier, ambiguous });
+    });
+    const order = { high: 0, medium: 1, low: 2, none: 3 };
+    return out.sort((a, b) => order[a.tier] - order[b.tier] || b.ids.length - a.ids.length);
+  }, [logs, assetById, assetsForCode, profiles, tokenIndex]);
+
+  useEffect(() => { if (logs) onScanned(groups.reduce((s, g) => s + g.ids.length, 0)); }, [groups, logs, onScanned]);
+
+  // Pre-select the top suggestion; pre-check only high confidence
+  useEffect(() => {
+    setChoice(prev => { const n = { ...prev }; groups.forEach(g => { if (n[g.key] === undefined) n[g.key] = g.ranked.length && g.tier !== 'none' ? g.ranked[0].asset.id : ''; }); return n; });
+    setApply(prev => { const n = { ...prev }; groups.forEach(g => { if (n[g.key] === undefined) n[g.key] = g.tier === 'high'; }); return n; });
+  }, [groups]);
+
+  const selected = groups.filter(g => apply[g.key] && choice[g.key]);
+  const selectedRows = selected.reduce((s, g) => s + g.ids.length, 0);
+  const totalRows = groups.reduce((s, g) => s + g.ids.length, 0);
+
+  const searchResults = (g) => {
+    const q = normName(search[g.key] || '');
+    if (q.length < 2) return [];
+    return assets.filter(a => normName(`${a.room}${a.area}${a.name}`).includes(q)).slice(0, 15);
+  };
+
+  const applySelected = async (only) => {
+    const todo = (only || selected).filter(g => choice[g.key]);
+    if (!todo.length) return;
+    setApplying(true); setResult(null);
+    const jobs = todo.flatMap(g => {
+      const a = assetById.get(choice[g.key]);
+      return g.ids.map(id => ({ id, g, payload: { craa5_equipmentguid: a.id, ...(g.room ? {} : { craa5_room: a.room }), ...(g.area ? {} : { craa5_area: a.area }), ...(g.equipment ? {} : { craa5_equipment: a.name }) } }));
+    });
+    const res = await pool(jobs, 8, (j) => api.update(LOG_TABLE, j.id, j.payload));
+    const failed = res.filter(r => !r.ok);
+    setResult({ ok: res.length - failed.length, failed: failed.length, error: failed.length ? errText(failed[0].error) : '' });
+    setApplying(false);
+    await scan(true);
+    if (onApplied) onApplied();
+  };
+
+  return (
+    <div>
+      <Text size={600} weight="semibold" block className={styles.sectionTitle}>Fix Missing Equipment IDs</Text>
+      <Text className={styles.hint} block style={{ marginBottom: 10 }}>
+        Log entries need the equipment’s ID (craa5_equipmentguid) so the calendar can match them. This finds entries with no ID, or an ID that no longer exists, and suggests the closest equipment using the SAP order first, then equipment name, room and area (equipment numbers must agree). Nothing is saved until you apply.
+      </Text>
+      <div className={styles.filterBar}>
+        <Select aria-label="Scan scope" value={scope} onChange={(e, d) => setScope(d.value)}>
+          <option value="all">All entries</option>
+          <option value="year">Last 12 months</option>
+        </Select>
+        <Button onClick={() => scan()} disabled={scanning}>{scanning ? 'Scanning…' : 'Rescan'}</Button>
+        <Button appearance="primary" style={ctaStyle} disabled={applying || !selected.length} onClick={() => applySelected()}>
+          Apply {selected.length} selected ({selectedRows} entries)
+        </Button>
+        <Button disabled={applying || !groups.some(g => g.tier === 'high')} onClick={() => applySelected(groups.filter(g => g.tier === 'high'))}>Apply all high confidence</Button>
+        <Checkbox label="Show no-match groups" checked={showAll} onChange={(e, d) => setShowAll(!!d.checked)} />
+      </div>
+      {scanError && <Text className={styles.errorText} block>Scan failed: {scanError}</Text>}
+      {result && <Text className={result.failed ? styles.errorText : styles.okText} block>{result.ok} entries updated{result.failed ? `; ${result.failed} failed (${result.error})` : ''}.</Text>}
+      {logs && <Text className={styles.hint} block style={{ marginBottom: 8 }}>{logs.length} entries scanned. {totalRows} need an ID, in {groups.length} distinct equipment groups.</Text>}
+      {logs && groups.length === 0 && <Text className={styles.okText} block>Every scanned entry has a valid equipment ID.</Text>}
+      {groups.length > 0 && (
+        <div style={{ overflowX: 'auto' }}>
+          <table className={styles.linesTable}>
+            <thead><tr>
+              <th className={styles.th}>Apply</th><th className={styles.th}>Logged as</th><th className={styles.th}>Room / Area</th><th className={styles.th}>SAP order</th>
+              <th className={styles.th}>Entries</th><th className={styles.th}>Issue</th><th className={styles.th}>Map to</th><th className={styles.th}>Confidence</th>
+            </tr></thead>
+            <tbody>
+              {groups.filter(g => showAll || g.tier !== 'none').map(g => {
+                const sr = searchResults(g);
+                const options = [...g.ranked.map(r => r.asset), ...sr].filter((a, i, arr) => arr.findIndex(b => b.id === a.id) === i);
+                const top = g.ranked.find(r => r.asset.id === choice[g.key]);
+                return (
+                  <tr key={g.key}>
+                    <td className={styles.td}><input type="checkbox" aria-label={`Apply ${g.equipment}`} checked={!!apply[g.key] && !!choice[g.key]} disabled={!choice[g.key]} onChange={(e) => setApply(p => ({ ...p, [g.key]: e.target.checked }))} /></td>
+                    <td className={styles.td}><strong>{g.equipment || '(blank)'}</strong></td>
+                    <td className={styles.td}>{[g.room, g.area].filter(Boolean).join(' / ')}</td>
+                    <td className={styles.td}>{g.sap}</td>
+                    <td className={styles.td}>{g.ids.length}</td>
+                    <td className={styles.td}><span className={mergeClasses(styles.tag, g.kind === 'unknown id' ? styles.tagBad : styles.tagWarn)}>{g.kind}</span></td>
+                    <td className={styles.td} style={{ minWidth: 260 }}>
+                      <Select aria-label={`Equipment for ${g.equipment}`} value={choice[g.key] || ''} onChange={(e, d) => { setChoice(p => ({ ...p, [g.key]: d.value })); if (!d.value) setApply(p => ({ ...p, [g.key]: false })); }}>
+                        <option value="">No match</option>
+                        {options.map(a => <option key={a.id} value={a.id}>{a.name} — {a.room} / {a.area}</option>)}
+                      </Select>
+                      <Input size="small" aria-label={`Search equipment for ${g.equipment}`} placeholder="Search other equipment…" value={search[g.key] || ''} onChange={(e, d) => setSearch(p => ({ ...p, [g.key]: d.value }))} style={{ marginTop: 4, width: '100%' }} />
+                    </td>
+                    <td className={styles.td}>
+                      {top ? (
+                        <span className={mergeClasses(styles.tag, g.tier === 'high' ? styles.tagOk : g.tier === 'none' ? styles.tagBad : styles.tagWarn)}>
+                          {TIER_LABEL[g.tier]} · {top.reason}{g.ambiguous ? ' · ambiguous' : ''}
+                        </span>
+                      ) : choice[g.key] ? <span className={mergeClasses(styles.tag, styles.tagWarn)}>manual</span> : <span className={mergeClasses(styles.tag, styles.tagBad)}>No match</span>}
+                    </td>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// --- APP ---
+export default function GeneratedComponent(props) {
+  const dataApi = props && props.dataApi;
+  const styles = useStyles();
+  const api = useMemo(() => makeApi(dataApi), [dataApi]);
+  const maxDate = useMemo(() => toDateInput(new Date()), []);
+  const minDate = useMemo(() => { const d = new Date(); d.setFullYear(d.getFullYear() - 1); return toDateInput(d); }, []);
+
+  const [assets, setAssets] = useState([]);
+  const [msRows, setMsRows] = useState([]);
+  const dataRef = useRef({ assets: [], msRows: [] });
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState('');
+
+  const [activeTab, setActiveTab] = useState('add');
+  const [entries, setEntries] = useState([]);
+  const [logPageSize, setLogPageSize] = useState(50);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+  const [isTableEditMode, setIsTableEditMode] = useState(false);
+  const [tableEdits, setTableEdits] = useState({});
+  const [selectedLogIds, setSelectedLogIds] = useState(new Set());
+  const [tableMessage, setTableMessage] = useState(null);
+  const [currentMonth, setCurrentMonth] = useState(() => { const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1); });
+  const [missingIds, setMissingIds] = useState(null);
+
+  const [rows, setRows] = useState([]);
+  const [addRowCount, setAddRowCount] = useState(1);
+  const [errorMessage, setErrorMessage] = useState('');
+  const [successMessage, setSuccessMessage] = useState('');
+  const [warnMessage, setWarnMessage] = useState('');
+  const [saving, setSaving] = useState(false);
+  const refs = useRef({});
+  const rowSeq = useRef(0);
+  const containerRef = useRef(null);
+
+  const newRow = (shared) => { rowSeq.current += 1; return { key: `r${rowSeq.current}`, date: shared && shared.date, initials: shared && shared.initials }; };
+  useEffect(() => { setRows([newRow()]); /* eslint-disable-next-line */ }, []);
+
+  // --- LOAD (everything is cached up front) ---
+  const loadRefData = useCallback(async () => {
+    const [a, m] = await Promise.all([
+      api.query(ASSET_TABLE, { select: ['craa5_aa_assetsid', 'craa5_equipmentidentifier', 'craa5_roomname', 'craa5_areaname'] }),
+      api.query(MS_TABLE),
+    ]);
+    const A = a.map(r => ({ id: r.craa5_aa_assetsid, name: safeString(r.craa5_equipmentidentifier), room: safeString(r.craa5_roomname), area: safeString(r.craa5_areaname) }));
+    const M = m.map(r => ({
+      id: r.craa5_aa_ms_assetsid,
+      equipment: safeString(r.craa5_equipment),
+      room: safeString(r.craa5_textroom),
+      area: safeString(r.craa5_textarea),
+      assetId: r._craa5_asset_value || null,
+      codes: CODE_COLS.map(col => ({ col, code: normCode(r[col]) })).filter(c => c.code),
+    }));
+    dataRef.current = { assets: A, msRows: M };
+    setAssets(A); setMsRows(M);
+  }, [api]);
+
+  const buildFilter = useCallback(() => {
+    const f = [];
+    const term = searchTerm.trim().replace(/'/g, "''");
+    if (term) f.push(`(startswith(craa5_sap,'${term}') or startswith(craa5_equipment,'${term}') or startswith(craa5_lastcleanedby,'${term}'))`);
+    if (startDate) f.push(`craa5_lastcleaned ge ${startDate}T00:00:00Z`);
+    if (endDate) f.push(`craa5_lastcleaned lt ${nextDay(endDate)}T00:00:00Z`);
+    return f.length ? f.join(' and ') : undefined;
+  }, [searchTerm, startDate, endDate]);
+
+  const loadEntries = useCallback(async (filter, pageSize) => {
+    const res = await api.query(LOG_TABLE, { select: LOG_SELECT, orderBy: 'craa5_lastcleaned desc', top: pageSize, filter });
+    setEntries(res.map(r => ({
+      id: r.craa5__log_id, sap: safeString(r.craa5_sap), equipment: safeString(r.craa5_equipment), guid: safeString(r.craa5_equipmentguid),
+      room: safeString(r.craa5_room), area: safeString(r.craa5_area), date: dayKey(r.craa5_lastcleaned),
+      hours: r.craa5_hoursworked === null || r.craa5_hoursworked === undefined ? null : Number(r.craa5_hoursworked), by: safeString(r.craa5_lastcleanedby),
+    })));
+  }, [api]);
+
+  const reloadAll = useCallback(async () => {
+    setLoading(true); setLoadError('');
+    try { await Promise.all([loadRefData(), loadEntries(buildFilter(), logPageSize)]); }
+    catch (e) { setLoadError(errText(e)); }
+    finally { setLoading(false); }
+  }, [loadRefData, loadEntries, buildFilter, logPageSize]);
+
+  useEffect(() => { reloadAll(); /* eslint-disable-next-line */ }, [api]);
+
+  const firstPage = useRef(true);
+  useEffect(() => {
+    if (firstPage.current) { firstPage.current = false; return; }
+    loadEntries(buildFilter(), logPageSize).catch(e => setLoadError(errText(e)));
+    // eslint-disable-next-line
+  }, [logPageSize]);
+
+  // --- INDEXES ---
+  const assetById = useMemo(() => new Map(assets.map(a => [a.id, a])), [assets]);
+  const assetsByName = useMemo(() => {
+    const m = new Map();
+    assets.forEach(a => { const k = normName(a.name); if (!m.has(k)) m.set(k, []); m.get(k).push(a); });
+    return m;
+  }, [assets]);
+  const codeIndex = useMemo(() => {
+    const m = new Map();
+    msRows.forEach(r => r.codes.forEach(c => {
+      if (!m.has(c.code)) m.set(c.code, []);
+      m.get(c.code).push({ row: r, col: c.col });
+    }));
+    return m;
+  }, [msRows]);
+  const rooms = useMemo(() => [...new Set(assets.map(a => a.room).filter(Boolean))].sort(), [assets]);
+  const areas = useMemo(() => [...new Set(assets.map(a => a.area).filter(Boolean))].sort(), [assets]);
+
+  const ctx = useMemo(() => ({
+    api, assets, assetById, assetsByName, codeIndex, rooms, areas, dataRef, maxDate, minDate,
+    addAsset: (a) => { dataRef.current = { ...dataRef.current, assets: [...dataRef.current.assets, a] }; setAssets(dataRef.current.assets); },
+    patchAsset: (a) => { dataRef.current = { ...dataRef.current, assets: dataRef.current.assets.map(x => (x.id === a.id ? a : x)) }; setAssets(dataRef.current.assets); },
+    upsertMs: (row) => { const list = dataRef.current.msRows.filter(r => r.id !== row.id).concat(row); dataRef.current = { ...dataRef.current, msRows: list }; setMsRows(list); },
+  }), [api, assets, assetById, assetsByName, codeIndex, rooms, areas, maxDate, minDate]);
+
+  // --- ADD ENTRIES ---
+  const addRows = (count, shared) => {
+    const last = rows.length ? refs.current[rows[rows.length - 1].key] : null;
+    const carry = shared || (last && last.getShared && last.getShared());
+    setRows(prev => [...prev, ...Array.from({ length: count }, () => newRow(carry))]);
+  };
+
+  const handleEnter = (index) => {
+    if (index < rows.length - 1) {
+      const next = containerRef.current && containerRef.current.querySelector(`[data-row="${index + 1}"][data-col="sap"]`);
+      if (next) next.focus();
+    } else addRows(1);
+  };
+
+  const submitAll = async () => {
+    setErrorMessage(''); setSuccessMessage(''); setWarnMessage('');
+    for (let i = 0; i < rows.length; i++) {
+      const h = refs.current[rows[i].key];
+      const err = h ? h.validate() : 'Row is not ready.';
+      if (err) { setErrorMessage(`Row ${i + 1}: ${err}`); return; }
+    }
+    setSaving(true);
+    const done = [];
+    const notes = [];
+    let saved = 0;
+    let lastShared = null;
+    let failure = '';
+    for (let i = 0; i < rows.length; i++) {
+      const h = refs.current[rows[i].key];
+      lastShared = h.getShared();
+      const res = await h.commit();
+      saved += res.saved || 0;
+      (res.notes || []).forEach(n => notes.push(`Row ${i + 1}: ${n}`));
+      if (res.error) { failure = `Row ${i + 1}: ${res.error}`; if (!res.saved) break; }
+      done.push(rows[i].key);
+      if (res.error) break;
+    }
+    setRows(prev => { const rest = prev.filter(r => !done.includes(r.key)); return rest.length ? rest : [newRow(lastShared)]; });
+    if (failure) setErrorMessage(failure);
+    else setSuccessMessage(`Saved ${saved} log ${saved === 1 ? 'entry' : 'entries'}.`);
+    if (notes.length) setWarnMessage(notes.join(' '));
+    setSaving(false);
+    try { await loadRefData(); await loadEntries(buildFilter(), logPageSize); } catch (e) { setLoadError(errText(e)); }
+  };
+
+  // --- LOG TABLE ---
+  const applyFilters = () => { setLogPageSize(50); loadEntries(buildFilter(), 50).catch(e => setLoadError(errText(e))); };
+  const clearFilters = () => { setSearchTerm(''); setStartDate(''); setEndDate(''); setLogPageSize(50); loadEntries(undefined, 50).catch(e => setLoadError(errText(e))); };
+  const handleGridEdit = (id, field, value) => setTableEdits(p => ({ ...p, [id]: { ...p[id], [field]: value } }));
+
+  const saveBatchEdits = async () => {
+    const jobs = [];
+    for (const [id, c] of Object.entries(tableEdits)) {
+      const payload = {};
+      if (c.sap !== undefined) payload.craa5_sap = normCode(c.sap);
+      if (c.date !== undefined) {
+        if (!c.date || c.date > maxDate) { setTableMessage({ kind: 'error', text: 'Dates cannot be blank or in the future.' }); return; }
+        payload.craa5_lastcleaned = toLogDate(c.date);
+      }
+      if (c.hours !== undefined) {
+        if (!(c.hours > 0)) { setTableMessage({ kind: 'error', text: 'Hours must be greater than 0.' }); return; }
+        payload.craa5_hoursworked = c.hours;
+      }
+      if (c.by !== undefined) {
+        const ini = normalizeInitials(c.by);
+        if (!INITIALS_RE.test(ini)) { setTableMessage({ kind: 'error', text: `Initials "${c.by}" are not valid (e.g. EL/LH).` }); return; }
+        payload.craa5_lastcleanedby = ini;
+      }
+      if (Object.keys(payload).length) jobs.push({ id, payload });
+    }
+    const res = await pool(jobs, 8, (j) => api.update(LOG_TABLE, j.id, j.payload));
+    const failed = res.filter(r => !r.ok);
+    if (failed.length) setTableMessage({ kind: 'error', text: `${failed.length} of ${jobs.length} updates failed: ${errText(failed[0].error)}` });
+    else { setTableMessage({ kind: 'ok', text: `Updated ${jobs.length} entries.` }); setTableEdits({}); setIsTableEditMode(false); }
+    await loadEntries(buildFilter(), logPageSize);
+  };
+
+  const batchDelete = async () => {
+    if (!selectedLogIds.size) return;
+    if (!window.confirm(`Are you sure you want to permanently delete ${selectedLogIds.size} records from Dataverse?`)) return;
+    const res = await pool([...selectedLogIds], 8, (id) => api.remove(LOG_TABLE, id));
+    const failed = res.filter(r => !r.ok);
+    setTableMessage(failed.length ? { kind: 'error', text: `${failed.length} deletes failed: ${errText(failed[0].error)}` } : { kind: 'ok', text: `Deleted ${res.length} entries.` });
+    setSelectedLogIds(new Set());
+    await loadEntries(buildFilter(), logPageSize);
+  };
+
+  const metrics = useMemo(() => {
+    let total = 0;
+    const orders = new Set();
+    const byInitials = {};
+    entries.forEach(e => {
+      const h = e.hours || 0;
+      total += h;
+      if (e.sap) orders.add(e.sap);
+      const k = (e.by || 'Unknown').toUpperCase();
+      byInitials[k] = (byInitials[k] || 0) + h;
+    });
+    return {
+      total: total.toFixed(1), orders: orders.size, count: entries.length,
+      noId: entries.filter(e => !e.guid || !assetById.has(e.guid)).length,
+      byInitials: Object.entries(byInitials).sort((a, b) => b[1] - a[1]),
+    };
+  }, [entries, assetById]);
+
+  const idStatus = (e) => (!e.guid ? 'missing' : assetById.size && !assetById.has(e.guid) ? 'unknown' : 'ok');
+
+  const renderTable = () => {
+    const cols = [
+      createTableColumn({ columnId: 'select',
+        renderHeaderCell: () => (<input type="checkbox" aria-label="Select all" checked={selectedLogIds.size > 0 && selectedLogIds.size === entries.length}
+          onChange={(e) => setSelectedLogIds(e.target.checked ? new Set(entries.map(x => x.id)) : new Set())} />),
+        renderCell: (item) => (<input type="checkbox" aria-label={`Select ${item.equipment}`} checked={selectedLogIds.has(item.id)}
+          onChange={(e) => { const n = new Set(selectedLogIds); if (e.target.checked) n.add(item.id); else n.delete(item.id); setSelectedLogIds(n); }} />) }),
+      createTableColumn({ columnId: 'sap', renderHeaderCell: () => 'SAP Order',
+        renderCell: (item) => isTableEditMode ? <Input value={tableEdits[item.id]?.sap ?? item.sap} onChange={(e, d) => handleGridEdit(item.id, 'sap', d.value)} /> : <Text>{item.sap}</Text> }),
+      createTableColumn({ columnId: 'equipment', renderHeaderCell: () => 'Equipment', renderCell: (item) => <Text>{item.equipment || '...'}</Text> }),
+      createTableColumn({ columnId: 'room', renderHeaderCell: () => 'Room', renderCell: (item) => <Text>{item.room || '...'}</Text> }),
+      createTableColumn({ columnId: 'area', renderHeaderCell: () => 'Area', renderCell: (item) => <Text>{item.area || '...'}</Text> }),
+      createTableColumn({ columnId: 'date', renderHeaderCell: () => 'Date of Clean',
+        renderCell: (item) => isTableEditMode ? <Input type="date" max={maxDate} value={tableEdits[item.id]?.date ?? item.date} onChange={(e, d) => handleGridEdit(item.id, 'date', d.value)} /> : <Text>{item.date}</Text> }),
+      createTableColumn({ columnId: 'hours', renderHeaderCell: () => 'Hours Worked',
+        renderCell: (item) => isTableEditMode ? <Input type="number" value={String(tableEdits[item.id]?.hours ?? item.hours ?? '')} onChange={(e, d) => handleGridEdit(item.id, 'hours', d.value ? parseFloat(d.value) : null)} /> : <Text>{item.hours ?? ''}</Text> }),
+      createTableColumn({ columnId: 'by', renderHeaderCell: () => 'Initials',
+        renderCell: (item) => isTableEditMode ? <Input value={tableEdits[item.id]?.by ?? item.by} onChange={(e, d) => handleGridEdit(item.id, 'by', d.value)} /> : <Text>{item.by}</Text> }),
+      createTableColumn({ columnId: 'id', renderHeaderCell: () => 'Equipment ID',
+        renderCell: (item) => { const s = idStatus(item); return <span className={mergeClasses(styles.tag, s === 'ok' ? styles.tagOk : s === 'missing' ? styles.tagWarn : styles.tagBad)}>{s === 'ok' ? 'linked' : s === 'missing' ? 'missing' : 'unknown'}</span>; } }),
+    ];
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+        <div className={styles.filterBar}>
+          <Input aria-label="Search" placeholder="Search order, equipment or initials…" value={searchTerm} onChange={(e, d) => setSearchTerm(d.value)} style={{ minWidth: '200px' }} />
+          <Input type="date" aria-label="Start date" value={startDate} onChange={(e, d) => setStartDate(d.value)} />
+          <Input type="date" aria-label="End date" value={endDate} onChange={(e, d) => setEndDate(d.value)} />
+          <Button appearance="primary" style={primaryStyle} onClick={applyFilters}>Apply Filters</Button>
+          <Button onClick={clearFilters}>Clear Filters</Button>
+        </div>
+        <div className={styles.actionBar}>
+          {!isTableEditMode ? <Button onClick={() => setIsTableEditMode(true)}>✏️ Batch Edit Mode</Button> : (
+            <>
+              <Button appearance="primary" style={primaryStyle} onClick={saveBatchEdits}>💾 Save Changes</Button>
+              <Button onClick={() => { setIsTableEditMode(false); setTableEdits({}); }}>❌ Cancel Edits</Button>
+            </>
           )}
+          <Button appearance="primary" style={selectedLogIds.size ? dangerStyle : undefined} disabled={!selectedLogIds.size} onClick={batchDelete}>🗑️ Delete Selected ({selectedLogIds.size})</Button>
+        </div>
+        {tableMessage && <Text className={tableMessage.kind === 'ok' ? styles.okText : styles.errorText} block>{tableMessage.text}</Text>}
+        <div style={{ maxHeight: '60vh', overflow: 'auto', border: `1px solid ${BRAND.line}`, borderRadius: '4px' }}>
+          <DataGrid items={entries} columns={cols} getRowId={(item) => item.id}>
+            <DataGridHeader><DataGridRow>{({ renderHeaderCell }) => <DataGridHeaderCell>{renderHeaderCell()}</DataGridHeaderCell>}</DataGridRow></DataGridHeader>
+            <DataGridBody>{({ item }) => (<DataGridRow key={item.id}>{({ renderCell }) => <DataGridCell>{renderCell(item)}</DataGridCell>}</DataGridRow>)}</DataGridBody>
+          </DataGrid>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'center' }}>
+          <Button onClick={() => setLogPageSize(p => p + 50)}>Load More Entries</Button>
+        </div>
+      </div>
+    );
+  };
+
+  const renderDashboard = () => (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+      <div className={styles.dashboardGrid}>
+        {[['Total Hours Logged', metrics.total, BRAND.blue], ['Unique SAP Orders', metrics.orders, BRAND.yellow], ['Loaded Log Entries', metrics.count, BRAND.logoBlue], ['Entries Missing Equipment ID', metrics.noId, BRAND.red]].map(([label, value, color]) => (
+          <div key={label} className={styles.metricCard} style={{ borderTop: `4px solid ${color}` }}>
+            <Text className={styles.metricLabel}>{label}</Text>
+            <Text className={styles.metricValue}>{value}</Text>
+          </div>
+        ))}
+      </div>
+      <div className={styles.listCard}>
+        <Text size={500} weight="semibold" block style={{ marginBottom: 12 }}>Hours Logged by Person (Initials)</Text>
+        <div style={{ maxHeight: 400, overflowY: 'auto', paddingRight: 8 }}>
+          {metrics.byInitials.length ? metrics.byInitials.map(([ini, h]) => (
+            <div key={ini} className={styles.listItem}><Text weight="semibold">{ini}</Text><Text>{h.toFixed(1)} Hours</Text></div>
+          )) : <Text>No entries loaded yet. Adjust your filters or load data.</Text>}
         </div>
       </div>
     </div>
+  );
+
+  const renderCalendar = () => {
+    const y = currentMonth.getFullYear(), m = currentMonth.getMonth();
+    const startDay = new Date(y, m, 1).getDay();
+    const days = new Date(y, m + 1, 0).getDate();
+    const cells = [...Array.from({ length: startDay }, () => null), ...Array.from({ length: days }, (_, i) => `${y}-${String(m + 1).padStart(2, '0')}-${String(i + 1).padStart(2, '0')}`)];
+    const byDay = {};
+    entries.forEach(e => { if (e.date) (byDay[e.date] = byDay[e.date] || []).push(e); });
+    return (
+      <div>
+        <div className={styles.calHeader}>
+          <Button onClick={() => setCurrentMonth(new Date(y, m - 1, 1))}>Previous</Button>
+          <Text weight="semibold">{currentMonth.toLocaleString('default', { month: 'long', year: 'numeric' })}</Text>
+          <Button onClick={() => setCurrentMonth(new Date(y, m + 1, 1))}>Next</Button>
+        </div>
+        <div className={styles.calGrid}>
+          {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(d => <div key={d} className={styles.weekday}>{d}</div>)}
+          {cells.map((k, i) => (
+            <div key={k || `e${i}`} className={mergeClasses(styles.dayCell, k === maxDate && styles.dayCellToday)}>
+              {k && <div style={{ fontWeight: 700, marginBottom: 4 }}>{Number(k.slice(8))}</div>}
+              {(k && byDay[k] || []).map(e => <div key={e.id} className={styles.entryText} title={`${e.equipment} · ${e.by}`}>{e.equipment || e.sap} · {e.by}</div>)}
+            </div>
+          ))}
+        </div>
+        <Text className={styles.hint} block style={{ marginTop: 8 }}>Showing the loaded entries. Use the Log Table filters or “Load More” to bring in other dates.</Text>
+      </div>
+    );
+  };
+
+  const tabs = [['add', 'Add Log Entries'], ['table', 'Log Table'], ['dashboard', 'Dashboard'], ['calendar', 'Calendar'], ['fix', `Fix Missing IDs${missingIds ? ` (${missingIds})` : ''}`]];
+
+  return (
+    <FluentProvider theme={THEME} style={{ background: 'transparent', minHeight: '100%' }}>
+      <div className={styles.root}>
+        <div className={styles.header}>
+          <div className={styles.title}>
+            <span className={styles.titleMain}>MSS Log Input</span>
+            <span className={styles.titleSub}>
+              {loading ? 'Loading…' : `${assets.length} equipment · ${codeIndex.size} SAP orders cached`}
+              {api.mode === 'preview' ? ' · preview data (no Dataverse connection)' : ''}
+            </span>
+          </div>
+          <div className={styles.logo}><BrandLogo /></div>
+        </div>
+
+        <TabList selectedValue={activeTab} onTabSelect={(_, d) => setActiveTab(d.value)} className={styles.navBar}>
+          {tabs.map(([v, label]) => (
+            <Tab key={v} value={v} className={mergeClasses(styles.tab, activeTab === v && styles.activeTab)}>{label}</Tab>
+          ))}
+        </TabList>
+
+        {loadError && <Text className={styles.errorText} block>Could not load Dataverse data: {loadError}</Text>}
+
+        <div className={styles.mainContent}>
+          {activeTab === 'add' && (
+            <>
+              <div className={styles.sidebar}>
+                <Text size={500} className={styles.sidebarTitle} block>Recent Log Entries</Text>
+                <ul style={{ paddingLeft: 18, margin: 0 }}>
+                  {entries.slice(0, 10).map(e => (
+                    <li key={e.id} style={{ marginBottom: 6, fontSize: 13 }}>
+                      {e.date} · <strong>{e.sap || e.equipment}</strong> {e.sap && e.equipment ? `(${e.equipment})` : ''} — {e.by}
+                    </li>
+                  ))}
+                  {!entries.length && <li style={{ listStyle: 'none', marginLeft: -18 }}>No entries yet.</li>}
+                </ul>
+              </div>
+              <div className={styles.contentArea}>
+                <Text size={600} weight="semibold" block className={styles.sectionTitle}>Add Log Entries</Text>
+                <div ref={containerRef} style={{ display: 'flex', flexDirection: 'column', gap: 14, width: '100%' }}>
+                  {rows.map((r, i) => (
+                    <EntryRow key={r.key} ref={(el) => { if (el) refs.current[r.key] = el; else delete refs.current[r.key]; }}
+                      ctx={ctx} index={i} initialDate={r.date} initialInitials={r.initials} canRemove={rows.length > 1}
+                      onEnter={handleEnter} onRemove={() => setRows(prev => prev.filter(x => x.key !== r.key))} />
+                  ))}
+                  {errorMessage && <Text className={styles.errorText} block role="alert">{errorMessage}</Text>}
+                  {successMessage && <Text className={styles.okText} block role="status">{successMessage}</Text>}
+                  {warnMessage && <Text className={styles.warnText} block role="status">{warnMessage}</Text>}
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <Input aria-label="Rows to add" type="number" min={1} value={String(addRowCount)} onChange={(e, d) => setAddRowCount(parseInt(d.value, 10) || 1)} style={{ width: 70 }} />
+                    <Button onClick={() => addRows(addRowCount)}>Add More Rows</Button>
+                  </div>
+                  <Button appearance="primary" size="large" disabled={saving || loading} onClick={submitAll} style={{ ...ctaStyle, maxWidth: 300 }}>
+                    {saving ? 'Saving…' : 'Submit All Records'}
+                  </Button>
+                </div>
+              </div>
+            </>
+          )}
+          {activeTab === 'table' && (
+            <div className={styles.contentArea}>
+              <Text size={600} weight="semibold" block className={styles.sectionTitle}>Log Table</Text>
+              {renderTable()}
+            </div>
+          )}
+          {activeTab === 'dashboard' && (
+            <div className={styles.contentArea}>
+              <Text size={600} weight="semibold" block className={styles.sectionTitle}>Dashboard Metrics</Text>
+              {renderDashboard()}
+            </div>
+          )}
+          {activeTab === 'calendar' && (
+            <div className={styles.contentArea}>
+              <Text size={600} weight="semibold" block className={styles.sectionTitle}>Calendar View</Text>
+              {renderCalendar()}
+            </div>
+          )}
+          {activeTab === 'fix' && (
+            <div className={styles.contentArea}>
+              <FixIdsTab ctx={ctx} onScanned={setMissingIds} onApplied={() => loadEntries(buildFilter(), logPageSize)} />
+            </div>
+          )}
+        </div>
+      </div>
+    </FluentProvider>
   );
 }
