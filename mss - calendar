@@ -177,7 +177,7 @@ const computeTextLinks = (index, logs) => {
 // failure leaves that log text-matched.
 const writeBackTextLinks = async (logs, links) => {
   const byKey = new Map(logs.map(l => [getLogKey(l), l]));
-  const remaining = new Map(links);
+  const writtenKeys = [];
   let written = 0, failed = 0;
   const todo = [...links].filter(([key]) => byKey.has(key) && normalizeId(getRaw(byKey.get(key), 'craa5__log_id')));
   for (let i = 0; i < todo.length; i += 5) {
@@ -186,14 +186,14 @@ const writeBackTextLinks = async (logs, links) => {
       try {
         await Xrm.WebApi.updateRecord("craa5__log_", normalizeId(getRaw(log, 'craa5__log_id')), { [LOG_ASSET_ID_SELECT]: assetId });
         log[LOG_ASSET_ID_SELECT] = assetId;
-        remaining.delete(key);
+        writtenKeys.push(key);
         written++;
       } catch (err) {
         failed++;
       }
     }));
   }
-  return { remaining, written, failed };
+  return { writtenKeys, written, failed };
 };
 
 // --- ON-DEMAND LOADING ---
@@ -202,9 +202,9 @@ const writeBackTextLinks = async (logs, links) => {
 // currently on screen: by equipment id (the main path) and, for old entries whose id is blank or matches
 // no equipment, by equipment name.
 const LOG_CORE = "craa5__log_id,craa5_equipment,craa5_lastcleaned,craa5_lastcleanedby,craa5_nameofemployee,craa5_uid";
-const LOG_OPTIONAL = "craa5_sap,craa5_hoursworked,craa5_room,craa5_area"; // dropped if the table lacks one of them
-const logColumns = { optional: true };
-const logSelect = (withId) => [LOG_CORE, logColumns.optional ? LOG_OPTIONAL : '', withId ? LOG_ASSET_ID_SELECT : ''].filter(Boolean).join(',');
+const LOG_OPTIONAL = ["craa5_sap", "craa5_hoursworked", "craa5_room", "craa5_area"]; // each is dropped on its own if the table lacks it
+const missingLogColumns = new Set();
+const logSelect = (withId) => [LOG_CORE, ...LOG_OPTIONAL.filter(c => !missingLogColumns.has(c)), withId ? LOG_ASSET_ID_SELECT : ''].filter(Boolean).join(',');
 const ASSET_SELECT = "craa5_aa_assetsid,craa5_equipmentidentifier,craa5_roomname,craa5_areaname";
 const PAGE_SIZE = 1000;          // rows per Dataverse page
 const ID_CHUNK = 15;             // equipment ids per log request
@@ -231,15 +231,25 @@ const retrievePaged = async (entity, query, maxRows) => {
   return { rows, truncated: !!res.nextLink };
 };
 
-// Reads log rows; queryFor(select) builds the query. If Dataverse says one of the optional columns does not
-// exist, they are dropped for the rest of the session (tooltip details only) instead of failing every load.
+// Reads log rows; queryFor(select) builds the query. If Dataverse says an optional column does not exist,
+// only that column is dropped (for the rest of the session, until the next Sync) and the request is retried,
+// so requests that were already in flight with the old select recover too. Errors about any other column
+// are thrown.
 const retrieveLogs = async (queryFor, withId, maxRows) => {
-  try {
-    return await retrievePaged("craa5__log_", queryFor(logSelect(withId)), maxRows);
-  } catch (err) {
-    if (!logColumns.optional || !isMissingColumnError(err) || new RegExp(LOG_ASSET_ID_SELECT, 'i').test(String(err.message))) throw err;
-    logColumns.optional = false;
-    return retrievePaged("craa5__log_", queryFor(logSelect(withId)), maxRows);
+  for (let attempt = 0; ; attempt++) {
+    const select = logSelect(withId);
+    try {
+      return await retrievePaged("craa5__log_", queryFor(select), maxRows);
+    } catch (err) {
+      if (!isMissingColumnError(err) || attempt > LOG_OPTIONAL.length) throw err;
+      const msg = String(err && err.message);
+      const inSelect = LOG_OPTIONAL.filter(c => select.split(',').includes(c));
+      let bad = inSelect.filter(c => new RegExp(`\\b${c}\\b`, 'i').test(msg));
+      // The message names no property we asked for: drop the two columns only the tooltip needs.
+      if (!bad.length && !new RegExp(`\\b(${[LOG_ASSET_ID_SELECT, ...LOG_CORE.split(',')].join('|')})\\b`, 'i').test(msg)) bad = inSelect.filter(c => c === 'craa5_sap' || c === 'craa5_hoursworked');
+      if (!bad.length) throw err;
+      bad.forEach(c => missingLogColumns.add(c));
+    }
   }
 };
 
@@ -373,10 +383,13 @@ export default function App() {
     if (isSaving || typeof Xrm === 'undefined' || !textLinks.size) return;
     if (!window.confirm(`Store the equipment id (craa5_equipmentguid) on ${textLinks.size} text-matched log row(s) in Dataverse?`)) return;
     setIsSaving(true);
+    const epoch = epochRef.current;
     try {
       const wb = await writeBackTextLinks(logs, textLinks);
+      if (epochRef.current !== epoch) return; // a Sync replaced the data while saving
+      // Remove only the links that were written: others may have been added while the updates ran.
       setLogs(prev => [...prev]);
-      setTextLinks(wb.remaining);
+      setTextLinks(prev => { const next = new Map(prev); wb.writtenKeys.forEach(k => next.delete(k)); return next; });
       setSyncNotes(prev => [...prev, `Stored the equipment id on ${wb.written} log(s)${wb.failed ? `; ${wb.failed} could not be updated and stay text-matched` : ''}.`]);
     } finally {
       setIsSaving(false);
@@ -408,7 +421,7 @@ export default function App() {
   // Sync loads the equipment directory only (four small columns) and checks the log table has the id column.
   // Logs are then loaded per visible equipment and month by the loader below.
   const triggerSync = async () => {
-    if (isLoading) return;
+    if (isLoading || isSaving) return;
     setIsLoading(true);
     setLoadProgress(5);
 
@@ -454,6 +467,10 @@ export default function App() {
       // Swap the loader state together with the data. Requests started before this point finish into the
       // old sets and are ignored (epoch), so nothing half-loaded survives a Sync.
       epochRef.current += 1;
+      diagSeqRef.current = { check: diagSeqRef.current.check + 1, lookup: diagSeqRef.current.lookup + 1 };
+      missingLogColumns.clear();
+      setLogCheck(null);
+      setLookup(null);
       loadedRef.current = new Set();
       inflightRef.current = new Set();
       queueRef.current = [];
@@ -559,12 +576,19 @@ export default function App() {
   const pagedRoomKeys = roomKeys.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
 
   // Settle the set of rendered equipment (debounced) into state; the loader below reacts to it.
+  // Runs after every render (mouse moves re-render this component), so a pending timer is only restarted
+  // when the rendered set actually changes; otherwise loading would wait until the pointer rests.
+  const settleTimerRef = useRef(null);
+  const pendingKeyRef = useRef(null);
   useEffect(() => {
     const key = [...new Set(renderedIdsRef.current)].join(',');
-    if (key === visibleKeyRef.current) return;
-    const t = setTimeout(() => { visibleKeyRef.current = key; setVisibleKey(key); }, 150);
-    return () => clearTimeout(t);
+    if (key === visibleKeyRef.current) { clearTimeout(settleTimerRef.current); pendingKeyRef.current = null; return; }
+    if (key === pendingKeyRef.current) return;
+    clearTimeout(settleTimerRef.current);
+    pendingKeyRef.current = key;
+    settleTimerRef.current = setTimeout(() => { pendingKeyRef.current = null; visibleKeyRef.current = key; setVisibleKey(key); }, 150);
   });
+  useEffect(() => () => clearTimeout(settleTimerRef.current), []);
 
   const jobKeys = (job) => job.items.flatMap(item => { const k = []; for (let m = job.m0; m <= job.m1; m++) k.push(`${job.kind}|${job.year}|${m}|${item}`); return k; });
 
@@ -651,6 +675,7 @@ export default function App() {
   const retryLoads = () => { setLoadErrors([]); setRetryTick(t => t + 1); };
 
   // --- Diagnostics checks (bounded: 200 newest log rows, or 25 rows for one equipment) ---
+  const diagSeqRef = useRef({ check: 0, lookup: 0 });   // newest diagnostics request of each kind wins; a Sync invalidates them all
   const [logCheck, setLogCheck] = useState(null);
   const [lookupQuery, setLookupQuery] = useState('');
   const [lookup, setLookup] = useState(null);
@@ -658,6 +683,7 @@ export default function App() {
   // Does the log table read at all, and do its stored equipment ids match equipment rows?
   const runLogCheck = async () => {
     if (typeof Xrm === 'undefined') return;
+    const my = ++diagSeqRef.current.check;
     setLogCheck({ busy: true });
     try {
       const { rows } = await retrieveLogs(select => `?$select=${select}&$orderby=craa5_lastcleaned desc&$top=200`, idColumn, 200);
@@ -666,9 +692,10 @@ export default function App() {
         const asset = id ? assetsById.get(id) : null;
         return { l, id, asset, state: !id ? 'no id' : asset ? 'matches equipment' : 'matches no equipment' };
       });
-      setLogCheck({ count: rows.length, noId: sample.filter(r => r.state === 'no id').length, matched: sample.filter(r => r.asset).length, orphan: sample.filter(r => r.state === 'matches no equipment').length, sample, assetsLoaded: assets.length });
+      if (my !== diagSeqRef.current.check) return;
+      setLogCheck({ count: rows.length, noId: sample.filter(r => r.state === 'no id').length, matched: sample.filter(r => r.asset).length, orphan: sample.filter(r => r.state === 'matches no equipment').length, sample, idColumn });
     } catch (err) {
-      setLogCheck({ error: String(err && err.message) });
+      if (my === diagSeqRef.current.check) setLogCheck({ error: String(err && err.message) });
     }
   };
 
@@ -676,6 +703,7 @@ export default function App() {
   const runLookup = async (asset) => {
     const id = getAssetId(asset);
     const name = safeString(getProp(asset, 'craa5_equipmentidentifier')).trim();
+    const my = ++diagSeqRef.current.lookup;
     setLookup({ busy: true, id, name });
     const one = async (filter) => {
       try {
@@ -687,6 +715,7 @@ export default function App() {
       idColumn && isGuid(id) ? one(`${LOG_ASSET_ID_SELECT} eq '${id}'`) : Promise.resolve({ skipped: true }),
       one(`craa5_equipment eq '${odataString(name)}'`)
     ]);
+    if (my !== diagSeqRef.current.lookup) return;
     setLookup({ id, name, room: safeString(getProp(asset, 'craa5_roomname')), area: safeString(getProp(asset, 'craa5_areaname')), byId, byName });
   };
 
@@ -951,7 +980,7 @@ export default function App() {
               <ZoomInIcon /><input type="range" min="0.8" max="2.0" step="0.1" value={zoom} onChange={e => setZoom(parseFloat(e.target.value))} />
               <span>{Math.round(zoom * 100)}%</span>
             </div>
-            <button className="sync-btn" onClick={triggerSync} disabled={isLoading}><RefreshIcon style={isLoading ? { animation: 'spin 1s linear infinite' } : {}} /> Sync Dataverse</button>
+            <button className="sync-btn" onClick={triggerSync} disabled={isLoading || isSaving}><RefreshIcon style={isLoading ? { animation: 'spin 1s linear infinite' } : {}} /> Sync Dataverse</button>
             {canWriteBack && textLinks.size > 0 && (
               <button className="sync-btn" style={{ background: '#d97706' }} onClick={saveTextMatches} disabled={isSaving || isLoading} title="Writes craa5_equipmentguid on the text-matched logs in Dataverse">{isSaving ? 'Saving...' : `Save ${textLinks.size} text match${textLinks.size === 1 ? '' : 'es'} to Dataverse`}</button>
             )}
@@ -986,7 +1015,7 @@ export default function App() {
           </div>
       )}
 
-      {activeTab === 'master' && assets.length > 0 && !visibleKey && !isLoading && typeof Xrm !== 'undefined' && (
+      {activeTab === 'master' && assets.length > 0 && roomKeys.length > 0 && !visibleKey && !isLoading && typeof Xrm !== 'undefined' && (
         <div data-testid="expand-hint" style={{ padding: '6px 24px', fontSize: '12px', color: '#475569', background: '#eff6ff', borderBottom: '1px solid #dbeafe' }}>Click an area name to open it. Completions are read from the log for the equipment you open, so nothing shows until an area is open.</div>
       )}
 
@@ -1005,8 +1034,11 @@ export default function App() {
                 <p>Duplicates (same equipment and day, one marker shown): {completionIndex.stats.duplicate}</p>
                 {syncNotes.map((n, i) => <p key={i} style={{ color: '#b45309' }}>{n}</p>)}
                 {loadErrors.map((n, i) => <p key={i} style={{ color: '#b91c1c' }}>Log load failed: {n}</p>)}
-                {!logColumns.optional && <p style={{ color: '#b45309' }}>Some optional log columns (SAP order, hours, room, area) do not exist in this table, so they are left out of the tooltip.</p>}
-                <p style={{ color: '#64748b' }}>Logs load per visible equipment and month, never the whole table: a log is shown on the equipment whose id is stored in its craa5_equipmentguid. Old entries whose id is blank or matches no equipment are matched by equipment name (amber). Nothing loads until an area is expanded on the Compliance Matrix tab, so "Logs loaded: 0" here only means nothing has been opened yet.</p>
+                {missingLogColumns.size > 0 && <p style={{ color: '#b45309' }}>These log columns do not exist in this table and are left out: {[...missingLogColumns].join(', ')}. SAP order and hours only fill the tooltip; room and area also help tell apart equipment that share a name.</p>}
+                <p style={{ color: '#64748b' }}>Logs load per visible equipment and month, never the whole table: a log is shown on the equipment whose id is stored in its craa5_equipmentguid. Old entries whose id is blank or matches no equipment are matched by equipment name (amber). Nothing loads until an area is expanded on the Compliance Matrix tab.</p>
+                <p>Equipment-month slices read from the log: {loadedRef.current.size}</p>
+                {loadedRef.current.size === 0 && <p style={{ color: '#64748b' }}>No area has been opened since the last Sync, so no logs have been requested yet.</p>}
+                {loadedRef.current.size > 0 && logs.length === 0 && <p style={{ color: '#b45309' }}>Log requests ran but returned no rows. Use Log check and Equipment lookup below to see what the log table holds and which ids it stores.</p>}
                 {typeof Xrm !== 'undefined' && (
                   <div data-testid="log-check" style={{ marginTop: '16px', paddingTop: '12px', borderTop: '1px solid #e2e8f0' }}>
                     <h3 style={{ fontSize: '15px', fontWeight: 'bold' }}>Log check</h3>
@@ -1016,7 +1048,9 @@ export default function App() {
                     {logCheck && logCheck.error && <p style={{ color: '#b91c1c' }}>Could not read the log: {logCheck.error}</p>}
                     {logCheck && logCheck.sample && (
                       <div>
-                        <p data-testid="log-check-summary">{logCheck.count} newest log rows read: {logCheck.matched} with an id that matches equipment · {logCheck.orphan} with an id that matches no equipment · {logCheck.noId} with no id stored.</p>
+                        {logCheck.idColumn
+                          ? <p data-testid="log-check-summary">{logCheck.count} newest log rows read: {logCheck.matched} with an id that matches equipment · {logCheck.orphan} with an id that matches no equipment · {logCheck.noId} with no id stored.</p>
+                          : <p data-testid="log-check-summary" style={{ color: '#b45309' }}>{logCheck.count} newest log rows read. The log table has no craa5_equipmentguid column, so ids cannot be checked.</p>}
                         <table style={{ fontSize: '12px', borderCollapse: 'collapse' }}>
                           <thead><tr>{['Date', 'Equipment text', 'Stored equipment id', 'Result'].map(h => <th key={h} style={{ textAlign: 'left', padding: '4px 12px 4px 0' }}>{h}</th>)}</tr></thead>
                           <tbody>{logCheck.sample.slice(0, 15).map((r, i) => (
