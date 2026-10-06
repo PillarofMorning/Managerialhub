@@ -264,14 +264,17 @@ const tierOf = (score) => (score >= 0.95 ? 'high' : score >= 0.8 ? 'medium' : sc
 const TIER_LABEL = { high: 'High', medium: 'Medium', low: 'Low', none: 'No match', manual: 'Manual', linked: 'Linked' };
 const downTier = (t) => (t === 'high' ? 'medium' : t === 'medium' ? 'low' : t);
 
+// Rooms and areas compare with numbers kept apart, so "Line 1-2" is not "Line 12"
+const placeKey = (s) => canonName(s);
+const samePlace = (a, b) => placeKey(a) === placeKey(b);
 // Room and area of a candidate agree with what the entry or SAP row says (a blank on either side is not a disagreement).
 const placeOk = (want, asset) =>
-  (!normName(want.room) || !normName(asset.room) || sameText(want.room, asset.room))
-  && (!normName(want.area) || !normName(asset.area) || sameText(want.area, asset.area));
+  (!placeKey(want.room) || !placeKey(asset.room) || samePlace(want.room, asset.room))
+  && (!placeKey(want.area) || !placeKey(asset.area) || samePlace(want.area, asset.area));
 // Name similarity with room and area agreement: a different room or area keeps a candidate out of any automatic pick.
 const scoreAsset = (want, asset, p = nameProfile(want.equipment)) => {
   let s = nameSimilarity(p, nameProfile(asset.name));
-  const wr = normName(want.room), wa = normName(want.area), ar = normName(asset.room), aa = normName(asset.area);
+  const wr = placeKey(want.room), wa = placeKey(want.area), ar = placeKey(asset.room), aa = placeKey(asset.area);
   if (wr && ar && wr !== ar) s *= 0.5;
   else if (wr && !ar) s *= 0.9;
   if (wa && aa && wa !== aa) s *= 0.55;
@@ -711,7 +714,8 @@ const makeStore = (api) => {
 
     // Candidate equipment for a name: server searches on its main words (and number), in the same room first, never the whole table.
     assetsLikeName(p, room) {
-      const ws = [...p.words].filter(w => w.length >= 2).sort((a, b) => b.length - a.length).slice(0, 2);
+      // Word stems, so "Floors" also finds "Floor"
+      const ws = p.words.map(w => (w.length > 3 ? w.replace(/s$/, '') : w)).filter(w => w.length >= 2).sort((a, b) => b.length - a.length).slice(0, 2);
       if (!ws.length) return Promise.resolve([]);
       const num = p.numList.slice(0, 1);
       return once(cache.names, `${ws.join(',')}|${num.join(',')}|${normName(room)}`, async () => {
@@ -757,9 +761,15 @@ const makeStore = (api) => {
       return once(cache.field, `${col}|${t.toLowerCase()}|${normName(room)}`, async () => {
         const parts = [ciContains(col, t)];
         if (normName(room)) parts.push(ciEq('craa5_roomname', room));
-        const rows = await api.query(ASSET_TABLE, { select: [col], filter: parts.join(' and '), top: 40, orderBy: col });
         const seen = new Map();
-        rows.forEach(r => { const v = safeString(r[col]); if (v && !seen.has(v.toLowerCase())) seen.set(v.toLowerCase(), v); });
+        // One big room can fill a whole page: ask again without the values already found (a few small queries at most)
+        for (let round = 0; round < 4 && seen.size < 15; round++) {
+          const not = Array.from(seen.values()).map(v => `${col} ne '${escOData(v)}'`);
+          const rows = await api.query(ASSET_TABLE, { select: [col], filter: parts.concat(not).join(' and '), top: 40, orderBy: col });
+          const before = seen.size;
+          rows.forEach(r => { const v = safeString(r[col]); if (v && !seen.has(v.toLowerCase())) seen.set(v.toLowerCase(), v); });
+          if (rows.length < 40 || seen.size === before) break;
+        }
         return Array.from(seen.values()).slice(0, 15);
       });
     },
@@ -863,7 +873,9 @@ const assignBestFits = (entries) => {
     .sort((a, b) => b.ranked[0].score - a.ranked[0].score || b.ranked[0].support - a.ranked[0].support)
     .forEach(e => {
       const top = e.ranked[0];
-      if (top.score >= 0.99 && taken.has(top.asset.id)) { e.asset = top.asset; e.how = 'same as another line'; return; }
+      // Folded only when that equipment is the one clear match and the SAP row names its room and area
+      const tie = e.ranked.some((c, j) => j > 0 && top.score - c.score < 0.02);
+      if (top.score >= 0.99 && taken.has(top.asset.id) && !tie && normName(e.room) && normName(e.area)) { e.asset = top.asset; e.how = 'same as another line'; return; }
       const i = e.ranked.findIndex(c => !taken.has(c.asset.id) && c.score >= 0.6 && placeOk(e, c.asset));
       if (i < 0) return;
       const pick = e.ranked[i];
@@ -925,7 +937,7 @@ const rankCandidates = async (store, g) => {
 
 // Entry's room/area text disagrees with the room/area of the equipment its ID points at
 const placeDiffers = (r, a) => {
-  const lr = normName(r.craa5_room), la = normName(r.craa5_area), ar = normName(a.room), aa = normName(a.area);
+  const lr = placeKey(r.craa5_room), la = placeKey(r.craa5_area), ar = placeKey(a.room), aa = placeKey(a.area);
   return !!((lr && ar && lr !== ar) || (la && aa && la !== aa));
 };
 
@@ -937,7 +949,13 @@ const retroFilter = (code, from, ms, fromStillUsed) => {
   const sap = ciEq('craa5_sap', code);
   const parts = [];
   if (from && !fromStillUsed) parts.push(`(${sap} and ${guidEq('craa5_equipmentguid', from.id)})`);
-  if (normName(ms.equipment)) parts.push(`(${sap} and ${BLANK_GUID} and ${ciEq('craa5_equipment', ms.equipment)})`);
+  if (normName(ms.equipment)) {
+    // a blank room or area on the entry is not a disagreement; a different one is
+    const place = [];
+    if (normName(ms.room)) place.push(`(craa5_room eq null or craa5_room eq '' or ${ciEq('craa5_room', ms.room)})`);
+    if (normName(ms.area)) place.push(`(craa5_area eq null or craa5_area eq '' or ${ciEq('craa5_area', ms.area)})`);
+    parts.push(`(${[sap, BLANK_GUID, ciEq('craa5_equipment', ms.equipment)].concat(place).join(' and ')})`);
+  }
   if (from && normName(ms.equipment) && normName(ms.room) && normName(ms.area) && !(sameText(from.room, ms.room) && sameText(from.area, ms.area))) {
     parts.push(`(${guidEq('craa5_equipmentguid', from.id)} and ${ciEq('craa5_equipment', ms.equipment)} and ${ciEq('craa5_room', ms.room)} and ${ciEq('craa5_area', ms.area)})`);
   }
@@ -956,19 +974,29 @@ const repointPayload = (r, from, target, guidOnly) => {
   return p;
 };
 // Point every log entry matching filter at target, a page at a time (moved entries drop out of the filter).
+// more: the round limit was reached with entries possibly left over.
 const repointEntries = async (api, filter, from, target, guidOnly = false) => {
   let fixed = 0;
   let error = '';
+  let more = true;
   const failedIds = new Set();
   for (let round = 0; round < LIMITS.retroRounds; round++) {
     const rows = await api.query(LOG_TABLE, { select: FIX_SELECT, filter, top: LIMITS.retroPage });
     const todo = rows.filter(r => !failedIds.has(r.craa5__log_id));
-    if (!todo.length) break;
+    if (!todo.length) { more = false; break; }
     const res = await pool(todo, 6, (r) => api.update(LOG_TABLE, r.craa5__log_id, repointPayload(r, from, target, guidOnly)));
     res.forEach((x, i) => { if (x.ok) fixed += 1; else { failedIds.add(todo[i].craa5__log_id); if (!error) error = errText(x.error); } });
-    if (rows.length < LIMITS.retroPage) break;
+    if (rows.length < LIMITS.retroPage) { more = false; break; }
   }
-  return { fixed, failed: failedIds.size, error };
+  return { fixed, failed: failedIds.size, error, more };
+};
+// Move a fixed list of entries (read before anything was written) onto target.
+const repointRows = async (api, rows, from, target) => {
+  const res = await pool(rows, 6, (r) => api.update(LOG_TABLE, r.craa5__log_id, repointPayload(r, from, target, false)));
+  const movedIds = [];
+  let error = '';
+  res.forEach((x, i) => { if (x.ok) movedIds.push(rows[i].craa5__log_id); else if (!error) error = errText(x.error); });
+  return { fixed: movedIds.length, failed: rows.length - movedIds.length, error, movedIds };
 };
 
 // Equipment already logged for an order on a date
@@ -1100,7 +1128,7 @@ const BrandLogo = () => {
 };
 
 // --- EQUIPMENT PICKER: server search as you type, small result list ---
-const AssetPicker = ({ store, onPick, exclude, initialQuery = '', ariaLabel = 'Search equipment', actionLabel = 'Add', placeholder = 'Start typing a name, room or area…' }) => {
+const AssetPicker = ({ store, onPick, exclude, initialQuery = '', ariaLabel = 'Search equipment', actionLabel = 'Add', placeholder = 'Start typing a name, room or area…', disabled = false }) => {
   const styles = useStyles();
   const [q, setQ] = useState(initialQuery);
   const [res, setRes] = useState([]);
@@ -1138,7 +1166,7 @@ const AssetPicker = ({ store, onPick, exclude, initialQuery = '', ariaLabel = 'S
                 <tr key={a.id}>
                   <td className={styles.td}><strong>{a.name}</strong></td><td className={styles.td}>{a.room}</td><td className={styles.td}>{a.area}</td>
                   <td className={styles.td} style={{ textAlign: 'right' }}>
-                    <Button size="small" appearance="primary" className={styles.btnPrimary} aria-label={`${actionLabel} ${a.name} (${placeText(a)})`} onClick={() => onPick(a)}>{actionLabel}</Button>
+                    <Button size="small" appearance="primary" className={styles.btnPrimary} disabled={disabled} aria-label={`${actionLabel} ${a.name} (${placeText(a)})`} onClick={() => onPick(a)}>{actionLabel}</Button>
                   </td>
                 </tr>
               ))}
@@ -1177,7 +1205,7 @@ const lineStatus = (l, dupe) => {
 // --- ENTRY ROW: one SAP order, one or more equipment ---
 const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initialInitials, onRemove, onEnter, canRemove, saving }, ref) {
   const styles = useStyles();
-  const { api, store, maxDate, minDate } = ctx;
+  const { api, store, maxDate, minDate, dataVer } = ctx;
 
   const [code, setCode] = useState('');
   const [showSuggest, setShowSuggest] = useState(false);
@@ -1189,11 +1217,12 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   const [totalHours, setTotalHours] = useState('');
   const [photo, setPhoto] = useState(null);
   const [photoName, setPhotoName] = useState('');
+  const [photoBusy, setPhotoBusy] = useState(false);
   const [excluded, setExcluded] = useState({});
   const [chosen, setChosen] = useState({});          // lineKey -> equipment picked instead of the automatic one
   const [hoursOverride, setHoursOverride] = useState({}); // lineKey -> hours as typed
   const [editMode, setEditMode] = useState(false);
-  const [edits, setEdits] = useState({});            // lineKey -> { name, room, area }
+  const [edits, setEdits] = useState({});            // lineKey -> { id, name, room, area } for the equipment with that id
   const [dupes, setDupes] = useState(new Set());
   const [extras, setExtras] = useState([]);
   const [addOpen, setAddOpen] = useState(false);
@@ -1207,8 +1236,9 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   const [panel, setPanel] = useState({});            // lineKey -> 'list' | 'search' | 'new' while its Change panel is open
   const [moreRank, setMoreRank] = useState({});      // lineKey -> { busy, ranked, error } (similar names looked up on demand)
   const [newFor, setNewFor] = useState({});          // lineKey -> { name, room, area } typed for "Create new asset"
-  const [retro, setRetro] = useState({});            // lineKey -> { status, count, more, from, filter, apply, error }
+  const [retro, setRetro] = useState({});            // lineKey -> { status, count, more, from, stillUsed, filter, apply, error }
   const seq = useRef(0);
+  const photoSeq = useRef(0);
   const retroSeq = useRef({});
   const listRef = useRef(null);
 
@@ -1233,13 +1263,14 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   useEffect(() => {
     if (normalizedCode.length < 3) { setOrder(null); return undefined; }
     let live = true;
-    setOrder({ status: 'loading', code: normalizedCode, entries: [] });
+    // Reloading the same order (after a Fix tab change) keeps its lines on screen until the new ones arrive
+    setOrder(o => (o && o.status === 'ready' && o.code === normalizedCode ? { ...o, refreshing: true } : { status: 'loading', code: normalizedCode, entries: [] }));
     const t = setTimeout(async () => {
       try { const r = await store.loadOrder(normalizedCode); if (live) setOrder({ status: 'ready', ...r }); }
       catch (e) { if (live) setOrder({ status: 'error', code: normalizedCode, entries: [], error: errText(e) }); }
     }, 350);
     return () => { live = false; clearTimeout(t); };
-  }, [normalizedCode, store]);
+  }, [normalizedCode, store, dataVer]); // dataVer: IDs were repaired or unified on the Fix tab, so best fits are worked out again
 
   // Only suggestions that fit what is typed now are shown or picked (results for an earlier prefix are dropped)
   const suggestions = useMemo(() => sugg.items.filter(x => x.code.includes(normalizedCode)), [sugg.items, normalizedCode]);
@@ -1284,8 +1315,8 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
       if (!x.asset.isNew) seen.add(x.asset.id);
       out.push({ key: x.key, msId: null, col: x.col, how: x.asset.isNew ? 'new equipment' : 'added', asset: x.asset, ranked: [], ms: null, name: x.asset.name, room: x.asset.room, area: x.asset.area, extra: true });
     });
-    // Apply "edit pre-filled details" overrides
-    return out.map(l => (edits[l.key] ? { ...l, name: edits[l.key].name, room: edits[l.key].room, area: edits[l.key].area } : l));
+    // Apply "edit pre-filled details" overrides, only to the equipment they were made for
+    return out.map(l => { const ed = edits[l.key]; return ed && l.asset && !l.asset.isNew && ed.id === l.asset.id ? { ...l, name: ed.name, room: ed.room, area: ed.area } : l; });
   }, [matches, chosen, extras, edits]);
 
   const takenIds = useMemo(() => new Set(lines.map(l => l.asset && !l.asset.isNew && l.asset.id).filter(Boolean)), [lines]);
@@ -1359,8 +1390,8 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     if (from && to && !to.isNew && from.id === to.id) { setRetro(p => { const x = { ...p }; delete x[l.key]; return x; }); return; }
     const stillUsed = !!from && lines.some(x => x.key !== l.key && x.asset && x.asset.id === from.id);
     const filter = retroFilter(normalizedCode, from, l.ms, stillUsed);
-    if (!filter) { setRetro(p => ({ ...p, [l.key]: { status: 'ready', count: 0, from, filter: null, apply: false } })); return; }
-    setRetro(p => ({ ...p, [l.key]: { status: 'scanning', count: 0, from, filter, apply: p[l.key] ? p[l.key].apply : true } }));
+    if (!filter) { setRetro(p => ({ ...p, [l.key]: { status: 'ready', count: 0, from, stillUsed, filter: null, apply: false } })); return; }
+    setRetro(p => ({ ...p, [l.key]: { status: 'scanning', count: 0, from, stillUsed, filter, apply: p[l.key] ? p[l.key].apply : true } }));
     try {
       const rows = await api.query(LOG_TABLE, { select: ['craa5__log_id'], filter, top: LIMITS.countCap + 1 });
       if (retroSeq.current[l.key] !== n) return;
@@ -1369,13 +1400,35 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
       if (retroSeq.current[l.key] === n) setRetro(p => ({ ...p, [l.key]: { ...p[l.key], status: 'error', error: errText(e), apply: false } }));
     }
   };
+  // Another line taking or freeing a changed line's old equipment changes which earlier entries that line may move
+  useEffect(() => {
+    lines.forEach(l => {
+      const r = retro[l.key];
+      if (!r || !r.from || !chosen[l.key]) return;
+      const used = lines.some(x => x.key !== l.key && x.asset && x.asset.id === r.from.id);
+      if (used !== !!r.stillUsed) scanRetro(l, l.asset);
+    });
+  }, [lines]); // eslint-disable-line react-hooks/exhaustive-deps
+  // "Edit pre-filled details" follows the equipment a line now uses, so an edit never lands on another record
+  const reseedEdit = (l, asset) => setEdits(p => {
+    const x = { ...p };
+    if (editMode && asset && !asset.isNew) x[l.key] = { id: asset.id, name: asset.name, room: asset.room, area: asset.area };
+    else delete x[l.key];
+    return x;
+  });
   const choose = (l, asset) => {
     setChosen(p => ({ ...p, [l.key]: asset }));
+    reseedEdit(l, asset);
     setNote('');
     scanRetro(l, asset);
   };
   const undoChoice = (l) => {
+    if (l.auto && !l.auto.isNew && lines.some(x => x.key !== l.key && x.asset && x.asset.id === l.auto.id)) {
+      setNote(`${l.auto.name} (${placeText(l.auto)}) is now used by another line of this order. Change that line first, or pick other equipment here.`);
+      return;
+    }
     setChosen(p => { const x = { ...p }; delete x[l.key]; return x; });
+    reseedEdit(l, l.auto);
     setRetro(p => { const x = { ...p }; delete x[l.key]; return x; });
     retroSeq.current[l.key] = (retroSeq.current[l.key] || 0) + 1;
   };
@@ -1386,21 +1439,32 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     try {
       const ranked = await store.rankLine(normalizedCode, l.ms, matches.length === 1);
       setMoreRank(p => ({ ...p, [l.key]: { busy: false, ranked } }));
-    } catch (e) { setMoreRank(p => ({ ...p, [l.key]: { busy: false, ranked: [], error: errText(e) } })); }
+      return ranked;
+    } catch (e) { setMoreRank(p => ({ ...p, [l.key]: { busy: false, ranked: [], error: errText(e) } })); return []; }
   };
-  // "Change" moves the line to the next best fit straight away; the panel lists the rest, a search and "Create new asset"
+  // "Change" moves the line to the next best fit straight away (looking up similar names when none is known yet);
+  // the panel lists the rest, a search and "Create new asset"
   const openChange = (l) => {
     setView(l, 'list');
-    if (!chosen[l.key]) {
-      const next = candidatesFor(l).find(c => c.score >= 0.6 && placeOk(l.ms, c.asset));
-      if (next) choose(l, next.asset);
-    }
-    if (l.partial && !moreRank[l.key]) rankMore(l);
+    const ok = (c) => c.score >= 0.6 && placeOk(l.ms, c.asset) && !takenIds.has(c.asset.id) && !(l.asset && c.asset.id === l.asset.id);
+    const next = chosen[l.key] ? null : candidatesFor(l).find(ok);
+    if (next) choose(l, next.asset);
+    if (moreRank[l.key] || (next && !l.partial)) return;
+    const n0 = retroSeq.current[l.key] || 0;
+    rankMore(l).then(r => {
+      if (next || chosen[l.key] || (retroSeq.current[l.key] || 0) !== n0) return; // the admin picked something meanwhile
+      const n = r.find(ok);
+      if (n) choose(l, n.asset);
+    });
   };
   const useNewAsset = async (l) => {
     const f = newFor[l.key] || { name: l.ms.equipment, room: l.ms.room, area: l.ms.area };
     const name = safeString(f.name), room = safeString(f.room), area = safeString(f.area);
     if (!name || !room || !area) { setNote('Enter a name, room and area for the new asset.'); return; }
+    if (lines.some(x => x.key !== l.key && x.asset && x.asset.isNew && sameText(x.asset.name, name) && sameText(x.asset.room, room) && sameText(x.asset.area, area))) {
+      setNote(`${name} (${room} / ${area}) is already being created for another line.`);
+      return;
+    }
     try {
       const existing = await store.findAssetExact(name, room, area);
       if (existing) {
@@ -1420,20 +1484,28 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     setEditMode(on);
     if (!on) { setEdits({}); return; }
     const e = {};
-    lines.forEach(l => { if (l.asset && !l.asset.isNew) e[l.key] = { name: l.name, room: l.room, area: l.area }; });
+    lines.forEach(l => { if (l.asset && !l.asset.isNew) e[l.key] = { id: l.asset.id, name: l.name, room: l.room, area: l.area }; });
     setEdits(e);
   };
 
+  // A picture is compressed once; one that cannot be read is reported, not dropped silently
   const onPhoto = async (file) => {
-    if (!file) { setPhoto(null); setPhotoName(''); return; }
+    const n = ++photoSeq.current;
+    setPhoto(null);
+    if (!file) { setPhotoName(''); setPhotoBusy(false); return; }
     setPhotoName(file.name);
-    setPhoto(await compressImage(file));
+    setPhotoBusy(true);
+    const data = await compressImage(file);
+    if (n !== photoSeq.current) return;
+    setPhotoBusy(false);
+    setPhoto(data);
+    if (!data) { setPhotoName(''); setNote(`Could not read ${file.name} (use a JPG or PNG picture); it will not be attached.`); }
   };
 
   const validate = () => {
     const today = toDateInput(new Date());
     if (!normalizedCode) return 'Enter a SAP order.';
-    if (order && order.status === 'loading') return 'Still loading this SAP order. Try again in a moment.';
+    if (order && (order.status === 'loading' || order.refreshing)) return 'Still loading this SAP order. Try again in a moment.';
     if (order && order.status === 'error') return `Could not load this SAP order: ${order.error}`;
     if (!dateStr || dateStr > today || dateStr < yearBefore(today)) return 'Date must be within the last year and not in the future.';
     if (!INITIALS_RE.test(normalizeInitials(initials))) return 'Initials: letters only, up to 4 per person, separate people with "/" (e.g. EL/LH).';
@@ -1443,10 +1515,13 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     if (lines.some(l => !excluded[l.key] && !l.asset)) return 'Choose the equipment for the highlighted line(s), or untick them.';
     if (lines.some(l => !excluded[l.key] && (!safeString(l.name) || !safeString(l.room) || !safeString(l.area)))) return 'Every equipment line needs a name, room and area.';
     if (included.length === 0) return 'Nothing to log: no equipment selected.';
+    const sigs = included.map(l => (l.asset.isNew ? `new|${normName(l.name)}|${normName(l.room)}|${normName(l.area)}` : l.asset.id));
+    if (sigs.some((x, i) => sigs.indexOf(x) !== i)) return 'Two lines use the same equipment. Change one of them.';
     if (included.every(isDupe)) return 'Every selected equipment already has this order logged for that date.';
     if (included.some(l => !isDupe(l) && !(lineHours(l) > 0))) return 'Every selected equipment needs hours greater than 0.';
     if (Math.abs(hoursSum - total) > 0.01) return `Line hours add up to ${hoursSum} but the order total is ${total}.`;
     if (Object.values(retro).some(r => r.status === 'scanning')) return 'Still checking earlier entries for a changed line. Try again in a moment.';
+    if (photoBusy) return 'Still preparing the paperwork picture. Try again in a moment.';
     return '';
   };
 
@@ -1468,14 +1543,35 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     if (r.tried && !r.linked) notes.push(`${asset.name}: SAP order saved without its equipment lookup (craa5_asset).`);
   };
 
-  // seen: "order|date|asset" already saved by earlier rows of this submit, so two rows never log the same thing twice
+  // seen: "order|date|asset" already saved by earlier rows of this submit, and "log|id" for entries this submit created or
+  // moved, so two rows never log the same thing twice and no entry is moved twice
   const commit = async (seen) => {
     const notes = [];
     const info = [];
     const ini = normalizeInitials(initials);
-    // 1. Equipment edits made through "Edit pre-filled details"
+    // 0. Earlier entries to move for changed lines: read before anything is written, and each entry claimed by one line only
+    const retroRows = {};
+    const claimed = new Set();
+    for (const l of included) {
+      const r = retro[l.key];
+      if (!r || !r.apply || !r.count) continue;
+      const stillUsed = !!r.from && lines.some(x => x.key !== l.key && x.asset && x.asset.id === r.from.id);
+      const filter = retroFilter(normalizedCode, r.from, l.ms, stillUsed);
+      if (!filter) continue;
+      try {
+        const rows = await api.query(LOG_TABLE, { select: FIX_SELECT, filter, top: LIMITS.countCap });
+        retroRows[l.key] = rows.filter(x => !claimed.has(x.craa5__log_id) && !seen.has(`log|${cleanGuid(x.craa5__log_id)}`));
+        retroRows[l.key].forEach(x => claimed.add(x.craa5__log_id));
+        if (rows.length >= LIMITS.countCap) notes.push(`${l.name}: more than ${LIMITS.countCap} earlier entries; the first ${LIMITS.countCap} are moved.`);
+      } catch (e) { notes.push(`${l.name}: earlier entries could not be checked (${errText(e)}).`); }
+    }
+    lines.forEach(l => {
+      const r = retro[l.key];
+      if (excluded[l.key] && r && r.apply && r.count) notes.push(`${l.name}: ${plural(r.count, 'earlier entry was', 'earlier entries were')} not moved because the line is unticked.`);
+    });
+    // 1. Equipment edits made through "Edit pre-filled details" (only for the equipment each edit was made for)
     for (const l of lines) {
-      if (excluded[l.key] || !l.asset || l.asset.isNew || !edits[l.key]) continue;
+      if (excluded[l.key] || !l.asset || l.asset.isNew || !edits[l.key] || edits[l.key].id !== l.asset.id) continue;
       const a = l.asset;
       if (a.name !== l.name || a.room !== l.room || a.area !== l.area) {
         try { await store.updateAsset(a, l.name, l.room, l.area); }
@@ -1506,16 +1602,19 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
         } catch (e) { notes.push(`${assetOf(l).name}: the SAP row's equipment link could not be stored (${errText(e)}).`); }
       }
     }
-    // 4. Changed lines: move the earlier entries found for them onto the chosen equipment
+    // 4. Changed lines: move the earlier entries read in step 0 onto the chosen equipment
     for (const l of included) {
       const r = retro[l.key];
-      if (!r || !r.apply || !r.filter || !r.count) continue;
-      try {
-        const res = await repointEntries(api, r.filter, r.from, assetOf(l));
-        if (res.fixed) info.push(`Moved ${plural(res.fixed, 'earlier entry', 'earlier entries')} to ${assetOf(l).name} (${placeText(assetOf(l))}).`);
-        if (res.failed) notes.push(`${assetOf(l).name}: ${plural(res.failed, 'earlier entry', 'earlier entries')} could not be moved (${res.error}).`);
-        setRetro(p => ({ ...p, [l.key]: { ...p[l.key], count: 0, apply: false } }));
-      } catch (e) { notes.push(`${assetOf(l).name}: earlier entries could not be checked (${errText(e)}).`); }
+      const todo = retroRows[l.key];
+      if (!r || !todo) continue;
+      const target = assetOf(l);
+      if (todo.length) {
+        const res = await repointRows(api, todo, r.from, target);
+        res.movedIds.forEach(id => seen.add(`log|${cleanGuid(id)}`));
+        if (res.fixed) info.push(`Moved ${plural(res.fixed, 'earlier entry', 'earlier entries')} to ${target.name} (${placeText(target)}).`);
+        if (res.failed) notes.push(`${target.name}: ${plural(res.failed, 'earlier entry', 'earlier entries')} could not be moved (${res.error}).`);
+      }
+      setRetro(p => ({ ...p, [l.key]: { ...p[l.key], count: 0, apply: false } }));
     }
     // 5. Skip equipment already logged for this order and date (checked again now, and against earlier rows of this submit)
     let already = dupes;
@@ -1540,7 +1639,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     const savedIds = [];
     const failedNames = [];
     results.forEach((r, i) => {
-      if (r.ok) { savedIds.push(r.value); seen.add(seenKey(toLog[i].asset.id)); }
+      if (r.ok) { savedIds.push(r.value); seen.add(seenKey(toLog[i].asset.id)); seen.add(`log|${cleanGuid(r.value)}`); }
       else failedNames.push(toLog[i].name);
     });
     if (savedIds.length) setDupes(prev => new Set(Array.from(prev).concat(results.map((r, i) => (r.ok ? toLog[i].asset.id : null)).filter(Boolean))));
@@ -1605,14 +1704,14 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
                   </tbody>
                 </table>
               </div>
-            ) : <Text className={styles.hint} block>{mr && mr.busy ? 'Looking for similar equipment…' : 'No other close matches.'}</Text>}
+            ) : <Text className={styles.hint} block>{mr && mr.busy ? 'Looking for similar equipment…' : mr ? 'No other close matches.' : 'No other close matches yet.'}</Text>}
             {!mr && <Button size="small" style={{ marginTop: 6 }} onClick={() => rankMore(l)}>Look for similar names</Button>}
             {mr && mr.error && <Text className={styles.errorText} block role="alert">Could not look for similar equipment: {mr.error}</Text>}
           </div>
         )}
         {view === 'search' && (
           <div style={{ marginTop: 6 }}>
-            <AssetPicker store={store} initialQuery={l.ms.equipment} ariaLabel={`Search equipment for ${l.ms.equipment}`} actionLabel="Use" exclude={takenIds}
+            <AssetPicker store={store} initialQuery={l.ms.equipment} ariaLabel={`Search equipment for ${l.ms.equipment}`} actionLabel="Use" exclude={takenIds} disabled={saving}
               onPick={(a) => { choose(l, a); setView(l, 'list'); }} />
           </div>
         )}
@@ -1733,7 +1832,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
         <div className={styles.field}>
           <Text className={styles.label}>Paperwork Picture</Text>
           <input type="file" accept="image/*" aria-label="Paperwork picture" disabled={saving} onChange={(e) => onPhoto(e.target.files && e.target.files[0])} style={{ minWidth: '150px', padding: '4px' }} />
-          {photoName && <span className={styles.hint}>{photoName}</span>}
+          {photoName && <span className={styles.hint}>{photoName}{photoBusy ? ' (preparing…)' : ''}</span>}
         </div>
         <Button appearance="subtle" style={{ alignSelf: 'flex-start', marginTop: '16px' }} aria-label={`Remove row ${index + 1}`} disabled={!canRemove || saving} onClick={onRemove}>Remove</Button>
       </div>
@@ -1766,7 +1865,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
               {lines.map(l => {
                 const off = !!excluded[l.key];
                 const dupe = isDupe(l);
-                const editing = editMode && edits[l.key];
+                const editing = editMode && edits[l.key] && l.asset && !l.asset.isNew && edits[l.key].id === l.asset.id;
                 const open = !off && !l.extra && !!l.ms && (!!panel[l.key] || !l.asset);
                 const rt = retro[l.key];
                 const differs = l.ms && l.asset && !(sameText(l.ms.equipment, l.asset.name) && sameText(l.ms.room, l.asset.room) && sameText(l.ms.area, l.asset.area));
@@ -1777,7 +1876,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
                       <td className={styles.td}><input type="checkbox" aria-label={`Include ${l.name}`} checked={!off} disabled={saving} onChange={(e) => setExcluded(p => ({ ...p, [l.key]: !e.target.checked }))} /></td>
                       <td className={styles.td}>
                         {editing ? (
-                          <Input size="small" aria-label={`Name for ${l.name}`} value={edits[l.key].name} onChange={(e, d) => setEdits(p => ({ ...p, [l.key]: { ...p[l.key], name: d.value } }))} />
+                          <Input size="small" aria-label={`Name for ${l.name}`} value={edits[l.key].name} disabled={saving} onChange={(e, d) => setEdits(p => ({ ...p, [l.key]: { ...p[l.key], name: d.value } }))} />
                         ) : <strong>{l.name || '(unnamed)'}</strong>}
                         {differs && <div className={styles.hint}>SAP row: {l.ms.equipment}{placeText(l.ms) ? ` · ${placeText(l.ms)}` : ''}</div>}
                         {l.extra && <Button size="small" appearance="subtle" style={{ marginLeft: 6 }} aria-label={`Remove ${l.name} from this order`} disabled={saving} onClick={() => setExtras(p => p.filter(x => x.key !== l.key))}>Remove</Button>}
@@ -1785,8 +1884,8 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
                           <Button size="small" appearance="subtle" style={{ marginLeft: 6 }} aria-label={`Change equipment for ${l.ms.equipment}`} disabled={saving} onClick={() => openChange(l)}>Change</Button>
                         )}
                       </td>
-                      <td className={styles.td}>{editing ? <Input size="small" aria-label={`Room for ${l.name}`} list={roomList} value={edits[l.key].room} onChange={(e, d) => { setEdits(p => ({ ...p, [l.key]: { ...p[l.key], room: d.value } })); setTyping(t => ({ ...t, room: d.value })); }} /> : l.room}</td>
-                      <td className={styles.td}>{editing ? <Input size="small" aria-label={`Area for ${l.name}`} list={areaList} value={edits[l.key].area} onChange={(e, d) => { setEdits(p => ({ ...p, [l.key]: { ...p[l.key], area: d.value } })); setTyping(t => ({ ...t, area: d.value, roomCtx: edits[l.key].room })); }} /> : l.area}</td>
+                      <td className={styles.td}>{editing ? <Input size="small" aria-label={`Room for ${l.name}`} list={roomList} value={edits[l.key].room} disabled={saving} onChange={(e, d) => { setEdits(p => ({ ...p, [l.key]: { ...p[l.key], room: d.value } })); setTyping(t => ({ ...t, room: d.value })); }} /> : l.room}</td>
+                      <td className={styles.td}>{editing ? <Input size="small" aria-label={`Area for ${l.name}`} list={areaList} value={edits[l.key].area} disabled={saving} onChange={(e, d) => { setEdits(p => ({ ...p, [l.key]: { ...p[l.key], area: d.value } })); setTyping(t => ({ ...t, area: d.value, roomCtx: edits[l.key].room })); }} /> : l.area}</td>
                       <td className={styles.td}>{l.col ? freqLabel(l.col) : ''}</td>
                       <td className={styles.td}>
                         {l.asset && !off ? (
@@ -1797,7 +1896,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
                       </td>
                       <td className={styles.td}>
                         <span className={tagClass(statusKind)} title={l.reason || undefined}>{statusText}</span>
-                        {rt && rt.apply && rt.count > 0 && <div className={styles.hint}>+ moves {rt.count}{rt.more ? '+' : ''} earlier</div>}
+                        {!off && rt && rt.apply && rt.count > 0 && <div className={styles.hint}>+ moves {rt.count}{rt.more ? '+' : ''} earlier</div>}
                       </td>
                     </tr>
                     {open && <tr><td className={styles.td} colSpan={7}>{renderPanel(l)}</td></tr>}
@@ -1835,7 +1934,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
                 </div>
               </div>
               {addMode === 'search' ? (
-                <AssetPicker store={store} ariaLabel="Search equipment" exclude={takenIds} onPick={addExtra} />
+                <AssetPicker store={store} ariaLabel="Search equipment" exclude={takenIds} disabled={saving} onPick={addExtra} />
               ) : (
                 <div className={styles.rowFields} style={{ alignItems: 'flex-end' }}>
                   <div className={styles.field}><Text className={styles.label}>Room</Text><Input aria-label="New equipment room" list={roomList} value={newRoom} onChange={(e, d) => { setNewRoom(d.value); setTyping(t => ({ ...t, room: d.value })); }} /></div>
@@ -1884,11 +1983,12 @@ const RepairIds = ({ ctx, onCount }) => {
   const [showAll, setShowAll] = useState(false);
   const [result, setResult] = useState(null);
   const nextRef = useRef(null);                  // continues the scan from where the last page stopped
+  const pendingRef = useRef(null);               // a page that was read but not checked yet (its lookup failed)
   const scannedRef = useRef(0);
   const scanId = useRef(0);                      // a newer scan (or a reset) makes older results stale
 
   const resetScan = useCallback(() => {
-    scanId.current += 1; nextRef.current = null; scannedRef.current = 0;
+    scanId.current += 1; nextRef.current = null; pendingRef.current = null; scannedRef.current = 0;
     setScan({ started: false, done: false, scanned: 0 });
     setGroups([]); setChoice({}); setApply({}); setExtraOpts({}); setSearchOpen({}); setResult(null); setScanError('');
   }, []);
@@ -1906,25 +2006,30 @@ const RepairIds = ({ ctx, onCount }) => {
     try {
       let scanned = reset ? 0 : scannedRef.current;
       let done = false;
+      let failure = null;
       const bad = [];
+      // The scan position only moves past a page once it has been read and checked; what was found before an error is kept
       for (let p = 0; p < m.pages && bad.length < 100 && !done; p++) {
         setProgress(`Scanning entries ${scanned + 1}–${scanned + m.pageSize}…`);
-        let pg;
-        if (nextRef.current) pg = await nextRef.current();
-        else if (scanned === 0) pg = await api.page(LOG_TABLE, { select: FIX_SELECT, filter: scanFilter(mode, scope), top: m.pageSize });
-        else { done = true; break; }
-        if (!live()) return;
+        let pg = pendingRef.current;
+        try {
+          if (!pg) {
+            if (nextRef.current) pg = await nextRef.current();
+            else if (scanned === 0) pg = await api.page(LOG_TABLE, { select: FIX_SELECT, filter: scanFilter(mode, scope), top: m.pageSize });
+            else { done = true; break; }
+            if (!live()) return;
+            pendingRef.current = pg;
+          }
+          if (mode !== 'missing') { await store.resolveAssets(pg.rows.map(r => r.craa5_equipmentguid)); if (!live()) return; }
+        } catch (e) { failure = e; break; }
+        pendingRef.current = null;
         nextRef.current = pg.next;
         scanned += pg.rows.length;
         scannedRef.current = scanned;
         if (!pg.next) done = true;
         if (mode === 'missing') bad.push(...pg.rows);
-        else {
-          await store.resolveAssets(pg.rows.map(r => r.craa5_equipmentguid));
-          if (!live()) return;
-          if (mode === 'unknown') bad.push(...pg.rows.filter(r => !store.hasAsset(r.craa5_equipmentguid)));
-          else bad.push(...pg.rows.filter(r => { const a = store.getAsset(r.craa5_equipmentguid); return a && placeDiffers(r, a); }));
-        }
+        else if (mode === 'unknown') bad.push(...pg.rows.filter(r => !store.hasAsset(r.craa5_equipmentguid)));
+        else bad.push(...pg.rows.filter(r => { const a = store.getAsset(r.craa5_equipmentguid); return a && placeDiffers(r, a); }));
       }
 
       // Group identical entries, then look up candidates once per new group
@@ -1932,7 +2037,7 @@ const RepairIds = ({ ctx, onCount }) => {
       const fresh = new Map();
       bad.forEach(r => {
         const l = { id: r.craa5__log_id, equipment: safeString(r.craa5_equipment), guid: cleanGuid(r.craa5_equipmentguid), sap: normCode(r.craa5_sap), room: safeString(r.craa5_room), area: safeString(r.craa5_area) };
-        const key = [normName(l.equipment), normName(l.room), normName(l.area), l.sap, l.guid].join('|');
+        const key = [canonName(l.equipment), placeKey(l.room), placeKey(l.area), l.sap, l.guid].join('|');
         const into = prior.get(key) || fresh.get(key);
         if (into) { if (!into.ids.includes(l.id)) into.ids = [...into.ids, l.id]; return; }
         const current = mode === 'place' ? store.getAsset(l.guid) : null;
@@ -1956,13 +2061,18 @@ const RepairIds = ({ ctx, onCount }) => {
         return merged.sort((a, b) => order[a.tier] - order[b.tier] || b.ids.length - a.ids.length);
       });
       setScan({ started: true, done, scanned });
+      if (failure) setScanError(`${errText(failure)}. Scan the next batch to try that page again.`);
     } catch (e) { if (live()) setScanError(errText(e)); }
     finally { if (live()) { setBusy(''); setProgress(''); } }
   };
 
-  const selected = groups.filter(g => apply[g.key] && choice[g.key]);
+  // Only groups on screen can be applied
+  const visible = groups.filter(g => showAll || g.tier !== 'none' || choice[g.key] || g.lookupError);
+  const hidden = groups.length - visible.length;
+  const shown = visible.slice(0, LIMITS.fixGroupsShown);
+  const selected = shown.filter(g => apply[g.key] && choice[g.key]);
   const selectedRows = selected.reduce((s, g) => s + g.ids.length, 0);
-  const highGroups = groups.filter(g => g.tier === 'high' && choice[g.key]);
+  const highGroups = shown.filter(g => g.tier === 'high' && choice[g.key] && g.ranked.length && g.ranked[0].asset.id === choice[g.key]);
 
   const applySelected = async () => {
     const todo = selected.filter(g => store.getAsset(choice[g.key]));
@@ -1981,7 +2091,7 @@ const RepairIds = ({ ctx, onCount }) => {
     // Remove fixed entries from the list in place; nothing is rescanned
     setGroups(prev => prev.map(g => (appliedKeys.has(g.key) ? { ...g, ids: g.ids.filter(id => failedIds.has(id)) } : g)).filter(g => g.ids.length));
     setResult({ ok: res.length - failedIds.size, failed: failedIds.size, error: firstError ? errText(firstError.error) : '' });
-    store.dropOrders();
+    ctx.dataChanged();
     setBusy('');
   };
 
@@ -1992,9 +2102,6 @@ const RepairIds = ({ ctx, onCount }) => {
     setSearchOpen(p => ({ ...p, [g.key]: false }));
   };
 
-  const visible = groups.filter(g => showAll || g.tier !== 'none' || choice[g.key] || g.lookupError);
-  const hidden = groups.length - visible.length;
-  const shown = visible.slice(0, LIMITS.fixGroupsShown);
   const failedLookups = groups.filter(g => g.lookupError).length;
 
   return (
@@ -2046,6 +2153,8 @@ const RepairIds = ({ ctx, onCount }) => {
               {shown.map(g => {
                 const options = uniqueById([...g.ranked.map(r => r.asset), ...(extraOpts[g.key] || [])]);
                 const top = g.ranked.find(r => r.asset.id === choice[g.key]);
+                // The badge follows the candidate chosen, not only the group's best one
+                const tier = top && top !== g.ranked[0] ? tierOf(top.score) : g.tier;
                 return (
                   <tr key={g.key}>
                     <td className={styles.td}><input type="checkbox" aria-label={`Apply ${g.equipment || 'blank entry'}`} checked={!!apply[g.key] && !!choice[g.key]} disabled={!choice[g.key] || !!busy} onChange={(e) => setApply(p => ({ ...p, [g.key]: e.target.checked }))} /></td>
@@ -2058,18 +2167,18 @@ const RepairIds = ({ ctx, onCount }) => {
                       {g.current && <div className={styles.hint}>ID is {g.current.name} · {placeText(g.current)}</div>}
                     </td>
                     <td className={styles.td} style={{ minWidth: 260 }}>
-                      <Select aria-label={`Equipment for ${g.equipment || 'blank entry'}`} value={choice[g.key] || ''} disabled={!!busy} onChange={(e, d) => { setChoice(p => ({ ...p, [g.key]: d.value })); if (!d.value) setApply(p => ({ ...p, [g.key]: false })); }}>
+                      <Select aria-label={`Equipment for ${g.equipment || 'blank entry'}`} value={choice[g.key] || ''} disabled={!!busy} onChange={(e, d) => { setChoice(p => ({ ...p, [g.key]: d.value })); const r = g.ranked.find(x => x.asset.id === d.value); if (!d.value || (r && !placeOk(g, r.asset))) setApply(p => ({ ...p, [g.key]: false })); }}>
                         <option value="">No match</option>
                         {options.map(a => <option key={a.id} value={a.id}>{a.name} — {placeText(a)}</option>)}
                       </Select>
                       {searchOpen[g.key]
-                        ? <div style={{ marginTop: 4 }}><AssetPicker store={store} initialQuery={g.equipment} ariaLabel={`Search equipment for ${g.equipment}`} actionLabel="Use" onPick={(a) => pickManual(g, a)} /></div>
+                        ? <div style={{ marginTop: 4 }}><AssetPicker store={store} initialQuery={g.equipment} ariaLabel={`Search equipment for ${g.equipment}`} actionLabel="Use" disabled={!!busy} onPick={(a) => pickManual(g, a)} /></div>
                         : <Button size="small" appearance="subtle" aria-label={`Search other equipment for ${g.equipment}`} onClick={() => setSearchOpen(p => ({ ...p, [g.key]: true }))}>Search other equipment…</Button>}
                     </td>
                     <td className={styles.td}>
                       {top ? (
-                        <span className={mergeClasses(styles.tag, g.tier === 'high' ? styles.tagOk : g.tier === 'none' ? styles.tagBad : styles.tagWarn)}>
-                          {TIER_LABEL[g.tier]} · {top.reason}{g.ambiguous ? ' · ambiguous' : ''}{g.conflict ? ' · SAP order and name disagree' : ''}
+                        <span className={mergeClasses(styles.tag, tier === 'high' ? styles.tagOk : tier === 'none' ? styles.tagBad : styles.tagWarn)}>
+                          {TIER_LABEL[tier]} · {top.reason}{g.ambiguous ? ' · ambiguous' : ''}{g.conflict ? ' · SAP order and name disagree' : ''}
                         </span>
                       ) : choice[g.key] ? <span className={mergeClasses(styles.tag, styles.tagWarn)}>manual</span>
                         : <span className={mergeClasses(styles.tag, styles.tagBad)} title={g.lookupError || ''}>{g.lookupError ? 'Lookup failed' : 'No match'}</span>}
@@ -2089,7 +2198,7 @@ const RepairIds = ({ ctx, onCount }) => {
 // Equipment records in one room that are the same equipment: same area and the same name (or, with similar on, a similar name)
 const clusterAssets = (list, similar) => {
   const byArea = new Map();
-  list.forEach(a => { const k = normName(a.area); if (!byArea.has(k)) byArea.set(k, []); byArea.get(k).push(a); });
+  list.forEach(a => { const k = placeKey(a.area); if (!byArea.has(k)) byArea.set(k, []); byArea.get(k).push(a); });
   const out = [];
   byArea.forEach((items, areaKey) => {
     const prof = items.map(a => nameProfile(a.name));
@@ -2107,7 +2216,7 @@ const clusterAssets = (list, similar) => {
       out.push({
         key: `${areaKey}|${members.map(m => m.id).sort().join(',')}`,
         room: members[0].room, area: members[0].area,
-        identical: new Set(members.map(m => canonName(m.name))).size === 1,
+        identical: new Set(members.map(m => canonName(m.name))).size === 1 && new Set(members.map(m => safeString(m.area).trim().toLowerCase())).size === 1,
         members: members.map(m => ({ ...m })),
       });
     });
@@ -2128,8 +2237,19 @@ const UnifyIds = ({ ctx }) => {
   const [found, setFound] = useState(null);   // { room, area, similar, capped, checked, clusters }
   const [keep, setKeep] = useState({});       // clusterKey -> asset id kept
   const [apply, setApply] = useState({});     // clusterKey -> bool
+  const [skip, setSkip] = useState({});       // "clusterKey|assetId" -> record left where it is
   const [result, setResult] = useState(null);
   const runId = useRef(0);
+  // In a similar-names group, records whose name is not close to the kept one are left out until ticked
+  const skipFor = (c, keepId) => {
+    const kept = c.members.find(m => m.id === keepId);
+    const out = {};
+    if (!kept || c.identical) return out;
+    const kp = nameProfile(kept.name);
+    c.members.forEach(m => { if (m.id !== keepId && nameSimilarity(nameProfile(m.name), kp) < 0.8) out[`${c.key}|${m.id}`] = true; });
+    return out;
+  };
+  const isSkipped = (c, m) => !!skip[`${c.key}|${m.id}`];
   const roomOpts = useSuggest(store, 'craa5_roomname', room);
   const areaOpts = useSuggest(store, 'craa5_areaname', area, room.trim());
 
@@ -2157,35 +2277,39 @@ const UnifyIds = ({ ctx }) => {
       // Keep the record the SAP orders point at, then the one most entries use
       const k = {};
       const ap = {};
+      let sk = {};
       clusters.forEach(c => {
         const best = [...c.members].sort((x, y) => (y.links.length ? 1 : 0) - (x.links.length ? 1 : 0) || ((y.count && y.count.n) || 0) - ((x.count && x.count.n) || 0))[0];
         k[c.key] = best.id;
         ap[c.key] = c.identical;
+        sk = { ...sk, ...skipFor(c, best.id) };
       });
-      setKeep(k); setApply(ap);
+      setKeep(k); setApply(ap); setSkip(sk);
       setFound({ room: r, area: a, similar, capped, checked: list.length, clusters });
     } catch (e) { if (live()) setError(errText(e)); }
     finally { if (live()) { setBusy(''); setProgress(''); } }
   };
 
-  const todo = found ? found.clusters.filter(c => apply[c.key] && keep[c.key]) : [];
-  const toMove = todo.reduce((s, c) => s + c.members.filter(m => m.id !== keep[c.key]).reduce((t, m) => t + ((m.count && m.count.n) || 0), 0), 0);
+  const todo = found ? found.clusters.filter(c => apply[c.key] && keep[c.key] && c.members.some(m => m.id !== keep[c.key] && !isSkipped(c, m))) : [];
+  const movers = (c) => c.members.filter(m => m.id !== keep[c.key] && !isSkipped(c, m));
+  const toMove = todo.reduce((s, c) => s + movers(c).reduce((t, m) => t + ((m.count && m.count.n) || 0), 0), 0);
+  const toMoveMore = todo.some(c => movers(c).some(m => !m.count || m.count.more));
 
   const unify = async () => {
     if (!todo.length) return;
     setBusy('apply'); setResult(null); setError('');
-    let moved = 0, relinked = 0, failed = 0, firstError = '';
+    let moved = 0, relinked = 0, failed = 0, firstError = '', remaining = false;
     const doneKeys = new Set();
     for (const c of todo) {
       const kept = c.members.find(m => m.id === keep[c.key]);
       let ok = true;
-      for (const m of c.members) {
-        if (m.id === kept.id) continue;
+      for (const m of movers(c)) {
         setProgress(`Moving entries from ${m.name} (${shortId(m.id)}) to ${kept.name} (${shortId(kept.id)})…`);
         try {
           const r = await repointEntries(api, guidEq('craa5_equipmentguid', m.id), null, kept, true);
           moved += r.fixed; failed += r.failed;
           if (r.failed) { ok = false; if (!firstError) firstError = r.error; }
+          if (r.more) { ok = false; remaining = true; }
         } catch (e) { ok = false; failed += 1; if (!firstError) firstError = errText(e); }
         if (moveLinks) {
           for (const row of m.links || []) {
@@ -2196,9 +2320,9 @@ const UnifyIds = ({ ctx }) => {
       }
       if (ok) doneKeys.add(c.key);
     }
-    store.dropOrders();
+    ctx.dataChanged();
     setFound(f => ({ ...f, clusters: f.clusters.filter(c => !doneKeys.has(c.key)) }));
-    setResult({ moved, relinked, failed, error: firstError, groups: doneKeys.size });
+    setResult({ moved, relinked, failed, error: firstError, groups: doneKeys.size, remaining });
     setProgress(''); setBusy('');
   };
 
@@ -2221,6 +2345,7 @@ const UnifyIds = ({ ctx }) => {
         {result && (
           <Text className={result.failed ? styles.errorText : styles.okText} block>
             Moved {plural(result.moved, 'entry', 'entries')}{result.relinked ? ` and ${plural(result.relinked, 'SAP row link', 'SAP row links')}` : ''}{result.failed ? `; ${result.failed} failed (${result.error})` : ''}.
+            {result.remaining ? ' More entries remain on a duplicate: click Unify again to move the rest.' : ''}
           </Text>
         )}
       </div>
@@ -2235,7 +2360,7 @@ const UnifyIds = ({ ctx }) => {
               <div className={styles.actionBar}>
                 <Checkbox label="Also point SAP orders at the kept record" checked={moveLinks} disabled={!!busy} onChange={(e, d) => setMoveLinks(!!d.checked)} />
                 <Button appearance="primary" className={styles.btnCta} disabled={!!busy || !todo.length} onClick={unify}>
-                  {busy === 'apply' ? 'Unifying…' : `Unify ${plural(todo.length, 'group', 'groups')} (${plural(toMove, 'entry', 'entries')} to move)`}
+                  {busy === 'apply' ? 'Unifying…' : `Unify ${plural(todo.length, 'group', 'groups')} (${toMove}${toMoveMore ? '+' : ''} ${toMove === 1 && !toMoveMore ? 'entry' : 'entries'} to move)`}
                 </Button>
               </div>
               <div style={{ overflowX: 'auto' }}>
@@ -2251,12 +2376,16 @@ const UnifyIds = ({ ctx }) => {
                         <td className={styles.td}>
                           {c.members.map(m => (
                             <div key={m.id} style={{ padding: '2px 0' }}>
-                              <strong>{m.name}</strong> <span className={styles.hint}>· ID …{shortId(m.id)} · {m.count ? `${m.count.n}${m.count.more ? '+' : ''} ${m.count.n === 1 && !m.count.more ? 'entry' : 'entries'}` : 'entries not counted'}{m.links.length ? ` · ${plural(m.links.length, 'SAP row', 'SAP rows')}` : ''}</span>
+                              {m.id !== keep[c.key] && (
+                                <input type="checkbox" style={{ marginRight: 6 }} aria-label={`Move ${m.name} …${shortId(m.id)}`} checked={!isSkipped(c, m)} disabled={!!busy}
+                                  onChange={(e) => setSkip(p => ({ ...p, [`${c.key}|${m.id}`]: !e.target.checked }))} />
+                              )}
+                              <strong>{m.name}</strong> <span className={styles.hint}>{m.area !== c.area ? `· ${m.area || '(no area)'} ` : ''}· ID …{shortId(m.id)} · {m.count ? `${m.count.n}${m.count.more ? '+' : ''} ${m.count.n === 1 && !m.count.more ? 'entry' : 'entries'}` : 'entries not counted'}{m.links.length ? ` · ${plural(m.links.length, 'SAP row', 'SAP rows')}` : ''}</span>
                             </div>
                           ))}
                         </td>
                         <td className={styles.td} style={{ minWidth: 240 }}>
-                          <Select aria-label={`Record to keep for ${c.members[0].name}`} value={keep[c.key] || ''} disabled={!!busy} onChange={(e, d) => setKeep(p => ({ ...p, [c.key]: d.value }))}>
+                          <Select aria-label={`Record to keep for ${c.members[0].name}`} value={keep[c.key] || ''} disabled={!!busy} onChange={(e, d) => { setKeep(p => ({ ...p, [c.key]: d.value })); setSkip(p => { const x = {}; Object.keys(p).forEach(k => { if (!k.startsWith(`${c.key}|`)) x[k] = p[k]; }); return { ...x, ...skipFor(c, d.value) }; }); }}>
                             {c.members.map(m => <option key={m.id} value={m.id}>{m.name} · …{shortId(m.id)}</option>)}
                           </Select>
                         </td>
@@ -2585,7 +2714,10 @@ export default function GeneratedComponent(props) {
     return () => clearInterval(t);
   }, []);
   const minDate = useMemo(() => yearBefore(maxDate), [maxDate]);
-  const ctx = useMemo(() => ({ api, store, maxDate, minDate }), [api, store, maxDate, minDate]);
+  // dataVer goes up when the Fix tab changes IDs, so open orders on the Add tab work out their equipment again
+  const [dataVer, setDataVer] = useState(0);
+  const dataChanged = useCallback(() => { store.dropOrders(); setDataVer(v => v + 1); }, [store]);
+  const ctx = useMemo(() => ({ api, store, maxDate, minDate, dataVer, dataChanged }), [api, store, maxDate, minDate, dataVer, dataChanged]);
 
   const [activeTab, setActiveTab] = useState('add');
   const [fixVisited, setFixVisited] = useState(false);
@@ -2657,6 +2789,9 @@ export default function GeneratedComponent(props) {
         const h = refs.current[snapshot[i].key];
         if (!h) continue;
         lastShared = h.getShared();
+        // Checked again: nothing on a row can change while saving, but a row must never be written unchecked
+        const again = h.validate();
+        if (again) { failure = `Row ${i + 1}: ${again}`; break; }
         const res = await h.commit(seen);
         saved += res.saved || 0;
         (res.notes || []).forEach(n => notes.push(`Row ${i + 1}: ${n}`));
