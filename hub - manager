@@ -279,7 +279,14 @@ function isProductionArea(a) {
 // ============================================================================
 const MAX_REPEAT_RUNS = 60;   // one save creates at most this many runs (each is one Dataverse row)
 const DOW_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-const parseYMD = (s) => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || ''); return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : null; };   // local midnight, or null when blank
+const parseYMD = (s) => {   // local midnight, or null when blank, half-typed (year 0026) or not a real date
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || '');
+    if (!m) return null;
+    const y = Number(m[1]), mo = Number(m[2]) - 1, day = Number(m[3]);
+    if (y < 2000 || y > 2100) return null;
+    const d = new Date(2000, 0, 1); d.setFullYear(y, mo, day);
+    return d.getMonth() === mo && d.getDate() === day ? d : null;
+};
 const withTime = (day, hhmm) => { const m = /^(\d{1,2}):(\d{2})/.exec(hhmm || ''); return m ? new Date(day.getFullYear(), day.getMonth(), day.getDate(), Number(m[1]), Number(m[2])) : null; };
 const addDaysYMD = (ymd, n) => { const d = parseYMD(ymd); return d ? getLocalYMD(addDaysLocal(d, n)) : ''; };
 const endMs = (r) => new Date(r.craa5_dateendtime || r.craa5_Dateendtime || r.craa5_endtime).getTime() || 0;
@@ -306,7 +313,8 @@ const makeSchPayload = (date) => ({
     flagsEdited: false              // allergen / crumb boxes were touched by hand since the code was last typed
 });
 // Every run the form will create: { items: [{ date, start, end }], error, tooMany }. Times are built in local time
-// (so 06:00 stays 06:00 across daylight-saving changes); the run keeps its real length in hours.
+// (so 06:00 stays 06:00 across daylight-saving changes). A run keeps its real length in hours, except whole days
+// (24 h, 48 h...), which end at the same clock time N days later so "24 h every day" runs back to back all year.
 function buildOccurrences(p) {
     const startDay = parseYMD(p.startDate);
     const first = startDay && withTime(startDay, p.startTime);
@@ -314,6 +322,7 @@ function buildOccurrences(p) {
     const hours = parseFloat(p.runLength);
     if (!(hours >= 0.25) || hours > 168) return { items: [], error: 'Run length must be between 0.25 and 168 hours.', tooMany: false };
     const durMs = Math.round(hours * 3600000);
+    const wholeDays = hours % 24 === 0 ? hours / 24 : 0;
     const days = [];
     let tooMany = false;
     if (p.repeat === 'once') {
@@ -321,26 +330,57 @@ function buildOccurrences(p) {
     } else {
         const last = parseYMD(untilYMD(p.startDate, p.until));
         if (!last || last.getTime() < startDay.getTime()) return { items: [], error: 'The "until" date must be on or after the start date.', tooMany: false };
+        if (Math.round((last.getTime() - startDay.getTime()) / 86400000) > 1100) return { items: [], error: 'Pick an "until" date within about 3 years of the start date.', tooMany: false };
         const firstSunday = addDaysLocal(startDay, -startDay.getDay()).getTime();
         const every = Math.max(1, parseInt(p.everyWeeks, 10) || 1);
         const picked = p.repeatDays || [];
-        let scanned = 0;
         for (let d = startDay; d.getTime() <= last.getTime(); d = addDaysLocal(d, 1)) {
-            if (++scanned > 800 || days.length > MAX_REPEAT_RUNS) { tooMany = true; break; }
             const dow = d.getDay();
             let on = true;
             if (p.repeat === 'weekdays') on = dow >= 1 && dow <= 5;
             else if (p.repeat === 'custom') on = picked.indexOf(dow) >= 0 && Math.round((addDaysLocal(d, -dow).getTime() - firstSunday) / 604800000) % every === 0;
             if (on) days.push(d);
+            if (days.length > MAX_REPEAT_RUNS) { tooMany = true; break; }
         }
-        if (days.length > MAX_REPEAT_RUNS) tooMany = true;
         if (!days.length) return { items: [], error: 'No day between the start date and the "until" date matches. Pick at least one day.', tooMany: false };
     }
-    const items = days.slice(0, MAX_REPEAT_RUNS + 1).map(d => {
+    const items = days.map(d => {
         const start = withTime(d, p.startTime);
-        return { date: getLocalYMD(d), start, end: new Date(start.getTime() + durMs) };
+        return { date: getLocalYMD(d), start, end: wholeDays ? addDaysLocal(start, wholeDays) : new Date(start.getTime() + durMs) };
     });
+    // Runs on one line cannot overlap each other (a 30 h run repeated daily would).
+    for (let k = 1; k < items.length; k++) {
+        if (items[k].start.getTime() < items[k - 1].end.getTime()) {
+            return { items: [], error: `Runs would overlap: the ${fmtDay(items[k - 1].start)} run lasts until ${fmtDay(items[k - 1].end)} ${fmtTime(items[k - 1].end)}, but the next one starts ${fmtDay(items[k].start)} ${fmtTime(items[k].start)}. Shorten the run or repeat less often.`, tooMany: false };
+        }
+    }
     return { items, error: null, tooMany };
+}
+// What is already on this area + line: the rows just read from Dataverse plus what is on screen. While the read is fresh
+// and complete it is the authority inside its window (a run deleted or moved elsewhere disappears or moves); a run
+// edited or created on this page in the last two minutes is kept as it is on screen.
+function mergeLineRuns(readRows, screenRows, area, lineNum, win, trusted, recentlyTouched) {
+    const byId = {};
+    const mine = (r) => renderSafe(r.craa5_area || r.craa5_Area) === area && lineOf(r) === lineNum;
+    readRows.forEach((r, i) => { byId[runIdOf(r) || `read${i}`] = r; });
+    screenRows.forEach((r, i) => {
+        const id = runIdOf(r) || `screen${i}`;
+        if (!mine(r)) { return; }
+        const inWindow = win && startMs(r) < win.to && endMs(r) > win.from;
+        if (byId[id] && !recentlyTouched(id)) return;                 // the fresh read wins
+        if (!byId[id] && trusted && inWindow && !recentlyTouched(id)) return;   // not there any more
+        byId[id] = r;
+    });
+    return Object.keys(byId).map(k => byId[k]).filter(mine).sort(byStartAsc);
+}
+// Each planned run with the existing run it overlaps (if any) and whether it will be created. A clashing day starts
+// unticked; overrides[date] is false (unticked by hand) or the id of the clashing run the user chose to double-book.
+function markClashes(items, lineRuns, overrides) {
+    return items.map(it => {
+        const clash = lineRuns.find(r => startMs(r) < it.end.getTime() && endMs(r) > it.start.getTime()) || null;
+        const ov = overrides[it.date];
+        return { ...it, clash, on: ov === false ? false : (clash ? ov === (runIdOf(clash) || 'x') : true) };
+    });
 }
 
 const Chip = ({ on, onClick, children, title }) => (
@@ -412,6 +452,8 @@ export default function ScheduleApp({ dataApi, ...props }) {
     const [schPayload, setSchPayload] = useState(() => makeSchPayload(selectedDate));
     const [isSubmittingSch, setIsSubmittingSch] = useState(false);
     const [saveProgress, setSaveProgress] = useState(null);   // { done, total } while a save is running
+    const [formTick, setFormTick] = useState(0);              // bump to re-read the line being scheduled (after a save, undo or edit)
+    const [lastSave, setLastSave] = useState(null);             // { ids, confirm, busy }: the runs created by the latest save, so it can be undone
     const savingRef = useRef(false);
     const [schSubmitStatus, setSchSubmitStatus] = useState(null); 
     
@@ -1068,7 +1110,8 @@ export default function ScheduleApp({ dataApi, ...props }) {
     // SCHEDULE INPUT: the runs the form would create, checked against what is already on that line.
     // Only the chosen area + line and the dates being scheduled are read from Dataverse (never the whole table).
     // ------------------------------------------------------------------------
-    const setSch = (patch) => { setSchPayload(p => ({ ...p, ...patch })); setSchSubmitStatus(null); };
+    const setSch = (patch) => { setSchPayload(p => ({ ...p, ...patch })); setSchSubmitStatus(null); setLastSave(null); };
+    const recentlyTouched = (id) => Date.now() - (touchedRef.current.get(id) || 0) < 120000;
     const lineNum = Math.max(1, parseInt(schPayload.line, 10) || 1);
     const plan = useMemo(() => buildOccurrences(schPayload),
         [schPayload.startDate, schPayload.startTime, schPayload.runLength, schPayload.repeat, schPayload.repeatDays, schPayload.everyWeeks, schPayload.until]);
@@ -1083,36 +1126,31 @@ export default function ScheduleApp({ dataApi, ...props }) {
         return { from: weekStart.getTime(), to: to.getTime(), key: `${schPayload.area}|${lineNum}|${weekStart.getTime()}|${to.getTime()}` };
     }, [schPayload.area, lineNum, schPayload.startDate, plan]);
     const [schRuns, setSchRuns] = useState({ key: '', rows: [], ok: true, capped: false, loading: false });
+    const readLineRuns = (lk, area, line) => queryRecords(TABLE_PROD, dataApiRef.current, {
+        filter: `statecode eq 0 and craa5_area eq '${odataStr(area)}' and craa5_line eq ${line} and craa5_datestarttime lt ${isoZ(lk.to)} and craa5_dateendtime gt ${isoZ(lk.from)}`,
+        orderby: 'craa5_datestarttime asc', top: RANGE_LIMIT });
     useEffect(() => {
         if (activeTab !== 'prod_form' || !apiReady || !lookup) return;
         let alive = true;
         const timer = setTimeout(async () => {
             setSchRuns(p => p.key === lookup.key ? p : { key: lookup.key, rows: [], ok: true, capped: false, loading: true });
-            const rows = await queryRecords(TABLE_PROD, dataApiRef.current, {
-                filter: `statecode eq 0 and craa5_area eq '${odataStr(schPayload.area)}' and craa5_line eq ${lineNum} and craa5_datestarttime lt ${isoZ(lookup.to)} and craa5_dateendtime gt ${isoZ(lookup.from)}`,
-                orderby: 'craa5_datestarttime asc', top: RANGE_LIMIT });
+            const rows = await readLineRuns(lookup, schPayload.area, lineNum);
             if (!alive) return;
             setSchRuns({ key: lookup.key, rows: rows || [], ok: rows !== null, capped: !!rows && rows.length >= RANGE_LIMIT, loading: false });
         }, 300);
         return () => { alive = false; clearTimeout(timer); };
-    }, [activeTab, apiReady, lookup && lookup.key, reloadTick]);
+    }, [activeTab, apiReady, lookup && lookup.key, reloadTick, formTick]);
     const checking = apiReady && !!lookup && (schRuns.key !== lookup.key || schRuns.loading);
 
-    // Runs already on this area + line: the ones just read plus whatever is on screen (on-screen copies win: they include edits made here).
-    const lineRuns = useMemo(() => {
-        const byId = {};
-        schRuns.rows.concat(prodSchedules).forEach((r, i) => { byId[runIdOf(r) || `row${i}`] = r; });
-        return Object.keys(byId).map(k => byId[k]).filter(r => renderSafe(r.craa5_area || r.craa5_Area) === schPayload.area && lineOf(r) === lineNum).sort(byStartAsc);
-    }, [schRuns.rows, prodSchedules, schPayload.area, lineNum]);
-    // Each planned run, with the existing run it would overlap (if any). Clashing days start unticked.
-    const planRows = useMemo(() => plan.items.map(it => {
-        const clash = lineRuns.find(r => startMs(r) < it.end.getTime() && endMs(r) > it.start.getTime()) || null;
-        const ov = schPayload.overrides[it.date];
-        return { ...it, clash, on: ov === undefined ? !clash : !!ov };
-    }), [plan, lineRuns, schPayload.overrides]);
+    // Runs already on this area + line (see mergeLineRuns), and each planned run checked against them.
+    const lookupFresh = !!lookup && schRuns.key === lookup.key && schRuns.ok && !schRuns.loading && !schRuns.capped;
+    const lineRuns = useMemo(() => mergeLineRuns(schRuns.rows, prodSchedules, schPayload.area, lineNum, lookup, lookupFresh, recentlyTouched),
+        [schRuns.rows, prodSchedules, schPayload.area, lineNum, lookupFresh, lookup && lookup.key]);
+    const planRows = useMemo(() => markClashes(plan.items, lineRuns, schPayload.overrides), [plan, lineRuns, schPayload.overrides]);
     const toCreate = planRows.filter(r => r.on);
     const schProblem = !schPayload.area ? 'Choose an area.'
         : !schPayload.product.trim() ? 'Enter the product, or pick a recent one.'
+        : schPayload.productCode !== '' && !/^\d{1,9}$/.test(String(schPayload.productCode)) ? 'Product code must be a whole number (digits only).'
         : plan.error ? plan.error
         : plan.tooMany ? `That is more than ${MAX_REPEAT_RUNS} runs in one go. Pick an earlier "until" date.`
         : null;
@@ -1127,7 +1165,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
         if (recentKeyRef.current === key) return;
         recentKeyRef.current = key;
         (async () => {
-            const rows = await queryRecords(TABLE_PROD, dataApiRef.current, { filter: `statecode eq 0 and craa5_area eq '${odataStr(area)}'`, orderby: 'craa5_datestarttime desc', top: 40 });
+            const rows = await queryRecords(TABLE_PROD, dataApiRef.current, { filter: `statecode eq 0 and craa5_area eq '${odataStr(area)}' and craa5_datestarttime le ${isoZ(Date.now())}`, orderby: 'craa5_datestarttime desc', top: 40 });
             if (recentKeyRef.current !== key) return;   // another area was chosen meanwhile
             if (rows === null) { recentKeyRef.current = ''; return; }   // failed: try again next time
             const seen = {}, items = [], lineSet = {};
@@ -1176,6 +1214,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
         if (schProblem) { setSchSubmitStatus({ type: 'error', message: schProblem }); return; }
         if (!toCreate.length) { setSchSubmitStatus({ type: 'error', message: 'Nothing to schedule: every day is unticked or already has a run.' }); return; }
         setSchSubmitStatus(null);
+        setLastSave(null);
         const writeApi = getWriteApi(dataApiRef.current);
         if (!writeApi) { 
             setSchSubmitStatus({ type: 'error', message: 'No Dataverse write connection in this environment (preview mode). Nothing was saved.' });
@@ -1187,10 +1226,24 @@ export default function ScheduleApp({ dataApi, ...props }) {
 
         try {
             const p = schPayload;
+            // Last look at the line just before writing: someone else may have scheduled it since the list was checked.
+            if (apiReady && lookup) {
+                const fresh = await readLineRuns(lookup, p.area, lineNum);
+                if (fresh !== null) {
+                    setSchRuns({ key: lookup.key, rows: fresh, ok: true, capped: fresh.length >= RANGE_LIMIT, loading: false });
+                    const seen = {}; toCreate.forEach(r => { seen[r.date] = true; });
+                    const now = markClashes(plan.items, mergeLineRuns(fresh, prodSchedulesRef.current, p.area, lineNum, lookup, fresh.length < RANGE_LIMIT, recentlyTouched), p.overrides);
+                    const clashing = now.filter(r => seen[r.date] && !r.on);
+                    if (clashing.length) {
+                        setSchSubmitStatus({ type: 'error', message: `The schedule changed while you were working: ${clashing.length} day${clashing.length === 1 ? '' : 's'} now clash${clashing.length === 1 ? 'es' : ''} with another run. Nothing was saved. The list is updated: check it and save again.` });
+                        return;
+                    }
+                }
+            }
             const runs = toCreate.map(r => ({
                 craa5_area: p.area,
                 craa5_line: lineNum,
-                craa5_productcode: parseInt(p.productCode, 10) || null,
+                craa5_productcode: p.productCode === '' ? null : Number(p.productCode),
                 craa5_product: p.product.trim(),
                 craa5_datestarttime: r.start.toISOString(),
                 craa5_dateendtime: r.end.toISOString(),
@@ -1198,34 +1251,67 @@ export default function ScheduleApp({ dataApi, ...props }) {
                 craa5_crumbclean: p.crumbClean,
                 craa5_typeofallergen: p.allergen ? p.typeOfAllergen : ""
             }));
-            // One at a time: every saved run is shown straight away, and a failure stops cleanly with a count
+            // One at a time: each saved run shows on screen straight away, and a failure stops cleanly with a count
             // instead of leaving unseen rows behind a "failed" message.
-            const saved = [];
+            const saved = [], savedDates = [];
             let failure = null;
             for (let i = 0; i < runs.length; i++) {
                 try {
                     const newId = await writeApi.create(TABLE_PROD, runs[i]);
                     if (!newId) throw new Error("Dataverse didn't return a record id");
-                    saved.push({ craa5__aa_prd_schdid: newId, ...runs[i] });
+                    const row = { craa5__aa_prd_schdid: newId, ...runs[i] };
+                    saved.push(row); savedDates.push(toCreate[i].date);
+                    touched(newId);
+                    setProdSchedules(prev => [...prev, row].sort(byStartAsc));
                     setSaveProgress({ done: i + 1, total: runs.length });
                 } catch (err) { failure = err; break; }
             }
-            saved.forEach(r => touched(r.craa5__aa_prd_schdid));
-            if (saved.length) setProdSchedules(prev => [...prev, ...saved].sort(byStartAsc));
+            setFormTick(t => t + 1);   // re-read the line so the saved runs come from Dataverse itself
+            // Days that are now saved must not be saved again by a retry, whatever was ticked for them.
+            setSchPayload(prev => { const o = { ...prev.overrides }; savedDates.forEach(d => { delete o[d]; }); return { ...prev, overrides: o }; });
             if (failure) {
                 console.error(failure);
-                setSchSubmitStatus({ type: 'error', message: `Saved ${saved.length} of ${runs.length} runs, then failed: ${failure.message || failure}. The saved runs are on the schedule (they now show as clashes); check before saving again.` });
+                setSchSubmitStatus({ type: 'error', message: `Saved ${saved.length} of ${runs.length} runs, then failed: ${failure.message || failure}. The saved runs are on the schedule (they now show as clashes and will not be saved twice).` });
+                if (saved.length) setLastSave({ ids: saved.map(r => r.craa5__aa_prd_schdid), confirm: false, busy: false });
                 return;
             }
             const skipped = planRows.length - toCreate.length;
             const span = toCreate.length > 1 ? `${fmtDay(toCreate[0].start)} to ${fmtDay(toCreate[toCreate.length - 1].start)}` : fmtDay(toCreate[0].start);
             setSchSubmitStatus({ type: 'success', message: `Scheduled ${saved.length} run${saved.length === 1 ? '' : 's'} on ${p.area}, line ${lineNum}: ${span}.${skipped ? ` ${skipped} day${skipped === 1 ? ' was' : 's were'} skipped.` : ''}` });
+            setLastSave({ ids: saved.map(r => r.craa5__aa_prd_schdid), confirm: false, busy: false });
             // Ready for the next product on the same area, line and dates.
             setSchPayload(prev => ({ ...prev, productCode: "", product: "", allergen: false, typeOfAllergen: "", crumbClean: false, overrides: {}, autoFilled: false, flagsEdited: false }));
         } catch (e) {
             console.error(e); 
             setSchSubmitStatus({ type: 'error', message: e.message || 'Failed to save to Dataverse.' });
         } finally { savingRef.current = false; setIsSubmittingSch(false); setSaveProgress(null); }
+    };
+
+    // Takes back the runs the latest save created (two taps: the first asks "are you sure").
+    const handleUndoLastSave = async () => {
+        if (!lastSave || lastSave.busy) return;
+        if (!lastSave.confirm) { setLastSave({ ...lastSave, confirm: true }); return; }
+        const writeApi = getWriteApi(dataApiRef.current);
+        if (!writeApi) { notify("Can't undo: no Dataverse write connection in this environment.", "error"); return; }
+        const batch = lastSave;
+        setLastSave({ ...batch, busy: true });
+        const gone = {}; let failure = null;
+        for (let i = 0; i < batch.ids.length; i++) {
+            try { await writeApi.remove(TABLE_PROD, batch.ids[i]); touched(batch.ids[i]); gone[batch.ids[i]] = true; }
+            catch (err) { failure = err; break; }
+        }
+        const removed = Object.keys(gone).length;
+        setProdSchedules(prev => prev.filter(r => !gone[runIdOf(r)]));
+        setSchRuns(p => ({ ...p, rows: p.rows.filter(r => !gone[runIdOf(r)]) }));
+        setFormTick(t => t + 1);
+        if (failure) {
+            console.error(failure);
+            setLastSave({ ids: batch.ids.filter(id => !gone[id]), confirm: false, busy: false });
+            setSchSubmitStatus({ type: 'error', message: `Removed ${removed} of ${batch.ids.length} runs, then failed: ${failure.message || failure}. The rest are still scheduled.` });
+        } else {
+            setLastSave(null);
+            setSchSubmitStatus({ type: 'success', message: `Removed the ${removed} run${removed === 1 ? '' : 's'} from the last save.` });
+        }
     };
 
     const handleUpdateSchedule = async () => {
@@ -1993,10 +2079,17 @@ export default function ScheduleApp({ dataApi, ...props }) {
         const weekEndMs = weekStart ? addDaysLocal(weekStart, 7).getTime() : 0;
         const weekRuns = weekStart ? lineRuns.filter(r => startMs(r) >= weekStart.getTime() && startMs(r) < weekEndMs) : [];
         const untilValue = untilYMD(schPayload.startDate, schPayload.until);
+        const toggleRun = (r) => setSch({ overrides: (() => {
+            const o = { ...schPayload.overrides };
+            if (r.on) { if (r.clash) delete o[r.date]; else o[r.date] = false; }          // untick: a clash day goes back to skipped, a free day is excluded
+            else if (r.clash) o[r.date] = runIdOf(r.clash) || 'x';                          // tick a clash day: double-book it on purpose
+            else delete o[r.date];
+            return o;
+        })() });
         const repeatOptions = [['once', 'Just once'], ['daily', 'Every day'], ['weekdays', 'Weekdays (Mon-Fri)'], ['custom', 'Pick days']];
 
         return (
-            <div className="animate-in fade-in duration-300 max-w-4xl mx-auto pb-12 space-y-5">
+            <fieldset disabled={isSubmittingSch || !!(lastSave && lastSave.busy)} className="animate-in fade-in duration-300 max-w-4xl mx-auto pb-12 space-y-5 min-w-0">
                 <div>
                     <h2 className="text-base font-black text-[#00468B] uppercase tracking-widest">Schedule Production</h2>
                     <p className="text-sm text-slate-500">Choose what runs, when, and how often. Nothing is saved until you press the blue button at the bottom.</p>
@@ -2009,7 +2102,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                             <div>
                                 <label className={labelCls}>Area <span className="text-[#E4002B]">*</span></label>
-                                <select value={schPayload.area} onChange={e => setSch({ area: e.target.value, overrides: {} })} className={inputCls}>
+                                <select value={schPayload.area} onChange={e => setSch({ area: e.target.value })} className={inputCls}>
                                     <option value="">Select...</option>
                                     {areas.filter(runsProduct).map(area => (
                                         <option key={area.craa5_area || area.craa5_name || Math.random()} value={renderSafe(area.craa5_area || area.craa5_name)}>
@@ -2020,11 +2113,11 @@ export default function ScheduleApp({ dataApi, ...props }) {
                             </div>
                             <div>
                                 <label className={labelCls}>Line #</label>
-                                <input type="number" min="1" value={schPayload.line} onChange={e => setSch({ line: e.target.value, overrides: {} })} className={inputCls} />
+                                <input type="number" min="1" value={schPayload.line} onChange={e => setSch({ line: e.target.value })} className={inputCls} />
                                 {recentFresh && recent.lines.length > 0 && (
                                     <div className="flex items-center gap-1.5 mt-2 flex-wrap">
                                         <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Lines in use</span>
-                                        {recent.lines.map(l => <Chip key={l} on={l === lineNum} onClick={() => setSch({ line: String(l), overrides: {} })}>{l}</Chip>)}
+                                        {recent.lines.map(l => <Chip key={l} on={l === lineNum} onClick={() => setSch({ line: String(l) })}>{l}</Chip>)}
                                     </div>
                                 )}
                             </div>
@@ -2082,24 +2175,27 @@ export default function ScheduleApp({ dataApi, ...props }) {
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
                                     <label className={labelCls}>Start date</label>
-                                    <input type="date" value={schPayload.startDate} onChange={e => setSch({ startDate: e.target.value, overrides: {} })} className={inputCls} />
+                                    <input type="date" value={schPayload.startDate} onChange={e => setSch({ startDate: e.target.value })} className={inputCls} />
                                 </div>
                                 <div>
                                     <label className={labelCls}>Start time</label>
-                                    <input type="time" value={schPayload.startTime} onChange={e => setSch({ startTime: e.target.value, overrides: {} })} className={inputCls} />
+                                    <input type="time" value={schPayload.startTime} onChange={e => setSch({ startTime: e.target.value })} className={inputCls} />
                                 </div>
                             </div>
                             <div className="flex gap-2 flex-wrap">
-                                <Chip on={schPayload.startTime === '06:00'} onClick={() => setSch({ startTime: '06:00', overrides: {} })}>Days 06:00</Chip>
-                                <Chip on={schPayload.startTime === '18:00'} onClick={() => setSch({ startTime: '18:00', overrides: {} })}>Nights 18:00</Chip>
+                                <Chip on={schPayload.startTime === '06:00'} onClick={() => setSch({ startTime: '06:00' })}>Days 06:00</Chip>
+                                <Chip on={schPayload.startTime === '18:00'} onClick={() => setSch({ startTime: '18:00' })}>Nights 18:00</Chip>
                             </div>
                             <div>
                                 <label className={labelCls}>Run length (hours)</label>
-                                <input type="number" min="0.25" step="0.25" value={schPayload.runLength} onChange={e => setSch({ runLength: e.target.value, overrides: {} })} className={inputCls} />
+                                <input type="number" min="0.25" step="0.25" value={schPayload.runLength} onChange={e => setSch({ runLength: e.target.value })} className={inputCls} />
                                 <div className="flex gap-2 flex-wrap mt-2">
-                                    {lengthPresets.map(h => <Chip key={h} on={parseFloat(schPayload.runLength) === h} onClick={() => setSch({ runLength: String(h), overrides: {} })}>{h} h</Chip>)}
+                                    {lengthPresets.map(h => <Chip key={h} on={parseFloat(schPayload.runLength) === h} onClick={() => setSch({ runLength: String(h) })}>{h} h</Chip>)}
                                 </div>
                             </div>
+                            {startDay && startDay.getTime() < new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate()).getTime() && (
+                                <p className="text-xs font-bold text-slate-800 bg-[#FFF6E0] border border-[#FFB81C] rounded-lg px-3 py-2">This start date is in the past. Check it is the date you meant.</p>
+                            )}
                             {first && !plan.error && (
                                 <p className="text-sm font-bold text-[#00468B] bg-[#E6F1FB] rounded-lg px-3 py-2">
                                     Each run: {fmtDay(first.start)} {fmtTime(first.start)} to {first.end.getDate() !== first.start.getDate() ? `${fmtDay(first.end)} ` : ''}{fmtTime(first.end)}
@@ -2113,7 +2209,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
                         {cardHead(3, 'How often')}
                         <div className="p-5 space-y-4">
                             <div className="flex gap-2 flex-wrap">
-                                {repeatOptions.map(o => <Chip key={o[0]} on={schPayload.repeat === o[0]} onClick={() => setSch({ repeat: o[0], overrides: {} })}>{o[1]}</Chip>)}
+                                {repeatOptions.map(o => <Chip key={o[0]} on={schPayload.repeat === o[0]} onClick={() => setSch({ repeat: o[0] })}>{o[1]}</Chip>)}
                             </div>
 
                             {schPayload.repeat === 'custom' && (
@@ -2123,13 +2219,13 @@ export default function ScheduleApp({ dataApi, ...props }) {
                                         <div className="flex gap-1.5 flex-wrap">
                                             {DOW_SHORT.map((name, dow) => {
                                                 const on = schPayload.repeatDays.indexOf(dow) >= 0;
-                                                return <Chip key={dow} on={on} title={name} onClick={() => setSch({ repeatDays: on ? schPayload.repeatDays.filter(x => x !== dow) : schPayload.repeatDays.concat([dow]).sort((a, b) => a - b), overrides: {} })}>{name}</Chip>;
+                                                return <Chip key={dow} on={on} title={name} onClick={() => setSch({ repeatDays: on ? schPayload.repeatDays.filter(x => x !== dow) : schPayload.repeatDays.concat([dow]).sort((a, b) => a - b) })}>{name}</Chip>;
                                             })}
                                         </div>
                                     </div>
                                     <div className="flex items-center gap-2 text-sm text-slate-700">
                                         <span className="font-bold">Every</span>
-                                        <select value={schPayload.everyWeeks} onChange={e => setSch({ everyWeeks: parseInt(e.target.value, 10) || 1, overrides: {} })} className="border border-slate-300 rounded-lg py-1.5 px-2 text-sm font-semibold bg-white">
+                                        <select value={schPayload.everyWeeks} onChange={e => setSch({ everyWeeks: parseInt(e.target.value, 10) || 1 })} className="border border-slate-300 rounded-lg py-1.5 px-2 text-sm font-semibold bg-white">
                                             <option value={1}>week</option><option value={2}>2nd week</option><option value={3}>3rd week</option><option value={4}>4th week</option>
                                         </select>
                                     </div>
@@ -2140,10 +2236,10 @@ export default function ScheduleApp({ dataApi, ...props }) {
                                 <div className="space-y-2">
                                     <span className={labelCls}>Until (last day)</span>
                                     <div className="flex gap-2 flex-wrap">
-                                        {[1, 2, 4].map(n => <Chip key={n} on={schPayload.until.k === 'weeks' && schPayload.until.n === n} onClick={() => setSch({ until: { k: 'weeks', n }, overrides: {} })}>{n} week{n > 1 ? 's' : ''}</Chip>)}
-                                        <Chip on={schPayload.until.k === 'eom'} onClick={() => setSch({ until: { k: 'eom' }, overrides: {} })}>End of month</Chip>
+                                        {[1, 2, 3, 4].map(n => <Chip key={n} on={schPayload.until.k === 'weeks' && schPayload.until.n === n} onClick={() => setSch({ until: { k: 'weeks', n } })}>{n} week{n > 1 ? 's' : ''}</Chip>)}
+                                        <Chip on={schPayload.until.k === 'eom'} onClick={() => setSch({ until: { k: 'eom' } })}>End of month</Chip>
                                     </div>
-                                    <input type="date" value={untilValue} onChange={e => setSch({ until: { k: 'date', v: e.target.value }, overrides: {} })} className={inputCls} />
+                                    <input type="date" value={untilValue} onChange={e => setSch({ until: { k: 'date', v: e.target.value } })} className={inputCls} />
                                 </div>
                             )}
                             {schPayload.repeat === 'once' && <p className="text-sm text-slate-500">One run on the start date. Pick another option to repeat it.</p>}
@@ -2178,6 +2274,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
                             </div>
                         )}
 
+                        {plan.error && <p className="text-sm font-bold text-[#E4002B] bg-[#FDE8EC] border border-[#E4002B]/40 rounded-lg px-3 py-2">{plan.error}</p>}
                         {checking && <p className="text-xs font-bold text-[#00468B] bg-[#E6F1FB] rounded-lg px-3 py-2">Checking the schedule for clashes...</p>}
                         {apiReady && !checking && schPayload.area && !schRuns.ok && (
                             <p className="text-xs font-bold text-slate-800 bg-[#FFF6E0] border border-[#FFB81C] rounded-lg px-3 py-2">Could not read this line's schedule from Dataverse, so only the runs already on screen were checked for clashes.</p>
@@ -2192,15 +2289,15 @@ export default function ScheduleApp({ dataApi, ...props }) {
                                 </div>
                                 <div className="max-h-72 overflow-y-auto rounded-lg border border-slate-200 divide-y divide-slate-100">
                                     {planRows.map(r => (
-                                        <label key={r.date} className={`flex items-center gap-3 px-3 py-2 cursor-pointer text-sm ${r.on ? 'bg-white' : 'bg-slate-50 text-slate-400'} ${r.clash ? 'border-l-4 border-l-[#E4002B]' : 'border-l-4 border-l-transparent'}`}>
-                                            <input type="checkbox" checked={r.on} onChange={() => setSch({ overrides: { ...schPayload.overrides, [r.date]: !r.on } })} className="w-4 h-4 accent-[#0072CE] flex-shrink-0" />
-                                            <span className={`font-bold w-28 flex-shrink-0 ${r.on ? 'text-slate-800' : 'line-through'}`}>{fmtDay(r.start)}</span>
+                                        <label key={r.date} className={`flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 cursor-pointer text-sm ${r.on ? 'bg-white' : 'bg-slate-50 text-slate-400'} ${r.clash ? 'border-l-4 border-l-[#E4002B]' : 'border-l-4 border-l-transparent'}`}>
+                                            <input type="checkbox" checked={r.on} onChange={() => toggleRun(r)} className="w-4 h-4 accent-[#0072CE] flex-shrink-0" />
+                                            <span className={`font-bold w-24 sm:w-28 flex-shrink-0 ${r.on ? 'text-slate-800' : 'line-through'}`}>{fmtDay(r.start)}</span>
                                             <span className="font-mono text-xs flex-shrink-0">{fmtTime(r.start)} - {fmtTime(r.end)}</span>
                                             {r.clash ? (
-                                                <span className="ml-auto text-xs font-bold text-[#E4002B] bg-[#FDE8EC] rounded px-2 py-0.5 truncate" title="Overlaps a run already scheduled on this line">
+                                                <span className="basis-full sm:basis-auto sm:ml-auto text-xs font-bold text-[#E4002B] bg-[#FDE8EC] rounded px-2 py-0.5 break-words" title="Overlaps a run already scheduled on this line">
                                                     Clash: {renderSafe(r.clash.craa5_product || r.clash.craa5_Product)} {fmtTime(new Date(startMs(r.clash)))}-{fmtTime(new Date(endMs(r.clash)))}{r.on ? ' (adding anyway)' : ' (skipped)'}
                                                 </span>
-                                            ) : <span className="ml-auto text-xs font-bold text-green-700">Free</span>}
+                                            ) : <span className="sm:ml-auto text-xs font-bold text-green-700">Free</span>}
                                         </label>
                                     ))}
                                 </div>
@@ -2220,13 +2317,19 @@ export default function ScheduleApp({ dataApi, ...props }) {
                             {schSubmitStatus && (
                                 <div className={`p-3 rounded-lg border flex gap-3 items-center w-full ${schSubmitStatus.type === 'success' ? 'bg-green-50 border-green-200 text-green-800' : 'bg-[#FDE8EC] border-[#E4002B]/40 text-[#E4002B]'}`}>
                                     <CheckCircleIcon className="w-5 h-5 flex-shrink-0" />
-                                    <span className="text-sm font-bold">{schSubmitStatus.message}</span>
+                                    <span className="text-sm font-bold flex-1">{schSubmitStatus.message}</span>
+                                    {lastSave && lastSave.ids.length > 0 && (
+                                        <button type="button" onClick={handleUndoLastSave} disabled={lastSave.busy}
+                                            className={`flex-shrink-0 text-xs font-extrabold rounded-lg px-3 py-1.5 border ${lastSave.confirm ? 'bg-[#E4002B] text-white border-[#E4002B]' : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'} disabled:opacity-60`}>
+                                            {lastSave.busy ? 'Removing...' : lastSave.confirm ? `Yes, remove ${lastSave.ids.length} run${lastSave.ids.length === 1 ? '' : 's'}` : `Undo this save (${lastSave.ids.length})`}
+                                        </button>
+                                    )}
                                 </div>
                             )}
                         </div>
                     </div>
                 </div>
-            </div>
+            </fieldset>
         );
     };
 
