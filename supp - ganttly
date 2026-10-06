@@ -323,8 +323,10 @@ function isNightHour(hour) { return hour >= NIGHT_START_HOUR || hour < NIGHT_END
 //   "Board · <supervisor> · <crew> · <yyyy-mm-dd> <hh>:00"   with the board JSON in craa5_equipmentjson:
 //   { leads: [employeeId], members: { employeeId: leadId }, overtime: [employeeId], out: { employeeId: reason },
 //     downLines: [lineId], manualLines: [{ id, name }], ... }
-// Ganttly can use those boards as its roster (leads, their teams, who is out) and as its list of rooms. A shift in the
-// plan that has no board yet (a future weekend) falls back to the employee table, so planning ahead still works.
+// The Shift Start board in use today saves craa5_taskassignment rows instead (see fetchTaskAssignmentRows); those rows are
+// turned into the same board shape, one per supervisor per shift. Ganttly uses the boards as its roster (leads, their teams,
+// who is out) and as its list of rooms. A shift in the plan with nothing saved yet (a future weekend) falls back to the
+// employee table, so planning ahead still works.
 // ============================================================================
 const SPECIALIST_KINDS = ['chemical', 'admin', 'janitorial', 'inspector'];
 const BOARD_PREFIX = 'Board · ';
@@ -826,6 +828,143 @@ function lineRowsSignature(rows) {
     return (rows || []).map(function(r) { return String(getRowField(r, 'craa5_aa_mss_areaid') || '') + '|' + String(getRowField(r, 'craa5_area') || ''); }).join(';');
 }
 
+// ---- Shift Start's saved task assignments (craa5_taskassignment) ----
+// 🚨 ARCHITECTURE NOTE: the supervisor board in use ("beta - hub - shift start") saves one row per person instead of a
+// board row: craa5_id = employee name, craa5__aaemp_guid = employee id, craa5_area = the room (or PTO / Sick / Late /
+// Left Early), craa5_lead = the lead's name (the supervisor's own name for rooms the supervisor holds), craa5_team = the
+// supervisor's name. Moving someone saves a new row, so the newest row per person is where they are now. Rows carry no
+// reliable shift letter (the apps disagree on B/C), so a row belongs to the shift of its supervisor that was running when
+// it was saved. Rows with equipment filled in are progress updates from the employee hub, not assignments, and are skipped.
+const SOURCES_VERSION = 2;       // bumped when Shift Start became the default source (see rosterSource / roomSource)
+const TASK_ROW_TOP = 2000;
+const TASK_ROW_DAYS = 4;          // never read further back than this, whatever the plan window says
+const TASK_PRE_SHIFT_MIN = 60;    // a board saved up to an hour before clock-in counts for that shift
+const TASK_ROW_FIELDS = ['craa5_taskassignmentid', 'craa5_id', 'craa5__aaemp_guid', 'craa5_area', 'craa5_lead', 'craa5_team', 'craa5_shift', 'craa5_equip', 'craa5_equipment', 'craa5_datetimeofassignment', 'createdon', 'modifiedon'];
+const OUT_AREA_NAMES = ['pto', 'sick', 'late', 'left early', 'ncns'];
+function odataDate(ms) { return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z'); }
+// Rows saved between sinceMs and untilMs, newest first. Returns null when the table couldn't be read (a refresh keeps what it had).
+async function fetchTaskAssignmentRows(dataApi, sinceMs, untilMs) {
+    const filter = 'modifiedon ge ' + odataDate(sinceMs) + ' and createdon le ' + odataDate(untilMs);
+    let failed = false;
+    const xrm = safeGetXrm();
+    if (xrm && xrm.WebApi && typeof xrm.WebApi.retrieveMultipleRecords === 'function') {
+        try {
+            const res = await xrm.WebApi.retrieveMultipleRecords('craa5_taskassignment', '?$select=' + TASK_ROW_FIELDS.join(',') + '&$filter=' + filter + '&$orderby=createdon desc&$top=' + TASK_ROW_TOP);
+            if (res && Array.isArray(res.entities)) return res.entities;
+        } catch (e) { failed = true; }
+    }
+    if (dataApi && typeof dataApi === 'object' && typeof dataApi.queryTable === 'function') {
+        try {
+            let page = await dataApi.queryTable('craa5_taskassignment', { select: TASK_ROW_FIELDS, filter: filter, orderBy: 'createdon desc', pageSize: 250, top: TASK_ROW_TOP });
+            if (page && Array.isArray(page.rows)) {
+                const rows = page.rows.slice();
+                while (page && page.hasMoreRows && typeof page.loadMoreRows === 'function' && rows.length < TASK_ROW_TOP) {
+                    page = await page.loadMoreRows();
+                    if (page && Array.isArray(page.rows)) rows.push.apply(rows, page.rows);
+                }
+                return rows.slice(0, TASK_ROW_TOP);
+            }
+        } catch (e) { failed = true; }
+    }
+    return failed ? null : [];
+}
+function taskRowsSignature(rows) {
+    return (rows || []).map(function(r) { return String(getRowField(r, 'craa5_taskassignmentid') || '') + '|' + String(getRowField(r, 'modifiedon') || ''); }).join(';');
+}
+function rowTimeMs(v) { const t = v ? Date.parse(v) : NaN; return isNaN(t) ? 0 : t; }
+// Turns saved task-assignment rows into Shift Start boards (the same shape as a board row's JSON), one per supervisor per
+// shift in the plan. who = { idByGuid, idByName, supIds, crewById } from the employee table. Returns
+// { boards: { windowKey: [{ supervisor, crew, startMs, board, fromTasks: true }] }, stats }.
+function boardsFromTaskRows(rows, windows, globalStartMs, who) {
+    const stats = { read: (rows || []).length, used: 0, equipment: 0, unknownPerson: 0, noShift: 0 };
+    const out = {};
+    if (!rows || !rows.length || !windows.length) return { boards: out, stats: stats };
+    const nameKey = function(v) { return normS(formatFullName(String(v || '').trim())); };
+    const idOfName = function(v) { return v ? (who.idByName[normS(v)] || who.idByName[nameKey(v)] || '') : ''; };
+    const wins = windows.map(function(w) {
+        return { key: w.key, crew: w.crew, s: globalStartMs + w.shiftStart * 60000 - TASK_PRE_SHIFT_MIN * 60000, e: globalStartMs + w.shiftEnd * 60000 };
+    });
+    const groups = {};   // windowKey -> supervisorKey -> { name, rows }
+    rows.forEach(function(r) {
+        const empName = String(getRowField(r, 'craa5_id') || '').trim();
+        if (/unassigned/i.test(empName)) return;
+        if (String(getRowField(r, 'craa5_equip') || getRowField(r, 'craa5_equipment') || '').trim()) { stats.equipment++; return; }
+        const guid = String(getRowField(r, 'craa5__aaemp_guid') || '').replace(/[{}]/g, '').toLowerCase();
+        const empId = (guid && who.idByGuid[guid]) || idOfName(empName);
+        if (!empId) { stats.unknownPerson++; return; }
+        const supName = String(getRowField(r, 'craa5_team') || '').trim();
+        const supId = idOfName(supName);
+        const supCrew = supId ? (who.crewById[supId] || '') : '';
+        const tc = rowTimeMs(getRowField(r, 'craa5_datetimeofassignment')) || rowTimeMs(getRowField(r, 'createdon'));
+        const tm = rowTimeMs(getRowField(r, 'modifiedon')) || tc;
+        const inWin = function(w, t) { return t >= w.s && t < w.e; };
+        // The supervisor's own crew decides the shift; saved again in a later shift (an unchanged row) counts for that shift too.
+        // (A supervisor whose crew isn't on during the plan saved for another plan; only rows with no known supervisor go by time.)
+        let hit = supCrew ? wins.filter(function(w) { return w.crew === supCrew && (inWin(w, tc) || inWin(w, tm)); }) : [];
+        if (!hit.length && !supCrew) {
+            hit = wins.filter(function(w) { return inWin(w, tc); });
+            const letter = normalizeShift(getRowField(r, 'craa5_shift'));
+            if (hit.length > 1 && letter) { const same = hit.filter(function(w) { return w.crew === letter; }); if (same.length) hit = same; }
+            hit = hit.slice(0, 1);
+        }
+        if (!hit.length) { stats.noShift++; return; }
+        const sk = nameKey(supName) || '(no supervisor)';
+        const item = { empId: empId, area: String(getRowField(r, 'craa5_area') || '').trim(), lead: String(getRowField(r, 'craa5_lead') || '').trim(), supName: supName, supId: supId, tc: tc, tm: tm };
+        hit.forEach(function(w) {
+            const g = groups[w.key] = groups[w.key] || {};
+            const sg = g[sk] = g[sk] || { name: supName, rows: [] };
+            sg.rows.push(item);
+        });
+    });
+    windows.forEach(function(w) {
+        const g = groups[w.key];
+        if (!g) return;
+        out[w.key] = Object.keys(g).map(function(sk) {
+            const sg = g[sk];
+            // Newest row per person (when two were saved at the same moment, the one touched last).
+            const latest = {};
+            sg.rows.forEach(function(it) {
+                const cur = latest[it.empId];
+                if (!cur || it.tc > cur.tc || (it.tc === cur.tc && it.tm > cur.tm)) latest[it.empId] = it;
+            });
+            const items = Object.keys(latest).map(function(id) { return latest[id]; });
+            const supKey = nameKey(sg.name);
+            const leadOf = function(it) {
+                if (!it.lead || nameKey(it.lead) === supKey) return '';
+                const lid = idOfName(it.lead);
+                if (!lid || who.supIds[lid] || lid === it.supId) return '';
+                return lid;
+            };
+            // Anyone a row names as lead leads that team; everyone else is crew, whatever their role in the employee table.
+            const leads = [];
+            items.forEach(function(it) { const l = leadOf(it); if (l && leads.indexOf(l) === -1) leads.push(l); });
+            const board = { leads: leads, members: {}, overtime: [], out: {}, downLines: [], manualLines: [], teamLines: {}, workerLine: {}, equip: {}, equipManual: [] };
+            const lineIds = {};
+            const lineIdOf = function(name) {
+                const id = 't:' + normS(name);
+                if (!lineIds[id]) { lineIds[id] = true; board.manualLines.push({ id: id, name: name }); }
+                return id;
+            };
+            items.forEach(function(it) {
+                stats.used++;
+                const area = normS(it.area);
+                if (OUT_AREA_NAMES.indexOf(area) > -1) { board.out[it.empId] = it.area; return; }
+                const l = leadOf(it);
+                const isLeadSelf = leads.indexOf(it.empId) > -1;
+                if (!isLeadSelf) board.members[it.empId] = l;
+                if (who.crewById[it.empId] && who.crewById[it.empId] !== w.crew && board.overtime.indexOf(it.empId) === -1) board.overtime.push(it.empId);
+                if (!area || area === 'unassigned') return;
+                const lid = lineIdOf(it.area);
+                board.workerLine[it.empId] = lid;
+                const owner = isLeadSelf ? it.empId : l;
+                if (owner) { const tl = board.teamLines[owner] = board.teamLines[owner] || []; if (tl.indexOf(lid) === -1) tl.push(lid); }
+            });
+            return { supervisor: formatFullName(sg.name) || 'Shift Start', crew: w.crew, startMs: globalStartMs + w.shiftStart * 60000, board: board, fromTasks: true };
+        });
+    });
+    return { boards: out, stats: stats };
+}
+
 const MOCK_ASSETS = [
     { id: 'eq1', name: 'Freezer Deep Clean', area: 'CUSTARD', minutesRequired: 1440, heads: 1, priority: 1, isComplete: false },
     { id: 'eq2', name: 'Norman Area', area: 'CUSTARD', minutesRequired: 720, heads: 1, priority: 2, isComplete: false },
@@ -835,13 +974,41 @@ const MOCK_ASSETS = [
     { id: 'eq6', name: 'Drains - Attachment', area: 'WATERJET', minutesRequired: 180, heads: 1, priority: 2, isComplete: false },
 ];
 
+// ============================================================================
+// COMPANY THEME (same blue / yellow / red as the Sanitation Scheduler 2.0)
+// ============================================================================
+// Optional: URL of the official company logo (for example a Dataverse web resource).
+// While empty, a simple blue / yellow / red mark is drawn instead.
+const LOGO_URL = "";
+const BRAND = {
+    blue: '#0072CE', blueDark: '#00468B', blueSoft: '#E6F1FB',
+    yellow: '#FFB81C', yellowSoft: '#FFF6E0',
+    red: '#E4002B', redSoft: '#FDE8EC'
+};
+const BRAND_FONT = '"Segoe UI", system-ui, -apple-system, sans-serif';
+
+function BrandLogo() {
+    if (LOGO_URL) return <img src={LOGO_URL} alt="Company logo" style={{ height: 40, width: 'auto', display: 'block', flexShrink: 0 }} />;
+    return (
+        <div aria-label="Company logo" style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 15, letterSpacing: '0.02em', color: '#1F2937', flexShrink: 0, whiteSpace: 'nowrap' }}>
+            <svg viewBox="0 0 40 40" width="36" height="36" aria-hidden="true">
+                <circle cx="15" cy="12" r="9" fill={BRAND.blue} />
+                <circle cx="27" cy="20" r="8" fill={BRAND.yellow} />
+                <circle cx="15" cy="29" r="8" fill={BRAND.red} />
+            </svg>
+            <span>CJ <b style={{ fontWeight: 800 }}>SCHWAN'S</b></span>
+        </div>
+    );
+}
+
 const Button = ({ children, onClick = () => {}, variant = 'primary', className = '', disabled = false, size = 'md', title = '' }) => {
-    const baseStyle = "inline-flex items-center justify-center font-bold rounded-lg transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2";
+    const baseStyle = "inline-flex items-center justify-center font-extrabold rounded-[10px] transition-colors focus:outline-none focus:ring-2 focus:ring-[#0072CE]/40 focus:ring-offset-2";
     const sizes = { sm: "px-2 py-1.5 text-xs", md: "px-4 py-2 text-sm" };
     const variants = {
-        primary: "bg-indigo-600 text-white hover:bg-indigo-700 shadow-sm",
+        primary: "bg-[#0072CE] text-white hover:bg-[#00468B] shadow-sm",
+        secondary: "bg-[#FFB81C] text-slate-800 hover:brightness-95 shadow-sm",
         success: "bg-emerald-600 text-white hover:bg-emerald-700 shadow-sm",
-        danger: "bg-rose-50 text-rose-600 hover:bg-rose-100",
+        danger: "bg-[#FDE8EC] text-[#E4002B] hover:bg-[#FBD0D9]",
         outline: "border border-slate-300 text-slate-700 hover:bg-slate-50 shadow-sm bg-white"
     };
     return <button onPointerDown={function(e) { if (e && typeof e.stopPropagation === 'function') e.stopPropagation(); }} onClick={onClick} disabled={disabled} title={title} className={`${baseStyle} ${sizes[size]} ${variants[variant]} ${disabled ? 'opacity-60 cursor-not-allowed' : ''} ${className}`}>{children}</button>;
@@ -857,13 +1024,16 @@ export default function App(props) {
             script.id = 'tailwind-cdn';
             script.src = 'https://cdn.tailwindcss.com';
             document.head.appendChild(script);
-
+        }
+        if (!document.getElementById('ganttly-style')) {
             const style = document.createElement('style');
+            style.id = 'ganttly-style';
             style.innerHTML = `
                 .custom-scrollbar::-webkit-scrollbar { height: 10px; width: 6px; }
                 .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
                 .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; border: 2px solid #f8fafc; }
                 .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+                .brand-tabs::-webkit-scrollbar { height: 0; }
                 .gantt-block-anim { transition: left 0.15s ease-out, width 0.15s ease-out, top 0.15s ease-out, height 0.15s ease-out; }
                 .touch-pan { touch-action: none; }
                 .touch-draggable { touch-action: none; cursor: grab; }
@@ -955,9 +1125,12 @@ export default function App(props) {
     const [absentEmployees, setAbsentEmployees] = useState(initialSettings.absentEmployees || {});
     // { jobRoleKey: true (gets tasks) | false (no tasks) } — only roles the user has toggled; others use DEFAULT_NON_TASK_ROLE.
     const [jobRoleChoices, setJobRoleChoices] = useState(initialSettings.jobRoleChoices || {});
-    // 'table' = employee table (plan ahead); 'shiftstart' = Shift Start's saved team boards (falls back to the table where a shift has no board).
-    const [rosterSource, setRosterSource] = useState(initialSettings.rosterSource === 'shiftstart' ? 'shiftstart' : 'table');
-    const [roomSource, setRoomSource] = useState(initialSettings.roomSource === 'shiftstart' ? 'shiftstart' : 'all');
+    // 'shiftstart' (default) = follow Shift Start: its saved teams, leads, rooms and who is out, for every shift Shift Start has
+    // saved; a shift with nothing saved yet (a future weekend) falls back to the employee table. 'table' = employee table only.
+    // Settings saved before Shift Start became the default (no sourcesV) start on Shift Start once; a later choice is kept.
+    const sourcesSaved = initialSettings.sourcesV === SOURCES_VERSION;
+    const [rosterSource, setRosterSource] = useState(sourcesSaved && initialSettings.rosterSource === 'table' ? 'table' : 'shiftstart');
+    const [roomSource, setRoomSource] = useState(sourcesSaved && initialSettings.roomSource === 'all' ? 'all' : 'shiftstart');
     const [boardRows, setBoardRows] = useState([]);
     const [lineRows, setLineRows] = useState([]);
     // Shift Start boards change during the shift: re-read them every few minutes (and on demand), re-planning only when one changed.
@@ -976,10 +1149,21 @@ export default function App(props) {
             if (sig !== lineSigRef.current) { lineSigRef.current = sig; setLineRows(lines); }
         }
     };
+    // Saved task assignments (one row per person) from the Shift Start board that doesn't save board rows.
+    const [taskRows, setTaskRows] = useState([]);
+    const [taskRowsFailed, setTaskRowsFailed] = useState(false);
+    const taskSigRef = useRef('');
+    const applyTaskRows = function(rows) {
+        setTaskRowsFailed(rows === null);
+        if (!rows) return;
+        const sig = taskRowsSignature(rows);
+        if (sig !== taskSigRef.current) { taskSigRef.current = sig; setTaskRows(rows); }
+    };
+    const loadTaskRowsRef = useRef(null);   // set once the plan window is known (below)
     const reloadShiftStart = async function() {
         setShiftStartLoading(true);
         try {
-            const res = await Promise.all([fetchBoardRows(props.dataApi), fetchAllActiveRecords("craa5_aa_mss_area", props.dataApi)]);
+            const res = await Promise.all([fetchBoardRows(props.dataApi), fetchAllActiveRecords("craa5_aa_mss_area", props.dataApi), loadTaskRowsRef.current ? loadTaskRowsRef.current() : null]);
             applyShiftStartRows(res[0], res[1]);
         } finally { setShiftStartLoading(false); }
     };
@@ -1055,6 +1239,7 @@ export default function App(props) {
             jobRoleChoices: jobRoleChoices,
             rosterSource: rosterSource,
             roomSource: roomSource,
+            sourcesV: SOURCES_VERSION,
             handoverMins: handoverMins,
             includeBreaks: includeBreaks,
             includeTransit: includeTransit,
@@ -1171,8 +1356,12 @@ export default function App(props) {
         const jobRoles = {};
         const namesById = {};
         const whyIgnored = {};
+        // For Shift Start's saved task assignments, which name people (and leads / supervisors) by text: every employee by
+        // id, by raw name ("Doe, John") and by display name ("John Doe"), plus each person's crew and who is a supervisor.
+        const idByGuid = {}, idByName = {}, supIds = {}, crewById = {};
         rawEmployees.forEach(function(e, i) {
-            const name = formatFullName(e.craa5_name || e.craa5_Name || e.craa5_fullname || e.fullname || '') || ('Employee ' + (i + 1));
+            const rawName = String(e.craa5_name || e.craa5_Name || e.craa5_fullname || e.fullname || '').trim();
+            const name = formatFullName(rawName) || ('Employee ' + (i + 1));
             const shift = readEmployeeShift(e);
             const roleRaw = e.craa5_role !== undefined ? e.craa5_role : e.craa5_Role;
             const role = String(roleRaw === undefined || roleRaw === null ? '' : roleRaw) + ' ' + String(e['craa5_role@OData.Community.Display.V1.FormattedValue'] || e['craa5_Role@OData.Community.Display.V1.FormattedValue'] || '');
@@ -1180,8 +1369,15 @@ export default function App(props) {
             // a lane marked "Leadership" for their whole shift, with their team beneath, and never any tasks.
             const empId = String(e.craa5__aa_employeeid || e.craa5_aa_employeeid || ('emp_' + i));
             namesById[empId] = name;
+            idByGuid[empId.replace(/[{}]/g, '').toLowerCase()] = empId;
+            if (rawName) {
+                // A blank-shift (left the company) namesake never hides a current employee with the same name.
+                const keep = function(k) { if (k && (!idByName[k] || (shift.crew && !crewById[idByName[k]]))) idByName[k] = empId; };
+                keep(normS(rawName)); keep(normS(name));
+            }
+            if (shift.crew) crewById[empId] = shift.crew;
             const isLeadRole = /256000001|\blead\b/i.test(role) && !/25600000[23]|super|manag/i.test(role);
-            if (!isLeadRole && /25600000[123]|lead|super|manag/i.test(role)) { excluded.push(name); whyIgnored[empId] = 'supervisor / manager'; return; }
+            if (!isLeadRole && /25600000[123]|lead|super|manag/i.test(role)) { supIds[empId] = true; excluded.push(name); whyIgnored[empId] = 'supervisor / manager'; return; }
             if (isLeadRole) {
                 if (!shift.crew && shift.raw === '(blank)') { inactive.push(name); whyIgnored[empId] = 'blank Shift (left the company)'; return; }
                 const leadRec = { id: empId, name: name, kind: 'leadership', jobRole: 'Lead', isLead: true, teamId: String(e._craa5_leadershipteamid_value || e.craa5_leadershipteamid || '') };
@@ -1205,7 +1401,8 @@ export default function App(props) {
             rosters[shift.crew].push(workerRec);
         });
         CREW_CODES.forEach(function(c) { rosters[c].sort(function(a, b) { return a.name.localeCompare(b.name); }); leadRosters[c].sort(function(a, b) { return a.name.localeCompare(b.name); }); });
-        return { rosters: rosters, leadRosters: leadRosters, empById: empById, namesById: namesById, whyIgnored: whyIgnored, unmatched: unmatched, inactive: inactive, excluded: excluded, roleExcluded: roleExcluded, jobRoles: Object.values(jobRoles).sort(function(a, b) { return a.label.localeCompare(b.label); }) };
+        return { rosters: rosters, leadRosters: leadRosters, empById: empById, namesById: namesById, whyIgnored: whyIgnored, unmatched: unmatched, inactive: inactive, excluded: excluded, roleExcluded: roleExcluded, jobRoles: Object.values(jobRoles).sort(function(a, b) { return a.label.localeCompare(b.label); }),
+            who: { idByGuid: idByGuid, idByName: idByName, supIds: supIds, crewById: crewById } };
     }, [rawEmployees, jobRoleChoices]);
     const setJobRoleKind = function(key, kind) {
         setJobRoleChoices(function(prev) { return Object.assign({}, prev, { [key]: kind }); });
@@ -1239,12 +1436,29 @@ export default function App(props) {
     // Rounded to 15 min so the plan only re-flows a few times an hour.
     const reforecastFrom = liveReforecast && nowMin > 0 ? Math.ceil(nowMin / 15) * 15 : 0;
 
+    // Shift Start's saved task assignments for the shifts in this plan that have started (an hour early counts), read again
+    // whenever the plan window moves, every 5 minutes, and on "Reload from Shift Start". Never more than a few days back.
+    const loadTaskRows = function() {
+        const now = Date.now();
+        const since = Math.max(globalStartMs - TASK_PRE_SHIFT_MIN * 60000, now - TASK_ROW_DAYS * 86400000);
+        const until = Math.min(globalStartMs + planHorizonMins * 60000, now + TASK_PRE_SHIFT_MIN * 60000);
+        if (since >= until) { applyTaskRows([]); return Promise.resolve(); }
+        return fetchTaskAssignmentRows(props.dataApi, since, until).then(applyTaskRows);
+    };
+    loadTaskRowsRef.current = loadTaskRows;
+    useEffect(function() { loadTaskRowsRef.current(); }, [props.dataApi, globalStartMs, planHorizonMins]);
+
     const shiftWindows = useMemo(function() {
         return buildShiftWindows(shiftRotation, getGlobalStart(ganttStartDate, ganttStartHour), planHorizonMins)
             .map(function(w) { return Object.assign({}, w, { key: w.crew + '|' + w.start }); });
     }, [shiftRotation, ganttStartDate, ganttStartHour, planHorizonMins]);
 
-    // Shift Start boards that line up with each shift in the plan (same crew, started within 90 min of the shift).
+    // Shift Start's saved task assignments as boards, one per supervisor per shift.
+    const taskBoards = useMemo(function() {
+        return boardsFromTaskRows(taskRows, shiftWindows, globalStartMs, rosterInfo.who);
+    }, [taskRows, shiftWindows, globalStartMs, rosterInfo]);
+    // Shift Start boards that line up with each shift in the plan (same crew, started within 90 min of the shift). A supervisor
+    // with no board row gets the board built from their saved task assignments instead.
     const windowBoards = useMemo(function() {
         const parsed = boardRows.map(parseBoardRow).filter(Boolean);
         const map = {};
@@ -1257,10 +1471,14 @@ export default function App(props) {
                 if (d > BOARD_MATCH_TOLERANCE_MS) return;
                 if (!bySup[b.supervisor] || d < bySup[b.supervisor].d) bySup[b.supervisor] = { d: d, b: b };
             });
-            map[w.key] = Object.keys(bySup).map(function(k) { return bySup[k].b; });
+            const list = Object.keys(bySup).map(function(k) { return bySup[k].b; });
+            const covered = {};
+            list.forEach(function(b) { covered[normS(b.supervisor)] = true; });
+            (taskBoards.boards[w.key] || []).forEach(function(b) { if (!covered[normS(b.supervisor)]) list.push(b); });
+            map[w.key] = list;
         });
         return map;
-    }, [boardRows, shiftWindows, globalStartMs]);
+    }, [boardRows, taskBoards, shiftWindows, globalStartMs]);
     const boardWindowCount = shiftWindows.filter(function(w) { return (windowBoards[w.key] || []).length > 0; }).length;
 
     // ---- Shift Start rooms: which room each person is set up on, and which equipment goes to whom ----
@@ -1320,6 +1538,8 @@ export default function App(props) {
     const windowPlans = useMemo(function() {
         const out = {};
         const kindOf = function(id) { const r = empById[id]; return r ? r.kind : 'none'; };
+        // A lead in the employee table who is on someone's crew in Shift Start does regular cleaning that shift.
+        const kindOn = function(board) { return function(id) { const k = kindOf(id); return k === 'leadership' && board.leads.indexOf(id) === -1 ? 'general' : k; }; };
         const keep = function(id) { return !!empById[id] && !absentEmployees[id]; };
         const nameOf = function(id) { return rosterInfo.namesById[id] || 'Unknown'; };
         const whyOut = function(id) { return absentEmployees[id] ? 'marked absent in Ganttly' : (rosterInfo.whyIgnored[id] || 'not on the Ganttly roster'); };
@@ -1344,7 +1564,7 @@ export default function App(props) {
                 const owners = people.map(ownerOf).filter(Boolean);
                 plan.lineTeam[lid] = counted.filter(function(id) { return owners.indexOf(ownerOf(id)) > -1; });
                 const list = lineAssets[lid] || [];
-                const split = splitLineEquipment(mb, line, list, kindOf, night, keep);
+                const split = splitLineEquipment(mb, line, list, kindOn(mb), night, keep);
                 Object.assign(plan.assign, split);   // an asset belongs to one line, so lines never clash
                 plan.lineUnassigned[lid] = list.filter(function(a) { return !split[a.id]; }).length;
             });
@@ -1375,7 +1595,7 @@ export default function App(props) {
                         const lid = nb.workerLine[id] && lineOfB(nb.workerLine[id]) ? nb.workerLine[id] : '';
                         const counts = keep(id);
                         const person = { id: id, name: nameOf(id), isLead: nb.leads.indexOf(id) > -1, counted: counts, why: counts ? '' : whyOut(id), equipCount: eqCount[id] || 0 };
-                        if (lid) lineCard(lid).people.push(person); else noRoom.push(person);
+                        if (lid) lineCard(lid).people.push(person); else if (!person.isLead) noRoom.push(person);   // a lead leads; no room needed
                     });
                     (nb.teamLines[col.ownerId] || []).forEach(function(lid) { if (lineOfB(lid)) lineCard(lid); });
                     col.lines = order.map(function(lid) { return byLine[lid]; }).sort(byNameNum);
@@ -1447,7 +1667,9 @@ export default function App(props) {
                         seen[id] = true;
                         const rec = empById[id];
                         if (!rec) return;
-                        addPerson(leadsB.indexOf(id) > -1 ? Object.assign({}, rec, { kind: 'leadership', isLead: true, jobRole: 'Lead' }) : rec, win);
+                        // Shift Start decides who leads: a lead placed on another lead's crew works as crew (regular cleaning).
+                        addPerson(leadsB.indexOf(id) > -1 ? Object.assign({}, rec, { kind: 'leadership', isLead: true, jobRole: 'Lead' })
+                            : rec.isLead ? Object.assign({}, rec, { kind: 'general', isLead: false, jobRole: 'Lead, on a crew in Shift Start' }) : rec, win);
                     });
                     leadsB.forEach(function(leadId) {
                         if (outB[leadId] || !empById[leadId]) return;
@@ -2405,9 +2627,9 @@ export default function App(props) {
 
     if (isLoading) {
         return (
-            <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center touch-pan">
-                <Loader2 className="w-12 h-12 text-indigo-600 animate-spin mb-4" />
-                <h2 className="text-xl font-bold text-slate-700">Loading Object-Oriented Intelligence Matrix...</h2>
+            <div className="min-h-screen bg-[#F7F9FC] flex flex-col items-center justify-center touch-pan" style={{ fontFamily: BRAND_FONT }}>
+                <Loader2 className="w-12 h-12 text-[#0072CE] animate-spin mb-4" />
+                <h2 className="text-xl font-bold text-[#00468B]">Loading Object-Oriented Intelligence Matrix...</h2>
             </div>
         );
     }
@@ -2569,38 +2791,37 @@ export default function App(props) {
         return formatClockTime(ganttStartDate, ganttStartHour, t.startMin) + ' – ' + formatClockTime(ganttStartDate, ganttStartHour, t.startMin + t.finalDuration).replace(/^\S+ /, '');
     };
     const tabBtn = function(id, label, Icon) {
+        const on = activeTab === id;
         return (
-            <button key={id} onClick={function() { setActiveTab(id); }} className={`px-4 py-1.5 text-sm font-bold rounded-md flex items-center gap-2 transition-colors ${activeTab === id ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-400 hover:text-white hover:bg-slate-700'}`}>
+            <button key={id} onClick={function() { setActiveTab(id); }} className={`px-4 py-2 text-[11px] font-extrabold uppercase tracking-[0.08em] rounded-xl flex items-center gap-2 whitespace-nowrap flex-shrink-0 transition-colors ${on ? 'bg-[#0072CE] text-white shadow-[0_6px_14px_rgba(0,114,206,0.25)]' : 'text-slate-500 hover:bg-[#E6F1FB] hover:text-[#0072CE]'}`}>
                 <Icon className="w-4 h-4" /> {label}
             </button>
         );
     };
 
     return (
-        <div className="min-h-screen bg-slate-100 font-sans text-gray-900 flex flex-col h-screen overflow-hidden select-none print-expand">
+        <div className="min-h-screen bg-[#F7F9FC] text-slate-800 flex flex-col h-screen overflow-hidden select-none print-expand" style={{ fontFamily: BRAND_FONT }}>
 
-            <header className="bg-slate-900 border-b border-slate-800 shadow-sm flex-shrink-0 z-20 no-print">
-                <div className="max-w-[1900px] mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
-                    <div className="flex items-center gap-3">
-                        <div className="bg-indigo-600 p-2 rounded-lg shadow-sm"><Layers className="w-6 h-6 text-white" /></div>
-                        <div>
-                            <h1 className="text-xl font-bold text-white leading-tight tracking-wide flex items-center gap-3">
-                                Intelligent Tandem Planner
-                            </h1>
-                            <p className="text-[11px] font-bold text-slate-400">{formatClockTime(ganttStartDate, ganttStartHour, 0)} → {formatClockTime(ganttStartDate, ganttStartHour, planHorizonMins)} · {globalHeadcount} people · {progressPct}% done</p>
-                        </div>
+            <header className="bg-white border-b-4 border-[#FFB81C] flex-shrink-0 z-20 no-print">
+                <div className="max-w-[1900px] mx-auto px-4 sm:px-7 h-[72px] flex items-center justify-between gap-4">
+                    <div className="min-w-0">
+                        <h1 className="text-lg font-black text-[#00468B] leading-tight tracking-tight truncate">Intelligent Tandem Planner</h1>
+                        <p className="text-[11px] font-bold text-slate-500 truncate">{formatClockTime(ganttStartDate, ganttStartHour, 0)} → {formatClockTime(ganttStartDate, ganttStartHour, planHorizonMins)} · {globalHeadcount} people · {progressPct}% done</p>
                     </div>
-
-                    <div className="flex bg-slate-800 p-1 rounded-lg border border-slate-700 shadow-inner">
-                        {tabBtn('setup', 'Setup', Wrench)}
-                        {tabBtn('equipment', 'Dashboard', LayoutDashboard)}
-                        {tabBtn('gantt', 'Gantt', GanttChartIcon)}
-                        {tabBtn('board', 'Crew Board', ClipboardList)}
-                        {tabBtn('focus', 'Focus Mode', Target)}
-                        {tabBtn('metrics', 'Metrics', BarChart2)}
-                    </div>
+                    <BrandLogo />
                 </div>
             </header>
+
+            <nav className="bg-white border-b border-gray-200 flex-shrink-0 z-10 no-print">
+                <div className="brand-tabs max-w-[1900px] mx-auto px-3 sm:px-6 py-2 flex gap-1.5 overflow-x-auto">
+                    {tabBtn('setup', 'Setup', Wrench)}
+                    {tabBtn('equipment', 'Dashboard', LayoutDashboard)}
+                    {tabBtn('gantt', 'Gantt', GanttChartIcon)}
+                    {tabBtn('board', 'Crew Board', ClipboardList)}
+                    {tabBtn('focus', 'Focus Mode', Target)}
+                    {tabBtn('metrics', 'Metrics', BarChart2)}
+                </div>
+            </nav>
 
             {/* 🚨 ARCHITECTURE NOTE: Fixed Canvas Scrolling
                 Replaced 'overflow-hidden flex-col items-center' with 
@@ -2609,18 +2830,18 @@ export default function App(props) {
             */}
             {/* SETUP TAB */}
             {activeTab === 'setup' && (
-                <div className="flex-1 flex flex-col items-center bg-slate-100 p-4 md:p-6 touch-pan overflow-y-auto custom-scrollbar">
+                <div className="flex-1 flex flex-col items-center bg-[#F7F9FC] p-4 md:p-6 touch-pan overflow-y-auto custom-scrollbar">
                     
                     <div className="w-full max-w-5xl flex flex-col h-full gap-6 pb-24">
                         
                         {/* GLOBAL MASTER CONFIGURATION */}
                         <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden flex-shrink-0">
-                            <div className="bg-indigo-50 border-b border-indigo-100 px-6 py-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-                                <h2 className="font-black text-indigo-900 uppercase tracking-widest text-sm flex items-center">
+                            <div className="bg-[#E6F1FB] border-b border-[#CFE3F7] px-6 py-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                                <h2 className="font-black text-[#00468B] uppercase tracking-widest text-sm flex items-center">
                                     <SettingsIcon className="w-5 h-5 mr-2" /> Planning Window
                                 </h2>
-                                <label className="flex items-center gap-2 cursor-pointer bg-white px-3 py-1.5 rounded-lg border border-indigo-200 shadow-sm transition-colors hover:bg-indigo-50">
-                                    <input type="checkbox" checked={hideConfiguredRooms} onChange={function(e) { setHideConfiguredRooms(e.target.checked); }} className="w-4 h-4 accent-indigo-600 cursor-pointer" />
+                                <label className="flex items-center gap-2 cursor-pointer bg-white px-3 py-1.5 rounded-lg border border-[#B3D4F2] shadow-sm transition-colors hover:bg-[#E6F1FB]">
+                                    <input type="checkbox" checked={hideConfiguredRooms} onChange={function(e) { setHideConfiguredRooms(e.target.checked); }} className="w-4 h-4 accent-[#0072CE] cursor-pointer" />
                                     <span className="text-[11px] font-bold text-slate-700 uppercase tracking-wider cursor-pointer">Hide 'Ready' Rooms</span>
                                 </label>
                             </div>
@@ -2641,8 +2862,8 @@ export default function App(props) {
                                     <input type="number" min="1" max="336" value={planHours} onChange={function(e) { setPlanHours(Math.max(1, Math.min(336, Number(e.target.value)||12))); }} className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none no-pan text-center" />
                                 </div>
                                 <div>
-                                    <label className="block text-[10px] font-black text-indigo-500 uppercase tracking-widest mb-1.5">Workforce In Window</label>
-                                    <div className="w-full border-2 border-indigo-400 bg-indigo-50 text-indigo-900 rounded p-2 text-sm font-black text-center" title="Sum of every crew's headcount that works inside the plan window">{globalHeadcount} people · {shiftWindows.length} shifts</div>
+                                    <label className="block text-[10px] font-black text-[#0072CE] uppercase tracking-widest mb-1.5">Workforce In Window</label>
+                                    <div className="w-full border-2 border-[#0072CE] bg-[#E6F1FB] text-[#00468B] rounded p-2 text-sm font-black text-center" title="Sum of every crew's headcount that works inside the plan window">{globalHeadcount} people · {shiftWindows.length} shifts</div>
                                 </div>
                             </div>
                             <div className="px-6 pb-5 flex flex-wrap items-center gap-2">
@@ -2659,9 +2880,9 @@ export default function App(props) {
                         {/* SHIFT START LINK */}
                         <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden flex-shrink-0">
                             <div className="bg-slate-50 border-b border-gray-200 px-6 py-4 flex flex-wrap items-center justify-between gap-3">
-                                <h2 className="font-black text-slate-800 uppercase tracking-widest text-sm flex items-center"><ClipboardList className="w-5 h-5 mr-2 text-indigo-500" /> Shift Start Link</h2>
+                                <h2 className="font-black text-slate-800 uppercase tracking-widest text-sm flex items-center"><ClipboardList className="w-5 h-5 mr-2 text-[#0072CE]" /> Shift Start Link</h2>
                                 <div className="flex flex-wrap items-center gap-2">
-                                    <span className="text-[10px] font-bold normal-case tracking-normal text-slate-500 bg-white border border-slate-200 rounded px-2 py-0.5" title={'Boards saved in the last ' + BOARD_DAYS + ' days. Checked again every 5 minutes.'}>{boardRows.length} Shift Start board{boardRows.length === 1 ? '' : 's'} loaded · {lineRows.length} lines{shiftStartCheckedAt ? ' · checked ' + shiftStartCheckedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : ''}</span>
+                                    <span className="text-[10px] font-bold normal-case tracking-normal text-slate-500 bg-white border border-slate-200 rounded px-2 py-0.5" title={'Team assignments saved for the shifts in this plan (newest ' + TASK_ROW_TOP + ', at most ' + TASK_ROW_DAYS + ' days back) and boards saved in the last ' + BOARD_DAYS + ' days. Checked again every 5 minutes.' + (taskBoards.stats.equipment ? ' ' + taskBoards.stats.equipment + ' equipment progress rows skipped.' : '') + (taskBoards.stats.unknownPerson ? ' ' + taskBoards.stats.unknownPerson + ' rows name someone not in the employee table.' : '')}>{taskRowsFailed ? "Couldn't read Shift Start's saved assignments" : taskRows.length + ' saved assignment' + (taskRows.length === 1 ? '' : 's')}{boardRows.length ? ' · ' + boardRows.length + ' board' + (boardRows.length === 1 ? '' : 's') : ''} · {lineRows.length} rooms{shiftStartCheckedAt ? ' · checked ' + shiftStartCheckedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : ''}</span>
                                     <Button variant="outline" size="sm" disabled={shiftStartLoading} onClick={function() { reloadShiftStart(); }}><RefreshCw className="w-3.5 h-3.5 mr-1" /> {shiftStartLoading ? 'Reloading…' : 'Reload from Shift Start'}</Button>
                                 </div>
                             </div>
@@ -2669,18 +2890,18 @@ export default function App(props) {
                                 <div>
                                     <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Employees &amp; teams come from</label>
                                     <select value={rosterSource} onChange={function(e) { setRosterSource(e.target.value); }} className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none no-pan bg-white cursor-pointer">
-                                        <option value="table">Employee table (Shift + Role columns)</option>
-                                        <option value="shiftstart">Shift Start boards (leads, their teams, who is out)</option>
+                                        <option value="shiftstart">Shift Start (leads, their teams, who is out)</option>
+                                        <option value="table">Employee table only (Shift + Role columns)</option>
                                     </select>
-                                    <p className="text-[11px] font-bold text-slate-500 mt-1.5">{rosterSource === 'shiftstart' ? 'A shift with a saved board uses that board. A shift with no board yet (a future weekend) falls back to the employee table, so you can still plan ahead.' : 'Leads own the people on their Leadership Team; everyone else comes from the Shift column.'}</p>
+                                    <p className="text-[11px] font-bold text-slate-500 mt-1.5">{rosterSource === 'shiftstart' ? "Shifts saved in Shift Start use its leads, teams and who is out (a lead placed on someone's crew works as crew). A shift with nothing saved yet (a future weekend) falls back to the employee table, so you can still plan ahead." : 'Leads own the people on their Leadership Team; everyone else comes from the Shift column.'}</p>
                                 </div>
                                 <div>
                                     <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Rooms come from</label>
                                     <select value={roomSource} onChange={function(e) { setRoomSource(e.target.value); }} className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none no-pan bg-white cursor-pointer">
-                                        <option value="all">All rooms that have equipment</option>
                                         <option value="shiftstart">Rooms with crew set up in Shift Start (equipment goes to the assigned person)</option>
+                                        <option value="all">All rooms that have equipment</option>
                                     </select>
-                                    <p className="text-[11px] font-bold text-slate-500 mt-1.5">{roomSource !== 'shiftstart' ? 'Turn rooms off in the Room Configuration list below.' : Object.keys(windowPlans).length === 0 ? (lineIndex.length === 0 && boardWindowCount > 0 ? "The Shift Start lines table (craa5_aa_mss_area) returned no rows, so rooms can't be matched yet." : 'No board falls inside this plan yet, so every room is shown.') : !shiftStartLines ? 'Nobody is set up on a room in Shift Start yet, so every room is shown until they are.' : `${Object.keys(shiftStartLines).length} room${Object.keys(shiftStartLines).length === 1 ? '' : 's'} have crew set up. Their equipment is in the plan and goes to the person Shift Start assigned it to; other rooms are left out.${shiftStartNoEquipLines.length ? ' No equipment found for: ' + shiftStartNoEquipLines.join(', ') + '.' : ''}`}</p>
+                                    <p className="text-[11px] font-bold text-slate-500 mt-1.5">{roomSource !== 'shiftstart' ? 'Turn rooms off in the Room Configuration list below.' : Object.keys(windowPlans).length === 0 ? (lineIndex.length === 0 && boardWindowCount > 0 ? "The Shift Start lines table (craa5_aa_mss_area) returned no rows, so rooms can't be matched yet." : 'Nothing is saved in Shift Start for the shifts in this plan yet, so every room is shown.') : !shiftStartLines ? 'Nobody is set up on a room in Shift Start yet, so every room is shown until they are.' : `${Object.keys(shiftStartLines).length} room${Object.keys(shiftStartLines).length === 1 ? '' : 's'} have crew set up. Their equipment is in the plan and goes to the person Shift Start assigned it to; other rooms are left out.${shiftStartNoEquipLines.length ? ' No equipment found for: ' + shiftStartNoEquipLines.join(', ') + '.' : ''}`}</p>
                                 </div>
                             </div>
                             <div className="px-4 md:px-6 pb-5 flex flex-wrap gap-2">
@@ -2695,7 +2916,7 @@ export default function App(props) {
                                         <span key={w.key} className={`text-[11px] font-bold rounded-lg px-2.5 py-1 border flex items-center gap-1.5 ${bs.length ? 'bg-emerald-50 border-emerald-300 text-emerald-900' : 'bg-slate-50 border-slate-200 text-slate-500'}`} title={bs.map(function(b) { return b.supervisor; }).join(', ')}>
                                             <span className={`text-[9px] font-black rounded px-1 py-0.5 ${style.badge}`}>{w.crew}</span>
                                             {w.dayLabel} {formatHourLabel(w.startHour)}:
-                                            {bs.length ? ` board found · ${leadsN} lead${leadsN === 1 ? '' : 's'} · ${memN} on teams` : (isFuture ? ' future shift — no board yet, using employee table' : ' no board saved — using employee table')}
+                                            {bs.length ? ` from Shift Start · ${leadsN} lead${leadsN === 1 ? '' : 's'} · ${memN} on teams` : (isFuture ? ' future shift — nothing in Shift Start yet, using employee table' : ' nothing saved in Shift Start — using employee table')}
                                         </span>
                                     );
                                 })}
@@ -2719,7 +2940,7 @@ export default function App(props) {
                                                     <span className={`text-[10px] font-black rounded px-1.5 py-0.5 ${style.badge}`}>{w.crew}</span>
                                                     <span className="font-black text-sm text-slate-800">{w.dayLabel} {formatHourLabel(w.startHour)}</span>
                                                     <span className="text-xs font-bold text-slate-500">{plan.views.map(function(v) { return v.supervisor; }).join(' · ')}</span>
-                                                    <button onClick={function() { setCollapsedPlans(function(prev) { return Object.assign({}, prev, { [w.key]: !prev[w.key] }); }); }} className="ml-auto text-[11px] font-black text-indigo-600 hover:text-indigo-800 underline">{collapsed ? 'Expand' : 'Collapse'}</button>
+                                                    <button onClick={function() { setCollapsedPlans(function(prev) { return Object.assign({}, prev, { [w.key]: !prev[w.key] }); }); }} className="ml-auto text-[11px] font-black text-[#0072CE] hover:text-[#00468B] underline">{collapsed ? 'Expand' : 'Collapse'}</button>
                                                 </div>
                                                 {!collapsed && plan.views.map(function(v, vi) {
                                                     return (
@@ -2746,7 +2967,7 @@ export default function App(props) {
                                                                                             return (
                                                                                                 <div key={p.id} title={p.counted ? '' : 'Not planned: ' + p.why} className={`flex items-center justify-between gap-2 text-[12px] mt-1 border border-dashed rounded px-1.5 py-1 ${p.counted ? 'border-slate-200' : 'border-slate-200 bg-slate-100 opacity-60'}`}>
                                                                                                     <span className={`truncate font-bold ${p.counted ? 'text-slate-700' : 'text-slate-400 line-through'}`}>{p.name}{p.isLead ? <span className="ml-1 text-[9px] font-black uppercase text-sky-600">Lead</span> : null}</span>
-                                                                                                    <span className={`text-[10px] font-black whitespace-nowrap flex-shrink-0 ${p.counted ? 'text-indigo-600' : 'text-slate-400'}`}>{!p.counted ? 'not planned' : p.isLead ? '—' : p.equipCount + ' to do'}</span>
+                                                                                                    <span className={`text-[10px] font-black whitespace-nowrap flex-shrink-0 ${p.counted ? 'text-[#0072CE]' : 'text-slate-400'}`}>{!p.counted ? 'not planned' : p.isLead ? '—' : p.equipCount + ' to do'}</span>
                                                                                                 </div>
                                                                                             );
                                                                                         })}
@@ -2778,7 +2999,7 @@ export default function App(props) {
                         <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden flex-shrink-0">
                             <div className="bg-slate-50 border-b border-gray-200 px-6 py-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
                                 <h2 className="font-black text-slate-800 uppercase tracking-widest text-sm flex items-center">
-                                    <Users className="w-5 h-5 mr-2 text-indigo-500" /> Crew Rotation & Headcount
+                                    <Users className="w-5 h-5 mr-2 text-[#0072CE]" /> Crew Rotation & Headcount
                                     <span className="ml-3 text-[10px] font-bold normal-case tracking-normal text-slate-500 bg-white border border-slate-200 rounded px-2 py-0.5">Rotation: {rotationSource}</span>
                                 </h2>
                                 <div className="flex items-center gap-3">
@@ -2885,8 +3106,8 @@ export default function App(props) {
                                                     <Button variant="outline" size="sm" className="px-2 py-0.5 text-[10px]" onClick={function() { addSlot(crew); }}>+ Add</Button>
                                                 </div>
                                                 <div className="flex flex-wrap items-center gap-3">
-                                                    <label className="flex items-center gap-1.5 text-[10px] font-black text-indigo-600 uppercase" title="Blank = present employees from Dataverse">Headcount
-                                                        <input type="number" min="0" value={isOverridden ? crewHeadcountOverrides[crew] : ''} placeholder={String(useCp ? defaultCrewCount(crew) : (roster.length > 0 ? presentCount : FALLBACK_CREW_SIZE))} onChange={function(e) { handleCrewHeadcountChange(crew, e.target.value); }} className={`w-14 text-center font-black text-xs outline-none border rounded p-1 no-pan ${isOverridden ? 'border-indigo-400 bg-indigo-50' : 'border-slate-200'}`} />
+                                                    <label className="flex items-center gap-1.5 text-[10px] font-black text-[#0072CE] uppercase" title="Blank = present employees from Dataverse">Headcount
+                                                        <input type="number" min="0" value={isOverridden ? crewHeadcountOverrides[crew] : ''} placeholder={String(useCp ? defaultCrewCount(crew) : (roster.length > 0 ? presentCount : FALLBACK_CREW_SIZE))} onChange={function(e) { handleCrewHeadcountChange(crew, e.target.value); }} className={`w-14 text-center font-black text-xs outline-none border rounded p-1 no-pan ${isOverridden ? 'border-[#0072CE] bg-[#E6F1FB]' : 'border-slate-200'}`} />
                                                     </label>
                                                 </div>
                                                 <div className="text-[11px] font-bold text-slate-500">
@@ -2895,7 +3116,7 @@ export default function App(props) {
                                                 </div>
                                                 {rosterList.length > 0 && (
                                                     <div>
-                                                        <button onClick={function() { setExpandedRosters(function(prev) { return Object.assign({}, prev, { [crew]: !prev[crew] }); }); }} className="text-[11px] font-black text-indigo-600 hover:text-indigo-800 flex items-center gap-1">
+                                                        <button onClick={function() { setExpandedRosters(function(prev) { return Object.assign({}, prev, { [crew]: !prev[crew] }); }); }} className="text-[11px] font-black text-[#0072CE] hover:text-[#00468B] flex items-center gap-1">
                                                             {expandedRosters[crew] ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />} Roster / mark absent
                                                         </button>
                                                         {expandedRosters[crew] && (
@@ -2922,7 +3143,7 @@ export default function App(props) {
                         {/* ROOM CONFIGURATION CANVAS */}
                         <div className="bg-white rounded-xl shadow-lg border border-gray-200 flex flex-col h-fit overflow-hidden flex-shrink-0">
                             <div className="bg-slate-50 border-b border-gray-200 px-4 md:px-6 py-4 md:py-5 shadow-sm z-10 flex-shrink-0 flex justify-between items-center">
-                                <h2 className="font-black text-slate-800 flex items-center uppercase tracking-widest text-xs md:text-sm"><MapPin className="w-4 h-4 md:w-5 md:h-5 mr-2 text-indigo-500"/> Room Configuration Canvas</h2>
+                                <h2 className="font-black text-slate-800 flex items-center uppercase tracking-widest text-xs md:text-sm"><MapPin className="w-4 h-4 md:w-5 md:h-5 mr-2 text-[#0072CE]"/> Room Configuration Canvas</h2>
                                 <Button variant="success" size="sm" onClick={function() { setIsCustomTaskModalOpen(true); }}>+ Add Custom Task</Button>
                             </div>
                             
@@ -2936,13 +3157,13 @@ export default function App(props) {
                                     if (hideConfiguredRooms && roomConfigured[room] && !isSkipped) return null;
 
                                     return (
-                                    <div key={room} className={`bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm transition-all flex-shrink-0 ${isSkipped ? 'opacity-50 bg-slate-50' : 'hover:border-indigo-200'}`}>
+                                    <div key={room} className={`bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm transition-all flex-shrink-0 ${isSkipped ? 'opacity-50 bg-slate-50' : 'hover:border-[#B3D4F2]'}`}>
                                         
-                                        <div className={`px-4 md:px-5 py-4 flex flex-col justify-between gap-3 ${isSkipped ? 'bg-slate-100/50' : 'bg-indigo-50/80'}`}>
+                                        <div className={`px-4 md:px-5 py-4 flex flex-col justify-between gap-3 ${isSkipped ? 'bg-slate-100/50' : 'bg-[#E6F1FB]'}`}>
                                             <div className="flex items-center justify-between">
                                                 <div className="flex items-center gap-2">
-                                                    <MapPin className={`w-4 h-4 md:w-5 md:h-5 ${isSkipped ? 'text-slate-400' : 'text-indigo-600'}`}/>
-                                                    <h3 className={`font-bold text-base md:text-[17px] tracking-wide ${isSkipped ? 'text-slate-500 line-through' : 'text-indigo-900'}`}>{room}</h3>
+                                                    <MapPin className={`w-4 h-4 md:w-5 md:h-5 ${isSkipped ? 'text-slate-400' : 'text-[#0072CE]'}`}/>
+                                                    <h3 className={`font-bold text-base md:text-[17px] tracking-wide ${isSkipped ? 'text-slate-500 line-through' : 'text-[#00468B]'}`}>{room}</h3>
                                                 </div>
                                                 <div className="flex items-center gap-3">
                                                     {!isSkipped && (
@@ -2952,7 +3173,7 @@ export default function App(props) {
                                                         </label>
                                                     )}
                                                     
-                                                    <button onClick={function() { if (!skippedByShiftStart) handleToggleRoom(room); }} title={skippedByShiftStart ? 'Nobody is set up on this room in Shift Start. Change "Rooms come from" above to turn it back on.' : ''} className={`px-3 py-1 flex items-center gap-1.5 rounded-full text-[11px] font-bold transition-colors whitespace-nowrap border shadow-sm touch-none ${!isSkipped ? 'bg-indigo-600 text-white border-indigo-700 hover:bg-indigo-700' : 'bg-white text-slate-500 border-slate-300 hover:bg-slate-50'}`}>
+                                                    <button onClick={function() { if (!skippedByShiftStart) handleToggleRoom(room); }} title={skippedByShiftStart ? 'Nobody is set up on this room in Shift Start. Change "Rooms come from" above to turn it back on.' : ''} className={`px-3 py-1 flex items-center gap-1.5 rounded-full text-[11px] font-bold transition-colors whitespace-nowrap border shadow-sm touch-none ${!isSkipped ? 'bg-[#0072CE] text-white border-[#00468B] hover:bg-[#00468B]' : 'bg-white text-slate-500 border-slate-300 hover:bg-slate-50'}`}>
                                                         {!isSkipped ? <CheckCircle className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />} {skippedByShiftStart ? 'No crew in Shift Start' : isSkipped ? 'Skipped' : 'Active'}
                                                     </button>
                                                     
@@ -2962,20 +3183,20 @@ export default function App(props) {
                                             
                                             {!isSkipped && (
                                                 <div className="flex flex-wrap items-center gap-3 mt-2">
-                                                    <div className="flex items-center gap-2 bg-white px-2 py-1.5 rounded border border-indigo-200 shadow-sm">
+                                                    <div className="flex items-center gap-2 bg-white px-2 py-1.5 rounded border border-[#B3D4F2] shadow-sm">
                                                         <span className="text-[10px] font-black text-slate-500 uppercase">Handover:</span>
                                                         <input type="datetime-local" value={roomHandovers[room] || getDatetimeLocalString(0, ganttStartDate, ganttStartHour)} onChange={function(e) { handleRoomHandoverChange(room, e.target.value); }} className="w-36 md:w-40 text-center font-bold text-xs md:text-sm outline-none border-b border-slate-200 no-pan bg-transparent" />
                                                     </div>
-                                                    <div className="flex items-center gap-2 bg-white px-2 py-1.5 rounded border border-indigo-200 shadow-sm">
+                                                    <div className="flex items-center gap-2 bg-white px-2 py-1.5 rounded border border-[#B3D4F2] shadow-sm">
                                                         <span className="text-[10px] font-black text-slate-500 uppercase">Max Workers:</span>
                                                         <input type="number" min="1" value={roomLimits[room] !== undefined ? roomLimits[room] : ''} placeholder="∞" onChange={function(e) { handleRoomLimitsChange(room, e.target.value); }} className="w-10 md:w-12 text-center font-bold text-xs md:text-sm outline-none border-b border-slate-200 no-pan" title="Max people in this room at the same time. Leave blank for no cap." />
                                                     </div>
-                                                    <div className="flex items-center gap-2 bg-white px-2 py-1.5 rounded border border-indigo-200 shadow-sm">
+                                                    <div className="flex items-center gap-2 bg-white px-2 py-1.5 rounded border border-[#B3D4F2] shadow-sm">
                                                         <span className="text-[10px] font-black text-slate-500 uppercase">Priority:</span>
                                                         <input type="number" min="1" max="50" value={roomPriority[room] || 2} onChange={function(e) { handleRoomPriorityChange(room, e.target.value); }} className="w-10 md:w-12 text-center font-bold text-xs md:text-sm outline-none border-b border-slate-200 no-pan" />
                                                     </div>
                                                     <div className="flex items-center gap-2 h-[32px] md:h-[38px] px-2">
-                                                        <input type="checkbox" checked={roomCleanTogether[room] || false} onChange={function(e) { handleRoomCleanTogetherChange(room, e.target.checked); }} className="w-4 h-4 md:w-5 md:h-5 accent-indigo-600 cursor-pointer" />
+                                                        <input type="checkbox" checked={roomCleanTogether[room] || false} onChange={function(e) { handleRoomCleanTogetherChange(room, e.target.checked); }} className="w-4 h-4 md:w-5 md:h-5 accent-[#0072CE] cursor-pointer" />
                                                         <span className="text-[11px] font-bold text-slate-700 leading-tight cursor-pointer" onClick={function() { handleRoomCleanTogetherChange(room, !(roomCleanTogether[room] || false)); }}>Clean Together</span>
                                                     </div>
                                                     <div className="flex items-center gap-2 h-[32px] md:h-[38px] px-2 bg-rose-50 rounded border border-rose-100 col-span-2">
@@ -2996,10 +3217,10 @@ export default function App(props) {
 
             {/* DASHBOARD (EQUIPMENT) TAB */}
             {activeTab === 'equipment' && (
-                <div className="flex-1 overflow-y-auto bg-slate-100 p-6 touch-pan flex justify-center">
+                <div className="flex-1 overflow-y-auto bg-[#F7F9FC] p-6 touch-pan flex justify-center">
                     <div className="w-full max-w-6xl bg-white rounded-xl shadow-lg border border-gray-200 overflow-hidden flex flex-col h-fit">
                         <div className="bg-slate-50 border-b border-gray-200 px-6 py-5 shadow-sm z-10 flex justify-between items-center">
-                            <h2 className="font-black text-slate-800 flex items-center uppercase tracking-widest"><LayoutDashboard className="w-5 h-5 mr-2 text-indigo-500"/> Equipment Management Dashboard</h2>
+                            <h2 className="font-black text-slate-800 flex items-center uppercase tracking-widest"><LayoutDashboard className="w-5 h-5 mr-2 text-[#0072CE]"/> Equipment Management Dashboard</h2>
                         </div>
                         <div className="p-6 grid gap-6 bg-slate-50/50">
                             {activeRooms.length === 0 ? (
@@ -3015,15 +3236,15 @@ export default function App(props) {
 
                                 return (
                                     <div key={room} className="bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden">
-                                        <div className="bg-indigo-50/80 px-4 py-3 border-b border-indigo-100 flex items-center justify-between cursor-pointer" onClick={function() { toggleDashboardRoom(room); }}>
+                                        <div className="bg-[#E6F1FB] px-4 py-3 border-b border-[#CFE3F7] flex items-center justify-between cursor-pointer" onClick={function() { toggleDashboardRoom(room); }}>
                                             <div className="flex items-center gap-4">
-                                                <h3 className="font-bold text-indigo-900">{room}</h3>
-                                                <span className="text-xs font-bold text-indigo-700 bg-indigo-100/50 px-2 py-0.5 rounded border border-indigo-200">
+                                                <h3 className="font-bold text-[#00468B]">{room}</h3>
+                                                <span className="text-xs font-bold text-[#00468B] bg-[#E6F1FB] px-2 py-0.5 rounded border border-[#B3D4F2]">
                                                     Manpower Required: {manpowerHours.toFixed(1)} hrs
                                                 </span>
                                                 {roomAllergen[room] && <span className="text-[10px] font-bold bg-rose-600 text-white px-2 py-0.5 rounded shadow-sm">ALLERGEN ACTIVE</span>}
                                             </div>
-                                            <button className="text-indigo-500 hover:text-indigo-700 transition-colors">
+                                            <button className="text-[#0072CE] hover:text-[#00468B] transition-colors">
                                                 {collapsedDashboardRooms[room] ? <ChevronRight className="w-5 h-5"/> : <ChevronDown className="w-5 h-5"/>}
                                             </button>
                                         </div>
@@ -3047,7 +3268,7 @@ export default function App(props) {
                                                                 <tr key={task.id} className="hover:bg-slate-50">
                                                                     <td className="p-3 font-bold text-slate-800">{task.name}</td>
                                                                     <td className="p-3">
-                                                                        <input type="number" min="0" value={task.minutesRequired} onChange={function(e) { handleBaseMinsChange(task.id, e.target.value); }} className={`w-full text-center border rounded p-1 outline-none no-pan font-bold ${!roomAllergen[room] ? 'border-indigo-300 bg-indigo-50 text-indigo-900' : 'border-slate-200'}`} />
+                                                                        <input type="number" min="0" value={task.minutesRequired} onChange={function(e) { handleBaseMinsChange(task.id, e.target.value); }} className={`w-full text-center border rounded p-1 outline-none no-pan font-bold ${!roomAllergen[room] ? 'border-[#8FC0EC] bg-[#E6F1FB] text-[#00468B]' : 'border-slate-200'}`} />
                                                                     </td>
                                                                     <td className="p-3">
                                                                         <input type="number" min="0" value={task.allergenMins} onChange={function(e) { handleAllergenMinsChange(task.id, e.target.value); }} className={`w-full text-center border rounded p-1 outline-none no-pan font-bold ${roomAllergen[room] ? 'border-rose-400 bg-rose-100 text-rose-800' : 'border-rose-200 text-rose-700 bg-rose-50'}`} />
@@ -3106,11 +3327,11 @@ export default function App(props) {
                 let shiftTotal = 0, shiftDone = 0, shiftLate = 0;
                 crewLanes.forEach(function(l) { blocksFor(l.lane).forEach(function(t) { shiftTotal++; if (t.isComplete) shiftDone++; if (isLate(t)) shiftLate++; }); });
                 return (
-                    <div className="flex-1 overflow-y-auto bg-slate-100 p-4 md:p-6 touch-pan custom-scrollbar print-expand">
+                    <div className="flex-1 overflow-y-auto bg-[#F7F9FC] p-4 md:p-6 touch-pan custom-scrollbar print-expand">
                         <div className="max-w-6xl mx-auto space-y-4">
                             <div className="bg-white rounded-xl shadow-sm border border-slate-200 px-5 py-4 flex flex-wrap items-center gap-4">
-                                <h2 className="font-black text-slate-800 uppercase tracking-widest text-sm flex items-center"><ClipboardList className="w-5 h-5 mr-2 text-indigo-500" /> Crew Board</h2>
-                                <select value={activeBoardKey} onChange={function(e) { setBoardShift(e.target.value); }} className="no-print border border-indigo-300 rounded-lg p-1.5 text-sm font-bold bg-indigo-50 text-indigo-900 outline-none cursor-pointer">
+                                <h2 className="font-black text-slate-800 uppercase tracking-widest text-sm flex items-center"><ClipboardList className="w-5 h-5 mr-2 text-[#0072CE]" /> Crew Board</h2>
+                                <select value={activeBoardKey} onChange={function(e) { setBoardShift(e.target.value); }} className="no-print border border-[#8FC0EC] rounded-lg p-1.5 text-sm font-bold bg-[#E6F1FB] text-[#00468B] outline-none cursor-pointer">
                                     {shiftWindows.map(function(w) {
                                         return <option key={w.key} value={w.key}>{w.crew} crew · {formatClockTime(ganttStartDate, ganttStartHour, w.shiftStart)}{currentWindow && currentWindow.key === w.key ? '  (now)' : ''}</option>;
                                     })}
@@ -3211,7 +3432,7 @@ export default function App(props) {
 
             {/* METRICS & ROI TAB — one-stop shop */}
             {activeTab === 'metrics' && (
-                <div className="flex-1 overflow-y-auto bg-slate-100 p-6 touch-pan flex justify-center custom-scrollbar">
+                <div className="flex-1 overflow-y-auto bg-[#F7F9FC] p-6 touch-pan flex justify-center custom-scrollbar">
                     <div className="w-full max-w-6xl space-y-6 pb-16">
 
                         {/* HEADLINE KPIs */}
@@ -3219,7 +3440,7 @@ export default function App(props) {
                             <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200 flex flex-col justify-between">
                                 <div>
                                     <h2 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-2 flex items-center"><Clock className="w-4 h-4 mr-2" /> Projected Finish (ETA)</h2>
-                                    <div className="text-2xl font-black text-indigo-600">{globalMaxEnd > 0 ? formatClockTime(ganttStartDate, ganttStartHour, globalMaxEnd) : '—'}</div>
+                                    <div className="text-2xl font-black text-[#0072CE]">{globalMaxEnd > 0 ? formatClockTime(ganttStartDate, ganttStartHour, globalMaxEnd) : '—'}</div>
                                     <div className="text-xs font-bold text-slate-500 mt-1">Span {formatMinutesToHours(globalMaxEnd)}</div>
                                 </div>
                                 <div className={`text-xs font-black p-2 rounded mt-3 border ${scheduleData.unscheduled.length > 0 ? 'bg-rose-50 text-rose-700 border-rose-100' : etaSlackMins >= 0 ? 'bg-emerald-50 text-emerald-700 border-emerald-100' : 'bg-rose-50 text-rose-700 border-rose-100'}`}>
@@ -3249,16 +3470,16 @@ export default function App(props) {
                                 </div>
                             </div>
 
-                            <div className="bg-indigo-900 p-5 rounded-xl shadow-sm border border-indigo-800 text-white relative overflow-hidden flex flex-col justify-between">
+                            <div className="bg-[#00468B] p-5 rounded-xl shadow-sm border border-[#003A73] text-white relative overflow-hidden flex flex-col justify-between">
                                 <DollarSign className="absolute -right-4 -bottom-4 w-28 h-28 text-white/5 pointer-events-none" />
                                 <div>
-                                    <h2 className="text-xs font-black text-indigo-300 uppercase tracking-widest mb-2">Labor Cost (task hours)</h2>
+                                    <h2 className="text-xs font-black text-[#FFB81C] uppercase tracking-widest mb-2">Labor Cost (task hours)</h2>
                                     <div className="text-3xl font-black">{money(neededManpowerMins)}</div>
-                                    <div className="text-xs font-bold text-indigo-200 mt-1">{money(remainingManpowerMins)} remaining · Crew payroll {money(payrollMins)}</div>
+                                    <div className="text-xs font-bold text-[#CFE3F7] mt-1">{money(remainingManpowerMins)} remaining · Crew payroll {money(payrollMins)}</div>
                                 </div>
                                 <div className="flex items-center gap-2 bg-white/10 p-2 rounded mt-3 w-fit border border-white/20">
-                                    <span className="text-[10px] font-bold text-indigo-200 uppercase tracking-wider">Avg Hourly: $</span>
-                                    <input type="number" min="0" step="0.5" value={hourlyRate} onChange={function(e) { setHourlyRate(Number(e.target.value)||0); }} className="w-16 bg-transparent text-white font-bold outline-none border-b border-indigo-400 no-pan" />
+                                    <span className="text-[10px] font-bold text-[#CFE3F7] uppercase tracking-wider">Avg Hourly: $</span>
+                                    <input type="number" min="0" step="0.5" value={hourlyRate} onChange={function(e) { setHourlyRate(Number(e.target.value)||0); }} className="w-16 bg-transparent text-white font-bold outline-none border-b border-[#FFB81C] no-pan" />
                                 </div>
                             </div>
                         </div>
@@ -3272,7 +3493,7 @@ export default function App(props) {
                                 { label: 'Late / Overrun', value: countLate, cls: countLate ? 'text-rose-600' : 'text-slate-700' },
                                 { label: 'Double-Booked', value: countConflict, cls: countConflict ? 'text-amber-600' : 'text-slate-700' },
                                 { label: 'Overflow', value: scheduleData.unscheduled.length, cls: scheduleData.unscheduled.length ? 'text-rose-600' : 'text-slate-700' },
-                                { label: 'Shift Handovers', value: handoverCount, cls: 'text-indigo-600' }
+                                { label: 'Shift Handovers', value: handoverCount, cls: 'text-[#0072CE]' }
                             ].map(function(s) {
                                 return (
                                     <div key={s.label} className="bg-white p-3 rounded-xl shadow-sm border border-slate-200 text-center">
@@ -3314,7 +3535,7 @@ export default function App(props) {
                         {/* CREW UTILIZATION */}
                         <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
                             <div className="bg-slate-50 px-6 py-4 border-b border-slate-200 flex items-center justify-between">
-                                <h2 className="text-lg font-black text-slate-800 flex items-center"><Users className="w-5 h-5 mr-2 text-indigo-500" /> Crews</h2>
+                                <h2 className="text-lg font-black text-slate-800 flex items-center"><Users className="w-5 h-5 mr-2 text-[#0072CE]" /> Crews</h2>
                                 <span className="text-xs font-bold text-slate-500">Payroll = everyone on shift for the full shift</span>
                             </div>
                             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 p-6 bg-slate-50/50">
@@ -3334,7 +3555,7 @@ export default function App(props) {
                                             <div className="flex justify-between text-sm"><span className="text-[11px] text-slate-500 font-bold uppercase">Assigned</span><span className="font-black text-slate-800">{(cs.bookedMins / 60).toFixed(1)} hrs</span></div>
                                             <div className="flex justify-between text-sm"><span className="text-[11px] text-slate-500 font-bold uppercase">Completed</span><span className="font-black text-emerald-700">{(cs.doneMins / 60).toFixed(1)} hrs</span></div>
                                             <div className="flex justify-between text-sm"><span className="text-[11px] text-slate-500 font-bold uppercase">Idle Capacity</span><span className="font-black text-slate-800">{((cs.availMins - cs.bookedMins) / 60).toFixed(1)} hrs</span></div>
-                                            <div className="flex justify-between text-sm"><span className="text-[11px] text-slate-500 font-bold uppercase">Payroll</span><span className="font-black text-indigo-700">{money(cs.availMins)}</span></div>
+                                            <div className="flex justify-between text-sm"><span className="text-[11px] text-slate-500 font-bold uppercase">Payroll</span><span className="font-black text-[#00468B]">{money(cs.availMins)}</span></div>
                                         </div>
                                     );
                                 })}
@@ -3344,7 +3565,7 @@ export default function App(props) {
                         {/* ROOMS */}
                         <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
                             <div className="bg-slate-50 px-6 py-4 border-b border-slate-200">
-                                <h2 className="text-lg font-black text-slate-800 flex items-center"><Zap className="w-5 h-5 mr-2 text-indigo-500" /> Rooms</h2>
+                                <h2 className="text-lg font-black text-slate-800 flex items-center"><Zap className="w-5 h-5 mr-2 text-[#0072CE]" /> Rooms</h2>
                             </div>
                             <div className="overflow-x-auto">
                                 <table className="w-full text-left text-sm">
@@ -3374,7 +3595,7 @@ export default function App(props) {
                                                     <td className="p-3 text-right font-bold text-slate-700">{(r.manpowerMins / 60).toFixed(1)} h</td>
                                                     <td className="p-3 text-right font-bold text-slate-700">{money(r.manpowerMins)}</td>
                                                     <td className="p-3 text-xs font-bold text-slate-500">{r.end > 0 ? formatClockTime(ganttStartDate, ganttStartHour, r.start) : '—'}</td>
-                                                    <td className="p-3 text-xs font-black text-indigo-700">{r.end > 0 ? formatClockTime(ganttStartDate, ganttStartHour, r.end) : '—'}</td>
+                                                    <td className="p-3 text-xs font-black text-[#00468B]">{r.end > 0 ? formatClockTime(ganttStartDate, ganttStartHour, r.end) : '—'}</td>
                                                     <td className="p-3 text-center text-[10px] font-black">
                                                         {r.late > 0 && <span className="text-rose-700 bg-rose-50 border border-rose-200 rounded px-1.5 py-0.5 mr-1">{r.late} LATE</span>}
                                                         {r.overflow > 0 && <span className="text-rose-700 bg-rose-50 border border-rose-200 rounded px-1.5 py-0.5">{r.overflow} OVERFLOW</span>}
@@ -3391,7 +3612,7 @@ export default function App(props) {
                         {/* WORKERS */}
                         <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
                             <div className="bg-slate-50 px-6 py-4 border-b border-slate-200 flex items-center justify-between">
-                                <h2 className="text-lg font-black text-slate-800 flex items-center"><Users className="w-5 h-5 mr-2 text-indigo-500" /> Worker Workload</h2>
+                                <h2 className="text-lg font-black text-slate-800 flex items-center"><Users className="w-5 h-5 mr-2 text-[#0072CE]" /> Worker Workload</h2>
                                 <span className="text-xs font-bold text-slate-500">Use the Crew Board to reassign</span>
                             </div>
                             <div className="overflow-x-auto max-h-[480px] overflow-y-auto custom-scrollbar">
@@ -3413,7 +3634,7 @@ export default function App(props) {
                                             return (
                                                 <tr key={ws.lane} className="hover:bg-slate-50">
                                                     <td className="p-2.5 font-bold text-slate-800"><span className={`text-[9px] font-black rounded px-1 py-0.5 mr-2 ${getCrewStyle(ws.crew).badge}`}>{ws.crew}</span>{ws.name}</td>
-                                                    <td className="p-2.5 w-40"><div className="flex items-center gap-2"><div className="flex-1 h-1.5 bg-slate-100 rounded-full overflow-hidden"><div className={`h-full ${pct > 100 ? 'bg-rose-500' : 'bg-indigo-500'}`} style={{ width: `${Math.min(100, pct)}%` }} /></div><span className="text-[11px] font-black text-slate-600 w-9 text-right">{pct}%</span></div></td>
+                                                    <td className="p-2.5 w-40"><div className="flex items-center gap-2"><div className="flex-1 h-1.5 bg-slate-100 rounded-full overflow-hidden"><div className={`h-full ${pct > 100 ? 'bg-rose-500' : 'bg-[#0072CE]'}`} style={{ width: `${Math.min(100, pct)}%` }} /></div><span className="text-[11px] font-black text-slate-600 w-9 text-right">{pct}%</span></div></td>
                                                     <td className="p-2.5 text-right font-bold text-slate-700">{(ws.bookedMins / 60).toFixed(1)} h</td>
                                                     <td className="p-2.5 text-right font-bold text-slate-500">{(ws.availMins / 60).toFixed(0)} h</td>
                                                     <td className="p-2.5 text-center font-bold text-slate-700">{ws.done}/{ws.tasks}</td>
@@ -3441,7 +3662,7 @@ export default function App(props) {
 
             {/* GANTT & FOCUS TABS */}
             {(activeTab === 'gantt' || activeTab === 'focus') && (
-                <main className="flex-1 flex overflow-hidden w-full mx-auto touch-pan bg-slate-100 flex-col">
+                <main className="flex-1 flex overflow-hidden w-full mx-auto touch-pan bg-[#F7F9FC] flex-col">
 
                     {/* Gantt Header & Room Key */}
                     <div className="bg-slate-50 px-5 py-2 border-b border-slate-200 flex flex-wrap gap-4 items-center shadow-inner z-10 flex-shrink-0">
@@ -3480,14 +3701,14 @@ export default function App(props) {
                             <div className="flex flex-wrap items-center gap-3">
                                 {activeTab === 'focus' ? (
                                     <div className="flex items-center gap-4 w-full max-w-md">
-                                        <h2 className="font-black text-slate-800 flex items-center text-xs uppercase tracking-widest flex-shrink-0"><Target className="w-4 h-4 mr-2 text-indigo-500"/> Focus Target</h2>
-                                        <select value={focusRoom} onChange={function(e) { setFocusRoom(e.target.value); }} className="flex-1 border border-indigo-300 rounded-lg p-1.5 text-sm font-bold bg-indigo-50 text-indigo-900 outline-none cursor-pointer">
+                                        <h2 className="font-black text-slate-800 flex items-center text-xs uppercase tracking-widest flex-shrink-0"><Target className="w-4 h-4 mr-2 text-[#0072CE]"/> Focus Target</h2>
+                                        <select value={focusRoom} onChange={function(e) { setFocusRoom(e.target.value); }} className="flex-1 border border-[#8FC0EC] rounded-lg p-1.5 text-sm font-bold bg-[#E6F1FB] text-[#00468B] outline-none cursor-pointer">
                                             <option value="">-- Select Room to Isolate --</option>
                                             {activeRooms.map(function(r) { return <option key={r} value={r}>{r}</option>; })}
                                         </select>
                                     </div>
                                 ) : (
-                                    <h2 className="font-black text-slate-800 flex items-center text-xs uppercase tracking-widest"><CalendarDays className="w-4 h-4 mr-2 text-indigo-500"/> Global Timeline</h2>
+                                    <h2 className="font-black text-slate-800 flex items-center text-xs uppercase tracking-widest"><CalendarDays className="w-4 h-4 mr-2 text-[#0072CE]"/> Global Timeline</h2>
                                 )}
                                 <select value={ganttShift} onChange={function(e) { setGanttShift(e.target.value); }} className="border border-slate-300 rounded-lg p-1.5 text-xs font-bold bg-white text-slate-800 outline-none cursor-pointer" title="Show one 12h shift's workers">
                                     <option value="">All shifts ({globalHeadcount} people)</option>
@@ -3527,7 +3748,7 @@ export default function App(props) {
                             </div>
                             <div className="flex items-center gap-3 bg-white px-3 py-1 rounded-lg border border-slate-200 shadow-sm">
                                 <ZoomIn className="w-3.5 h-3.5 text-slate-400" />
-                                <input type="range" min="15" max="120" value={zoomLevel} onChange={function(e) { setZoomLevel(Number(e.target.value)); }} className="w-24 accent-indigo-500 cursor-pointer no-pan" title="Adjust timeline scale"/>
+                                <input type="range" min="15" max="120" value={zoomLevel} onChange={function(e) { setZoomLevel(Number(e.target.value)); }} className="w-24 accent-[#0072CE] cursor-pointer no-pan" title="Adjust timeline scale"/>
                             </div>
                         </div>
 
@@ -3539,7 +3760,7 @@ export default function App(props) {
                                         {TIME_MARKERS.map(function(hour) {
                                             return (
                                             <div key={hour} className="absolute top-0 bottom-0 border-l border-gray-300 flex flex-col justify-center -ml-[1px]" style={{ left: `${hour * zoomLevel}px` }}>
-                                                <span className="text-[10px] font-black text-indigo-700 bg-indigo-50/80 px-2 rounded-br border-b border-r border-indigo-100 absolute top-0 left-0 whitespace-nowrap">
+                                                <span className="text-[10px] font-black text-[#00468B] bg-[#E6F1FB] px-2 rounded-br border-b border-r border-[#CFE3F7] absolute top-0 left-0 whitespace-nowrap">
                                                     {formatGanttHeaderTime(ganttStartDate, ganttStartHour, hour * 60)}
                                                 </span>
                                             </div>
@@ -3605,7 +3826,7 @@ export default function App(props) {
                                                         <div className="mt-1 text-[9px] font-bold truncate whitespace-nowrap" style={{ color: gc || '#64748b' }}>{teamTxt}</div>
                                                     ) : (
                                                         <div className="flex items-center gap-1.5 mt-1">
-                                                            <div className="flex-1 min-w-0 h-1 bg-slate-100 rounded-full overflow-hidden"><div className={`h-full ${pct > 100 ? 'bg-rose-500' : 'bg-indigo-400'}`} style={{ width: `${Math.min(100, pct)}%` }} /></div>
+                                                            <div className="flex-1 min-w-0 h-1 bg-slate-100 rounded-full overflow-hidden"><div className={`h-full ${pct > 100 ? 'bg-rose-500' : 'bg-[#0072CE]'}`} style={{ width: `${Math.min(100, pct)}%` }} /></div>
                                                             <span className="text-[9px] font-black text-slate-400 text-right whitespace-nowrap flex-shrink-0">{ws ? (ws.bookedMins / 60).toFixed(1) : 0}h · {ws ? ws.done : 0}/{ws ? ws.tasks : 0}</span>
                                                         </div>
                                                     )}
@@ -3700,7 +3921,7 @@ export default function App(props) {
                                                                 className={`absolute block-draggable flex flex-col justify-center z-20 cursor-grab rounded-md
                                                                     ${task.isComplete ? 'opacity-60 grayscale' : ''}
                                                                     ${ringCls}
-                                                                    ${isDraggingMe ? 'z-50 shadow-2xl scale-[1.02] ring-2 ring-white ring-offset-2 ring-offset-indigo-500 opacity-90 cursor-grabbing' : 'gantt-block-anim hover:z-30 hover:brightness-110 hover:shadow-md'}
+                                                                    ${isDraggingMe ? 'z-50 shadow-2xl scale-[1.02] ring-2 ring-white ring-offset-2 ring-offset-[#0072CE] opacity-90 cursor-grabbing' : 'gantt-block-anim hover:z-30 hover:brightness-110 hover:shadow-md'}
                                                                     ${hoveredTaskId === task.id && !isDraggingMe ? 'z-30 brightness-110 shadow-lg' : ''}
                                                                 `}
                                                                 style={{ left: `${leftPx}px`, width: `${Math.max(widthPx, 8)}px`, top: `${topPx + 2}px`, height: `${LANE_HEIGHT_PX - 4}px` }}
@@ -3800,7 +4021,7 @@ export default function App(props) {
                             <h3 className="text-lg font-black text-slate-800">{dtTarget === 'GLOBAL' ? 'Add Global Downtime' : 'Add Room Downtime'}</h3>
                             <Button variant="outline" size="sm" onClick={function() { setIsRoomDtModalOpen(false); }} className="px-2 py-1 shadow-none text-slate-400 hover:text-slate-800">✕</Button>
                         </div>
-                        <div className="text-xs font-bold text-indigo-600 mb-4 bg-indigo-50 p-2 rounded">Target: {dtTarget}</div>
+                        <div className="text-xs font-bold text-[#0072CE] mb-4 bg-[#E6F1FB] p-2 rounded">Target: {dtTarget}</div>
                         <div className="space-y-4">
                             <div>
                                 <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Event Label</label>
@@ -3834,7 +4055,7 @@ export default function App(props) {
                             <h3 className="text-lg font-black text-slate-800">Add Equipment Downtime</h3>
                             <Button variant="outline" size="sm" onClick={function() { setIsEquipDtModalOpen(false); }} className="px-2 py-1 shadow-none text-slate-400 hover:text-slate-800">✕</Button>
                         </div>
-                        <div className="text-xs font-bold text-indigo-600 mb-4 bg-indigo-50 p-2 rounded">Target Equipment ID: {dtTarget}</div>
+                        <div className="text-xs font-bold text-[#0072CE] mb-4 bg-[#E6F1FB] p-2 rounded">Target Equipment ID: {dtTarget}</div>
                         <div className="space-y-4">
                             <div>
                                 <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Event Label</label>
