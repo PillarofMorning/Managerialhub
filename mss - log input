@@ -104,10 +104,14 @@ const THEME = createLightTheme(BRAND_RAMP);
 
 // --- SCHEMA CONSTANTS ---
 const LOG_TABLE = 'craa5__log_';
+const LOG_SET = 'craa5__log_s';
 const ASSET_TABLE = 'craa5_aa_assets';
 const ASSET_SET = 'craa5_aa_assetses';
 const MS_TABLE = 'craa5_aa_ms_assets';
 const ID_COL = { [LOG_TABLE]: 'craa5__log_id', [ASSET_TABLE]: 'craa5_aa_assetsid', [MS_TABLE]: 'craa5_aa_ms_assetsid' };
+const ENTITY_SET = { [LOG_TABLE]: LOG_SET, [ASSET_TABLE]: ASSET_SET };
+// A Dataverse File column: a create or update cannot set it, the picture is uploaded to each saved row on its own
+const PAPERWORK_COL = 'craa5_pictureorfileofpaperwork';
 
 const FREQUENCIES = [
   { col: 'craa5_sapdaily', label: 'Daily' },
@@ -424,6 +428,12 @@ const makeMock = (opts = {}) => {
       bindId(payload, row);
     },
     async remove(table, id) { db[table] = (db[table] || []).filter(r => r[ID_COL[table]] !== id); },
+    async uploadFile(table, id, column, data, fileName) {
+      const row = (db[table] || []).find(r => r[ID_COL[table]] === id);
+      if (!row) throw new Error('Row not found');
+      row[column] = `file ${fileName} (${Math.round((data.length * 3) / 4)} bytes)`;
+      row[`${column}_name`] = fileName;
+    },
   };
   return mock;
 };
@@ -442,6 +452,89 @@ const findWebApi = (props) => {
   }
   const c = props && ((props.context && props.context.webAPI) || props.webAPI);
   return c && c.retrieveMultipleRecords ? c : null;
+};
+
+// --- FILE UPLOAD (File columns) ---
+const findXrm = () => {
+  const ok = (x) => (x && x.WebApi ? x : null);
+  try { if (typeof Xrm !== 'undefined' && ok(Xrm)) return Xrm; } catch (_) { /* no global Xrm */ } // eslint-disable-line no-undef
+  if (typeof window !== 'undefined') {
+    for (const get of [() => window.Xrm, () => window.parent.Xrm, () => window.top.Xrm]) {
+      try { const x = ok(get()); if (x) return x; } catch (_) { /* a cross-origin parent */ }
+    }
+  }
+  return null;
+};
+
+const base64ToBytes = (b64) => {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) out[i] = bin.charCodeAt(i);
+  return out;
+};
+
+// Xrm.WebApi.online.execute reads getMetadata from the request's prototype
+const xrmAction = (name, params, types) => {
+  const Req = function Req() {};
+  Req.prototype.getMetadata = () => ({ boundParameter: null, parameterTypes: types, operationType: 0, operationName: name });
+  const req = new Req();
+  Object.keys(params).forEach((k) => { req[k] = params[k]; });
+  return req;
+};
+const EDM_STRING = { typeName: 'Edm.String', structuralProperty: 1 };
+const BLOCK_CHARS = 4 * 1024 * 1024; // base64 characters per block: 3 MB of file, under the 4 MB block limit
+const readJson = async (res) => {
+  if (!res) return {};
+  if (typeof res.json === 'function') return (await res.json()) || {};
+  return res.json ? (await res.json) || {} : res;
+};
+
+// The hosting app's own Xrm: InitializeFileBlocksUpload, one UploadBlock per 3 MB, CommitFileBlocksUpload
+const uploadByBlocks = async (xrm, table, id, column, b64, fileName, mime) => {
+  const exec = (req) => xrm.WebApi.online.execute(req);
+  const init = await readJson(await exec(xrmAction('InitializeFileBlocksUpload',
+    { Target: { '@odata.type': `Microsoft.Dynamics.CRM.${table}`, [ID_COL[table]]: id }, FileAttributeName: column, FileName: fileName },
+    { Target: { typeName: 'mscrm.crmbaseentity', structuralProperty: 5 }, FileAttributeName: EDM_STRING, FileName: EDM_STRING })));
+  const token = init.FileContinuationToken;
+  if (!token) throw new Error('Dataverse did not start the file upload.');
+  const blocks = [];
+  for (let i = 0; i * BLOCK_CHARS < b64.length; i += 1) {
+    const blockId = btoa(`block-${String(i).padStart(6, '0')}`); // every block id has the same length
+    await exec(xrmAction('UploadBlock', { BlockId: blockId, BlockData: b64.slice(i * BLOCK_CHARS, (i + 1) * BLOCK_CHARS), FileContinuationToken: token },
+      { BlockId: EDM_STRING, BlockData: { typeName: 'Edm.Binary', structuralProperty: 1 }, FileContinuationToken: EDM_STRING }));
+    blocks.push(blockId);
+  }
+  await exec(xrmAction('CommitFileBlocksUpload', { FileName: fileName, MimeType: mime, BlockList: blocks, FileContinuationToken: token },
+    { FileName: EDM_STRING, MimeType: EDM_STRING, BlockList: { typeName: 'Collection(Edm.String)', structuralProperty: 4 }, FileContinuationToken: EDM_STRING }));
+};
+
+// The Web API directly: one PATCH with the file's bytes (same site as the app)
+const uploadByPatch = async (xrm, table, id, column, b64, fileName) => {
+  let base = '';
+  try { base = xrm && xrm.Utility && xrm.Utility.getGlobalContext ? safeString(xrm.Utility.getGlobalContext().getClientUrl()) : ''; } catch (_) { /* use this site */ }
+  const res = await fetch(`${base.replace(/\/+$/, '')}/api/data/v9.2/${ENTITY_SET[table]}(${id})/${column}`, {
+    method: 'PATCH',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/octet-stream', 'OData-MaxVersion': '4.0', 'OData-Version': '4.0', Accept: 'application/json', 'x-ms-file-name': fileName },
+    body: base64ToBytes(b64),
+  });
+  if (!res.ok) {
+    let msg = '';
+    try { const j = await res.json(); msg = j && j.error && j.error.message; } catch (_) { /* no JSON body */ }
+    throw new Error(msg || `the server answered ${res.status}`);
+  }
+};
+
+const uploadFileColumn = async (table, id, column, b64, fileName, mime) => {
+  const xrm = findXrm();
+  const errors = [];
+  if (xrm && xrm.WebApi.online && typeof xrm.WebApi.online.execute === 'function') {
+    try { await uploadByBlocks(xrm, table, id, column, b64, fileName, mime); return; } catch (e) { errors.push(errText(e)); }
+  }
+  if (typeof fetch === 'function') {
+    try { await uploadByPatch(xrm, table, id, column, b64, fileName); return; } catch (e) { errors.push(errText(e)); }
+  }
+  throw new Error(errors.length ? Array.from(new Set(errors)).join('; ') : 'this app has no way to upload files');
 };
 
 const webApiAdapter = (w) => {
@@ -464,6 +557,7 @@ const webApiAdapter = (w) => {
     async create(table, payload) { const r = await w.createRecord(table, payload); return r && typeof r === 'object' ? r.id : r; },
     async update(table, id, payload) { await w.updateRecord(table, id, payload); },
     async remove(table, id) { await w.deleteRecord(table, id); },
+    uploadFile: uploadFileColumn,
   };
 };
 
@@ -495,6 +589,7 @@ const dataApiAdapter = (ref) => {
     },
     async update(table, id, payload) { await ref.current.updateRow(table, id, payload); },
     async remove(table, id) { await ref.current.deleteRow(table, id); },
+    uploadFile: uploadFileColumn, // dataApi has no file upload of its own
   };
 };
 
@@ -530,6 +625,7 @@ const makeApi = (dataApiRef, props) => {
     },
     update: (t, id, p) => limit(() => base.update(t, id, p)),
     remove: (t, id) => limit(() => base.remove(t, id)),
+    uploadFile: (t, id, col, data, name, mime) => limit(() => base.uploadFile(t, id, col, data, name, mime)),
   };
 };
 
@@ -1010,18 +1106,19 @@ const fetchDupes = async (api, code, dateStr) => {
   return new Set(rows.map(r => cleanGuid(r.craa5_equipmentguid)).filter(Boolean));
 };
 
+// Paperwork must stay readable: up to 1600 px on the long side as a JPEG (a few hundred KB), returned as base64
 const compressImage = (file) => new Promise((resolve) => {
   const reader = new FileReader();
   reader.onload = (e) => {
     const img = new Image();
     img.onload = () => {
       try {
-        const scale = Math.min(1, 1000 / Math.max(img.width, img.height));
+        const scale = Math.min(1, 1600 / Math.max(img.width, img.height));
         const c = document.createElement('canvas');
         c.width = Math.round(img.width * scale);
         c.height = Math.round(img.height * scale);
         c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-        resolve(c.toDataURL('image/jpeg', 0.7).split(',')[1]);
+        resolve(c.toDataURL('image/jpeg', 0.8).split(',')[1]);
       } catch (_) { resolve(null); }
     };
     img.onerror = () => resolve(null);
@@ -1098,6 +1195,10 @@ const useStyles = makeStyles({
   tagBad: { backgroundColor: '#FDD9DA', color: '#A5161B' },
   tagInfo: { backgroundColor: '#DCEBFA', color: '#0B4F94' },
   addPanel: { marginTop: '12px', padding: '10px', backgroundColor: '#FFF6E6', border: `1px dashed ${BRAND.yellow}`, borderRadius: '6px' },
+  // Long equipment lists scroll inside their own box instead of running off the page
+  pickList: { maxHeight: '300px', overflow: 'auto', marginTop: '6px', backgroundColor: '#FFFFFF', border: '1px solid #E4ECF6', borderRadius: '4px' },
+  linesScroll: { maxHeight: '60vh', overflow: 'auto', marginTop: '10px', border: '1px solid #E4ECF6', borderRadius: '4px' },
+  stickyTh: { position: 'sticky', top: 0, zIndex: 1, backgroundColor: '#FFFFFF' },
   changePanel: { padding: '10px', backgroundColor: '#F5F9FE', border: `1px solid ${BRAND.line}`, borderLeft: `4px solid ${BRAND.yellow}`, borderRadius: '6px' },
   hint: { fontSize: '12px', color: '#5B6F86' },
   dashboardGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px', marginBottom: '16px' },
@@ -1162,19 +1263,21 @@ const AssetPicker = ({ store, onPick, exclude, initialQuery = '', ariaLabel = 'S
         {!busy && !err && q.trim().length >= 2 && shown.length === 0 && <Text className={styles.hint} block style={{ marginTop: 6 }}>No matching equipment.</Text>}
       </div>
       {shown.length > 0 && (
-        <div style={{ overflowX: 'auto' }}>
-          <table className={styles.linesTable}>
-            <tbody>
-              {shown.map(a => (
-                <tr key={a.id}>
-                  <td className={styles.td}><strong>{a.name}</strong></td><td className={styles.td}>{a.room}</td><td className={styles.td}>{a.area}</td>
-                  <td className={styles.td} style={{ textAlign: 'right' }}>
-                    <Button size="small" appearance="primary" className={styles.btnPrimary} disabled={disabled} aria-label={`${actionLabel} ${a.name} (${placeText(a)})`} onClick={() => onPick(a)}>{actionLabel}</Button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div>
+          <div className={styles.pickList}>
+            <table className={styles.linesTable} style={{ marginTop: 0 }}>
+              <tbody>
+                {shown.map(a => (
+                  <tr key={a.id}>
+                    <td className={styles.td}><strong>{a.name}</strong></td><td className={styles.td}>{a.room}</td><td className={styles.td}>{a.area}</td>
+                    <td className={styles.td} style={{ textAlign: 'right' }}>
+                      <Button size="small" appearance="primary" className={styles.btnPrimary} disabled={disabled} aria-label={`${actionLabel} ${a.name} (${placeText(a)})`} onClick={() => onPick(a)}>{actionLabel}</Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
           {res.length >= LIMITS.assetSearch && <Text className={styles.hint} block style={{ marginTop: 4 }}>Showing the first {LIMITS.assetSearch}. Type more to narrow it down.</Text>}
         </div>
       )}
@@ -1228,7 +1331,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   const [edits, setEdits] = useState({});            // lineKey -> { id, name, room, area } for the equipment with that id
   const [dupes, setDupes] = useState(new Set());
   const [extras, setExtras] = useState([]);
-  const [addOpen, setAddOpen] = useState(false);
+  const [addOpen, setAddOpen] = useState(null); // null: open only for an order that is not in the SAP list
   const [addMode, setAddMode] = useState('search');
   const [addFreq, setAddFreq] = useState('craa5_sapw');
   const [newRoom, setNewRoom] = useState('');
@@ -1296,7 +1399,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   const clearOrderState = () => {
     resetPicks();
     setExcluded({}); setHoursOverride({}); setExtras([]); setEdits({});
-    setAddOpen(false); setEditMode(false); setNote(''); setNewFor({});
+    setAddOpen(null); setEditMode(false); setNote(''); setNewFor({});
   };
   const selectCode = (c) => { setCode(c); setShowSuggest(false); clearOrderState(); };
   // IDs changed on the Fix tab: picks made by hand may point at equipment that was just unified away, so they are dropped
@@ -1670,10 +1773,13 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
       else failedNames.push(toLog[i].name);
     });
     if (savedIds.length) setDupes(prev => new Set(Array.from(prev).concat(results.map((r, i) => (r.ok ? toLog[i].asset.id : null)).filter(Boolean))));
-    // The paperwork photo is compressed once and attached to each saved entry
+    // The paperwork picture is compressed once and uploaded to each saved entry's file column
     if (photo && savedIds.length) {
-      const pr = await pool(savedIds, 4, (id) => api.update(LOG_TABLE, id, { craa5_pictureorfileofpaperwork: photo }));
-      if (pr.some(r => !r.ok)) notes.push('Entries saved, but the paperwork photo could not be attached.');
+      const fileName = `paperwork-${normalizedCode}-${dateStr}.jpg`.replace(/[^A-Za-z0-9._-]/g, '_');
+      const pr = await pool(savedIds, 3, (id) => api.uploadFile(LOG_TABLE, id, PAPERWORK_COL, photo, fileName, 'image/jpeg'));
+      const bad = pr.filter(r => !r.ok);
+      if (bad.length) notes.push(`Entries saved, but the paperwork picture was not attached to ${bad.length === pr.length ? (pr.length === 1 ? 'it' : 'them') : plural(bad.length, 'of them', 'of them')} (${errText(bad[0].error)}).`);
+      else info.push(`Paperwork picture attached to ${plural(pr.length, 'entry', 'entries')}.`);
     }
     store.dropOrders();
     if (failedNames.length) {
@@ -1690,6 +1796,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   const summarize = (k) => { const v = Array.from(new Set(live.map(l => l[k]).filter(Boolean))); return v.length === 0 ? '' : v.length === 1 ? v[0] : `Multiple (${v.length})`; };
   const roomList = `mss-rooms-${index}`;
   const areaList = `mss-areas-${index}`;
+  const addShown = addOpen === null ? isUnknown : addOpen;
   const tagClass = (k) => mergeClasses(styles.tag, k === 'ok' ? styles.tagOk : k === 'warn' ? styles.tagWarn : k === 'bad' ? styles.tagBad : k === 'info' ? styles.tagInfo : undefined);
 
   const renderPanel = (l) => {
@@ -1882,11 +1989,12 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
       )}
 
       {lines.length > 0 && (
-        <div style={{ overflowX: 'auto' }}>
-          <table className={styles.linesTable}>
+        <div className={styles.linesScroll}>
+          <table className={styles.linesTable} style={{ marginTop: 0 }}>
             <thead><tr>
-              <th className={styles.th}><span style={{ position: 'absolute', left: -9999 }}>Include</span></th><th className={styles.th}>Equipment</th><th className={styles.th}>Room</th><th className={styles.th}>Area</th>
-              <th className={styles.th}>Frequency</th><th className={styles.th}>Hours</th><th className={styles.th}>Status</th>
+              {['Include', 'Equipment', 'Room', 'Area', 'Frequency', 'Hours', 'Status'].map((h, i) => (
+                <th key={h} className={mergeClasses(styles.th, styles.stickyTh)}>{i === 0 ? <span style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)', whiteSpace: 'nowrap' }}>{h}</span> : h}</th>
+              ))}
             </tr></thead>
             <tbody>
               {lines.map(l => {
@@ -1943,11 +2051,16 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
 
       {ready && !settling && (
         <div className={styles.addPanel}>
-          {!addOpen && !isUnknown ? (
-            <Button size="small" appearance="secondary" disabled={saving} onClick={() => setAddOpen(true)}>+ Equipment missing from this order?</Button>
+          {!addShown ? (
+            <Button size="small" appearance="secondary" disabled={saving} aria-expanded={false} onClick={() => setAddOpen(true)}>
+              {isUnknown ? `+ Add equipment to ${normalizedCode}` : '+ Equipment missing from this order?'}{extras.length ? ` (${extras.length} added)` : ''}
+            </Button>
           ) : (
             <>
-              <Text weight="semibold" block style={{ marginBottom: 8 }}>Add equipment to {normalizedCode}</Text>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', marginBottom: '8px' }}>
+                <Text weight="semibold">Add equipment to {normalizedCode}{extras.length ? ` · ${extras.length} added` : ''}</Text>
+                <Button size="small" appearance="secondary" aria-expanded aria-label="Done adding equipment (hide this panel)" onClick={() => setAddOpen(false)}>Done</Button>
+              </div>
               <div className={styles.rowFields} style={{ alignItems: 'center', marginBottom: 8 }}>
                 <RadioGroup layout="horizontal" aria-label="How to add equipment" value={addMode} onChange={(e, d) => setAddMode(d.value)}>
                   <Radio value="search" label="Search existing equipment" />
@@ -2100,6 +2213,9 @@ const RepairIds = ({ ctx, onCount }) => {
   const selected = shown.filter(g => apply[g.key] && choice[g.key]);
   const selectedRows = selected.reduce((s, g) => s + g.ids.length, 0);
   const highGroups = shown.filter(g => g.tier === 'high' && choice[g.key] && g.ranked.length && g.ranked[0].asset.id === choice[g.key]);
+  // Medium matches on screen whose suggestion is still the one chosen (and, as for every bulk pick, in the same room and area)
+  const mediumGroups = shown.filter(g => g.tier === 'medium' && choice[g.key] && g.ranked.length && g.ranked[0].asset.id === choice[g.key] && placeOk(g, g.ranked[0].asset));
+  const tickAll = (list) => setApply(p => { const x = { ...p }; list.forEach(g => { x[g.key] = true; }); return x; });
 
   const applySelected = async () => {
     const todo = selected.filter(g => store.getAsset(choice[g.key]));
@@ -2150,7 +2266,8 @@ const RepairIds = ({ ctx, onCount }) => {
             <Button onClick={() => scanBatch(false)} disabled={!!busy || scan.done}>{busy === 'scan' ? 'Scanning…' : scan.done ? 'End of log reached' : 'Scan next batch'}</Button>
             <Button onClick={() => scanBatch(true)} disabled={!!busy}>Start over</Button>
           </>}
-        <Button disabled={!!busy || !highGroups.length} onClick={() => setApply(p => { const x = { ...p }; highGroups.forEach(g => { x[g.key] = true; }); return x; })}>Tick all high confidence</Button>
+        <Button disabled={!!busy || !highGroups.length} onClick={() => tickAll(highGroups)}>Tick all high confidence</Button>
+        <Button disabled={!!busy || !mediumGroups.length} onClick={() => tickAll(mediumGroups)}>{`Tick all medium shown${mediumGroups.length ? ` (${mediumGroups.length})` : ''}`}</Button>
         <Button appearance="primary" className={styles.btnCta} disabled={!!busy || !selected.length || ctx.saving} onClick={applySelected}>
           {busy === 'apply' ? 'Applying…' : `Apply ${selected.length} selected (${selectedRows} entries)`}
         </Button>
