@@ -834,7 +834,9 @@ function lineRowsSignature(rows) {
 // Left Early), craa5_lead = the lead's name (the supervisor's own name for rooms the supervisor holds), craa5_team = the
 // supervisor's name. Moving someone saves a new row, so the newest row per person is where they are now. Rows carry no
 // reliable shift letter (the apps disagree on B/C), so a row belongs to the shift of its supervisor that was running when
-// it was saved. Rows with equipment filled in are progress updates from the employee hub, not assignments, and are skipped.
+// it was saved. Shift Start always stores the employee id (craa5__aaemp_guid); the employee hubs never do, so their equipment
+// progress rows (equipment filled in, no employee id) are skipped. A hub can also write equipment into a Shift Start row in
+// place; that row still counts, with its area matched to a room.
 const SOURCES_VERSION = 2;       // bumped when Shift Start became the default source (see rosterSource / roomSource)
 const TASK_ROW_TOP = 2000;
 const TASK_ROW_DAYS = 4;          // never read further back than this, whatever the plan window says
@@ -844,18 +846,20 @@ const OUT_AREA_NAMES = ['pto', 'sick', 'late', 'left early', 'ncns'];
 function odataDate(ms) { return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z'); }
 // Rows saved between sinceMs and untilMs, newest first. Returns null when the table couldn't be read (a refresh keeps what it had).
 async function fetchTaskAssignmentRows(dataApi, sinceMs, untilMs) {
-    const filter = 'modifiedon ge ' + odataDate(sinceMs) + ' and createdon le ' + odataDate(untilMs);
+    // Only Shift Start's rows: they carry the employee id, or at least no equipment (the hubs' progress rows have equipment and
+    // no id). Filtering on the server keeps the hubs' many progress rows from filling the row cap.
+    const filter = 'modifiedon ge ' + odataDate(sinceMs) + ' and createdon le ' + odataDate(untilMs) + " and (craa5__aaemp_guid ne null or craa5_equip eq null or craa5_equip eq '')";
     let failed = false;
     const xrm = safeGetXrm();
     if (xrm && xrm.WebApi && typeof xrm.WebApi.retrieveMultipleRecords === 'function') {
         try {
-            const res = await xrm.WebApi.retrieveMultipleRecords('craa5_taskassignment', '?$select=' + TASK_ROW_FIELDS.join(',') + '&$filter=' + filter + '&$orderby=createdon desc&$top=' + TASK_ROW_TOP);
+            const res = await xrm.WebApi.retrieveMultipleRecords('craa5_taskassignment', '?$select=' + TASK_ROW_FIELDS.join(',') + '&$filter=' + filter + '&$orderby=modifiedon desc&$top=' + TASK_ROW_TOP);
             if (res && Array.isArray(res.entities)) return res.entities;
         } catch (e) { failed = true; }
     }
     if (dataApi && typeof dataApi === 'object' && typeof dataApi.queryTable === 'function') {
         try {
-            let page = await dataApi.queryTable('craa5_taskassignment', { select: TASK_ROW_FIELDS, filter: filter, orderBy: 'createdon desc', pageSize: 250, top: TASK_ROW_TOP });
+            let page = await dataApi.queryTable('craa5_taskassignment', { select: TASK_ROW_FIELDS, filter: filter, orderBy: 'modifiedon desc', pageSize: 250, top: TASK_ROW_TOP });
             if (page && Array.isArray(page.rows)) {
                 const rows = page.rows.slice();
                 while (page && page.hasMoreRows && typeof page.loadMoreRows === 'function' && rows.length < TASK_ROW_TOP) {
@@ -873,9 +877,10 @@ function taskRowsSignature(rows) {
 }
 function rowTimeMs(v) { const t = v ? Date.parse(v) : NaN; return isNaN(t) ? 0 : t; }
 // Turns saved task-assignment rows into Shift Start boards (the same shape as a board row's JSON), one per supervisor per
-// shift in the plan. who = { idByGuid, idByName, supIds, crewById } from the employee table. Returns
-// { boards: { windowKey: [{ supervisor, crew, startMs, board, fromTasks: true }] }, stats }.
-function boardsFromTaskRows(rows, windows, globalStartMs, who) {
+// shift in the plan. who = { idByGuid, idByName, supIds, crewById } from the employee table; lines = Shift Start's lines
+// (to match the area a hub wrote into a row). Returns { boards: { windowKey: [{ supervisor, crew, startMs, board,
+// fromTasks: true }] }, stats }.
+function boardsFromTaskRows(rows, windows, globalStartMs, who, lines) {
     const stats = { read: (rows || []).length, used: 0, equipment: 0, unknownPerson: 0, noShift: 0 };
     const out = {};
     if (!rows || !rows.length || !windows.length) return { boards: out, stats: stats };
@@ -884,12 +889,13 @@ function boardsFromTaskRows(rows, windows, globalStartMs, who) {
     const wins = windows.map(function(w) {
         return { key: w.key, crew: w.crew, s: globalStartMs + w.shiftStart * 60000 - TASK_PRE_SHIFT_MIN * 60000, e: globalStartMs + w.shiftEnd * 60000 };
     });
-    const groups = {};   // windowKey -> supervisorKey -> { name, rows }
+    const newest = {};   // windowKey -> employeeId -> that person's newest row in the shift (across supervisors)
     rows.forEach(function(r) {
         const empName = String(getRowField(r, 'craa5_id') || '').trim();
         if (/unassigned/i.test(empName)) return;
-        if (String(getRowField(r, 'craa5_equip') || getRowField(r, 'craa5_equipment') || '').trim()) { stats.equipment++; return; }
         const guid = String(getRowField(r, 'craa5__aaemp_guid') || '').replace(/[{}]/g, '').toLowerCase();
+        const equipText = String(getRowField(r, 'craa5_equip') || getRowField(r, 'craa5_equipment') || '').trim();
+        if (equipText && !guid) { stats.equipment++; return; }   // an employee hub's progress row
         const empId = (guid && who.idByGuid[guid]) || idOfName(empName);
         if (!empId) { stats.unknownPerson++; return; }
         const supName = String(getRowField(r, 'craa5_team') || '').trim();
@@ -908,26 +914,38 @@ function boardsFromTaskRows(rows, windows, globalStartMs, who) {
             hit = hit.slice(0, 1);
         }
         if (!hit.length) { stats.noShift++; return; }
-        const sk = nameKey(supName) || '(no supervisor)';
-        const item = { empId: empId, area: String(getRowField(r, 'craa5_area') || '').trim(), lead: String(getRowField(r, 'craa5_lead') || '').trim(), supName: supName, supId: supId, tc: tc, tm: tm };
+        let area = String(getRowField(r, 'craa5_area') || '').trim();
+        if (equipText && area && OUT_AREA_NAMES.indexOf(normS(area)) === -1 && lines && lines.length) {
+            // A hub that wrote equipment into the row also wrote that equipment's area; use the room it belongs to.
+            const line = lineForArea(lines, area);
+            if (line) area = line.name;
+        }
+        const item = { empId: empId, area: area, lead: String(getRowField(r, 'craa5_lead') || '').trim(), supName: supName, supId: supId, tc: tc, tm: tm, touched: !!equipText };
         hit.forEach(function(w) {
-            const g = groups[w.key] = groups[w.key] || {};
-            const sg = g[sk] = g[sk] || { name: supName, rows: [] };
-            sg.rows.push(item);
+            // Newest row per person (when two were saved at the same moment, the one touched last), so someone moved to
+            // another supervisor's board is only on that board.
+            const n = newest[w.key] = newest[w.key] || {};
+            const cur = n[empId];
+            if (!cur || item.tc > cur.tc || (item.tc === cur.tc && item.tm > cur.tm)) n[empId] = item;
         });
     });
     windows.forEach(function(w) {
-        const g = groups[w.key];
-        if (!g) return;
-        out[w.key] = Object.keys(g).map(function(sk) {
-            const sg = g[sk];
-            // Newest row per person (when two were saved at the same moment, the one touched last).
-            const latest = {};
-            sg.rows.forEach(function(it) {
-                const cur = latest[it.empId];
-                if (!cur || it.tc > cur.tc || (it.tc === cur.tc && it.tm > cur.tm)) latest[it.empId] = it;
-            });
-            const items = Object.keys(latest).map(function(id) { return latest[id]; });
+        const n = newest[w.key];
+        if (!n) return;
+        const all = Object.keys(n).map(function(id) { return n[id]; });
+        // A hub saving into a row may also have put another supervisor's name on it; such a row stays with its lead's supervisor.
+        const supOfLead = {};
+        all.forEach(function(it) { const lk = nameKey(it.lead); if (lk && !it.touched && !supOfLead[lk]) supOfLead[lk] = it.supName; });
+        const groups = {};   // supervisorKey -> { name, items }
+        all.forEach(function(it) {
+            const name = (it.touched && supOfLead[nameKey(it.lead)]) || it.supName;
+            const sk = nameKey(name) || '(no supervisor)';
+            const sg = groups[sk] = groups[sk] || { name: name, items: [] };
+            sg.items.push(name === it.supName ? it : Object.assign({}, it, { supName: name, supId: idOfName(name) }));
+        });
+        out[w.key] = Object.keys(groups).map(function(sk) {
+            const sg = groups[sk];
+            const items = sg.items;
             const supKey = nameKey(sg.name);
             const leadOf = function(it) {
                 if (!it.lead || nameKey(it.lead) === supKey) return '';
@@ -1438,25 +1456,29 @@ export default function App(props) {
 
     // Shift Start's saved task assignments for the shifts in this plan that have started (an hour early counts), read again
     // whenever the plan window moves, every 5 minutes, and on "Reload from Shift Start". Never more than a few days back.
-    const loadTaskRows = function() {
-        const now = Date.now();
-        const since = Math.max(globalStartMs - TASK_PRE_SHIFT_MIN * 60000, now - TASK_ROW_DAYS * 86400000);
-        const until = Math.min(globalStartMs + planHorizonMins * 60000, now + TASK_PRE_SHIFT_MIN * 60000);
-        if (since >= until) { applyTaskRows([]); return Promise.resolve(); }
-        return fetchTaskAssignmentRows(props.dataApi, since, until).then(applyTaskRows);
-    };
-    loadTaskRowsRef.current = loadTaskRows;
-    useEffect(function() { loadTaskRowsRef.current(); }, [props.dataApi, globalStartMs, planHorizonMins]);
-
     const shiftWindows = useMemo(function() {
         return buildShiftWindows(shiftRotation, getGlobalStart(ganttStartDate, ganttStartHour), planHorizonMins)
             .map(function(w) { return Object.assign({}, w, { key: w.crew + '|' + w.start }); });
     }, [shiftRotation, ganttStartDate, ganttStartHour, planHorizonMins]);
+    // From the earliest clock-in of a shift in the plan (a plan can start mid-shift), an hour early.
+    const taskSinceMs = shiftWindows.reduce(function(m, w) { return Math.min(m, globalStartMs + w.shiftStart * 60000); }, globalStartMs) - TASK_PRE_SHIFT_MIN * 60000;
+    const taskReqRef = useRef(0);
+    const loadTaskRows = function() {
+        const req = ++taskReqRef.current;   // a slower answer for an earlier plan window is dropped
+        const now = Date.now();
+        const since = Math.max(taskSinceMs, now - TASK_ROW_DAYS * 86400000);
+        const until = Math.min(globalStartMs + planHorizonMins * 60000, now + TASK_PRE_SHIFT_MIN * 60000);
+        if (since >= until) { applyTaskRows([]); return Promise.resolve(); }
+        return fetchTaskAssignmentRows(props.dataApi, since, until).then(function(rows) { if (req === taskReqRef.current) applyTaskRows(rows); });
+    };
+    loadTaskRowsRef.current = loadTaskRows;
+    useEffect(function() { loadTaskRowsRef.current(); }, [props.dataApi, globalStartMs, planHorizonMins, taskSinceMs]);
 
+    const lineIndex = useMemo(function() { return buildLineIndex(lineRows); }, [lineRows]);
     // Shift Start's saved task assignments as boards, one per supervisor per shift.
     const taskBoards = useMemo(function() {
-        return boardsFromTaskRows(taskRows, shiftWindows, globalStartMs, rosterInfo.who);
-    }, [taskRows, shiftWindows, globalStartMs, rosterInfo]);
+        return boardsFromTaskRows(taskRows, shiftWindows, globalStartMs, rosterInfo.who, lineIndex);
+    }, [taskRows, shiftWindows, globalStartMs, rosterInfo, lineIndex]);
     // Shift Start boards that line up with each shift in the plan (same crew, started within 90 min of the shift). A supervisor
     // with no board row gets the board built from their saved task assignments instead.
     const windowBoards = useMemo(function() {
@@ -1473,8 +1495,9 @@ export default function App(props) {
             });
             const list = Object.keys(bySup).map(function(k) { return bySup[k].b; });
             const covered = {};
-            list.forEach(function(b) { covered[normS(b.supervisor)] = true; });
-            (taskBoards.boards[w.key] || []).forEach(function(b) { if (!covered[normS(b.supervisor)]) list.push(b); });
+            const supKey = function(v) { return normS(formatFullName(v)); };   // board rows say "Last, First"
+            list.forEach(function(b) { covered[supKey(b.supervisor)] = true; });
+            (taskBoards.boards[w.key] || []).forEach(function(b) { if (!covered[supKey(b.supervisor)]) list.push(b); });
             map[w.key] = list;
         });
         return map;
@@ -1482,7 +1505,6 @@ export default function App(props) {
     const boardWindowCount = shiftWindows.filter(function(w) { return (windowBoards[w.key] || []).length > 0; }).length;
 
     // ---- Shift Start rooms: which room each person is set up on, and which equipment goes to whom ----
-    const lineIndex = useMemo(function() { return buildLineIndex(lineRows); }, [lineRows]);
     const lineById = useMemo(function() { const m = {}; lineIndex.forEach(function(l) { m[l.id] = l; }); return m; }, [lineIndex]);
     const lineByName = useMemo(function() {
         const m = {};
@@ -2882,7 +2904,7 @@ export default function App(props) {
                             <div className="bg-slate-50 border-b border-gray-200 px-6 py-4 flex flex-wrap items-center justify-between gap-3">
                                 <h2 className="font-black text-slate-800 uppercase tracking-widest text-sm flex items-center"><ClipboardList className="w-5 h-5 mr-2 text-[#0072CE]" /> Shift Start Link</h2>
                                 <div className="flex flex-wrap items-center gap-2">
-                                    <span className="text-[10px] font-bold normal-case tracking-normal text-slate-500 bg-white border border-slate-200 rounded px-2 py-0.5" title={'Team assignments saved for the shifts in this plan (newest ' + TASK_ROW_TOP + ', at most ' + TASK_ROW_DAYS + ' days back) and boards saved in the last ' + BOARD_DAYS + ' days. Checked again every 5 minutes.' + (taskBoards.stats.equipment ? ' ' + taskBoards.stats.equipment + ' equipment progress rows skipped.' : '') + (taskBoards.stats.unknownPerson ? ' ' + taskBoards.stats.unknownPerson + ' rows name someone not in the employee table.' : '')}>{taskRowsFailed ? "Couldn't read Shift Start's saved assignments" : taskRows.length + ' saved assignment' + (taskRows.length === 1 ? '' : 's')}{boardRows.length ? ' · ' + boardRows.length + ' board' + (boardRows.length === 1 ? '' : 's') : ''} · {lineRows.length} rooms{shiftStartCheckedAt ? ' · checked ' + shiftStartCheckedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : ''}</span>
+                                    <span className="text-[10px] font-bold normal-case tracking-normal text-slate-500 bg-white border border-slate-200 rounded px-2 py-0.5" title={'Team assignments saved for the shifts in this plan (newest ' + TASK_ROW_TOP + ', at most ' + TASK_ROW_DAYS + ' days back) and boards saved in the last ' + BOARD_DAYS + ' days. Checked again every 5 minutes.' + (taskBoards.stats.equipment ? ' ' + taskBoards.stats.equipment + ' equipment progress rows skipped.' : '') + (taskBoards.stats.unknownPerson ? ' ' + taskBoards.stats.unknownPerson + ' rows name someone not in the employee table.' : '')}>{taskRowsFailed ? "Couldn't read Shift Start's saved assignments" : (taskRows.length - taskBoards.stats.equipment) + ' saved assignment' + (taskRows.length - taskBoards.stats.equipment === 1 ? '' : 's') + (taskRows.length >= TASK_ROW_TOP ? ' (newest ' + TASK_ROW_TOP + ' only)' : '')}{boardRows.length ? ' · ' + boardRows.length + ' board' + (boardRows.length === 1 ? '' : 's') : ''} · {lineRows.length} rooms{shiftStartCheckedAt ? ' · checked ' + shiftStartCheckedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : ''}</span>
                                     <Button variant="outline" size="sm" disabled={shiftStartLoading} onClick={function() { reloadShiftStart(); }}><RefreshCw className="w-3.5 h-3.5 mr-1" /> {shiftStartLoading ? 'Reloading…' : 'Reload from Shift Start'}</Button>
                                 </div>
                             </div>
