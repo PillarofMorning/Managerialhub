@@ -1026,7 +1026,9 @@ const makeStore = (api) => {
       await resolve(linked.rows.map(r => r.craa5_equipmentguid));
       const wrong = (wrongIds || []).map(cleanGuid);
       const fix = linked.rows.filter(r => { const id = cleanGuid(r.craa5_equipmentguid); return id !== cleanGuid(assetId) && (wrong.includes(id) || store.isGone(id)); });
-      return { rows: blank.rows.concat(fix), kept: linked.rows.length - fix.length, keptMore: linked.capped, capped: blank.capped || linked.capped };
+      const fixIds = new Set(fix.map(r => r.craa5__log_id));
+      const keptIds = linked.rows.filter(r => !fixIds.has(r.craa5__log_id)).map(r => cleanGuid(r.craa5_equipmentguid));
+      return { rows: blank.rows.concat(fix), kept: keptIds.length, keptIds, keptMore: linked.capped, capped: blank.capped || linked.capped };
     },
 
     async findAssetExact(name, room, area) {
@@ -1091,7 +1093,11 @@ const makeStore = (api) => {
       let rows = null;
       if (createdOk !== false) {
         try { rows = await ask(true); createdOk = true; }
-        catch (e) { if (createdOk === true || !MISSING_COLUMN.test(errText(e))) throw e; createdOk = false; }
+        catch (e) {
+          if (createdOk === true) throw e;
+          rows = await ask(false); // throws its own error if the problem is elsewhere
+          if (MISSING_COLUMN.test(errText(e))) createdOk = false;
+        }
       }
       if (!rows) rows = await ask(false);
       const top = rows[0];
@@ -1115,7 +1121,10 @@ const makeStore = (api) => {
           const rows = await api.query(USER_TABLE, { select: ['systemuserid', 'fullname'], filter: c.map(id => `systemuserid eq ${id}`).join(' or '), top: c.length });
           rows.forEach(r => users.set(cleanGuid(r.systemuserid), safeString(r.fullname)));
           c.forEach(id => { if (!users.has(id)) users.set(id, ''); });
-        } catch (e) { usersOff = true; }
+        } catch (e) {
+          // No access to user names: stop asking. Anything else (a throttle, a blip): the next page asks again.
+          if (MISSING_COLUMN.test(errText(e)) || /privilege|permission|denied|forbidden|403|not found|does not exist/i.test(errText(e))) usersOff = true;
+        }
       });
     },
     userName(id) { return users.get(cleanGuid(id)) || ''; },
@@ -1381,7 +1390,7 @@ const repointEntries = async (api, filter, from, target, guidOnly = false) => {
     res.forEach((x, i) => { if (x.ok) fixed += 1; else { failedIds.add(todo[i].craa5__log_id); if (!error) error = errText(x.error); } });
     if (rows.length < LIMITS.retroPage) { more = false; break; }
   }
-  return { fixed, failed: failedIds.size, error, more };
+  return { fixed, failed: failedIds.size, failedIds: Array.from(failedIds), error, more };
 };
 // Move a fixed list of entries (read before anything was written) onto target.
 const repointRows = async (api, rows, from, target) => {
@@ -2950,7 +2959,8 @@ const UnifyIds = ({ ctx }) => {
       let sk = {};
       clusters.forEach(c => {
         k[c.key] = c.members[0].id;
-        ap[c.key] = c.identical;
+        // A record whose entries could not be counted may be the newest: that group waits for the admin to tick it
+        ap[c.key] = c.identical && c.members.every(m => m.count);
         sk = { ...sk, ...skipFor(c, c.members[0].id) };
       });
       setKeep(k); setApply(ap); setSkip(sk);
@@ -2969,24 +2979,29 @@ const UnifyIds = ({ ctx }) => {
   const unify = async () => {
     if (!todo.length) return;
     setBusy('apply'); setResult(null); setError('');
-    let moved = 0, relinked = 0, filled = 0, left = 0, unplaced = 0, failed = 0, firstError = '', remaining = false;
+    let moved = 0, relinked = 0, filled = 0, left = 0, leftMore = false, onSkipped = 0, unplaced = 0, unchecked = 0, failed = 0, firstError = '', remaining = false;
     const doneKeys = new Set();
+    const fail = (e) => { failed += 1; if (!firstError) firstError = typeof e === 'string' ? e : errText(e); };
     for (const c of todo) {
       const kept = c.members.find(m => m.id === keep[c.key]);
-      const fail = (e) => { failed += 1; if (!firstError) firstError = typeof e === 'string' ? e : errText(e); };
+      const moverIds = movers(c).map(m => m.id);
+      const skippedIds = c.members.filter(m => m.id !== kept.id && isSkipped(c, m)).map(m => m.id);
+      const failedIds = new Set(); // entries that could not be moved: not tried again below
       let ok = true;
       for (const m of movers(c)) {
         setProgress(`Moving entries from ${m.name} (${shortId(m.id)}) to ${kept.name} (${shortId(kept.id)})…`);
         try {
           const r = await repointEntries(api, guidEq('craa5_equipmentguid', m.id), null, kept, true);
-          moved += r.fixed; failed += r.failed;
-          if (r.failed) { ok = false; if (!firstError) firstError = r.error; }
+          moved += r.fixed;
+          r.failedIds.forEach(id => { failedIds.add(id); fail(r.error); });
+          if (r.failed) ok = false;
           if (r.more) { ok = false; remaining = true; }
-        } catch (e) { ok = false; failed += 1; if (!firstError) firstError = errText(e); }
+        } catch (e) { ok = false; fail(e); }
         if (moveLinks) {
-          for (const row of m.links || []) {
-            try { const w = await store.writeMs(row.id, {}, kept); if (w.linked) relinked += 1; else { ok = false; failed += 1; if (!firstError) firstError = w.error || 'SAP row link not stored'; } }
-            catch (e) { ok = false; failed += 1; if (!firstError) firstError = errText(e); }
+          // Links already moved by an earlier click are not written (or counted) again
+          for (const row of (m.links || []).filter(x => !x.moved)) {
+            try { const w = await store.writeMs(row.id, {}, kept); if (w.linked) { relinked += 1; row.moved = true; } else { ok = false; fail(w.error || 'SAP row link not stored'); } }
+            catch (e) { ok = false; fail(e); }
           }
         }
       }
@@ -3001,11 +3016,21 @@ const UnifyIds = ({ ctx }) => {
           for (const name of names) {
             setProgress(`Giving ${kept.name} (${shortId(kept.id)}) to entries of ${name} with no ID…`);
             try {
-              const r = await store.familyToFix({ equipment: name, room: c.room, area: c.area }, kept.id, movers(c).map(m => m.id), places);
-              left += r.kept;
-              if (r.capped) { ok = false; remaining = true; }
-              const res = await pool(r.rows, 6, (row) => api.update(LOG_TABLE, row.craa5__log_id, { craa5_equipmentguid: kept.id }));
-              res.forEach(x => { if (x.ok) filled += 1; else { ok = false; fail(x.error); } });
+              const r = await store.familyToFix({ equipment: name, room: c.room, area: c.area }, kept.id, moverIds, places);
+              // What the entries left alone point at: the kept record in another spelling (nothing to say), a record left out, or other equipment
+              r.keptIds.forEach(id => { if (id === cleanGuid(kept.id)) return; if (skippedIds.indexOf(id) >= 0) onSkipped += 1; else left += 1; });
+              leftMore = leftMore || r.keptMore;
+              const rows = r.rows.filter(row => !failedIds.has(row.craa5__log_id));
+              const res = await pool(rows, 6, (row) => api.update(LOG_TABLE, row.craa5__log_id, { craa5_equipmentguid: kept.id }));
+              let wrote = 0;
+              res.forEach((x, i) => {
+                if (!x.ok) { ok = false; fail(x.error); return; }
+                wrote += 1;
+                // An entry still on a record being moved was moved, not filled
+                if (moverIds.indexOf(cleanGuid(rows[i].craa5_equipmentguid)) >= 0) moved += 1; else filled += 1;
+              });
+              // Another click only helps when this one changed something; otherwise the rest are left for Repair IDs
+              if (r.capped) { if (wrote) { ok = false; remaining = true; } else unchecked += 1; }
             } catch (e) { ok = false; fail(e); }
           }
         }
@@ -3014,14 +3039,14 @@ const UnifyIds = ({ ctx }) => {
     }
     ctx.dataChanged();
     setFound(f => ({ ...f, clusters: f.clusters.filter(c => !doneKeys.has(c.key)) }));
-    setResult({ moved, relinked, filled, left, unplaced, failed, error: firstError, groups: doneKeys.size, remaining });
+    setResult({ moved, relinked, filled, left, leftMore, onSkipped, unplaced, unchecked, failed, error: firstError, groups: doneKeys.size, remaining });
     setProgress(''); setBusy('');
   };
 
   return (
     <div>
       <Text className={styles.hint} block style={{ marginBottom: 10 }}>
-        Finds equipment records that are the same equipment in the same room and area (for example two “Floors” records in Bakery / Breading) and moves every log entry onto the one you keep, so the calendar shows them together. Each group lists its records newest first, by when their newest log entry was saved, and keeps the first one unless you pick another. Old entries of those names in that room and area with no ID get the kept ID too. By default only identical names are grouped; tick “Also unify similar names” to group names like “Floor” and “Floors” too. Equipment records are not deleted. Nothing is saved until you unify.
+        Finds equipment records that are the same equipment in the same room and area (for example two “Floors” records in Bakery / Breading) and moves every log entry onto the one you keep, so the calendar shows them together. Each group lists its records newest first, by when their newest log entry was saved, and keeps the first one unless you pick another. With the box below ticked, old entries of those names in that room and area with no ID, or an ID that no longer exists, get the kept ID too. By default only identical names are grouped; tick “Also unify similar names” to group names like “Floor” and “Floors” too. Equipment records are not deleted. Nothing is saved until you unify.
       </Text>
       <div className={styles.filterBar}>
         <Input aria-label="Room to check" placeholder="Room (required)" list="unify-rooms" value={room} disabled={!!busy} onChange={(e, d) => setRoom(d.value)} onKeyDown={(e) => { if (e.key === 'Enter') find(); }} />
@@ -3040,11 +3065,13 @@ const UnifyIds = ({ ctx }) => {
             {result.remaining ? ' More entries remain: click Unify again to move the rest.' : ''}
           </Text>
         )}
-        {result && (result.unplaced > 0 || result.left > 0) && (
+        {result && (result.unplaced > 0 || result.unchecked > 0 || result.left > 0 || result.onSkipped > 0) && (
           <Text className={styles.warnText} block>
             {[
               result.unplaced > 0 && `For ${plural(result.unplaced, 'group', 'groups')} the room or area is blank, so entries with no ID were left for Repair IDs.`,
-              result.left > 0 && `${plural(result.left, 'entry', 'entries')} with these names ${result.left === 1 ? 'points' : 'point'} at other equipment that is not in the group and ${result.left === 1 ? 'was' : 'were'} left as ${result.left === 1 ? 'it is' : 'they are'}.`,
+              result.unchecked > 0 && `For ${plural(result.unchecked, 'name', 'names')} the room and area have too many entries with similar names to check them all; use Repair IDs for the rest.`,
+              result.onSkipped > 0 && `${plural(result.onSkipped, 'entry', 'entries')} with these names stay on the records you left unticked.`,
+              result.left > 0 && `${result.leftMore ? 'At least ' : ''}${plural(result.left, 'entry', 'entries')} with these names ${result.left === 1 ? 'points' : 'point'} at other equipment that is not in the group and ${result.left === 1 ? 'was' : 'were'} left as ${result.left === 1 ? 'it is' : 'they are'}.`,
             ].filter(Boolean).join(' ')}
           </Text>
         )}
@@ -3059,10 +3086,10 @@ const UnifyIds = ({ ctx }) => {
             <>
               <div className={styles.actionBar}>
                 <Checkbox label="Also point SAP orders at the kept record" checked={moveLinks} disabled={!!busy} onChange={(e, d) => setMoveLinks(!!d.checked)} />
-                <Checkbox label="Also give the kept ID to entries of these names here with no ID" checked={fillBlank} disabled={!!busy} onChange={(e, d) => setFillBlank(!!d.checked)} />
+                <Checkbox label="Also give the kept ID to entries of these names here with no ID or an ID that no longer exists" checked={fillBlank} disabled={!!busy} onChange={(e, d) => setFillBlank(!!d.checked)} />
                 <Button disabled={!!busy || found.clusters.every(c => apply[c.key])} onClick={() => setApply(p => { const x = { ...p }; found.clusters.forEach(c => { x[c.key] = true; }); return x; })}>Tick all groups</Button>
                 <Button appearance="primary" className={styles.btnCta} disabled={!!busy || !todo.length || ctx.saving} onClick={unify}>
-                  {busy === 'apply' ? 'Unifying…' : `Unify ${plural(todo.length, 'group', 'groups')} (${toMove}${toMoveMore ? '+' : ''} ${toMove === 1 && !toMoveMore ? 'entry' : 'entries'} to move${fillBlank ? ', plus entries with no ID' : ''})`}
+                  {busy === 'apply' ? 'Unifying…' : `Unify ${plural(todo.length, 'group', 'groups')} (${toMove}${toMoveMore ? '+' : ''} ${toMove === 1 && !toMoveMore ? 'entry' : 'entries'} to move${fillBlank ? ', plus entries with no or unknown ID' : ''})`}
                 </Button>
               </div>
               <div style={{ overflowX: 'auto' }}>
@@ -3074,7 +3101,8 @@ const UnifyIds = ({ ctx }) => {
                     {found.clusters.map(c => (
                       <tr key={c.key}>
                         <td className={styles.td}><input type="checkbox" aria-label={`Unify ${c.members[0].name} in ${placeText(c)}`} checked={!!apply[c.key]} disabled={!!busy} onChange={(e) => setApply(p => ({ ...p, [c.key]: e.target.checked }))} /></td>
-                        <td className={styles.td}>{c.area || '(no area)'}{!c.identical && <div><span className={mergeClasses(styles.tag, styles.tagWarn)}>similar names</span></div>}</td>
+                        <td className={styles.td}>{c.area || '(no area)'}{!c.identical && <div><span className={mergeClasses(styles.tag, styles.tagWarn)}>similar names</span></div>}
+                          {!c.members.every(m => m.count) && <div><span className={mergeClasses(styles.tag, styles.tagBad)} title="Find again to count them">some records not counted</span></div>}</td>
                         <td className={styles.td}>
                           {c.members.map(m => (
                             <div key={m.id} style={{ padding: '2px 0' }}>
@@ -3083,13 +3111,13 @@ const UnifyIds = ({ ctx }) => {
                                   onChange={(e) => setSkip(p => ({ ...p, [`${c.key}|${m.id}`]: !e.target.checked }))} />
                               )}
                               <strong>{m.name}</strong> <span className={styles.hint}>{m.area !== c.area ? `· ${m.area || '(no area)'} ` : ''}· ID …{shortId(m.id)} · {m.count ? `${m.count.n}${m.count.more ? '+' : ''} ${m.count.n === 1 && !m.count.more ? 'entry' : 'entries'}` : 'entries not counted'}{newestText(m) ? ` · ${newestText(m)}` : ''}{stampText(m.added) ? ` · record added ${stampText(m.added).slice(0, 10)}` : ''}{m.links.length ? ` · ${plural(m.links.length, 'SAP row', 'SAP rows')}` : ''}</span>
-                              {m === c.members[0] && newestText(m) && <span className={mergeClasses(styles.tag, styles.tagOk)} style={{ marginLeft: 6 }}>newest</span>}
+                              {m === c.members[0] && newestText(m) && c.members.every(x => x.count) && <span className={mergeClasses(styles.tag, styles.tagOk)} style={{ marginLeft: 6 }}>newest</span>}
                             </div>
                           ))}
                         </td>
                         <td className={styles.td} style={{ minWidth: 240 }}>
                           <Select aria-label={`Record to keep for ${c.members[0].name}`} value={keep[c.key] || ''} disabled={!!busy} onChange={(e, d) => { setKeep(p => ({ ...p, [c.key]: d.value })); setSkip(p => { const x = {}; Object.keys(p).forEach(k => { if (!k.startsWith(`${c.key}|`)) x[k] = p[k]; }); return { ...x, ...skipFor(c, d.value) }; }); }}>
-                            {c.members.map(m => <option key={m.id} value={m.id}>{m.name} · …{shortId(m.id)}{newestText(m) ? ` · ${newestText(m)}` : ' · no entries'}</option>)}
+                            {c.members.map(m => <option key={m.id} value={m.id}>{m.name} · …{shortId(m.id)} · {!m.count ? 'entries not counted' : !m.count.n ? 'no entries' : newestText(m) || plural(m.count.n, 'entry', 'entries')}</option>)}
                           </Select>
                         </td>
                       </tr>
@@ -3202,7 +3230,8 @@ const LogTableTab = ({ ctx }) => {
   const [, setIdTick] = useState(0);
   const [viewing, setViewing] = useState(null);
   const [sortBy, setSortBy] = useState('applied'); // 'applied': newest saved first; 'clean': newest date of clean first
-  const [sorted, setSorted] = useState('applied'); // the order the rows on screen are actually in
+  const [sorted, setSorted] = useState('applied'); // the order on screen: 'applied', 'clean', or 'fallback' (applied asked, not possible this time)
+  const view = useRef({ size: LIMITS.logPage, sort: 'applied' }); // what the table shows now, for reloads after a save or delete
   const applied = useRef({ term: '', start: '', end: '' });
   const reqId = useRef(0);
   // Columns read when Dataverse allows them; one is dropped for the session once Dataverse says it cannot be read
@@ -3223,14 +3252,17 @@ const LogTableTab = ({ ctx }) => {
     setLoading(true);
     try {
       const filter = buildFilter(applied.current);
-      // Last applied = when the entry was saved; the date of clean breaks ties and is the order when that cannot be read
+      // Last applied = when the entry was saved; the order is the date of clean when that cannot be read
       const ask = (cols) => api.query(LOG_TABLE, {
         select: LOG_SELECT.concat(cols), filter, top: size,
         orderBy: order === 'applied' && cols.indexOf(CREATED_ON) >= 0 ? `${CREATED_ON} desc` : 'craa5_lastcleaned desc',
       });
       let cols = Object.keys(optCols.current).filter(c => optCols.current[c]);
       let res;
-      // Without an extra column the log still loads (the last try throws its own error if the problem is elsewhere)
+      let guess = null; // the column left out on the last try when the error named none
+      // Without an extra column the log still loads (the last try throws its own error if the problem is elsewhere).
+      // A column named in a missing-column error is dropped for the session; otherwise one column at a time is left out,
+      // the file name first, and only dropped for good if leaving it out is what made a missing-column error go away.
       for (;;) {
         try { res = await ask(cols); break; }
         catch (e) {
@@ -3238,15 +3270,18 @@ const LogTableTab = ({ ctx }) => {
           const msg = errText(e);
           const missing = MISSING_COLUMN.test(msg);
           const named = missing ? cols.filter(c => msg.toLowerCase().indexOf(c.replace(/^_|_value$/g, '').toLowerCase()) >= 0) : [];
-          (named.length ? named : missing ? cols : []).forEach(c => { optCols.current[c] = false; });
-          cols = named.length ? cols.filter(c => named.indexOf(c) < 0) : [];
+          if (named.length) { named.forEach(c => { optCols.current[c] = false; }); cols = cols.filter(c => named.indexOf(c) < 0); guess = null; continue; }
+          const out = [PAPERWORK_NAME, CREATED_BY, CREATED_ON].filter(c => cols.indexOf(c) >= 0)[0] || cols[0];
+          cols = cols.filter(c => c !== out);
+          guess = { col: out, missing };
         }
       }
+      if (guess && guess.missing) optCols.current[guess.col] = false;
       if (id !== reqId.current) return;
       const has = (c) => cols.indexOf(c) >= 0;
       const list = res.map(r => ({ ...mapLog(r), pictureKnown: has(PAPERWORK_NAME) }));
       setEntries(list); setLoaded(true);
-      setSorted(order === 'applied' && has(CREATED_ON) ? 'applied' : 'clean');
+      setSorted(order !== 'applied' ? 'clean' : has(CREATED_ON) ? 'applied' : optCols.current[CREATED_ON] ? 'fallback' : 'clean');
       // Check this page's equipment ids (only the distinct ids on screen)
       store.resolveAssets(list.map(e => e.guid)).then(() => setIdTick(t => t + 1)).catch(() => {});
       // Names of the people who saved the entries, where the rows came without them
@@ -3257,11 +3292,12 @@ const LogTableTab = ({ ctx }) => {
   }, [api, store]);
 
   useEffect(() => { load(LIMITS.logPage, 'applied'); }, [load]);
+  const show = (size, sort) => { view.current = { size, sort }; setPageSize(size); load(size, sort); };
 
-  const applyFilters = () => { applied.current = { term: searchTerm, start: startDate, end: endDate }; setPageSize(LIMITS.logPage); setSelected(new Set()); setMessage(null); load(LIMITS.logPage, sortBy); };
-  const clearFilters = () => { setSearchTerm(''); setStartDate(''); setEndDate(''); applied.current = { term: '', start: '', end: '' }; setPageSize(LIMITS.logPage); setSelected(new Set()); setMessage(null); load(LIMITS.logPage, sortBy); };
-  const loadMore = () => { const n = Math.min(pageSize + LIMITS.logPage, LIMITS.logMax); setPageSize(n); load(n, sortBy); };
-  const changeSort = (v) => { setSortBy(v); setPageSize(LIMITS.logPage); setSelected(new Set()); load(LIMITS.logPage, v); };
+  const applyFilters = () => { applied.current = { term: searchTerm, start: startDate, end: endDate }; setSelected(new Set()); setMessage(null); show(LIMITS.logPage, sortBy); };
+  const clearFilters = () => { setSearchTerm(''); setStartDate(''); setEndDate(''); applied.current = { term: '', start: '', end: '' }; setSelected(new Set()); setMessage(null); show(LIMITS.logPage, sortBy); };
+  const loadMore = () => show(Math.min(pageSize + LIMITS.logPage, LIMITS.logMax), sortBy);
+  const changeSort = (v) => { setSortBy(v); setSelected(new Set()); setMessage(null); show(LIMITS.logPage, v); };
   const handleEdit = (id, field, value) => setEdits(p => ({ ...p, [id]: { ...p[id], [field]: value } }));
 
   const saveBatchEdits = async () => {
@@ -3290,7 +3326,7 @@ const LogTableTab = ({ ctx }) => {
     const failed = res.filter(r => !r.ok);
     if (failed.length) setMessage({ kind: 'error', text: `${failed.length} of ${jobs.length} updates failed: ${errText(failed[0].error)}` });
     else { setMessage({ kind: 'ok', text: `Updated ${plural(jobs.length, 'entry', 'entries')}.` }); setEdits({}); setIsEdit(false); }
-    await load(pageSize, sortBy);
+    await load(view.current.size, view.current.sort);
   };
 
   const batchDelete = async () => {
@@ -3300,7 +3336,7 @@ const LogTableTab = ({ ctx }) => {
     const failed = res.filter(r => !r.ok);
     setMessage(failed.length ? { kind: 'error', text: `${failed.length} deletes failed: ${errText(failed[0].error)}` } : { kind: 'ok', text: `Deleted ${plural(res.length, 'entry', 'entries')}.` });
     setSelected(new Set());
-    await load(pageSize, sortBy);
+    await load(view.current.size, view.current.sort);
   };
 
   const idStatus = (e) => (!e.guid ? 'missing' : store.hasAsset(e.guid) ? 'ok' : store.isGone(e.guid) ? 'unknown' : 'checking');
@@ -3355,7 +3391,7 @@ const LogTableTab = ({ ctx }) => {
           </>
         )}
         <Button appearance="primary" className={styles.btnDanger} disabled={!selected.size} onClick={batchDelete}><Emoji>🗑️</Emoji>Delete Selected ({selected.size})</Button>
-        <Text className={styles.hint} aria-live="polite">{loading ? 'Loading…' : `Showing the ${entries.length} ${sorted === 'applied' ? 'most recently applied' : 'most recently cleaned'} matching entries${sortBy === 'applied' && sorted !== 'applied' ? ' (the time entries were applied cannot be read here, so they are sorted by date of clean)' : ''}. Double-click an entry to see its paperwork picture.`}</Text>
+        <Text className={styles.hint} aria-live="polite">{loading ? 'Loading…' : `Showing the ${entries.length} ${sorted === 'applied' ? 'most recently applied' : 'most recently cleaned'} matching entries${sorted === 'fallback' ? ' (they could not be sorted by when they were applied this time, so they are sorted by date of clean; load again to retry)' : sortBy === 'applied' && sorted === 'clean' ? ' (the time entries were applied cannot be read here, so they are sorted by date of clean)' : ''}. Double-click an entry to see its paperwork picture.`}</Text>
       </div>
       {message && <Text className={message.kind === 'ok' ? styles.okText : styles.errorText} block role={message.kind === 'ok' ? 'status' : 'alert'}>{message.text}</Text>}
       <div style={{ maxHeight: '60vh', overflow: 'auto', border: `1px solid ${BRAND.line}`, borderRadius: '4px' }}>
