@@ -3,11 +3,24 @@ LEARNINGS & CHAT CONTEXT LOG
 =======================================================================
 - Entry 1-14: Built Dataverse Map tracking app, mapped schema, timeframe filters, location thumbnails, and edit capabilities. 
 - Entry 15: Removed mock databases, added native fetch wrappers for live API integration (read/write), and added a payload copy button to debug console.
-- Entry 16 (Current Fix): Restored the accidentally removed `Download` icon definition which was causing a ReferenceError crash on load.
+- Entry 16: Restored the accidentally removed `Download` icon definition which was causing a ReferenceError crash on load.
+- Entry 17 (Current): The three requested changes, plus what they pulled in.
+  * Category filter: one shared filter (multi-select chips with counts) for the map, Recent Issues, Gallery and the Data Table tab; the chips double
+    as the map legend and flags / pins / badges are coloured by category. Map Submission keeps showing every pin of the timeframe. Free-text notes
+    are now the single "note" category (still shown with their text); a Note whose text equals a category name is refused, because category and
+    note share the one craa5__customnote column.
+  * Pictures: saved and loaded for real. The row is saved first, then the picture is PATCHed to the table's Image/File column as octet-stream
+    (DELETE to remove); the column is auto-detected from metadata, or pin PICTURE_COLUMN. Photos are re-encoded as JPEG with the long side capped at
+    1600 px. A failed picture upload keeps the saved row and the form open, and Update retries only the picture. Row saves send If-Match on edits
+    (a row deleted elsewhere is no longer silently re-created) and show Dataverse's own error message.
+  * Data Table is a rolling Action Item Rail: newest first in day groups, windowed 30 at a time, with search, the shared chips, location and photo
+    thumbnails, and Locate / Details / Edit.
+  * Also fixed: logEvent is stable (the edit form re-rendered in an infinite loop); jumping to an item from the rail or Recent Issues zooms without
+    the width animation so the map ends up centred on it; the edit form scrolls the Submission map to its box again.
 =======================================================================
 */
 
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 
 // --- INLINE SVG ICONS ---
 const createIcon = (paths) => ({ className = "w-6 h-6", fill = "none", ...props }) => (
@@ -48,6 +61,232 @@ const FacilityMapSvg = () => (
 const DATAVERSE_MAPS_SCHEMA = { TableName: 'craa5___mapses' };
 const DATAVERSE_SCHEMA = { TableName: 'craa5__facilityobservations' };
 
+// --- PICTURES ---
+// Logical name of the Image (or File) column that holds an observation's picture on craa5__facilityobservation.
+// Leave it null and the app finds the table's picture column itself; pin it (e.g. 'craa5_picture') if the table has more than one.
+const PICTURE_COLUMN = null;
+const OBSERVATION_LOGICAL_NAME = 'craa5__facilityobservation';
+const ODATA_HEADERS = { 'Accept': 'application/json', 'OData-MaxVersion': '4.0', 'OData-Version': '4.0' };
+const PICTURE_NAME_HINT = /pic|photo|image|upload|attach/i;
+
+const apiUrl = (path) => {
+  let baseUrl = '';
+  try {
+    if (typeof window !== 'undefined' && window.Xrm && window.Xrm.Utility) baseUrl = window.Xrm.Utility.getGlobalContext().getClientUrl();
+  } catch (e) { /* same-origin relative URL */ }
+  return `${baseUrl}/api/data/v9.2/${path}`;
+};
+
+const readApiError = async (res) => {
+  let text = '';
+  try { text = await res.text(); } catch (e) { /* no body */ }
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && parsed.error && parsed.error.message) return `${parsed.error.message} (HTTP ${res.status})`;
+  } catch (e) { /* not JSON */ }
+  return text ? `${text.slice(0, 300)} (HTTP ${res.status})` : `HTTP ${res.status}`;
+};
+
+// Finds the column pictures are stored in: { ready, name, type: 'image' | 'file' | null, reason }
+async function detectPictureColumn(logEvent) {
+  const listColumns = async (cast) => {
+    const res = await fetch(apiUrl(`EntityDefinitions(LogicalName='${OBSERVATION_LOGICAL_NAME}')/Attributes/Microsoft.Dynamics.CRM.${cast}?$select=LogicalName,SchemaName`), { headers: ODATA_HEADERS });
+    if (!res.ok) throw new Error(await readApiError(res));
+    return ((await res.json()).value || []).map(a => a.LogicalName).filter(Boolean);
+  };
+
+  const failures = [];
+  const lookup = (cast) => listColumns(cast).catch(e => { failures.push(e.message); return []; });
+  const [images, files] = await Promise.all([lookup('ImageAttributeMetadata'), lookup('FileAttributeMetadata')]);
+  logEvent(`Picture column scan: image columns [${images.join(', ')}], file columns [${files.join(', ')}]`, failures.length ? 'warn' : 'debug', failures.length ? { failures } : null);
+
+  if (PICTURE_COLUMN) {
+    const type = images.includes(PICTURE_COLUMN) ? 'image' : (files.includes(PICTURE_COLUMN) ? 'file' : null);
+    // Both lookups worked and neither lists the pinned column: it is a typo or the wrong kind of column
+    if (!type && failures.length === 0) {
+      return { ready: false, name: null, type: null, reason: `PICTURE_COLUMN "${PICTURE_COLUMN}" is not an Image or File column of ${OBSERVATION_LOGICAL_NAME}.` };
+    }
+    return { ready: true, name: PICTURE_COLUMN, type, reason: '' };
+  }
+
+  // Image columns before File columns; within a kind prefer a name like a picture, then any other custom column, then the system "entityimage"
+  const candidates = [...images.map(name => ({ name, type: 'image' })), ...files.map(name => ({ name, type: 'file' }))];
+  const rank = (c) => (c.type === 'file' ? 10 : 0) + (c.name === 'entityimage' ? 2 : (PICTURE_NAME_HINT.test(c.name) ? 0 : 1));
+  candidates.sort((a, b) => rank(a) - rank(b));
+  if (candidates.length > 0) {
+    if (candidates.length > 1) logEvent(`Several picture columns found (${candidates.map(c => c.name).join(', ')}). Using ${candidates[0].name}. Set PICTURE_COLUMN at the top of the file to choose another.`, 'warn');
+    return { ready: true, name: candidates[0].name, type: candidates[0].type, reason: '' };
+  }
+  if (failures.length > 0) {
+    return { ready: false, name: null, type: null, reason: `the app could not look up the table's columns (${failures[0]}). Set PICTURE_COLUMN at the top of the file to the Image column's logical name.` };
+  }
+  return { ready: false, name: null, type: null, reason: `the ${OBSERVATION_LOGICAL_NAME} table has no Image or File column. Add an Image column (for example "Picture") in Dataverse.` };
+}
+
+// Extra $select fields that tell a row has a picture, tried in order. Selecting the image column itself would drag
+// a base64 thumbnail into every row, and a wrong guess is a 400, so the list query steps down until one is accepted.
+const pictureSelectOptions = (col, type) => {
+  const imageStyle = [[`${col}_timestamp`], [`${col}_url`]];
+  const fileStyle = [[`${col}_name`], [col]];
+  const order = type === 'image' ? imageStyle : (type === 'file' ? fileStyle : [...imageStyle, ...fileStyle]);
+  return [...order, []];
+};
+
+// true / false when the query returned a marker for the picture, null when it could not tell
+const rowHasPicture = (row, fields) => {
+  if (fields.length === 0) return null;
+  return fields.some(f => {
+    const v = row[f];
+    return v !== null && v !== undefined && v !== '' && v !== 0 && v !== '0';
+  });
+};
+
+// Stored pictures: full size first (needs "can store full image"), then the 144 px thumbnail Dataverse always keeps
+const storedPictureUrls = (col, id) => ({
+  full: apiUrl(`${DATAVERSE_SCHEMA.TableName}(${id})/${col}/$value?size=full`),
+  thumb: apiUrl(`${DATAVERSE_SCHEMA.TableName}(${id})/${col}/$value`)
+});
+
+// Every URL that might show this item's picture, best first (small thumbnails want the cheap 144 px one first)
+const pictureSources = (item, thumbFirst = false) => {
+  if (!item) return [];
+  if (item.image) return [item.image];
+  if (item.picture) return thumbFirst ? [item.picture.thumb, item.picture.full] : [item.picture.full, item.picture.thumb];
+  return [];
+};
+
+const GUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// One request per picture: Dataverse cannot take it inside the create call (only the table's primary image can)
+async function uploadPicture(column, id, dataUrl) {
+  if (!GUID_PATTERN.test(id)) throw new Error('Dataverse did not return the new record id, so the picture could not be attached.');
+  const res = await fetch(apiUrl(`${DATAVERSE_SCHEMA.TableName}(${id})/${column}`), {
+    method: 'PATCH',
+    headers: { ...ODATA_HEADERS, 'Content-Type': 'application/octet-stream', 'x-ms-file-name': `observation-${id}.jpg` },
+    body: dataUrlToBytes(dataUrl)
+  });
+  if (!res.ok) throw new Error(await readApiError(res));
+}
+
+async function deletePicture(column, id) {
+  const res = await fetch(apiUrl(`${DATAVERSE_SCHEMA.TableName}(${id})/${column}`), { method: 'DELETE', headers: ODATA_HEADERS });
+  if (!res.ok && res.status !== 404) throw new Error(await readApiError(res));
+}
+
+// --- ISSUE CATEGORIES ---
+// One list drives the form dropdown, the map flag colours, the filter chips and the action rail.
+const CATEGORIES = [
+  // 700-weight colours so white text on a selected chip (and the tinted badge text) stays readable (WCAG AA)
+  { key: 'to be cleaned', label: 'To Be Cleaned', color: '#1d4ed8' },
+  { key: 'to be fixed', label: 'To Be Fixed', color: '#c2410c' },
+  { key: 'safety concern', label: 'Safety Concern', color: '#b91c1c' },
+  { key: 'idea', label: 'Idea', color: '#15803d' },
+  { key: 'fsq concern', label: 'FSQ Concern', color: '#7e22ce' },
+  { key: 'note', label: 'Note', color: '#475569' }
+];
+
+// Unknown keys fall back to the last entry, which must stay 'note'
+const categoryMeta = (key) => CATEGORIES.find(c => c.key === key) || CATEGORIES[CATEGORIES.length - 1];
+
+// Dataverse keeps the category AND the custom note in ONE column (craa5__customnote):
+// a preset name for the five presets, or free text for a "note". Split it back apart so every
+// free-text note counts as the single "note" category instead of becoming a category of its own.
+const parseCategory = (raw) => {
+  const text = (raw || '').trim();
+  const preset = CATEGORIES.find(c => c.key !== 'note' && c.key === text.toLowerCase());
+  return preset ? { category: preset.key, customNote: '' } : { category: 'note', customNote: text };
+};
+
+const categoryText = (item) => {
+  if (item.category === 'note') return item.customNote ? `Note: ${item.customNote}` : 'Note';
+  return categoryMeta(item.category).label;
+};
+
+// --- TIME HELPERS FOR THE ACTION RAIL ---
+// --- PICTURE HELPERS ---
+const MAX_PICTURE_SIDE = 1600; // px on the long side. Phone photos (5-12 MB) become a JPEG of a few hundred KB.
+
+// Re-encode whatever the user picked as a JPEG that is small enough to upload reliably. Resolves a data URL.
+const compressImage = (file) => new Promise((resolve, reject) => {
+  const objectUrl = URL.createObjectURL(file);
+  const img = new Image();
+  img.onerror = () => {
+    URL.revokeObjectURL(objectUrl);
+    reject(new Error('That file is not a picture this browser can open. Try a JPG or PNG.'));
+  };
+  img.onload = () => {
+    URL.revokeObjectURL(objectUrl);
+    try {
+      const scale = Math.min(1, MAX_PICTURE_SIDE / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(img.width * scale));
+      canvas.height = Math.max(1, Math.round(img.height * scale));
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#FFFFFF'; // JPEG has no transparency: see-through parts would turn black
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL('image/jpeg', 0.8));
+    } catch (err) {
+      reject(new Error('The picture could not be prepared for upload.'));
+    }
+  };
+  img.src = objectUrl;
+});
+
+const dataUrlToBytes = (dataUrl) => {
+  const binary = atob(dataUrl.slice(dataUrl.indexOf(',') + 1));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+};
+
+// Scroll a zoomable map container so the point (xPct, yPct) of the map sits in the middle of the view.
+// Waits for the map picture to be laid out first: before that the container has nothing to scroll to.
+const centerMapOn = (container, xPct, yPct) => {
+  if (!container) return;
+  const img = container.querySelector('img');
+  const go = () => {
+    container.scrollTo({
+      left: (xPct / 100) * container.scrollWidth - container.clientWidth / 2,
+      top: (yPct / 100) * container.scrollHeight - container.clientHeight / 2,
+      behavior: 'smooth'
+    });
+  };
+  if (img && !img.complete) img.addEventListener('load', go, { once: true });
+  else go();
+};
+
+// "Tue, Oct 6, 5:49 PM" (the year too when it is not this year)
+const formatWhen = (iso) => {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const date = d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', ...(d.getFullYear() !== new Date().getFullYear() ? { year: 'numeric' } : {}) });
+  return `${date}, ${d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`;
+};
+
+// A relative hint only while it is under a day old, so it can never disagree with the day heading
+const recentAgo = (iso) => {
+  const mins = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
+  if (isNaN(mins) || mins < 0 || mins >= 24 * 60) return '';
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins} min ago`;
+  return `${Math.floor(mins / 60)} h ago`;
+};
+
+// Calendar-day buckets so the rail reads "Today / Yesterday / ..." as it rolls
+const dayBucket = (iso) => {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return 'Older';
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  d.setHours(0, 0, 0, 0);
+  const days = Math.round((today - d) / 86400000);
+  if (days <= 0) return 'Today';
+  if (days === 1) return 'Yesterday';
+  if (days <= 7) return '2-7 days ago';
+  if (days <= 30) return '8-30 days ago';
+  return 'Older';
+};
+
 export default function App() {
   const [activeTab, setActiveTab] = useState('overview');
   const [submissions, setSubmissions] = useState([]);
@@ -58,15 +297,21 @@ export default function App() {
   const [editingItem, setEditingItem] = useState(null);
   const [focusItem, setFocusItem] = useState(null);
   const [timeFilter, setTimeFilter] = useState('all');
-  
+  const [categoryFilter, setCategoryFilter] = useState([]); // [] = every category
+
   const [adminOpen, setAdminOpen] = useState(false);
   const [logs, setLogs] = useState([]);
   const [loadTime, setLoadTime] = useState(0);
+  // Where observation pictures live. Until the table has been checked, saving a picture is held back.
+  const [pictureColumn, setPictureColumn] = useState({ ready: false, name: null, type: null, reason: 'the app is still checking the observations table.' });
 
   // --- ADMIN LOGGER & HELPERS ---
-  const logEvent = (message, type = 'info', payload = null) => {
-    setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), message, type, payload }]);
-  };
+  // Stable identity: effects that list logEvent as a dependency (like the edit-form setup in SubmitTab)
+  // would otherwise re-run on every render, and each run logs, which renders again, and so on.
+  // `request` ({ method, path, contentType }) is only for 'data' entries that are not the usual JSON call to the table
+  const logEvent = useCallback((message, type = 'info', payload = null, request = null) => {
+    setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), message, type, payload, request }]);
+  }, []);
 
   const handleCopyPayload = (payload) => {
     const text = JSON.stringify(payload, null, 2);
@@ -138,22 +383,48 @@ export default function App() {
             logEvent(`Map Live Fetch Failed: ${error.message}`, 'error');
         }
 
-        // 2. Fetch Live Observations Data
+        // 2. Find the picture column, then fetch Live Observations Data
         try {
+            let picColumn = { ready: false, name: null, type: null, reason: 'the picture column could not be checked.' };
+            try {
+                picColumn = await detectPictureColumn(logEvent);
+            } catch (error) {
+                picColumn.reason = `the picture column check failed (${error.message}).`;
+                logEvent(`Picture column check failed: ${error.message}`, 'error');
+            }
+            setPictureColumn(picColumn);
+            if (picColumn.ready) logEvent(`Pictures are stored in column "${picColumn.name}" (${picColumn.type || 'type unknown'}).`, 'info');
+            else logEvent(`Pictures cannot be saved: ${picColumn.reason}`, 'warn');
+
             logEvent('Querying live observations from facilityobservations API...', 'debug');
-            const obsResponse = await fetch(`${baseUrl}/api/data/v9.2/craa5__facilityobservations?$select=craa5__facilityobservationid,craa5_mapx,craa5_mapy,craa5__boxwidth,craa5__boxheight,craa5__room,craa5__area,craa5__equipment,craa5__description,craa5__whotonotify,craa5__customnote,createdon&$expand=createdby($select=fullname)&$orderby=createdon desc`, {
-                headers: { 
-                  'Accept': 'application/json', 
-                  'OData-MaxVersion': '4.0', 
-                  'OData-Version': '4.0',
-                  'Prefer': 'odata.include-annotations="*"'
-                }
-            });
+            const baseSelect = 'craa5__facilityobservationid,craa5_mapx,craa5_mapy,craa5__boxwidth,craa5__boxheight,craa5__room,craa5__area,craa5__equipment,craa5__description,craa5__whotonotify,craa5__customnote,createdon';
+            // Ask for the picture marker too; if Dataverse rejects a guessed column (HTTP 400) step down to a plainer query
+            // so a wrong guess can never blank the whole map.
+            const selectOptions = picColumn.ready ? pictureSelectOptions(picColumn.name, picColumn.type) : [[]];
+            let obsResponse = null;
+            let pictureFields = [];
+            for (const extra of selectOptions) {
+                const select = extra.length ? `${baseSelect},${extra.join(',')}` : baseSelect;
+                obsResponse = await fetch(`${baseUrl}/api/data/v9.2/craa5__facilityobservations?$select=${select}&$expand=createdby($select=fullname)&$orderby=createdon desc`, {
+                    headers: { 
+                      'Accept': 'application/json', 
+                      'OData-MaxVersion': '4.0', 
+                      'OData-Version': '4.0',
+                      'Prefer': 'odata.include-annotations="*"'
+                    }
+                });
+                if (obsResponse.status !== 400) { pictureFields = extra; break; }
+                logEvent(`Observation query with picture fields [${extra.join(', ') || 'none'}] was rejected (HTTP 400).`, 'warn');
+            }
 
             if (obsResponse.ok) {
                const obsData = await obsResponse.json();
-               const mappedObs = obsData.value.map(item => ({
-                  id: item.craa5__facilityobservationid,
+               if (picColumn.ready && pictureFields.length === 0) logEvent('Could not tell which observations have pictures; trying to show a picture for every one.', 'warn');
+               const mappedObs = obsData.value.map(item => {
+                  const id = item.craa5__facilityobservationid;
+                  const hasPicture = picColumn.ready ? rowHasPicture(item, pictureFields) : false;
+                  return {
+                  id,
                   mapX: item.craa5_mapx || 0,
                   mapY: item.craa5_mapy || 0,
                   boxW: item.craa5__boxwidth || 10,
@@ -163,11 +434,13 @@ export default function App() {
                   equipment: item.craa5__equipment || '',
                   description: item.craa5__description || '',
                   whoToNotify: item.craa5__whotonotify || '',
-                  category: item.craa5__customnote || 'note', 
-                  customNote: item.craa5__customnote || '',
+                  ...parseCategory(item.craa5__customnote),
+                  image: null,
+                  picture: hasPicture === false ? null : storedPictureUrls(picColumn.name, id),
                   submittedOn: item.createdon,
                   submittedBy: item.createdby ? item.createdby.fullname : (item['_createdby_value@OData.Community.Display.V1.FormattedValue'] || 'Unknown')
-               }));
+                  };
+               });
                setSubmissions(mappedObs);
                logEvent(`Successfully loaded ${mappedObs.length} live observations.`, 'success');
             } else {
@@ -189,7 +462,7 @@ export default function App() {
   }, []);
 
   // --- TIMEFRAME FILTERING LOGIC ---
-  const filteredSubmissions = useMemo(() => {
+  const timeFilteredSubmissions = useMemo(() => {
     const now = new Date();
     return submissions.filter(sub => {
       if (timeFilter === 'all') return true;
@@ -201,6 +474,27 @@ export default function App() {
       return true;
     });
   }, [submissions, timeFilter]);
+
+  // --- CATEGORY FILTERING LOGIC (shared by the map, sidebar, gallery and action rail) ---
+  const categoryCounts = useMemo(() => {
+    const counts = {};
+    timeFilteredSubmissions.forEach(sub => { counts[sub.category] = (counts[sub.category] || 0) + 1; });
+    return counts;
+  }, [timeFilteredSubmissions]);
+
+  const filteredSubmissions = useMemo(() => (
+    categoryFilter.length === 0
+      ? timeFilteredSubmissions
+      : timeFilteredSubmissions.filter(sub => categoryFilter.includes(sub.category))
+  ), [timeFilteredSubmissions, categoryFilter]);
+
+  const categoryBar = {
+    counts: categoryCounts,
+    selected: categoryFilter,
+    onToggle: (key) => setCategoryFilter(prev => prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key]),
+    onOnly: (key) => setCategoryFilter([key]),
+    onClear: () => setCategoryFilter([])
+  };
 
   // Group logs for the 3 columns
   const infoLogs = logs.filter(l => l.type === 'info' || l.type === 'success').reverse();
@@ -279,6 +573,7 @@ export default function App() {
         {activeTab === 'overview' && (
            <OverviewTab 
              submissions={filteredSubmissions} 
+             categoryBar={categoryBar}
              logEvent={logEvent} 
              mapImage={mainMapImage} 
              setMainMapImage={setMainMapImage} 
@@ -289,18 +584,20 @@ export default function App() {
         )}
         {activeTab === 'submit' && (
            <SubmitTab 
-             submissions={filteredSubmissions} 
+             submissions={timeFilteredSubmissions} 
              setSubmissions={setSubmissions} 
              logEvent={logEvent} 
              mapImage={mainMapImage} 
              setMainMapImage={setMainMapImage} 
              editingItem={editingItem}
              setEditingItem={setEditingItem}
+             pictureColumn={pictureColumn}
            />
         )}
         {activeTab === 'gallery' && (
            <GalleryTab 
              submissions={filteredSubmissions} 
+             categoryBar={categoryBar}
              logEvent={logEvent} 
              onEdit={(item) => { setEditingItem(item); setActiveTab('submit'); }}
            />
@@ -308,8 +605,12 @@ export default function App() {
         {activeTab === 'table' && (
            <TableTab 
              submissions={filteredSubmissions} 
+             timeFilteredCount={timeFilteredSubmissions.length}
+             categoryBar={categoryBar}
              mapImage={mainMapImage}
+             logEvent={logEvent}
              onLocate={(item) => { setFocusItem(item); setActiveTab('overview'); }}
+             onEdit={(item) => { setEditingItem(item); setActiveTab('submit'); }}
            />
         )}
       </main>
@@ -407,7 +708,9 @@ export default function App() {
                     </button>
                   </div>
                   <pre className="text-[10px] text-green-500/80 whitespace-pre-wrap font-mono mt-2">
-                    {`${log.message.includes('PATCH') ? 'PATCH' : 'POST'} /api/data/v9.2/${DATAVERSE_SCHEMA.TableName}\nHost: mock-dataverse-env.crm.dynamics.com\nContent-Type: application/json\n\n`}
+                    {log.request
+                      ? `${log.request.method} /api/data/v9.2/${log.request.path}\nHost: mock-dataverse-env.crm.dynamics.com\nContent-Type: ${log.request.contentType}\n\n`
+                      : `${log.message.includes('PATCH') ? 'PATCH' : 'POST'} /api/data/v9.2/${DATAVERSE_SCHEMA.TableName}\nHost: mock-dataverse-env.crm.dynamics.com\nContent-Type: application/json\n\n`}
                     {JSON.stringify(log.payload, null, 2)}
                   </pre>
                 </div>
@@ -472,6 +775,60 @@ function ZoomControls({ zoomLevel, setZoomLevel }) {
 
 
 // ==========================================
+// SHARED PICTURE: tries each URL in turn (full size, then thumbnail); `fallback` shows when none loads
+// ==========================================
+function StoredImage({ sources, alt, className, fallback = null, onMissing }) {
+  const key = sources.join('|');
+  // The index belongs to ONE list of sources: a different list starts again at its first URL
+  const [attempt, setAttempt] = useState({ key, index: 0 });
+  const index = attempt.key === key ? attempt.index : 0;
+  const src = sources[index];
+  const exhausted = sources.length > 0 && !src;
+  useEffect(() => { if (exhausted && onMissing) onMissing(); }, [exhausted, onMissing]);
+  if (!src) return fallback;
+  return <img src={src} alt={alt} loading="lazy" className={className} onError={() => setAttempt({ key, index: index + 1 })} />;
+}
+
+// ==========================================
+// SHARED CATEGORY FILTER (chips double as the map legend)
+// ==========================================
+function CategoryFilterBar({ counts, selected, onToggle, onClear, className = '' }) {
+  const total = CATEGORIES.reduce((sum, c) => sum + (counts[c.key] || 0), 0);
+  const base = 'inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold border whitespace-nowrap shrink-0 transition-colors';
+  return (
+    <div className={`flex items-center gap-2 overflow-x-auto md:flex-wrap pb-1 ${className}`} role="group" aria-label="Filter by category">
+      <button
+        type="button"
+        onClick={onClear}
+        aria-pressed={selected.length === 0}
+        className={`${base} ${selected.length === 0 ? 'bg-slate-800 text-white border-slate-800' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-100'}`}
+      >
+        All <span>{total}</span>
+      </button>
+      {CATEGORIES.map(c => {
+        const on = selected.includes(c.key);
+        const n = counts[c.key] || 0;
+        return (
+          <button
+            key={c.key}
+            type="button"
+            onClick={() => onToggle(c.key)}
+            aria-pressed={on}
+            disabled={n === 0 && !on}
+            title={on ? `Stop filtering by ${c.label}` : `Show only ${c.label}`}
+            className={`${base} ${on ? 'text-white' : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-100 disabled:opacity-40 disabled:hover:bg-white disabled:cursor-not-allowed'}`}
+            style={on ? { backgroundColor: c.color, borderColor: c.color } : undefined}
+          >
+            <span className="w-2 h-2 rounded-full" style={{ backgroundColor: on ? '#ffffff' : c.color }} />
+            {c.label} <span>{n}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// ==========================================
 // SHARED DETAIL MODAL
 // ==========================================
 function DetailModal({ selectedItem, onClose, onEdit }) {
@@ -482,17 +839,20 @@ function DetailModal({ selectedItem, onClose, onEdit }) {
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-full overflow-hidden flex flex-col md:flex-row animate-in fade-in zoom-in duration-200" onClick={e => e.stopPropagation()}>
         {/* Image Side */}
         <div className="md:w-1/2 bg-slate-100 border-r border-slate-200 flex items-center justify-center relative min-h-[250px]">
-          {selectedItem.image ? (
-             <img src={selectedItem.image} alt="Enlarged" className="w-full h-full object-contain" />
-          ) : (
-             <div className="text-center text-slate-400">
+          <StoredImage
+            sources={pictureSources(selectedItem)}
+            alt="Enlarged"
+            className="w-full h-full object-contain"
+            fallback={(
+              <div className="text-center text-slate-400">
                 <ImageIcon className="w-16 h-16 mx-auto mb-2 opacity-50" />
                 <p>No Image Provided</p>
-             </div>
-          )}
+              </div>
+            )}
+          />
           <div className="absolute top-4 left-4">
-             <span className="bg-slate-900/70 backdrop-blur text-white px-3 py-1 rounded-full text-sm font-medium capitalize shadow-sm">
-                {selectedItem.category === 'note' ? `Note: ${selectedItem.customNote}` : selectedItem.category}
+             <span className="bg-slate-900/70 backdrop-blur text-white px-3 py-1 rounded-full text-sm font-medium shadow-sm">
+                {categoryText(selectedItem)}
              </span>
           </div>
         </div>
@@ -554,31 +914,24 @@ function DetailRow({ label, value }) {
 // ==========================================
 // TAB 0: MAP OVERVIEW
 // ==========================================
-function OverviewTab({ submissions, logEvent, mapImage, setMainMapImage, focusItem, setFocusItem, onEdit }) {
+function OverviewTab({ submissions, categoryBar, logEvent, mapImage, setMainMapImage, focusItem, setFocusItem, onEdit }) {
   const [selectedItem, setSelectedItem] = useState(null);
   const [zoomLevel, setZoomLevel] = useState(100);
+  const [jumping, setJumping] = useState(false); // zoom without the width animation while jumping to an item
   const containerRef = useRef(null);
 
   // Handle auto-focus double clicking from the table or sidebar
   useEffect(() => {
     if (focusItem && containerRef.current) {
         logEvent(`Centering overview map on observation ID: ${focusItem.id}`, 'debug');
+        // The zoom wrapper animates its width; scrolling while it is still growing would stop short, so jump straight to the final size
+        setJumping(true);
         setZoomLevel(300);
         setSelectedItem(focusItem);
         
         setTimeout(() => {
-            if (containerRef.current) {
-                const scrollW = containerRef.current.scrollWidth;
-                const scrollH = containerRef.current.scrollHeight;
-                const x = (focusItem.mapX / 100) * scrollW;
-                const y = (focusItem.mapY / 100) * scrollH;
-                
-                containerRef.current.scrollTo({
-                    left: x - containerRef.current.clientWidth / 2,
-                    top: y - containerRef.current.clientHeight / 2,
-                    behavior: 'smooth'
-                });
-            }
+            centerMapOn(containerRef.current, focusItem.mapX, focusItem.mapY);
+            setJumping(false);
             setFocusItem(null); 
         }, 100);
     }
@@ -598,11 +951,12 @@ function OverviewTab({ submissions, logEvent, mapImage, setMainMapImage, focusIt
           <h2 className="text-2xl font-bold text-slate-800">Facility Map Overview</h2>
           <p className="text-sm text-slate-500">Holistic view of all reported items across the facility.</p>
         </div>
+        <CategoryFilterBar {...categoryBar} className="mb-3 shrink-0" />
         
         {/* Zoomable Container */}
         <div className="flex-1 relative rounded-xl shadow-inner border border-slate-400/50 bg-slate-300 overflow-auto" ref={containerRef}>
           <div 
-            className="relative mx-auto transition-all origin-top-left"
+            className={`relative mx-auto origin-top-left ${jumping ? '' : 'transition-all'}`}
             style={{ width: `${zoomLevel}%`, minWidth: '100%' }}
           >
             {mapImage ? (
@@ -612,31 +966,41 @@ function OverviewTab({ submissions, logEvent, mapImage, setMainMapImage, focusIt
             )}
             
             {/* Render Flags mapped via percentage overlays */}
-            {submissions.map(sub => (
-              <div 
-                key={sub.id} 
-                className="absolute transform -translate-x-1/2 -translate-y-[90%] cursor-pointer group"
-                style={{ left: `${sub.mapX}%`, top: `${sub.mapY}%` }}
-                onClick={() => {
-                  logEvent(`Map overview flag clicked. ID: ${sub.id}`, 'info');
-                  setSelectedItem(sub);
-                }}
-              >
-                <FlagIcon className="w-6 h-6 md:w-8 md:h-8 text-red-600 drop-shadow-md group-hover:scale-125 transition-transform origin-bottom" fill="#ef4444" />
-                
-                {/* Tooltip */}
-                <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1 bg-slate-900/90 backdrop-blur text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 pointer-events-none whitespace-nowrap shadow-lg transition-opacity z-20">
-                  <span className="font-bold block capitalize border-b border-slate-700 mb-0.5 pb-0.5">
-                    {sub.category === 'note' ? 'Note' : sub.category}
-                  </span>
-                  <span className="text-slate-300">{sub.area}</span>
+            {submissions.map(sub => {
+              const flagColor = categoryMeta(sub.category).color;
+              return (
+                <div 
+                  key={sub.id} 
+                  className="absolute transform -translate-x-1/2 -translate-y-[90%] cursor-pointer group"
+                  style={{ left: `${sub.mapX}%`, top: `${sub.mapY}%` }}
+                  onClick={() => {
+                    logEvent(`Map overview flag clicked. ID: ${sub.id}`, 'info');
+                    setSelectedItem(sub);
+                  }}
+                >
+                  <FlagIcon className="w-6 h-6 md:w-8 md:h-8 drop-shadow-md group-hover:scale-125 transition-transform origin-bottom" style={{ color: flagColor }} fill={flagColor} />
+                  
+                  {/* Tooltip */}
+                  <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1 bg-slate-900/90 backdrop-blur text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 pointer-events-none whitespace-nowrap shadow-lg transition-opacity z-20">
+                    <span className="font-bold block border-b border-slate-700 mb-0.5 pb-0.5">
+                      {categoryText(sub)}
+                    </span>
+                    <span className="text-slate-300">{sub.area}</span>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
 
             {submissions.length === 0 && (
-              <div className="absolute inset-0 flex items-center justify-center text-slate-500 font-medium bg-white/50 backdrop-blur-sm">
-                 No reports submitted yet.
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-slate-500 font-medium bg-white/50 backdrop-blur-sm">
+                 {categoryBar.selected.length > 0 ? (
+                   <>
+                     <span>No reports match the selected categories.</span>
+                     <button type="button" onClick={categoryBar.onClear} className="text-sm text-blue-700 underline hover:text-blue-900">Show all categories</button>
+                   </>
+                 ) : (
+                   <span>No reports submitted yet.</span>
+                 )}
               </div>
             )}
           </div>
@@ -663,7 +1027,10 @@ function OverviewTab({ submissions, logEvent, mapImage, setMainMapImage, focusIt
                >
                   <div className="flex justify-between items-start mb-2">
                      <span className="font-bold text-slate-800 text-xs">{new Date(sub.submittedOn).toLocaleDateString()}</span>
-                     <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 text-slate-700 rounded font-medium capitalize">{sub.category}</span>
+                     <span className="text-[10px] px-1.5 py-0.5 bg-slate-100 text-slate-700 rounded font-medium inline-flex items-center gap-1 max-w-[60%]">
+                        <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: categoryMeta(sub.category).color }} />
+                        <span className="truncate">{categoryText(sub)}</span>
+                     </span>
                   </div>
                   <div className="font-semibold text-blue-900 text-sm truncate mb-1">{sub.area} {sub.room ? `- ${sub.room}` : ''}</div>
                   <p className="text-slate-600 text-xs line-clamp-2">{sub.description}</p>
@@ -683,7 +1050,7 @@ function OverviewTab({ submissions, logEvent, mapImage, setMainMapImage, focusIt
 // ==========================================
 // TAB 1: SUBMISSION & MAP
 // ==========================================
-function SubmitTab({ submissions, setSubmissions, logEvent, mapImage, setMainMapImage, editingItem, setEditingItem }) {
+function SubmitTab({ submissions, setSubmissions, logEvent, mapImage, setMainMapImage, editingItem, setEditingItem, pictureColumn }) {
   const mapRef = useRef(null);
   const containerRef = useRef(null);
   const [selection, setSelection] = useState(null);
@@ -691,6 +1058,16 @@ function SubmitTab({ submissions, setSubmissions, logEvent, mapImage, setMainMap
   const [hoverPos, setHoverPos] = useState(null);
   const [isResizing, setIsResizing] = useState(false);
   const [zoomLevel, setZoomLevel] = useState(100);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState('');
+  // A ref as well as state: two submits in the same tick would both see saving === false
+  const savingRef = useRef(false);
+  // The tab may be left while a save is in flight; the save still finishes, but must not touch a form that is gone
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   // Catch edit triggers and set form/selection states
   useEffect(() => {
@@ -703,17 +1080,7 @@ function SubmitTab({ submissions, setSubmissions, logEvent, mapImage, setMainMap
           h: editingItem.boxH
        });
        
-       if (containerRef.current) {
-          const scrollW = containerRef.current.scrollWidth;
-          const scrollH = containerRef.current.scrollHeight;
-          const x = (editingItem.mapX / 100) * scrollW;
-          const y = (editingItem.mapY / 100) * scrollH;
-          containerRef.current.scrollTo({
-              left: x - containerRef.current.clientWidth / 2,
-              top: y - containerRef.current.clientHeight / 2,
-              behavior: 'smooth'
-          });
-       }
+       centerMapOn(containerRef.current, editingItem.mapX, editingItem.mapY);
 
        setShowForm(true);
     }
@@ -859,8 +1226,8 @@ function SubmitTab({ submissions, setSubmissions, logEvent, mapImage, setMainMap
             return (
               <div 
                 key={sub.id} 
-                className="absolute w-2.5 h-2.5 bg-red-500 rounded-full border border-white shadow-sm pointer-events-none"
-                style={{ left: `${sub.mapX}%`, top: `${sub.mapY}%`, transform: 'translate(-50%, -50%)' }}
+                className="absolute w-2.5 h-2.5 rounded-full border border-white shadow-sm pointer-events-none"
+                style={{ left: `${sub.mapX}%`, top: `${sub.mapY}%`, transform: 'translate(-50%, -50%)', backgroundColor: categoryMeta(sub.category).color }}
                 title={sub.description}
               />
             );
@@ -878,11 +1245,12 @@ function SubmitTab({ submissions, setSubmissions, logEvent, mapImage, setMainMap
               <h2 className="text-xl font-bold flex items-center gap-2 text-slate-800">
                 <Activity className="text-blue-600" /> {editingItem ? 'Edit Observation' : 'New Observation'}
               </h2>
-              <button onClick={() => { 
+              <button disabled={saving} title={saving ? 'Saving - one moment' : 'Close'} onClick={() => { 
                 setShowForm(false); 
                 setEditingItem(null); 
+                setSaveError('');
                 logEvent('Form closed without submission.', 'info'); 
-              }} className="text-slate-400 hover:text-red-500">
+              }} className="text-slate-400 hover:text-red-500 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-slate-400">
                 <X className="w-6 h-6" />
               </button>
             </div>
@@ -892,17 +1260,19 @@ function SubmitTab({ submissions, setSubmissions, logEvent, mapImage, setMainMap
                 selection={selection} 
                 logEvent={logEvent}
                 editingItem={editingItem}
-                onSubmit={async (localData, dbPayload) => {
-                  
-                  // LIVE DATAVERSE API FETCH LOGIC FOR CREATE/UPDATE
-                  let baseUrl = '';
-                  if (typeof window !== 'undefined' && window.Xrm && window.Xrm.Utility) {
-                      baseUrl = window.Xrm.Utility.getGlobalContext().getClientUrl();
-                  }
+                pictureSupport={pictureColumn}
+                saving={saving}
+                saveError={saveError}
+                onSubmit={async (localData, dbPayload, picture) => {
+                  if (savingRef.current) return;
+                  savingRef.current = true;
+                  setSaving(true);
+                  setSaveError('');
 
+                  // LIVE DATAVERSE API FETCH LOGIC FOR CREATE/UPDATE
                   const url = editingItem 
-                      ? `${baseUrl}/api/data/v9.2/craa5__facilityobservations(${editingItem.id})`
-                      : `${baseUrl}/api/data/v9.2/craa5__facilityobservations`;
+                      ? apiUrl(`${DATAVERSE_SCHEMA.TableName}(${editingItem.id})?$select=craa5__facilityobservationid`)
+                      : apiUrl(`${DATAVERSE_SCHEMA.TableName}?$select=craa5__facilityobservationid`);
                       
                   const method = editingItem ? 'PATCH' : 'POST';
                   
@@ -916,7 +1286,9 @@ function SubmitTab({ submissions, setSubmissions, logEvent, mapImage, setMainMap
                               'Content-Type': 'application/json',
                               'OData-MaxVersion': '4.0', 
                               'OData-Version': '4.0',
-                              'Prefer': 'return=representation'
+                              'Prefer': 'return=representation',
+                              // Without If-Match a PATCH is an upsert: it would quietly re-create an observation someone has deleted
+                              ...(editingItem ? { 'If-Match': '*' } : {})
                           },
                           body: JSON.stringify(dbPayload)
                       });
@@ -941,6 +1313,39 @@ function SubmitTab({ submissions, setSubmissions, logEvent, mapImage, setMainMap
                              }
                           }
 
+                          // The picture travels in its own request once the record exists
+                          let pictureFailure = '';
+                          if (picture) {
+                              try {
+                                  if (!pictureColumn.ready) throw new Error(`Pictures cannot be saved: ${pictureColumn.reason}`);
+                                  if (picture.op === 'new') {
+                                      logEvent(`Uploading picture to ${pictureColumn.name} for ${savedId} (${Math.round(picture.dataUrl.length * 0.75 / 1024)} KB)...`, 'data',
+                                          { column: pictureColumn.name, id: savedId, bytes: Math.round(picture.dataUrl.length * 0.75) },
+                                          { method: 'PATCH', path: `${DATAVERSE_SCHEMA.TableName}(${savedId})/${pictureColumn.name}`, contentType: 'application/octet-stream' });
+                                      await uploadPicture(pictureColumn.name, savedId, picture.dataUrl);
+                                      logEvent(`Dataverse picture upload Success (ID: ${savedId})`, 'success');
+                                  } else {
+                                      logEvent(`Clearing picture in ${pictureColumn.name} for ${savedId}...`, 'data', { column: pictureColumn.name, id: savedId, action: 'delete' },
+                                          { method: 'DELETE', path: `${DATAVERSE_SCHEMA.TableName}(${savedId})/${pictureColumn.name}`, contentType: '(no body)' });
+                                      await deletePicture(pictureColumn.name, savedId);
+                                      logEvent(`Dataverse picture removal Success (ID: ${savedId})`, 'success');
+                                  }
+                              } catch (picErr) {
+                                  pictureFailure = picErr.message;
+                                  logEvent(`Dataverse Picture Save Failed: ${picErr.message}`, 'error', { id: savedId, column: pictureColumn.name, op: picture.op });
+                              }
+                          }
+
+                          // What the lists show: the new picture, none after a removal, or whatever was there before
+                          if (picture && !pictureFailure) {
+                              localData.image = picture.op === 'new' ? picture.dataUrl : null;
+                              localData.picture = null;
+                          } else if (picture && pictureFailure) {
+                              // The record is saved but the picture is not: show the truth in the lists
+                              localData.image = editingItem ? editingItem.image : null;
+                              localData.picture = editingItem ? editingItem.picture : null;
+                          }
+
                           if (editingItem) {
                             setSubmissions(prev => prev.map(s => s.id === localData.id ? localData : s));
                             logEvent(`Dataverse PATCH Success (ID: ${localData.id})`, 'success');
@@ -948,16 +1353,32 @@ function SubmitTab({ submissions, setSubmissions, logEvent, mapImage, setMainMap
                             setSubmissions(prev => [localData, ...prev]);
                             logEvent(`Dataverse POST Success (ID: ${localData.id})`, 'success');
                           }
-                          
-                          setShowForm(false);
-                          setSelection(null);
-                          setEditingItem(null);
+
+                          if (pictureFailure) {
+                              // Keep the form open on the saved record so "Update" retries only the picture instead of creating a duplicate
+                              if (mountedRef.current) {
+                                  setEditingItem(localData);
+                                  setSaveError(`The observation was saved, but its picture could not be ${picture.op === 'new' ? 'uploaded' : 'removed'}: ${pictureFailure} Press Update Observation to try the picture again.`);
+                              }
+                          } else {
+                              setShowForm(false);
+                              setSelection(null);
+                              setEditingItem(null);
+                          }
                       } else {
                           const errData = await response.text();
+                          let reason = `HTTP ${response.status}`;
+                          try { reason = `${JSON.parse(errData).error.message} (HTTP ${response.status})`; } catch (e) { /* not a Dataverse error body */ }
+                          if (response.status === 404 && editingItem) reason = 'this observation no longer exists in Dataverse (HTTP 404)';
+                          setSaveError(`Dataverse did not save the observation: ${reason}. Nothing was changed.`);
                           logEvent(`Dataverse Save Failed: HTTP ${response.status}`, 'error', { responseText: errData, payloadSent: dbPayload });
                       }
                   } catch (error) {
+                      setSaveError(`The observation could not be sent: ${error.message}. Nothing was changed - try again.`);
                       logEvent(`Dataverse Network Error: ${error.message}`, 'error', dbPayload);
+                  } finally {
+                      savingRef.current = false;
+                      setSaving(false);
                   }
                 }} 
               />
@@ -969,9 +1390,9 @@ function SubmitTab({ submissions, setSubmissions, logEvent, mapImage, setMainMap
   );
 }
 
-function SubmissionForm({ selection, onSubmit, logEvent, editingItem }) {
+function SubmissionForm({ selection, onSubmit, logEvent, editingItem, pictureSupport, saving, saveError }) {
   const [formData, setFormData] = useState({
-    image: editingItem?.image || null,
+    image: null, // a NEW picture picked in this form (data URL). The picture already stored is shown via editingItem.
     room: editingItem?.room || '',
     area: editingItem?.area || '',
     equipment: editingItem?.equipment || '',
@@ -981,26 +1402,52 @@ function SubmissionForm({ selection, onSubmit, logEvent, editingItem }) {
     customNote: editingItem?.customNote || ''
   });
   const [errors, setErrors] = useState({});
+  const [removedStored, setRemovedStored] = useState(false); // the user pressed Remove on the stored picture
+  const [storedMissing, setStoredMissing] = useState(false);  // the stored picture turned out not to exist / not to load
+  const [pictureError, setPictureError] = useState('');
+  const storedSources = editingItem ? pictureSources(editingItem) : [];
+  const storedShown = storedSources.length > 0 && !removedStored && !storedMissing;
+  const previewSources = formData.image ? [formData.image] : (storedShown ? storedSources : []);
+  const handleStoredMissing = useCallback(() => setStoredMissing(true), []);
+  const [preparingPicture, setPreparingPicture] = useState(false);
 
-  const handleImageChange = (e) => {
-    const file = e.target.files[0];
-    if (file) {
-      logEvent(`Image selected: ${file.name} (${(file.size/1024).toFixed(1)} KB)`, 'debug');
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setFormData(prev => ({ ...prev, image: reader.result }));
-      };
-      reader.readAsDataURL(file);
+  const handleImageChange = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ''; // picking the same file again must still fire onChange
+    if (!file) return;
+    logEvent(`Image selected: ${file.name} (${(file.size/1024).toFixed(1)} KB)`, 'debug');
+    setPictureError('');
+    setPreparingPicture(true);
+    try {
+      const dataUrl = await compressImage(file);
+      setFormData(prev => ({ ...prev, image: dataUrl }));
+      logEvent(`Image resized for upload: ${Math.round(dataUrl.length * 0.75 / 1024)} KB JPEG`, 'debug');
+    } catch (err) {
+      setPictureError(err.message);
+      logEvent(`Image could not be prepared: ${err.message}`, 'error', { fileName: file.name, fileType: file.type, sizeKB: Math.round(file.size / 1024) });
+    } finally {
+      setPreparingPicture(false);
     }
+  };
+
+  const handleRemoveImage = () => {
+    setFormData(prev => ({ ...prev, image: null }));
+    setPictureError('');
+    // Removing a stored picture means clearing it on the server when the form is saved
+    if (storedSources.length > 0) setRemovedStored(true);
+    logEvent('Picture removed from the form.', 'debug');
   };
 
   const handleSubmit = (e) => {
     e.preventDefault();
+    if (saving || preparingPicture) return;
     logEvent('Validating form data...', 'debug');
     const newErrors = {};
     if (!formData.area.trim()) newErrors.area = "Area is required";
     if (!formData.description.trim()) newErrors.description = "Description is required";
     if (formData.category === 'note' && !formData.customNote.trim()) newErrors.customNote = "Custom text is required for Notes";
+    // The category and the note share one Dataverse column, so a note reading exactly like a category would become that category on reload
+    else if (formData.category === 'note' && CATEGORIES.some(c => c.key !== 'note' && c.key === formData.customNote.trim().toLowerCase())) newErrors.customNote = "That is a category name - pick it from the Issue Category list instead";
     
     if (Object.keys(newErrors).length > 0) {
       logEvent('Form validation failed.', 'warn', newErrors);
@@ -1017,6 +1464,9 @@ function SubmissionForm({ selection, onSubmit, logEvent, editingItem }) {
       boxW: selection.w,
       boxH: selection.h,
       ...formData,
+      // formData.image is only a NEW picture; keep whatever is already stored unless the save changes it
+      image: editingItem ? editingItem.image : null,
+      picture: editingItem ? editingItem.picture : null,
       submittedBy: editingItem ? editingItem.submittedBy : 'Current User',
       submittedOn: editingItem ? editingItem.submittedOn : new Date().toISOString()
     };
@@ -1036,7 +1486,11 @@ function SubmissionForm({ selection, onSubmit, logEvent, editingItem }) {
       craa5__facility: 'MAIN' 
     };
 
-    onSubmit(localData, dbPayload);
+    // new picture -> upload it; stored picture removed -> clear it; otherwise leave the picture alone
+    const pictureChange = formData.image
+      ? { op: 'new', dataUrl: formData.image }
+      : (removedStored && storedSources.length > 0 && !storedMissing ? { op: 'removed' } : null);
+    onSubmit(localData, dbPayload, pictureChange);
   };
 
   return (
@@ -1044,27 +1498,35 @@ function SubmissionForm({ selection, onSubmit, logEvent, editingItem }) {
       {/* Image Upload */}
       <div>
         <label className="block text-sm font-medium text-slate-700 mb-1">Picture Upload</label>
-        <div className="mt-1 flex justify-center px-6 pt-5 pb-6 border-2 border-slate-300 border-dashed rounded-lg hover:border-blue-500 transition-colors bg-slate-50 relative overflow-hidden group">
-          {formData.image ? (
+        {!pictureSupport.ready && (
+          <div className="mb-2 text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-md p-2">
+            Pictures cannot be saved yet: {pictureSupport.reason}
+          </div>
+        )}
+        <div className="mt-1 flex flex-col items-center justify-center gap-3 px-6 py-5 border-2 border-slate-300 border-dashed rounded-lg bg-slate-50">
+          {previewSources.length > 0 ? (
             <>
-              <img src={formData.image} alt="Preview" className="max-h-48 object-contain" />
-              <div className="absolute inset-0 bg-black/50 hidden group-hover:flex items-center justify-center">
-                 <span className="text-white text-sm font-medium">Click to change image</span>
-                 <input type="file" accept="image/*" onChange={handleImageChange} className="absolute inset-0 opacity-0 cursor-pointer" />
+              <StoredImage sources={previewSources} alt="Preview" className="max-h-48 object-contain rounded" onMissing={handleStoredMissing} />
+              <div className="flex flex-wrap justify-center gap-2">
+                <label className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-white border border-slate-300 text-sm font-medium text-slate-700 focus-within:ring-2 focus-within:ring-blue-400 ${pictureSupport.ready && !preparingPicture ? 'cursor-pointer hover:bg-slate-100' : 'opacity-50 cursor-not-allowed'}`}>
+                  <Camera className="w-4 h-4" /> Replace picture
+                  <input type="file" accept="image/*" className="sr-only" onChange={handleImageChange} disabled={!pictureSupport.ready || preparingPicture} />
+                </label>
+                <button type="button" onClick={handleRemoveImage} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-white border border-slate-300 text-sm font-medium text-red-600 hover:bg-red-50">
+                  <X className="w-4 h-4" /> Remove
+                </button>
               </div>
             </>
           ) : (
-            <div className="space-y-1 text-center">
+            <label className={`space-y-1 text-center rounded-md focus-within:ring-2 focus-within:ring-blue-400 ${pictureSupport.ready && !preparingPicture ? 'cursor-pointer' : 'opacity-50 cursor-not-allowed'}`}>
               <Camera className="mx-auto h-12 w-12 text-slate-400" />
-              <div className="flex text-sm text-slate-600 justify-center">
-                <label htmlFor="file-upload" className="relative cursor-pointer bg-white rounded-md font-medium text-blue-600 hover:text-blue-500 focus-within:outline-none px-2 py-1">
-                  <span>Upload a file</span>
-                  <input id="file-upload" name="file-upload" type="file" accept="image/*" className="sr-only" onChange={handleImageChange} />
-                </label>
-              </div>
-              <p className="text-xs text-slate-500">PNG, JPG, GIF up to 10MB</p>
-            </div>
+              <span className="block text-sm font-medium text-blue-600">Take or upload a picture</span>
+              <span className="block text-xs text-slate-500">PNG, JPG, GIF or a phone photo - resized to 1600 px before saving</span>
+              <input id="file-upload" name="file-upload" type="file" accept="image/*" className="sr-only" onChange={handleImageChange} disabled={!pictureSupport.ready || preparingPicture} />
+            </label>
           )}
+          {preparingPicture && <p className="text-xs text-slate-500">Preparing picture...</p>}
+          {pictureError && <p className="text-xs text-red-600" role="alert">{pictureError}</p>}
         </div>
       </div>
 
@@ -1114,12 +1576,9 @@ function SubmissionForm({ selection, onSubmit, logEvent, editingItem }) {
           className="block w-full rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2 border"
           value={formData.category} onChange={e => setFormData({...formData, category: e.target.value})}
         >
-          <option value="to be cleaned">To Be Cleaned</option>
-          <option value="to be fixed">To Be Fixed</option>
-          <option value="safety concern">Safety Concern</option>
-          <option value="idea">Idea</option>
-          <option value="fsq concern">FSQ Concern</option>
-          <option value="note">Note (Custom)</option>
+          {CATEGORIES.map(c => (
+            <option key={c.key} value={c.key}>{c.key === 'note' ? 'Note (Custom)' : c.label}</option>
+          ))}
         </select>
 
         {formData.category === 'note' && (
@@ -1132,9 +1591,13 @@ function SubmissionForm({ selection, onSubmit, logEvent, editingItem }) {
         )}
       </div>
 
+      {saveError && (
+        <div className="text-sm bg-red-50 border border-red-200 text-red-800 rounded-lg p-3" role="alert">{saveError}</div>
+      )}
+
       <div className="pt-4 flex justify-end">
-        <button type="submit" className="bg-blue-600 text-white px-6 py-2 rounded-lg shadow hover:bg-blue-700 focus:ring-4 focus:ring-blue-300 transition-all font-medium text-lg">
-          {editingItem ? 'Update Observation' : 'Submit Observation'}
+        <button type="submit" disabled={saving || preparingPicture} className="bg-blue-600 text-white px-6 py-2 rounded-lg shadow hover:bg-blue-700 focus:ring-4 focus:ring-blue-300 transition-all font-medium text-lg disabled:opacity-60 disabled:cursor-not-allowed">
+          {saving ? 'Saving...' : (editingItem ? 'Update Observation' : 'Submit Observation')}
         </button>
       </div>
     </form>
@@ -1144,7 +1607,7 @@ function SubmissionForm({ selection, onSubmit, logEvent, editingItem }) {
 // ==========================================
 // TAB 2: GALLERY VIEW
 // ==========================================
-function GalleryTab({ submissions, logEvent, onEdit }) {
+function GalleryTab({ submissions, categoryBar, logEvent, onEdit }) {
   const [groupBy, setGroupBy] = useState('combined'); // 'combined' means Room -> Area -> Equipment
   const [selectedItem, setSelectedItem] = useState(null);
 
@@ -1154,6 +1617,8 @@ function GalleryTab({ submissions, logEvent, onEdit }) {
       let key = 'Other';
       if (groupBy === 'combined') {
         key = [sub.room, sub.area, sub.equipment].filter(Boolean).join(' > ') || 'Unassigned Location';
+      } else if (groupBy === 'category') {
+        key = categoryMeta(sub.category).label;
       } else {
         key = sub[groupBy] || `No ${groupBy}`;
       }
@@ -1170,7 +1635,7 @@ function GalleryTab({ submissions, logEvent, onEdit }) {
 
   return (
     <div className="h-full flex flex-col bg-slate-100 p-6 overflow-auto">
-      <div className="flex justify-between items-center mb-6">
+      <div className="flex flex-wrap gap-3 justify-between items-center mb-4">
         <h2 className="text-2xl font-bold text-slate-800">Observation Gallery</h2>
         <div className="flex items-center gap-2 bg-white p-2 rounded-lg shadow-sm">
           <label className="text-sm text-slate-600 font-medium">Group By:</label>
@@ -1185,6 +1650,7 @@ function GalleryTab({ submissions, logEvent, onEdit }) {
           </select>
         </div>
       </div>
+      <CategoryFilterBar {...categoryBar} className="mb-6 shrink-0" />
 
       <div className="space-y-8 pb-12">
         {Object.entries(groupedData).map(([groupName, items]) => (
@@ -1201,16 +1667,18 @@ function GalleryTab({ submissions, logEvent, onEdit }) {
                   className="group relative bg-white border border-slate-200 rounded-lg overflow-hidden shadow-sm hover:shadow-md transition-all cursor-pointer hover:border-blue-400"
                 >
                   <div className="aspect-video bg-slate-100 flex items-center justify-center overflow-hidden border-b border-slate-100">
-                    {item.image ? (
-                      <img src={item.image} alt="Observation" className="w-full h-full object-cover group-hover:scale-105 transition-transform" />
-                    ) : (
-                      <ImageIcon className="w-10 h-10 text-slate-300" />
-                    )}
+                    <StoredImage
+                      sources={pictureSources(item)}
+                      alt="Observation"
+                      className="w-full h-full object-cover group-hover:scale-105 transition-transform"
+                      fallback={<ImageIcon className="w-10 h-10 text-slate-300" />}
+                    />
                   </div>
                   <div className="p-3 space-y-1">
                     <div className="flex justify-between items-start">
-                      <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800 capitalize">
-                        {item.category === 'note' ? 'Note' : item.category}
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-700 max-w-[65%]">
+                        <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: categoryMeta(item.category).color }} />
+                        <span className="truncate">{categoryText(item)}</span>
                       </span>
                       <span className="text-[10px] text-slate-400">{new Date(item.submittedOn).toLocaleDateString()}</span>
                     </div>
@@ -1230,7 +1698,14 @@ function GalleryTab({ submissions, logEvent, onEdit }) {
           </div>
         ))}
         {Object.keys(groupedData).length === 0 && (
-          <div className="text-center text-slate-500 py-12">No observations submitted yet.</div>
+          <div className="text-center text-slate-500 py-12">
+            {categoryBar.selected.length > 0 ? (
+              <>
+                No observations match the selected categories.{' '}
+                <button type="button" onClick={categoryBar.onClear} className="text-blue-700 underline hover:text-blue-900">Show all categories</button>
+              </>
+            ) : 'No observations submitted yet.'}
+          </div>
         )}
       </div>
 
@@ -1244,83 +1719,253 @@ function GalleryTab({ submissions, logEvent, onEdit }) {
 }
 
 // ==========================================
-// TAB 3: TABLE VIEW
+// TAB 3: ACTION ITEM RAIL (rolling list - replaces the old raw table)
 // ==========================================
-function TableTab({ submissions, mapImage, onLocate }) {
+const RAIL_PAGE = 30;        // cards that roll in at a time as the user scrolls
+const THUMB_SIZE = 80;       // px, square location / photo thumbnails
+const THUMB_MAP_WIDTH = 480; // px the whole map is drawn at inside a location thumbnail
+
+// Natural width/height of the map, so location thumbnails are cropped without squashing the picture
+function useImageAspect(src) {
+  const [aspect, setAspect] = useState(null);
+  useEffect(() => {
+    if (!src) { setAspect(null); return undefined; }
+    let cancelled = false;
+    const img = new Image();
+    img.onload = () => { if (!cancelled && img.naturalHeight) setAspect(img.naturalWidth / img.naturalHeight); };
+    img.src = src;
+    return () => { cancelled = true; };
+  }, [src]);
+  return aspect;
+}
+
+// Crop of the facility map centred exactly on the reported box
+function MapThumb({ item, mapImage, aspect }) {
+  if (!mapImage || !aspect) {
+    return <div className="w-20 h-20 shrink-0 bg-slate-200 rounded-lg border border-slate-300 flex items-center justify-center text-[10px] text-slate-400">N/A</div>;
+  }
+  const color = categoryMeta(item.category).color;
+  const mapW = THUMB_MAP_WIDTH;
+  const mapH = mapW / aspect;
+  const boxW = Math.min(THUMB_SIZE, Math.max(8, (item.boxW / 100) * mapW));
+  const boxH = Math.min(THUMB_SIZE, Math.max(8, (item.boxH / 100) * mapH));
   return (
-    <div className="h-full bg-white overflow-auto flex flex-col">
-      <div className="p-6 border-b border-slate-200 bg-slate-50 sticky top-0 z-10">
-        <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
-          <TableIcon className="text-blue-600" />
-          Raw Data Table
-        </h2>
-        <p className="text-sm text-slate-500 mt-1">Direct view of underlying records. Double-click any row to instantly jump to its location on the map.</p>
+    <div
+      className="w-20 h-20 shrink-0 rounded-lg border border-slate-300 shadow-sm relative overflow-hidden bg-slate-200"
+      title="Where this was reported"
+      style={{
+        backgroundImage: `url(${mapImage})`,
+        backgroundRepeat: 'no-repeat',
+        backgroundSize: `${mapW}px ${mapH}px`,
+        backgroundPosition: `${THUMB_SIZE / 2 - (item.mapX / 100) * mapW}px ${THUMB_SIZE / 2 - (item.mapY / 100) * mapH}px`
+      }}
+    >
+      <div
+        className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 border-2 rounded-sm"
+        style={{ width: boxW, height: boxH, borderColor: color, backgroundColor: `${color}33` }}
+      />
+    </div>
+  );
+}
+
+function PhotoThumb({ item, label, onClick }) {
+  const [missing, setMissing] = useState(false);
+  const sources = pictureSources(item, true);
+  const key = sources.join('|');
+  useEffect(() => { setMissing(false); }, [key]);
+  const handleMissing = useCallback(() => setMissing(true), []);
+  if (sources.length === 0 || missing) return null;
+  return (
+    <button type="button" onClick={onClick} title="View photo" aria-label={`View photo for ${label}`} className="w-20 h-20 shrink-0 rounded-lg overflow-hidden border border-slate-300 shadow-sm bg-slate-100 hover:ring-2 hover:ring-blue-400 transition">
+      <StoredImage sources={sources} alt="Observation" className="w-full h-full object-cover" onMissing={handleMissing} />
+    </button>
+  );
+}
+
+function RailCard({ item, mapImage, aspect, onLocate, onOpen, onEdit, onPickCategory }) {
+  const meta = categoryMeta(item.category);
+  const place = [item.room, item.area, item.equipment].filter(Boolean).join(' / ');
+  // Picking a category re-flows the list, so the second click of a double-click can land somewhere else (another card,
+  // or the same card's text). Only a double-click whose two clicks were both on this card's body jumps to the map.
+  const recentClicks = useRef([]);
+  return (
+    <article
+      aria-label={`${categoryText(item)}: ${place || 'Unassigned location'}`}
+      onClick={(e) => { const now = Date.now(); recentClicks.current = [...recentClicks.current.filter(c => now - c.at < 600), { at: now, onButton: !!e.target.closest('button') }]; }}
+      onDoubleClick={(e) => { const last = recentClicks.current.slice(-2); if (!e.target.closest('button') && last.length === 2 && last.every(c => !c.onButton)) onLocate(item); }}
+      title="Double-click to jump to this location on the map"
+      className="group bg-white rounded-xl border border-slate-200 shadow-sm hover:shadow-md hover:border-blue-300 transition-all flex flex-col sm:flex-row gap-3 p-3 sm:p-4"
+      style={{ borderLeft: `4px solid ${meta.color}` }}
+    >
+      <div className="flex sm:flex-col gap-2 shrink-0">
+        <MapThumb item={item} mapImage={mapImage} aspect={aspect} />
+        <PhotoThumb item={item} label={place || 'this item'} onClick={() => onOpen(item)} />
       </div>
 
-      <div className="p-6 overflow-x-auto flex-1">
-        <table className="w-full text-left border-collapse min-w-[1000px]">
-          <thead>
-            <tr className="bg-slate-100 border-y border-slate-200 text-sm text-slate-600 uppercase tracking-wider">
-              <th className="p-3 font-semibold">Location</th>
-              <th className="p-3 font-semibold">Date</th>
-              <th className="p-3 font-semibold">Submitted By</th>
-              <th className="p-3 font-semibold">Category</th>
-              <th className="p-3 font-semibold">Rm/Ar/Eq</th>
-              <th className="p-3 font-semibold">Description</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-slate-100 text-sm">
-            {submissions.map((sub) => (
-              <tr 
-                key={sub.id} 
-                className="hover:bg-blue-50 transition-colors cursor-pointer group"
-                onDoubleClick={() => onLocate(sub)}
-              >
-                {/* CSS GENERATED LOCATION THUMBNAIL (800% ZOOM CROP) */}
-                <td className="p-3">
-                  {mapImage ? (
-                    <div 
-                       className="w-12 h-12 rounded border border-slate-300 shadow-sm relative overflow-hidden"
-                       title="Double-click to zoom map"
-                       style={{
-                          backgroundImage: `url(${mapImage})`,
-                          backgroundSize: '800% 800%',
-                          backgroundPosition: `${sub.mapX}% ${sub.mapY}%`
-                       }}
-                    >
-                       <div className="absolute inset-0 bg-blue-500/10 group-hover:bg-blue-500/30 transition-colors" />
-                       {/* Center dot to show pin in thumbnail */}
-                       <div className="absolute top-1/2 left-1/2 w-1.5 h-1.5 bg-red-500 rounded-full transform -translate-x-1/2 -translate-y-1/2 shadow" />
-                    </div>
-                  ) : (
-                    <div className="w-12 h-12 bg-slate-200 rounded border border-slate-300 flex items-center justify-center text-[10px] text-slate-400">N/A</div>
-                  )}
-                </td>
-                <td className="p-3 text-slate-600 whitespace-nowrap">{new Date(sub.submittedOn).toLocaleDateString()}</td>
-                <td className="p-3 font-medium text-slate-800">{sub.submittedBy}</td>
-                <td className="p-3">
-                  <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-700 capitalize border border-slate-200">
-                    {sub.category}
-                  </span>
-                </td>
-                <td className="p-3 text-slate-600">
-                  {[sub.room, sub.area, sub.equipment].filter(Boolean).join(' / ')}
-                </td>
-                <td className="p-3 text-slate-800 max-w-xs truncate" title={sub.description}>
-                  {sub.description}
-                </td>
-              </tr>
-            ))}
-            {submissions.length === 0 && (
-              <tr>
-                <td colSpan="6" className="p-8 text-center text-slate-500">
-                  No data available for the selected timeframe.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+      <div className="flex-1 min-w-0">
+        <div className="flex flex-wrap items-center gap-2 mb-1.5">
+          <button
+            type="button"
+            onClick={() => onPickCategory(item.category)}
+            title="Show only this category"
+            className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-semibold border max-w-full"
+            style={{ color: meta.color, borderColor: `${meta.color}55`, backgroundColor: `${meta.color}14` }}
+          >
+            <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: meta.color }} />
+            <span className="truncate">{categoryText(item)}</span>
+          </button>
+          <time dateTime={item.submittedOn} className="text-xs text-slate-600" title={new Date(item.submittedOn).toLocaleString()}>
+            {formatWhen(item.submittedOn)}
+            {recentAgo(item.submittedOn) && <span className="text-slate-500"> - {recentAgo(item.submittedOn)}</span>}
+          </time>
+        </div>
+
+        <h4 className="font-semibold text-slate-800 text-sm sm:text-base [overflow-wrap:anywhere]">{place || 'Unassigned location'}</h4>
+        <p className="text-sm text-slate-600 mt-1 line-clamp-3 whitespace-pre-wrap break-words">{item.description}</p>
+
+        <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-600">
+          {item.whoToNotify && <span className="min-w-0 max-w-full [overflow-wrap:anywhere]">Notify: <span className="font-medium text-slate-700">{item.whoToNotify}</span></span>}
+          <span className="min-w-0 max-w-full [overflow-wrap:anywhere]">By <span className="font-medium text-slate-700">{item.submittedBy}</span></span>
+        </div>
+
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button type="button" onClick={() => onLocate(item)} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700 shadow-sm">
+            <MapPin className="w-3.5 h-3.5" /> Locate on map
+          </button>
+          <button type="button" onClick={() => onOpen(item)} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-white text-slate-700 border border-slate-300 text-xs font-semibold hover:bg-slate-100">
+            <Maximize2 className="w-3.5 h-3.5" /> Details
+          </button>
+          <button type="button" onClick={() => onEdit(item)} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-white text-slate-700 border border-slate-300 text-xs font-semibold hover:bg-slate-100">
+            <PencilIcon className="w-3.5 h-3.5" /> Edit
+          </button>
+        </div>
       </div>
+    </article>
+  );
+}
+
+function TableTab({ submissions, timeFilteredCount, categoryBar, mapImage, logEvent, onLocate, onEdit }) {
+  const [query, setQuery] = useState('');
+  const [selectedItem, setSelectedItem] = useState(null);
+  const [visibleCount, setVisibleCount] = useState(RAIL_PAGE);
+  const scrollRef = useRef(null);
+  const sentinelRef = useRef(null);
+  const aspect = useImageAspect(mapImage);
+
+  // Newest first, narrowed by the search box (the category chips already narrowed `submissions`)
+  const items = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const matches = q
+      ? submissions.filter(sub => [sub.room, sub.area, sub.equipment, sub.description, sub.whoToNotify, sub.submittedBy, categoryText(sub)].join(' ').toLowerCase().includes(q))
+      : submissions;
+    return matches.slice().sort((a, b) => new Date(b.submittedOn) - new Date(a.submittedOn));
+  }, [submissions, query]);
+
+  // Roll back to the top whenever the list itself changes (new search or filter)
+  useEffect(() => {
+    setVisibleCount(RAIL_PAGE);
+    if (scrollRef.current) scrollRef.current.scrollTop = 0;
+  }, [items]);
+
+  // Roll more cards in as the end of the list comes into view
+  const hasMore = visibleCount < items.length;
+  useEffect(() => {
+    if (!hasMore) return undefined;
+    if (typeof IntersectionObserver === 'undefined') { setVisibleCount(items.length); return undefined; }
+    const node = sentinelRef.current;
+    if (!node) return undefined;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some(entry => entry.isIntersecting)) setVisibleCount(count => count + RAIL_PAGE);
+    }, { root: scrollRef.current, rootMargin: '400px 0px' });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [hasMore, visibleCount, items.length]);
+
+  // Day groups: Today / Yesterday / 2-7 days ago / ...
+  const groups = useMemo(() => {
+    const out = [];
+    items.slice(0, visibleCount).forEach(item => {
+      const label = dayBucket(item.submittedOn);
+      const last = out[out.length - 1];
+      if (last && last.label === label) last.items.push(item);
+      else out.push({ label, items: [item] });
+    });
+    return out;
+  }, [items, visibleCount]);
+
+  const locate = (item) => { logEvent(`Action rail: locating ${item.id} on the map`, 'info'); onLocate(item); };
+  const open = (item) => { logEvent(`Action rail: opened details for ${item.id}`, 'info'); setSelectedItem(item); };
+  const pickCategory = (key) => categoryBar.onOnly(key);
+  const hasNarrowing = query.trim() !== '' || categoryBar.selected.length > 0;
+
+  return (
+    <div className="h-full flex flex-col bg-slate-100">
+      <div className="shrink-0 bg-white border-b border-slate-200 shadow-sm px-4 sm:px-6 py-4 space-y-3 z-10 [@media(max-height:520px)]:py-2 [@media(max-height:520px)]:space-y-1">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
+              <TableIcon className="text-blue-600" />
+              Action Item Rail
+            </h2>
+            <p className="text-sm text-slate-600 mt-1 [@media(max-height:520px)]:hidden">Newest first. Scroll to roll through every item; double-click a card (or press Locate) to jump to it on the map.</p>
+          </div>
+          <div className="relative w-full sm:w-72">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 transform -translate-y-1/2 pointer-events-none" />
+            <input
+              type="search"
+              value={query}
+              onChange={e => setQuery(e.target.value)}
+              placeholder="Search room, area, equipment, text..."
+              aria-label="Search action items"
+              className="w-full pl-9 pr-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400"
+            />
+          </div>
+        </div>
+        <CategoryFilterBar {...categoryBar} />
+        <div role="status" className="text-xs text-slate-600">Showing <span className="font-bold text-slate-700">{items.length}</span> of {timeFilteredCount} items in this timeframe</div>
+      </div>
+      <div ref={scrollRef} className="flex-1 overflow-y-auto overflow-x-hidden">
+        <div className="max-w-3xl mx-auto px-4 sm:px-6 pb-8">
+          {groups.map(group => (
+            <section key={group.label}>
+              <h3 className="sticky top-0 z-10 -mx-4 sm:-mx-6 px-4 sm:px-6 py-2 bg-slate-100/95 backdrop-blur text-xs font-bold uppercase tracking-wider text-slate-600">{group.label}</h3>
+              {/* The rail itself: a vertical spine with a category-coloured node per item */}
+              <ol className="relative ml-3 border-l-2 border-slate-300 space-y-3 py-3 list-none">
+                {group.items.map(item => (
+                  <li key={item.id} className="relative pl-6">
+                    <span
+                      className="absolute -left-[9px] top-6 w-4 h-4 rounded-full border-2 border-white shadow"
+                      style={{ backgroundColor: categoryMeta(item.category).color }}
+                      aria-hidden="true"
+                    />
+                    <RailCard item={item} mapImage={mapImage} aspect={aspect} onLocate={locate} onOpen={open} onEdit={onEdit} onPickCategory={pickCategory} />
+                  </li>
+                ))}
+              </ol>
+            </section>
+          ))}
+
+          {hasMore && <div ref={sentinelRef} className="py-6 text-center text-xs text-slate-500">Rolling in more items...</div>}
+          {!hasMore && items.length > 0 && <div className="py-6 text-center text-xs text-slate-500">End of the rail - {items.length} item{items.length === 1 ? '' : 's'}</div>}
+
+          {items.length === 0 && (
+            <div className="text-center text-slate-500 py-16">
+              {timeFilteredCount === 0 ? 'No data available for the selected timeframe.' : 'No action items match the current search or categories.'}
+              {timeFilteredCount > 0 && hasNarrowing && (
+                <div className="mt-2">
+                  <button type="button" onClick={() => { setQuery(''); categoryBar.onClear(); }} className="text-blue-700 underline hover:text-blue-900">Clear search and filters</button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <DetailModal
+        selectedItem={selectedItem}
+        onClose={() => setSelectedItem(null)}
+        onEdit={(item) => { setSelectedItem(null); onEdit(item); }}
+      />
     </div>
   );
 }
