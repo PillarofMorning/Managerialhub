@@ -2294,7 +2294,7 @@ export default function App(props) {
                 totalWork: t.rawWorkloadMins,
                 inspectMins: includeInspection ? baseMins * 0.10 : 0,
                 transitMins: includeTransit ? 10 * t.heads : 0,
-                blocks: [], unscheduledWork: 0
+                blocks: [], unscheduledWork: 0, removed: !!rawT.removed   // removed: taken out on the Dashboard, only its started / done parts kept
             };
             parents.push(parent);
 
@@ -2724,6 +2724,8 @@ export default function App(props) {
                 if (plan) {
                     const emp = plan.assign[task.parentId];
                     if (emp && laneByEmpCrew[emp + '|' + W.crew] !== undefined) res.must = laneByEmpCrew[emp + '|' + W.crew];
+                    // A lead keeps what Shift Start gave them only when the lead setting allows that work; otherwise it's the room's.
+                    if (res.must !== null && workers[res.must].isLead && !workers[res.must].canDo(task.kind, true)) res.must = null;
                     if (lid && plan.lineWorkers[lid]) {
                         staffed = true;
                         const isLeadLane = function(l) { return workers[l].isLead; };
@@ -2912,31 +2914,31 @@ export default function App(props) {
                 }
                 return parts;
             };
-            // A lead takes a PIC clean off a Tech 1 / 2 (into the lead's earliest free time it fits, their own team's lead first)
-            // when work only the Tech can do is still waiting, so the Tech can take that instead. Never a clean Shift Start gave
-            // that Tech, a part of a longer clean or a 2-person clean, and never more minutes than are waiting. Returns the swaps.
-            const swapPic = function() {
+            // A PIC-only lead takes a PIC clean off a Tech 1 / 2 (into the lead's earliest free time it fits, their own team's lead
+            // first) when regular cleaning the Tech could do is still waiting, so the Tech can take that instead. Never a clean
+            // Shift Start gave that Tech, a part of a longer clean or a 2-person clean, and about no more minutes than are
+            // waiting. skip: cleans not to move. Returns the swaps.
+            const swapPic = function(skip) {
                 const out = [];
-                const picLeads = leadLanes.filter(function(l) { return workers[l].canDo('pic', false); });
-                if (!picLeads.length) return out;
+                const picLeads = leadLanes.filter(function(l) { return workers[l].kind === 'pic'; });
+                if (!picLeads.length || !crewLanes.some(function(l) { return workers[l].kind === 'general'; })) return out;
                 let waiting = 0;
-                pending.forEach(function(u) { if (u.kind !== 'pic' && fromOf(u) < W.end && crewLanes.some(function(l) { return workers[l].canDo(u.kind, true); })) waiting += u.rawWorkloadMins; });
+                pending.forEach(function(u) { if (u.kind === 'general' && fromOf(u) < W.end) waiting += u.rawWorkloadMins; });
                 if (waiting <= 0) return out;
                 const cands = allTasks.filter(function(t) {
-                    if (t.kind !== 'pic' || t.isPinned || t.isFrozen || t.isSplitPart1 || t.isSplitPart2 || !t.assignedLanes || t.assignedLanes.length !== 1) return false;
+                    if (t.kind !== 'pic' || skip[t.id] || t.isPinned || t.isFrozen || t.isSplitPart1 || t.isSplitPart2 || !t.assignedLanes || t.assignedLanes.length !== 1) return false;
                     const x = t.assignedLanes[0];
                     return crewLanes.indexOf(x) > -1 && workers[x].kind === 'general' && t.startMin >= W.start && t.startMin < W.end && pending.indexOf(t) === -1;
                 }).sort(function(a, b) { return a.startMin - b.startMin; });
                 let moved = 0;
                 cands.forEach(function(t) {
-                    if (moved >= waiting) return;
+                    if (moved >= waiting || moved + t.rawWorkloadMins > waiting + tailMin) return;
                     const x = t.assignedLanes[0];
                     const was = { start: t.startMin, dur: t.finalDuration, segs: t.segments };
                     const who = whoFor(t);
                     if (who.must === x && !who.late) return;
-                    const night = isNightAt(was.start);
                     const xUses = pending.some(function(u) {
-                        if (u.kind === 'pic' || !workers[x].canDo(u.kind, night) || fromOf(u) > was.start + was.dur - tailMin) return false;
+                        if (u.kind !== 'general' || fromOf(u) > was.start + was.dur - tailMin) return false;
                         const wu = whoFor(u);
                         return wu.must === x || wu.room.indexOf(x) > -1 || wu.team.indexOf(x) > -1 || crewFor(wu).length > 0;
                     });
@@ -2956,12 +2958,25 @@ export default function App(props) {
             };
             return { wholePass: wholePass, partPass: partPass, swapPic: swapPic, hasPlan: !!plan, hasLeads: leadLanes.length > 0 };
         };
-        // The rest of a clean picked up on a later shift (or left over) carries the handover minutes, once, per head.
+        // The rest of a clean picked up on a later shift (or left over) carries the handover minutes, once, per head; picked up
+        // on the shift it was cut on, none.
         const chargeHandover = function(task) {
             if (task.cutAt === undefined || task.cutAt === null || task.handoverAdded) return;
             task.workOverrideMins = task.rawWorkloadMins + handoverMins * (task.handoverHeads || 1);
             task.handoverAdded = true;
             if (task.prevPart) task.prevPart.handedOver = true;
+        };
+        const unchargeHandover = function(task) {
+            if (!task.handoverAdded) return;
+            task.workOverrideMins = task.rawWorkloadMins - handoverMins * (task.handoverHeads || 1);
+            task.handoverAdded = false;
+            if (task.prevPart) task.prevPart.handedOver = false;
+        };
+        const handoverFor = function(gStart) {
+            pending.forEach(function(task) {
+                if (task.cutAt === undefined || task.cutAt === null) return;
+                if (task.cutAt === gStart) unchargeHandover(task); else chargeHandover(task);
+            });
         };
         const winList = shiftWindows.slice().sort(function(a, b) { return a.start - b.start || a.crew.localeCompare(b.crew); });
         const groups = [];
@@ -2991,23 +3006,36 @@ export default function App(props) {
         groups.forEach(function(g) {
             if (pending.length === 0) return;
             const gStart = g[0].start;
-            pending.forEach(function(task) { if (task.cutAt !== undefined && task.cutAt !== null && task.cutAt !== gStart) chargeHandover(task); });
+            handoverFor(gStart);
             const ctxs = g.map(function(W) { return ctxOf(W, gStart); }).filter(function(c) { return !!c; });
             if (ctxs.length === 0) return;
             fillGroup(ctxs, true);
         });
         // Leads come last of all, once every shift's crew is planned, so the crew's own work always comes first:
         //   1. PIC nobody on any shift could get to (their own team's first, then the shift's);
-        //   2. PIC taken off a Tech 1 / 2 when work only the Tech can do is still waiting; the Tech then takes that work (a swap
-        //      the Tech's freed time can't use at all is put back);
+        //   2. PIC-only leads: PIC taken off a Tech 1 / 2 when regular cleaning is still waiting; the Tech then takes that work
+        //      (a try that leaves a Tech with a gap they could have filled is taken back);
         //   3. with "Regular cleaning + PIC", regular cleaning nobody could get to.
-        // The rest of their shift is leadership. A clean cut on a lead's own shift carries no handover minutes when the lead
-        // picks up the rest.
-        const unchargeHandover = function(task) {
-            if (!task.handoverAdded) return;
-            task.workOverrideMins = task.rawWorkloadMins - handoverMins * (task.handoverHeads || 1);
-            task.handoverAdded = false;
-            if (task.prevPart) task.prevPart.handedOver = false;
+        // The rest of their shift is leadership. (Equipment Shift Start gave a lead stays with them in the crew's own pass when
+        // the lead setting allows that work.)
+        // Everything a handover try can change, so a try that leaves a Tech with a fillable gap can be taken back whole.
+        const snapshot = function() {
+            return {
+                pending: pending.slice(), n: allTasks.length,
+                sched: workers.map(function(w) { return w.schedule.slice(); }),
+                tasks: allTasks.map(function(t) { return [t, t.startMin, t.appliedHeads, t.assignedLanes, t.segments, t.finalDuration, t.crew, t.workOverrideMins, t.isSplitPart1, t.name]; })
+            };
+        };
+        const restore = function(snap) {
+            pending = snap.pending;
+            allTasks.length = snap.n;
+            workers.forEach(function(w, i) { w.schedule = snap.sched[i]; w.runs = null; });
+            snap.tasks.forEach(function(o) {
+                const t = o[0];
+                t.startMin = o[1]; t.appliedHeads = o[2]; t.assignedLanes = o[3]; t.segments = o[4]; t.finalDuration = o[5];
+                t.crew = o[6]; t.workOverrideMins = o[7]; t.isSplitPart1 = o[8]; t.name = o[9];
+            });
+            Object.keys(virtualRoomsMap).forEach(function(k) { virtualRoomsMap[k].occ = null; });
         };
         const leadGroups = groups.filter(function(g) {
             return g.some(function(W) { return workers.some(function(w) { return w.isLead && w.crew === W.crew && w.kind !== 'none' && w.kind !== 'leadership'; }); });
@@ -3016,26 +3044,29 @@ export default function App(props) {
             leadGroups.forEach(function(g) {
                 if (pending.length === 0) return;
                 const gStart = g[0].start;
-                pending.forEach(function(task) {
-                    if (task.cutAt === undefined || task.cutAt === null) return;
-                    if (task.cutAt === gStart) unchargeHandover(task); else chargeHandover(task);
-                });
+                handoverFor(gStart);
                 if (step[0] === 'swap') {
-                    const all = g.map(function(W) { return ctxOf(W, gStart); }).filter(function(c) { return !!c; });
-                    const swaps = [];
-                    all.forEach(function(c) { if (c.hasLeads) Array.prototype.push.apply(swaps, c.swapPic()); });
-                    if (!swaps.length) return;
-                    fillGroup(g.map(function(W) { return ctxOf(W, gStart); }).filter(function(c) { return !!c; }), false);
-                    // A Tech whose freed time got no work at all takes their clean back (unless the room has filled up since).
-                    swaps.forEach(function(sw) {
-                        const a = sw.was.start, b = sw.was.start + sw.was.dur;
-                        if (!workers[sw.x].isFree(a, b)) return;
-                        const lead = sw.t.assignedLanes.slice();
-                        unbook(sw.t);
-                        const vRoom = virtualRoomsMap[sw.t.vRoomKey];
-                        if (vRoom.limit < Infinity && capEnd(roomOcc(vRoom), vRoom, [], 1, a, b) < b - 0.01) { placeTask(sw.t, 1, lead, sw.t.startMin, sw.t.finalDuration); return; }
-                        rebook(sw.t, sw.x, sw.was);
-                    });
+                    // Hand PIC over, then let the crew fill the time it frees. Keep it only when less work is left waiting and no
+                    // Tech is left where their PIC was with nothing at all or a free stretch long enough to fill (Filling gaps);
+                    // otherwise take the whole try back and try again without those cleans.
+                    const waitingMins = function() { let m = 0; pending.forEach(function(u) { m += u.rawWorkloadMins; }); return m; };
+                    const skip = {};
+                    for (let tries = 0; tries < 4; tries++) {
+                        const snap = snapshot();
+                        const before = waitingMins();
+                        const swaps = [];
+                        g.map(function(W) { return ctxOf(W, gStart); }).forEach(function(c) { if (c && c.hasLeads) Array.prototype.push.apply(swaps, c.swapPic(skip)); });
+                        if (!swaps.length) return;
+                        fillGroup(g.map(function(W) { return ctxOf(W, gStart); }).filter(function(c) { return !!c; }), false);
+                        const gaps = swaps.filter(function(sw) {
+                            const a = sw.was.start, b = sw.was.start + sw.was.dur;
+                            return workers[sw.x].isFree(a, b) || freeRuns(workers[sw.x], a, b, tailMin).length > 0;
+                        });
+                        if (!gaps.length && waitingMins() < before - 0.5) return;
+                        restore(snap);
+                        if (!gaps.length) return;
+                        gaps.forEach(function(sw) { skip[sw.t.id] = true; });
+                    }
                     return;
                 }
                 const ctxs = g.map(function(W) { return ctxOf(W, gStart); }).filter(function(c) { return c && c.hasLeads; });
@@ -3336,7 +3367,7 @@ export default function App(props) {
 
     // Deep Metrics Calculation (overheads counted once per piece of equipment)
     let deepTransit = 0, deepInspect = 0, deepBreak = 0, deepDown = 0;
-    scheduleData.parents.forEach(function(p) { deepTransit += p.transitMins; deepInspect += p.inspectMins; });
+    scheduleData.parents.forEach(function(p) { deepTransit += p.transitMins; if (!p.removed) deepInspect += p.inspectMins; });
 
     // Breaks / downtime that land inside a worker's booked time (absorbed into their blocks).
     metricsWorkers.forEach(function(w) {
@@ -3385,8 +3416,13 @@ export default function App(props) {
     const bookedMinsTotal = crewStats.reduce(function(acc, c) { return acc + c.bookedMins; }, 0);
     const money = function(mins) { return '$' + ((mins / 60) * hourlyRate).toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 }); };
 
+    // Rooms with planned equipment, plus rooms only kept for the started / checked-off parts of equipment taken out of cleaning.
+    const ganttRooms = {};
+    scheduleData.groups.forEach(function(g) { ganttRooms[g.name] = true; });
+    const shownRooms = activeRooms.filter(function(r) { return plannedRooms.indexOf(r) > -1 || !!ganttRooms[r]; });
+
     // Per-room rollup.
-    const roomStats = plannedRooms.map(function(room) {
+    const roomStats = shownRooms.map(function(room) {
         const g = scheduleData.groups.find(function(x) { return x.name === room; });
         const blocks = g ? g.tasks : [];
         let start = Infinity, end = 0, mp = 0, wt = 0, wd = 0, late = 0;
@@ -3400,7 +3436,7 @@ export default function App(props) {
         });
         const overflow = scheduleData.unscheduled.filter(function(t) { return t.originalArea === room; });
         overflow.forEach(function(t) { wt += t.rawWorkloadMins; });
-        const parentsHere = scheduleData.parents.filter(function(p) { return p.area === room; });
+        const parentsHere = scheduleData.parents.filter(function(p) { return p.area === room && !p.removed; });
         return {
             room: room, start: start === Infinity ? 0 : start, end: end, manpowerMins: mp,
             pct: wt > 0 ? Math.round((wd / wt) * 100) : 0, late: late, overflow: overflow.length,
@@ -3571,7 +3607,7 @@ export default function App(props) {
                                     <input type="number" min="5" max="240" value={tailFillDraft !== null ? tailFillDraft : tailFillMins} onChange={function(e) { setTailFillDraft(e.target.value); }} onBlur={commitTailFill} onKeyDown={function(e) { if (e.key === 'Enter') e.target.blur(); }} className="w-14 border border-slate-300 rounded p-1 text-xs font-bold outline-none no-pan text-center" title="The rest of that clean continues later in the shift or on a later shift (a later shift adds the handover minutes set on the Crew tab)" />
                                     <span className="text-[11px] font-bold text-slate-600">working minutes</span>
                                 </div>
-                                <p className="text-[11px] font-bold text-slate-500 mt-2">Each shift, a piece of equipment goes to the person Shift Start gave it to, then anyone else on that room, then the rest of that team, then anyone on the shift whose role allows it. People fill their own room first (whole cleans, then parts of cleans) before they help their team, and their team before the rest of the shift. When a shift has more work than its Tech 1s and 2s can do, Tech 3s and Inspectors get the PIC work first and Tech 1s and 2s do regular cleaning first, taking PIC only when they run out. Shorter jobs fill the gaps between longer ones, and a job longer than a shift starts at clock-in. Any blank space left is outlined in yellow on the Gantt. {leadKind === 'leadership' ? 'Leads take no tasks (set on the Crew tab).' : `Leads (set on the Crew tab) come last, after the crew is planned: a lead takes PIC nobody on this or a later shift can get to, or PIC a Tech 1 or 2 hands over so the Tech can do other work still waiting, their own team's first${leadKind === 'general' ? ', then regular cleaning nobody can get to' : ''}. The rest of their shift shows as Leadership.`}</p>
+                                <p className="text-[11px] font-bold text-slate-500 mt-2">Each shift, a piece of equipment goes to the person Shift Start gave it to, then anyone else on that room, then the rest of that team, then anyone on the shift whose role allows it. People fill their own room first (whole cleans, then parts of cleans) before they help their team, and their team before the rest of the shift. When a shift has more work than its Tech 1s and 2s can do, Tech 3s and Inspectors get the PIC work first, and Tech 1s and 2s do regular cleaning first, taking PIC when they run out of it or when no Tech 3 or Inspector has time left for it. Shorter jobs fill the gaps between longer ones, and a job longer than a shift starts at clock-in. Any blank space left is outlined in yellow on the Gantt. {leadKind === 'leadership' ? 'Leads take no tasks (set on the Crew tab).' : leadKind === 'pic' ? 'Leads (set on the Crew tab) keep PIC that Shift Start gave them. Otherwise they come last, after the crew is planned: a lead takes PIC nobody on this or a later shift can get to, or PIC a Tech 1 or 2 hands over when regular cleaning is still waiting for that Tech, their own team\'s first. The rest of their shift shows as Leadership.' : 'Leads (set on the Crew tab) keep what Shift Start gave them. Otherwise they come last, after the crew is planned: a lead takes PIC nobody on this or a later shift can get to, their own team\'s first, then regular cleaning nobody can get to. The rest of their shift shows as Leadership.'}</p>
                             </div>
                         </div>
 
@@ -3974,7 +4010,7 @@ export default function App(props) {
                                                                                                 return (
                                                                                                     <div key={p.id} title={p.counted ? '' : 'Not planned: ' + p.why} className={`flex items-center justify-between gap-2 text-[12px] mt-1 border border-dashed rounded px-1.5 py-1 ${p.counted ? 'border-slate-200' : 'border-slate-200 bg-slate-100 opacity-60'}`}>
                                                                                                         <span className={`truncate font-bold ${p.counted ? 'text-slate-700' : 'text-slate-400 line-through'}`}>{p.name}{p.isLead ? <span className="ml-1 text-[9px] font-black uppercase text-sky-600">Lead</span> : null}</span>
-                                                                                                        <span className={`text-[10px] font-black whitespace-nowrap flex-shrink-0 ${p.counted ? 'text-[#0072CE]' : 'text-slate-400'}`}>{!p.counted ? 'not planned' : p.isLead ? '—' : (pcc ? (pcc.eq[p.id] || 0) : p.equipCount) + ' to do'}</span>
+                                                                                                        <span className={`text-[10px] font-black whitespace-nowrap flex-shrink-0 ${p.counted ? 'text-[#0072CE]' : 'text-slate-400'}`}>{(function() { const n = pcc ? (pcc.eq[p.id] || 0) : p.equipCount; return !p.counted ? 'not planned' : p.isLead && !n ? '—' : n + ' to do'; })()}</span>
                                                                                                     </div>
                                                                                                 );
                                                                                             })}
@@ -4035,9 +4071,9 @@ export default function App(props) {
                                     )}
                                     {rosterInfo.jobRoles.length > 0 && (
                                         <div className="w-full mt-1 space-y-1">
-                                            <div className="text-slate-600">What each job role (_aa_Role) is assigned — Techs 1 / 2 do regular cleaning and PIC items; Tech 3 only PIC; Inspectors PIC plus admin (data entry) on nights; Chemical Clerk, Admin and Janitorial only their own area; leads {leadKind === 'leadership' ? 'no tasks, only leadership' : `take PIC items nobody else can get to, or that a Tech hands over to do other waiting work${leadKind === 'general' ? ', then regular cleaning nobody can get to' : ''}; the rest of their shift is leadership`}:</div>
+                                            <div className="text-slate-600">What each job role (_aa_Role) is assigned — Techs 1 / 2 do regular cleaning and PIC items; Tech 3 only PIC; Inspectors PIC plus admin (data entry) on nights; Chemical Clerk, Admin and Janitorial only their own area; leads {leadKind === 'leadership' ? 'no tasks, only leadership' : leadKind === 'pic' ? 'keep PIC Shift Start gives them and take PIC items nobody else can get to, or that a Tech hands over to do waiting regular cleaning; the rest of their shift is leadership' : 'keep what Shift Start gives them and take PIC items, then regular cleaning, nobody else can get to; the rest of their shift is leadership'}:</div>
                                             <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                                                <label className={`flex items-center gap-1.5 text-[11px] font-bold rounded-lg px-2 py-1 border ${leadKind === 'leadership' ? 'bg-slate-100 text-slate-400 border-slate-200' : 'bg-white text-emerald-900 border-emerald-300'}`} title="A lead only takes work after the crew is planned: PIC nobody on this or a later shift can fit, or PIC a Tech 1 / 2 hands over so they can do other work still waiting (their own team's first). With Regular cleaning + PIC, also regular cleaning nobody can fit. Time with no task shows as Leadership, not blank space.">
+                                                <label className={`flex items-center gap-1.5 text-[11px] font-bold rounded-lg px-2 py-1 border ${leadKind === 'leadership' ? 'bg-slate-100 text-slate-400 border-slate-200' : 'bg-white text-emerald-900 border-emerald-300'}`} title="Equipment Shift Start gives a lead stays with them when this setting allows that work. Otherwise a lead only takes work after the crew is planned: PIC nobody on this or a later shift can fit (their own team's first). With PIC items only, also PIC a Tech 1 / 2 hands over when regular cleaning is waiting for them; with Regular cleaning + PIC, also regular cleaning nobody can fit. Time with no task shows as Leadership, not blank space.">
                                                     <span>Leads ({leadCount})</span>
                                                     <select data-lead-work value={leadKind} onChange={function(e) { setJobRoleKind(LEAD_WORK_KEY, e.target.value); }} className="text-[11px] font-bold border border-slate-200 rounded p-0.5 bg-white text-slate-700 outline-none cursor-pointer">
                                                         {LEAD_WORK_KINDS.map(function(k) { return <option key={k.id} value={k.id}>{k.label}</option>; })}
@@ -4395,7 +4431,7 @@ export default function App(props) {
                     {/* Gantt Header & Room Key */}
                     <div className="bg-slate-50 px-5 py-2 border-b border-slate-200 flex flex-wrap gap-4 items-center shadow-inner z-10 flex-shrink-0">
                         <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest mr-2">Color Key:</span>
-                        {plannedRooms.map(function(room) {
+                        {shownRooms.map(function(room) {
                             return (
                                 <div key={room} className="flex items-center gap-1.5">
                                     <div className={`w-3 h-3 rounded-full ${getRoomColor(room)}`}></div>
@@ -4439,7 +4475,7 @@ export default function App(props) {
                                         <h2 className="font-black text-slate-800 flex items-center text-xs uppercase tracking-widest flex-shrink-0"><Target className="w-4 h-4 mr-2 text-[#0072CE]"/> Focus Target</h2>
                                         <select value={focusRoom} onChange={function(e) { setFocusRoom(e.target.value); }} className="flex-1 border border-[#8FC0EC] rounded-lg p-1.5 text-sm font-bold bg-[#E6F1FB] text-[#00468B] outline-none cursor-pointer">
                                             <option value="">-- Select Room to Isolate --</option>
-                                            {plannedRooms.map(function(r) { return <option key={r} value={r}>{r}</option>; })}
+                                            {shownRooms.map(function(r) { return <option key={r} value={r}>{r}</option>; })}
                                         </select>
                                     </div>
                                 ) : (
@@ -4870,7 +4906,7 @@ export default function App(props) {
                             <div className="grid grid-cols-3 gap-2">
                                 <Button variant="outline" disabled={t.isInProgress || t.isComplete} onClick={function() { setBlockStatus(t, 'started'); }}><Play className="w-4 h-4 mr-1" /> Start</Button>
                                 <Button variant="success" disabled={t.isComplete} onClick={function() { setBlockStatus(t, 'done'); close(); }}><Check className="w-4 h-4 mr-1" /> Done</Button>
-                                <Button variant="outline" disabled={!t.isFrozen} onClick={function() { setBlockStatus(t, null); }} title="Undo check-off and let the planner re-plan this work">Undo</Button>
+                                <Button variant="outline" disabled={!t.isFrozen} onClick={function() { setBlockStatus(t, null); }} title={parentAsset && parentAsset.removed ? "Undo check-off. This equipment is taken out of cleaning on the Dashboard, so the block is dropped and nothing is re-planned (Put back on the Dashboard to plan it again)." : "Undo check-off and let the planner re-plan this work"}>Undo</Button>
                             </div>
 
                             <div>
