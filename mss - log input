@@ -142,7 +142,7 @@ const FIX_SELECT = ['craa5__log_id', 'craa5_equipment', 'craa5_equipmentguid', '
 const LIMITS = {
   orderSuggest: 100, orderRows: 300, assetSearch: 25, assetNames: 80, idChunk: 20, nameChunk: 5, prevEntries: 300, fuzzyLines: 30,
   logPage: 50, logMax: 500, calendar: 600, dashboard: 1000, fixGroupsShown: 200, retroPage: 200, retroRounds: 25, unifyAssets: 500, countCap: 500,
-  familyPage: 500, familyPages: 10,
+  familyPage: 500, familyPages: 4, familyLinkedPages: 2, familyWriteMax: 2000, evidence: 100,
 };
 
 // --- HELPERS ---
@@ -306,13 +306,22 @@ const placeText = (a) => [a.room, a.area].filter(Boolean).join(' / ');
 // room and the same area. A blank room or area only matches blank, because names like "Floors" exist in many rooms.
 const familyKey = (g) => [canonName(g.equipment), placeKey(g.room), placeKey(g.area)].join('|');
 const inFamily = (g, r) => canonName(r.craa5_equipment) === canonName(g.equipment) && samePlace(r.craa5_room, g.room) && samePlace(r.craa5_area, g.area);
-const placeFilter = (col, v) => (placeKey(v) ? ciEq(col, v) : `(${col} eq null or ${col} eq '')`);
+// Bulk picks need room and area filled in on the entry and the same on the equipment
+const sameRoomAndArea = (g, a) => !!(a && placeKey(g.room) && placeKey(g.area)) && samePlace(g.room, a.room) && samePlace(g.area, a.area);
+// A room or area as it may be written (every spelling seen in the list), or blank
+const placeFilter = (col, values) => {
+  const vs = Array.from(new Set([].concat(values).map(safeString).filter(v => placeKey(v))));
+  return vs.length ? `(${vs.map(v => ciEq(col, v)).join(' or ')})` : `(${col} eq null or ${col} eq '')`;
+};
 // Server filter for a family: every word and number of the name, and the room and area (the exact name is checked after)
-const familyFilter = (g) => {
+const familyFilter = (g, places) => {
   const p = nameProfile(g.equipment);
   const name = p.words.slice(0, 4).map(w => ciContains('craa5_equipment', w)).concat(p.numList.slice(0, 2).map(n => `contains(craa5_equipment,'${n}')`));
-  return name.concat([placeFilter('craa5_room', g.room), placeFilter('craa5_area', g.area)]).join(' and ');
+  return name.concat([placeFilter('craa5_room', places ? places.rooms : g.room), placeFilter('craa5_area', places ? places.areas : g.area)]).join(' and ');
 };
+const LINKED = `craa5_equipmentguid ne null and craa5_equipmentguid ne ''`;
+const EVIDENCE_SELECT = ['craa5__log_id', 'craa5_equipment', 'craa5_equipmentguid', 'craa5_room', 'craa5_area'];
+const uniqueRows = (rows) => Array.from(new Map(rows.map(r => [r.craa5__log_id, r])).values());
 
 // --- DATA ACCESS (Xrm.WebApi, Power Apps dataApi, or an in-memory preview) ---
 // Every query takes a row limit (default 100). There is deliberately no "load everything" call.
@@ -954,11 +963,14 @@ const makeStore = (api) => {
     logEvidence(g) {
       if (!canonName(g.equipment)) return Promise.resolve({ by: [], unknown: 0, checked: 0, capped: false });
       return once(cache.evidence, familyKey(g), async () => {
-        const rows = await api.query(LOG_TABLE, {
-          select: FIX_SELECT, filter: `${familyFilter(g)} and craa5_equipmentguid ne null and craa5_equipmentguid ne ''`,
-          orderBy: 'craa5_lastcleaned desc', top: LIMITS.prevEntries,
-        });
-        const mine = rows.filter(r => inFamily(g, r));
+        const ask = (filter) => api.query(LOG_TABLE, { select: EVIDENCE_SELECT, filter: `${filter} and ${LINKED}`, orderBy: 'craa5_lastcleaned desc', top: LIMITS.evidence });
+        // Every spelling of the name; when that fills the cap, also the name as written, so similar names
+        // ("Oven 1 racks", "Conveyor 10") cannot crowd it out
+        const loose = await ask(familyFilter(g));
+        const place = `${placeFilter('craa5_room', g.room)} and ${placeFilter('craa5_area', g.area)}`;
+        const exact = loose.length >= LIMITS.evidence ? await ask(`${ciEq('craa5_equipment', g.equipment)} and ${place}`) : [];
+        const rows = exact.concat(loose);
+        const mine = uniqueRows(rows).filter(r => inFamily(g, r));
         await resolve(mine.map(r => r.craa5_equipmentguid));
         const by = new Map();
         let unknown = 0;
@@ -968,30 +980,32 @@ const makeStore = (api) => {
           if (!by.has(a.id)) by.set(a.id, { asset: a, count: 0 });
           by.get(a.id).count += 1;
         });
-        return { by: Array.from(by.values()).sort((a, b) => b.count - a.count), unknown, checked: mine.length, capped: rows.length >= LIMITS.prevEntries };
+        return { by: Array.from(by.values()).sort((a, b) => b.count - a.count), unknown, checked: mine.length, capped: exact.length >= LIMITS.evidence || loose.length >= LIMITS.evidence };
       });
     },
     // Every entry of a group's equipment (same name, room and area) that needs this equipment: no ID, an ID that no longer
     // exists, or one of the wrong IDs given. Entries already on other existing equipment are only counted. Read page by page.
-    async familyToFix(g, assetId, wrongIds) {
-      if (!canonName(g.equipment)) return { rows: [], kept: 0, capped: false };
-      const readAll = async (filter) => {
+    async familyToFix(g, assetId, wrongIds, places) {
+      if (!canonName(g.equipment)) return { rows: [], kept: 0, keptMore: false, capped: false };
+      const readAll = async (filter, maxPages) => {
         const out = [];
         let pg = await api.page(LOG_TABLE, { select: FIX_SELECT, filter, top: LIMITS.familyPage });
         for (let pages = 1; ; pages++) {
           pg.rows.forEach(r => { if (inFamily(g, r)) out.push(r); });
           if (!pg.next) return { rows: out, capped: false };
-          if (pages >= LIMITS.familyPages) return { rows: out, capped: true };
+          if (pages >= maxPages) return { rows: out, capped: true };
           pg = await pg.next();
         }
       };
-      const base = familyFilter(g);
-      const blank = await readAll(`${base} and ${BLANK_GUID}`);
-      const linked = await readAll(`${base} and craa5_equipmentguid ne null and craa5_equipmentguid ne '' and ${guidNe('craa5_equipmentguid', assetId)}`);
+      const base = familyFilter(g, places);
+      const [blank, linked] = await Promise.all([
+        readAll(`${base} and ${BLANK_GUID}`, LIMITS.familyPages),
+        readAll(`${base} and ${LINKED} and ${guidNe('craa5_equipmentguid', assetId)}`, LIMITS.familyLinkedPages),
+      ]);
       await resolve(linked.rows.map(r => r.craa5_equipmentguid));
       const wrong = (wrongIds || []).map(cleanGuid);
       const fix = linked.rows.filter(r => { const id = cleanGuid(r.craa5_equipmentguid); return id !== cleanGuid(assetId) && (wrong.includes(id) || store.isGone(id)); });
-      return { rows: blank.rows.concat(fix), kept: linked.rows.length - fix.length, capped: blank.capped || linked.capped };
+      return { rows: blank.rows.concat(fix), kept: linked.rows.length - fix.length, keptMore: linked.capped, capped: blank.capped || linked.capped };
     },
 
     async findAssetExact(name, room, area) {
@@ -1189,24 +1203,32 @@ const rankCandidates = async (store, g) => {
     });
   }
   // 3. Double-check against the log: entries with this name in this room and area that already carry an equipment ID.
-  // When they all use one equipment in this same room and area, that is the match; a split or another answer needs a look.
+  // The log confirms equipment whose own name fits (or that the SAP order or the name search found); on its own it is
+  // Medium at best, a single entry never makes High, and entries pointing at other rooms or areas weigh against it.
   let check = null;
   const logCount = new Map(); // asset id -> entries of this name here that use it
+  const placed = !!(placeKey(g.room) && placeKey(g.area));
+  const inPlace = (a) => placed && samePlace(g.room, a.room) && samePlace(g.area, a.area);
   if (canonName(g.equipment)) {
     try {
       const ev = await store.logEvidence(g);
       const uses = ev.by.filter(x => placeOk(want, x.asset) && x.asset.id !== g.exclude);
+      const elsewhere = ev.by.filter(x => !placeOk(want, x.asset) && x.asset.id !== g.exclude).reduce((s, x) => s + x.count, 0);
       const total = uses.reduce((s, x) => s + x.count, 0);
-      const placed = !!(placeKey(g.room) && placeKey(g.area));
       uses.forEach(x => {
         const share = x.count / total;
-        const here = placed && samePlace(g.room, x.asset.room) && samePlace(g.area, x.asset.area);
-        // Several entries all on one equipment count as much as an identical name; a single entry a little less
-        const sure = x.count >= 2 ? 1 : 0.96;
-        bump(x.asset, share === 1 ? (here ? sure : 0.9) : share >= 0.8 ? 0.9 : 0.6 + 0.3 * share, LOG_REASON);
+        const q = nameProfile(x.asset.name);
+        const numClash = p.hasNums && q.hasNums && p.nums !== q.nums;
+        const prior = cand.get(x.asset.id);
+        const confirms = !numClash && (nameSimilarity(p, q) >= 0.8 || !!(prior && prior.score >= 0.6));
+        let s = share === 1 ? (inPlace(x.asset) ? (x.count >= 2 ? 1 : 0.96) : 0.9) : share >= 0.8 ? 0.9 : 0.6 + 0.3 * share;
+        if (x.count < 2 && !prior) s = Math.min(s, 0.94);
+        if (!confirms) s = Math.min(s, numClash ? 0.6 : 0.85);
+        if (elsewhere >= x.count) s = Math.min(s, 0.9);
+        bump(x.asset, s, LOG_REASON);
         logCount.set(x.asset.id, x.count);
       });
-      check = { uses, total, unknown: ev.unknown, capped: ev.capped };
+      check = { uses, total, elsewhere, unknown: ev.unknown, capped: ev.capped };
     } catch (e) { check = { error: errText(e) }; }
   }
   // Equal scores: the equipment more entries of this name already use comes first
@@ -1218,24 +1240,38 @@ const rankCandidates = async (store, g) => {
   // The SAP order, the name and the log point at different equipment
   const src = (r) => (r.reason.startsWith('SAP') ? 'SAP order' : r.reason === LOG_REASON ? 'log' : 'name');
   const conflict = ranked.length > 1 && ranked[1].score >= 0.95 && src(ranked[0]) !== src(ranked[1]);
-  if (conflict && tier === 'high') tier = 'medium';
-  return { ranked, tier, ambiguous, conflict, conflictText: conflict ? `${src(ranked[0])} and ${src(ranked[1])} disagree` : '', check };
+  // Most linked entries of this name here use other equipment than the suggestion
+  const rival = check && check.uses && ranked.length
+    ? check.uses.find(x => x.asset.id !== ranked[0].asset.id && inPlace(x.asset) && x.count >= 2 && x.count * 2 > check.total && (logCount.get(ranked[0].asset.id) || 0) < x.count)
+    : null;
+  if ((conflict || rival) && tier === 'high') tier = 'medium';
+  const conflictText = conflict ? `${src(ranked[0])} and ${src(ranked[1])} disagree` : rival ? 'the log disagrees' : '';
+  return { ranked, tier, ambiguous, conflict: conflict || !!rival, conflictText, check };
 };
 const LOG_REASON = 'earlier entries with this name';
 // What the log double-check says about the equipment chosen for a group
-const logCheck = (g, chosenId) => {
+const logCheck = (g, chosenId, asset) => {
   const c = g.check;
   if (!c) return null;
   if (c.error) return { kind: 'warn', text: `Log check failed: ${c.error}` };
-  const here = placeKey(g.room) || placeKey(g.area) ? 'here' : 'and no room or area';
-  if (!c.total) return { kind: 'none', text: `Log check: no other entry with this name ${here} has an equipment ID yet.` };
+  const placed = !!(placeKey(g.room) || placeKey(g.area));
+  const here = placed ? 'here' : 'and no room or area';
+  const notes = [
+    c.elsewhere > 0 && `${plural(c.elsewhere, 'entry', 'entries')} with this name ${here} ${c.elsewhere === 1 ? 'points' : 'point'} at equipment in another room or area`,
+    c.unknown > 0 && (c.unknown === 1 ? '1 entry has an ID that no longer exists' : `${c.unknown} entries have IDs that no longer exist`),
+    c.capped && 'only the newest entries were checked',
+  ].filter(Boolean);
+  const tail = notes.length ? ` (${notes.join('; ')})` : '';
+  if (!c.total) return { kind: c.elsewhere > 0 ? 'warn' : 'none', text: `Log check: no other entry with this name ${here} is linked to equipment ${placed ? 'in this room and area ' : ''}yet${tail}.` };
   const mine = chosenId ? c.uses.find(x => x.asset.id === chosenId) : null;
   const top = c.uses[0];
   if (mine && mine.count === c.total) {
-    return { kind: 'ok', text: c.total === 1 ? `Log check: the one other entry with this name ${here} that has an ID uses this equipment.` : `Log check: all ${c.total} entries with this name ${here} that have an ID use this equipment.` };
+    const fits = !asset || nameSimilarity(nameProfile(g.equipment), nameProfile(asset.name)) >= 0.8;
+    const text = c.total === 1 ? `Log check: the one other entry with this name ${here} that has an ID uses this equipment` : `Log check: all ${c.total} entries with this name ${here} that have an ID use this equipment`;
+    return { kind: fits && !c.elsewhere ? 'ok' : 'warn', text: `${text}${fits ? '' : ', but its name is different, so check it'}${tail}.` };
   }
-  if (mine) return { kind: 'warn', text: `Log check: ${mine.count} of ${c.total} entries with this name ${here} use this equipment; the rest use ${plural(c.uses.length - 1, 'other one', 'others')}.` };
-  return { kind: 'warn', text: `Log check: ${plural(top.count, 'entry', 'entries')} with this name ${here} ${top.count === 1 ? 'uses' : 'use'} ${top.asset.name} (${placeText(top.asset) || 'no room/area'})${chosenId ? ', not this one' : ''}.` };
+  if (mine) return { kind: 'warn', text: `Log check: ${mine.count} of ${c.total} entries with this name ${here} use this equipment; the rest use ${plural(c.uses.length - 1, 'other one', 'others')}${tail}.` };
+  return { kind: 'warn', text: `Log check: ${plural(top.count, 'entry', 'entries')} with this name ${here} ${top.count === 1 ? 'uses' : 'use'} ${top.asset.name} (${placeText(top.asset) || 'no room/area'})${chosenId ? ', not this one' : ''}${tail}.` };
 };
 
 // Entry's room/area text disagrees with the room/area of the equipment its ID points at
@@ -2343,21 +2379,22 @@ const scanFilter = (mode, scope) => {
 // "Map to" picker: the suggested equipment, or type to search all equipment (a server search, a few results at a time)
 const EquipmentChoice = ({ store, label, options, value, disabled, onChoose, uses }) => {
   const [text, setText] = useState(null); // what is being typed; null shows the chosen equipment
-  const [res, setRes] = useState([]);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState('');
+  const [found, setFound] = useState({ q: '', rows: [], err: '' }); // search results, kept with the text they are for
   const q = text === null ? '' : text.trim();
   useEffect(() => {
-    if (q.length < 2) { setRes([]); setErr(''); setBusy(false); return undefined; }
+    if (q.length < 2) return undefined;
     let live = true;
-    setBusy(true);
     const t = setTimeout(async () => {
-      try { const r = await store.searchAssets(q); if (live) { setRes(r); setErr(''); } }
-      catch (e) { if (live) { setRes([]); setErr(errText(e)); } }
-      finally { if (live) setBusy(false); }
+      try { const r = await store.searchAssets(q); if (live) setFound({ q, rows: r, err: '' }); }
+      catch (e) { if (live) setFound({ q, rows: [], err: errText(e) }); }
     }, 250);
     return () => { live = false; clearTimeout(t); };
   }, [q, store]);
+  // Results for older text are never shown
+  const fresh = q.length >= 2 && found.q === q;
+  const res = fresh ? found.rows : [];
+  const err = fresh ? found.err : '';
+  const busy = q.length >= 2 && !fresh;
   const words = tokenize(q);
   const hit = (a) => words.every(w => `${a.name} ${a.room} ${a.area}`.toLowerCase().includes(w));
   const list = q.length >= 2 ? uniqueById(options.filter(hit).concat(res)) : options;
@@ -2374,20 +2411,21 @@ const EquipmentChoice = ({ store, label, options, value, disabled, onChoose, use
   };
   const pick = (id) => {
     setText(null);
+    if (id === (value || NO_MATCH)) return; // the current choice picked again: nothing changes
     if (id === NO_MATCH) { onChoose(null); return; }
     const a = list.find(x => x.id === id) || options.find(x => x.id === id);
     if (a) onChoose(a);
   };
   const info = (key, msg) => <Option key={key} value={`${INFO}${key}`} text={msg} disabled>{msg}</Option>;
   return (
-    <Combobox freeform aria-label={label} placeholder="No match · type to search all equipment" disabled={disabled}
+    <Combobox freeform disableAutoFocus aria-label={label} placeholder="No match · type to search all equipment" disabled={disabled}
       style={{ minWidth: '260px', width: '100%' }}
       value={text === null ? (chosen ? labelOf(chosen) : '') : text}
       selectedOptions={[value || NO_MATCH]}
       input={{ onFocus: (e) => { try { e.target.select(); } catch (_) { /* nothing to select */ } } }}
       onChange={(e) => setText(e.target.value)}
-      onOptionSelect={(e, d) => { if (d.optionValue && d.optionValue.indexOf(INFO) !== 0) pick(d.optionValue); }}
-      onOpenChange={(e, d) => { if (!d.open) setText(null); }}>
+      onOptionSelect={(e, d) => { if (e && e.type === 'keydown' && e.key === 'Tab') return; if (d.optionValue && d.optionValue.indexOf(INFO) !== 0) pick(d.optionValue); }}
+      onOpenChange={(e, d) => { if (!d.open && !(e && e.type === 'click')) setText(null); }}>
       <Option value={NO_MATCH} text="No match">No match</Option>
       {list.map(a => <Option key={a.id} value={a.id} text={labelOf(a)}>{labelOf(a)}</Option>)}
       {busy && info('busy', 'Searching all equipment…')}
@@ -2488,9 +2526,21 @@ const RepairIds = ({ ctx, onCount }) => {
       });
       if (!live()) return;
       const added = todo.map((g, i) => ({ ...g, ...(ranks[i].ok ? ranks[i].value : { ranked: [], tier: 'none', ambiguous: false, conflict: false, check: null, lookupError: errText(ranks[i].error) }) }));
-      setChoice(prev => { const x = { ...prev }; added.forEach(g => { x[g.key] = g.ranked.length && g.tier !== 'none' ? g.ranked[0].asset.id : ''; }); return x; });
-      // High confidence is ticked; entries whose ID points elsewhere are always left for the admin to tick
-      setApply(prev => { const x = { ...prev }; added.forEach(g => { x[g.key] = g.tier === 'high' && mode !== 'place'; }); return x; });
+      // A name (same room and area) already in the list keeps the equipment chosen there, if its rows agree
+      const famPick = new Map();
+      Array.from(prior.values()).forEach(g => {
+        if (!canonName(g.equipment) || !choice[g.key]) return;
+        const k = familyKey(g);
+        famPick.set(k, famPick.has(k) && famPick.get(k) !== choice[g.key] ? null : choice[g.key]);
+      });
+      const known = (id) => { let a = store.getAsset(id); prior.forEach(g => { if (!a) a = g.ranked.concat((extraOpts[g.key] || []).map(o => ({ asset: o }))).map(r => r.asset).find(o => o.id === id) || null; }); return a; };
+      const inherited = new Map();
+      added.forEach(g => { const id = canonName(g.equipment) ? famPick.get(familyKey(g)) : null; const a = id ? known(id) : null; if (a) inherited.set(g.key, a); });
+      const own = (g) => (g.ranked.length && g.tier !== 'none' ? g.ranked[0].asset.id : '');
+      setChoice(prev => { const x = { ...prev }; added.forEach(g => { const a = inherited.get(g.key); x[g.key] = a ? a.id : own(g); }); return x; });
+      // High confidence is ticked (not when it differs from the choice made for the name); entries whose ID points elsewhere are always left for the admin to tick
+      setApply(prev => { const x = { ...prev }; added.forEach(g => { const a = inherited.get(g.key); x[g.key] = g.tier === 'high' && mode !== 'place' && (!a || a.id === own(g)); }); return x; });
+      setExtraOpts(prev => { const x = { ...prev }; added.forEach(g => { const a = inherited.get(g.key); if (a && !g.ranked.some(r => r.asset.id === a.id)) x[g.key] = [a]; }); return x; });
       setGroups(() => {
         const merged = Array.from(prior.values()).concat(added);
         const order = { high: 0, medium: 1, low: 2, none: 3 };
@@ -2511,7 +2561,6 @@ const RepairIds = ({ ctx, onCount }) => {
   const highGroups = shown.filter(g => g.tier === 'high' && choice[g.key] && g.ranked.length && g.ranked[0].asset.id === choice[g.key]);
   // Medium matches on screen whose suggestion is still the one chosen, not flagged ambiguous or disagreeing,
   // and (as for every bulk pick) with room and area filled in and the same on the entry and the equipment
-  const sameRoomAndArea = (g, a) => !!(placeKey(g.room) && placeKey(g.area)) && samePlace(g.room, a.room) && samePlace(g.area, a.area);
   const mediumGroups = shown.filter(g => g.tier === 'medium' && !g.ambiguous && !g.conflict && choice[g.key] && g.ranked.length && g.ranked[0].asset.id === choice[g.key] && sameRoomAndArea(g, g.ranked[0].asset));
   const tickAll = (list) => setApply(p => { const x = { ...p }; list.forEach(g => { x[g.key] = true; }); return x; });
 
@@ -2524,7 +2573,7 @@ const RepairIds = ({ ctx, onCount }) => {
     const jobs = new Map(); // log id -> { id, payload }
     todo.forEach(g => { const a = store.getAsset(choice[g.key]); g.ids.forEach(id => jobs.set(id, { id, payload: { craa5_equipmentguid: a.id, ...fill(g, a) } })); });
     const listed = jobs.size;
-    const out = { extra: 0, kept: 0, mixed: 0, capped: false, famError: '', declined: false };
+    const out = { extra: 0, moreIds: [], kept: 0, keptMore: false, mixed: 0, unplaced: 0, held: 0, capped: false, failedNames: [], declined: false };
     if (sameName) {
       // The same name in the same room and area is the same equipment: every such entry gets the equipment chosen,
       // unless the ticked rows for that name chose different equipment (then only those rows are written)
@@ -2534,30 +2583,55 @@ const RepairIds = ({ ctx, onCount }) => {
         const k = familyKey(g);
         const wrong = g.mode === 'place' && g.current ? [g.current.id] : [];
         const f = fams.get(k);
-        if (!f) { fams.set(k, { g, assetId: choice[g.key], wrong, mixed: false }); return; }
+        if (!f) { fams.set(k, { key: k, g, assetId: choice[g.key], wrong, mixed: false }); return; }
         if (f.assetId !== choice[g.key]) f.mixed = true;
         f.wrong = f.wrong.concat(wrong);
       });
-      const list = Array.from(fams.values()).filter(f => !f.mixed);
-      out.mixed = fams.size - list.length;
+      const agreed = Array.from(fams.values()).filter(f => !f.mixed);
+      out.mixed = fams.size - agreed.length;
+      // Only a name with room and area filled in, and equipment in that same room and area, is spread to the rest of the log
+      const list = agreed.filter(f => sameRoomAndArea(f.g, store.getAsset(f.assetId)));
+      out.unplaced = agreed.length - list.length;
+      list.forEach(f => {
+        const rows = groups.filter(x => canonName(x.equipment) && familyKey(x) === f.key);
+        // Every spelling of the room and area in the list, so the log read finds them all
+        f.places = { rooms: rows.map(r => r.room), areas: rows.map(r => r.area) };
+        // Rows of this name in the list that were given other equipment (or No match) keep the admin's decision
+        f.held = new Set();
+        rows.forEach(r => { if (choice[r.key] !== f.assetId) r.ids.forEach(id => f.held.add(id)); });
+      });
       let n = 0;
       setProgress(`Looking through the log for other entries with the same names… 0 of ${list.length}`);
       const found = await pool(list, 3, async (f) => {
-        const r = await store.familyToFix(f.g, f.assetId, f.wrong);
+        const r = await store.familyToFix(f.g, f.assetId, f.wrong, f.places);
         n += 1; setProgress(`Looking through the log for other entries with the same names… ${n} of ${list.length}`);
         return r;
       });
-      const more = [];
+      let more = [];
       found.forEach((r, i) => {
-        if (!r.ok) { out.famError = out.famError || errText(r.error); return; }
         const f = list[i];
+        if (!r.ok) { out.failedNames.push(f.g.equipment); return; }
         const a = store.getAsset(f.assetId);
         out.kept += r.value.kept;
+        out.keptMore = out.keptMore || r.value.keptMore;
         out.capped = out.capped || r.value.capped;
-        r.value.rows.forEach(row => { if (!jobs.has(row.craa5__log_id)) more.push({ id: row.craa5__log_id, payload: { craa5_equipmentguid: a.id, ...fill(f.g, a) } }); });
+        r.value.rows.forEach(row => {
+          const id = row.craa5__log_id;
+          if (jobs.has(id)) return;
+          if (f.held.has(id)) { out.held += 1; return; }
+          more.push({ id, payload: { craa5_equipmentguid: a.id, ...fill(f.g, a) } });
+        });
       });
-      // More entries than the list shows: ask first (on the page, so it works where pop-up dialogs are blocked)
-      if (more.length) { setPending({ jobs, more: uniqueById(more), listed, out }); setProgress(''); setBusy('confirm'); return; }
+      more = uniqueById(more);
+      if (more.length > LIMITS.familyWriteMax) { more = more.slice(0, LIMITS.familyWriteMax); out.capped = true; }
+      // More entries than were ticked: ask first (on the page, so it works where pop-up dialogs are blocked)
+      if (more.length) {
+        const inList = new Set();
+        groups.forEach(g => g.ids.forEach(id => inList.add(id)));
+        setPending({ jobs, more, listed, inList: more.filter(j => inList.has(j.id)).length, out });
+        setProgress(''); setBusy('confirm');
+        return;
+      }
     }
     await writeJobs(Array.from(jobs.values()), out);
   };
@@ -2565,12 +2639,11 @@ const RepairIds = ({ ctx, onCount }) => {
   const answerPending = async (withMore) => {
     const pd = pending;
     setPending(null);
-    if (!pd) { setBusy(''); return; }
-    if (withMore === null) { setBusy(''); return; }
+    if (!pd || withMore === null) { setBusy(''); return; }
     const jobs = new Map();
     pd.jobs.forEach((j, id) => jobs.set(id, j));
     const out = { ...pd.out };
-    if (withMore) pd.more.forEach(j => { if (!jobs.has(j.id)) { jobs.set(j.id, j); out.extra += 1; } });
+    if (withMore) pd.more.forEach(j => { if (!jobs.has(j.id)) { jobs.set(j.id, j); out.moreIds.push(j.id); } });
     else out.declined = true;
     await writeJobs(Array.from(jobs.values()), out);
   };
@@ -2587,7 +2660,7 @@ const RepairIds = ({ ctx, onCount }) => {
     const firstError = res.find(r => !r.ok);
     // Remove fixed entries from every row of the list (same-name rows included); nothing is rescanned
     setGroups(prev => prev.map(g => ({ ...g, ids: g.ids.filter(id => !fixed.has(id)) })).filter(g => g.ids.length));
-    setResult({ ok: fixed.size, failed: all.length - fixed.size, error: firstError ? errText(firstError.error) : '', ...out });
+    setResult({ ok: fixed.size, failed: all.length - fixed.size, error: firstError ? errText(firstError.error) : '', ...out, extra: out.moreIds.filter(id => fixed.has(id)).length });
     setProgress('');
     ctx.dataChanged();
     setBusy('');
@@ -2599,10 +2672,19 @@ const RepairIds = ({ ctx, onCount }) => {
     const fam = canonName(g.equipment) ? familyKey(g) : null;
     const rows = fam ? groups.filter(x => x.key === g.key || (canonName(x.equipment) && familyKey(x) === fam)) : [g];
     const custom = !g.ranked.some(r => r.asset.id === a.id);
-    if (custom) setExtraOpts(p => { const x = { ...p }; rows.forEach(r => { x[r.key] = (x[r.key] || []).filter(o => o.id !== a.id).concat([a]); }); return x; });
+    // Rows whose own suggestions do not include it get it as an option
+    setExtraOpts(p => { const x = { ...p }; rows.forEach(r => { if (!r.ranked.some(c => c.asset.id === a.id)) x[r.key] = (x[r.key] || []).filter(o => o.id !== a.id).concat([a]); }); return x; });
     setChoice(p => { const x = { ...p }; rows.forEach(r => { x[r.key] = a.id; }); return x; });
-    // A match picked by hand is ticked; a suggestion keeps the tick unless it is in another room or area
-    setApply(p => { const x = { ...p }; rows.forEach(r => { if (custom) x[r.key] = true; else if (!placeOk(r, a)) x[r.key] = false; }); return x; });
+    // The row picked: a match picked by hand is ticked; a suggestion keeps the tick unless it is in another room or area.
+    // The other rows of the name keep their tick, except entries whose ID points elsewhere and equipment in another room or area
+    setApply(p => {
+      const x = { ...p };
+      rows.forEach(r => {
+        if (r.key === g.key) { if (custom) x[r.key] = true; else if (!placeOk(r, a)) x[r.key] = false; }
+        else if (r.mode === 'place' || !sameRoomAndArea(r, a)) x[r.key] = false;
+      });
+      return x;
+    });
   };
 
   const failedLookups = groups.filter(g => g.lookupError).length;
@@ -2636,11 +2718,12 @@ const RepairIds = ({ ctx, onCount }) => {
       </div>
       {pending && (
         <div role="alertdialog" aria-label="Update the other entries with the same names?" style={{ border: `2px solid ${BRAND.yellow}`, backgroundColor: '#FFF6E5', borderRadius: '6px', padding: '10px 12px', marginBottom: '10px' }}>
-          <Text block weight="semibold">The log has {plural(pending.more.length, 'more entry', 'more entries')} with the same name, room and area as the ticked rows. Update {pending.more.length === 1 ? 'it' : 'them'} to the same equipment too?</Text>
-          {pending.out.kept > 0 && <Text className={styles.hint} block>{plural(pending.out.kept, 'entry', 'entries')} with those names already {pending.out.kept === 1 ? 'points' : 'point'} at other existing equipment and will be left as {pending.out.kept === 1 ? 'it is' : 'they are'}.</Text>}
+          <Text block weight="semibold">The log has {plural(pending.more.length, 'more entry', 'more entries')} with the same name, room and area as the ticked rows{pending.inList ? ` (${pending.inList} of them further down this list)` : ''}. Update {pending.more.length === 1 ? 'it' : 'them'} to the same equipment too?</Text>
+          {pending.out.held > 0 && <Text className={styles.hint} block>{plural(pending.out.held, 'entry', 'entries')} with those names {pending.out.held === 1 ? 'has' : 'have'} a row in this list with other equipment (or No match) chosen and will be left out.</Text>}
+          {pending.out.kept > 0 && <Text className={styles.hint} block>{pending.out.keptMore ? 'At least ' : ''}{plural(pending.out.kept, 'entry', 'entries')} with those names already {pending.out.kept === 1 ? 'points' : 'point'} at other existing equipment and will be left as {pending.out.kept === 1 ? 'it is' : 'they are'}.</Text>}
           <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px' }}>
             <Button appearance="primary" className={styles.btnCta} onClick={() => answerPending(true)}>{`Update all ${pending.listed + pending.more.length}`}</Button>
-            <Button onClick={() => answerPending(false)}>{`Only the ${pending.listed} in the list`}</Button>
+            <Button onClick={() => answerPending(false)}>{`Only the ${pending.listed} ticked`}</Button>
             <Button appearance="subtle" onClick={() => answerPending(null)}>Cancel</Button>
           </div>
         </div>
@@ -2650,14 +2733,16 @@ const RepairIds = ({ ctx, onCount }) => {
         {scanError && <Text className={styles.errorText} block role="alert">Scan failed: {scanError}</Text>}
         {failedLookups > 0 && <Text className={styles.errorText} block role="alert">Equipment lookup failed for {plural(failedLookups, 'group', 'groups')} (marked “Lookup failed”). Scan again to retry.</Text>}
         {result && <Text className={result.failed ? styles.errorText : styles.okText} block>{plural(result.ok, 'entry', 'entries')} updated{result.extra ? `, including ${plural(result.extra, 'more entry', 'more entries')} found in the log with the same name, room and area` : ''}{result.failed ? `; ${result.failed} failed (${result.error})` : ''}.</Text>}
-        {result && (result.kept > 0 || result.mixed > 0 || result.capped || result.famError || result.declined) && (
+        {result && (result.kept > 0 || result.mixed > 0 || result.unplaced > 0 || result.held > 0 || (result.capped && !result.declined) || result.failedNames.length > 0 || result.declined) && (
           <Text className={styles.warnText} block>
             {[
-              result.kept > 0 && `${plural(result.kept, 'entry', 'entries')} with those names already ${result.kept === 1 ? 'points' : 'point'} at other existing equipment and ${result.kept === 1 ? 'was' : 'were'} left as ${result.kept === 1 ? 'it is' : 'they are'}.`,
+              result.declined && 'Only the ticked entries were updated.',
               result.mixed > 0 && `For ${plural(result.mixed, 'name', 'names')} the ticked rows chose different equipment, so only those rows were updated.`,
-              result.capped && 'Some names have more entries than one apply reads: apply again to fix the rest.',
-              result.famError && `Could not look up the other entries with the same name (${result.famError}); only the rows in the list were updated.`,
-              result.declined && 'Only the entries in the list were updated.',
+              result.unplaced > 0 && `For ${plural(result.unplaced, 'name', 'names')} the room or area is blank, or the equipment chosen is in another room or area, so only the ticked rows were updated.`,
+              result.held > 0 && `${plural(result.held, 'entry', 'entries')} with those names ${result.held === 1 ? 'was' : 'were'} left because ${result.held === 1 ? 'its' : 'their'} row in the list has other equipment (or No match) chosen.`,
+              result.kept > 0 && `${result.keptMore ? 'At least ' : ''}${plural(result.kept, 'entry', 'entries')} with those names already ${result.kept === 1 ? 'points' : 'point'} at other existing equipment and ${result.kept === 1 ? 'was' : 'were'} left as ${result.kept === 1 ? 'it is' : 'they are'}.`,
+              result.capped && !result.declined && 'Some names have more entries than one apply reads: scan again and apply to fix the rest.',
+              result.failedNames.length > 0 && `Could not look through the log for ${result.failedNames.slice(0, 3).map(x => `“${x}”`).join(', ')}${result.failedNames.length > 3 ? ` and ${result.failedNames.length - 3} more` : ''}, so only the ticked rows for ${result.failedNames.length === 1 ? 'it' : 'them'} were updated.`,
             ].filter(Boolean).join(' ')}
           </Text>
         )}
@@ -2684,7 +2769,7 @@ const RepairIds = ({ ctx, onCount }) => {
                 const ORDER = { high: 0, medium: 1, low: 2, none: 3 };
                 const own = top && top !== g.ranked[0] ? tierOf(top.score) : g.tier;
                 const tier = ORDER[own] < ORDER[g.tier] ? g.tier : own;
-                const check = logCheck(g, choice[g.key]);
+                const check = logCheck(g, choice[g.key], options.find(a => a.id === choice[g.key]) || store.getAsset(choice[g.key]));
                 return (
                   <tr key={g.key}>
                     <td className={styles.td}><input type="checkbox" aria-label={`Apply ${g.equipment || 'blank entry'}`} checked={!!apply[g.key] && !!choice[g.key]} disabled={!choice[g.key] || !!busy} onChange={(e) => setApply(p => ({ ...p, [g.key]: e.target.checked }))} /></td>
