@@ -1,1139 +1,1009 @@
-import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { FluentProvider, createLightTheme, Button, Text, DataGrid, DataGridHeader, DataGridBody, DataGridRow, DataGridCell, DataGridHeaderCell, TableCellLayout, createTableColumn, ProgressBar, Input, Divider, Badge, Spinner, Checkbox } from "@fluentui/react-components";
 
 // ============================================================================
-// HUB - SHIFT START (Supervisor board)
-//
-// Flow (tabs, left to right):
-//   1. Teams     – shift is detected automatically; pick leads, drag employees under them.
-//                  Overtime: pull in someone from another crew. "Out" zone for PTO / Sick / Late.
-//   2. Lines     – pick which lines are down for cleaning (manual until the production
-//                  scheduler drives it), add manual tasks, drop teams onto lines.
-//                  Production lines sort above non-production lines.
-//   3. Equipment – each line's equipment is split across the people on it automatically;
-//                  drag equipment between people (or people between lines) to adjust.
-//   4. Manage    – progress per line, then the shift update: copy/paste or Send to Teams.
-//                  Once the board is set up, the app opens on this tab.
-//
-// Dataverse
-//   craa5__aa_employee          roster (craa5_role: 256000001 lead, 256000002 supervisor, 256000003 manager)
-//   craa5_aa_mss_area           lines (craa5_production, craa5_everyday)
-//   craa5_aa_assets             equipment (craa5_areaname -> line)
-//   craa5_workshift             crew rotation (same parser as Ganttly)
-//   craa5_taskassignment        one open row per person on the board (what Gantt / Manager read).
-//                               Moving someone closes their row (craa5_endtime) and opens a new one.
-//   craa5_sanitationshiftreport "Board · …"        whole board, so a reload or another device picks up where you left off
-//                               "Teams Update · …" one row per update sent to Teams
-//
-// Teams posting (one-time Power Automate setup)
-//   Trigger: Dataverse "When a row is added" on craa5_sanitationshiftreport,
-//            filter rows: startswith(craa5_name, 'Teams Update')
-//   Action:  Teams "Post message in a chat or channel", message = craa5_handofftext.
-//   The app writes those rows from "Send to Teams" and, with auto-send on, at
-//   3, 9 and 12 AM/PM while it is open.
+// SHIFT START — Supervisor Hub
+// Leads → Areas → Assign Areas → Assign Employees → Update Teams
+// Signs in with the Microsoft account; anyone who isn't a supervisor (leads,
+// managers) lands on the board of the supervisor on the current shift.
+// The current shift comes from craa5_workshift (same reading rules as Ganttly).
 // ============================================================================
 
-// --- Inline SVG icons (self-contained for Power Apps) ---
-const SvgIcon = ({ children, className = "w-5 h-5", ...props }: any) => (
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true" {...props}>{children}</svg>
-);
-const Users = (p: any) => <SvgIcon {...p}><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></SvgIcon>;
-const ClipboardCopy = (p: any) => <SvgIcon {...p}><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></SvgIcon>;
-const Send = (p: any) => <SvgIcon {...p}><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></SvgIcon>;
-const Check = (p: any) => <SvgIcon {...p}><path d="M20 6 9 17l-5-5"/></SvgIcon>;
-const X = (p: any) => <SvgIcon {...p}><path d="M18 6 6 18"/><path d="m6 6 12 12"/></SvgIcon>;
-const Plus = (p: any) => <SvgIcon {...p}><path d="M5 12h14"/><path d="M12 5v14"/></SvgIcon>;
-const Search = (p: any) => <SvgIcon {...p}><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></SvgIcon>;
-const Alert = (p: any) => <SvgIcon {...p}><circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/></SvgIcon>;
-const Loader = (p: any) => <SvgIcon {...p} className={`animate-spin ${p.className || ''}`}><path d="M21 12a9 9 0 1 1-6.219-8.56"/></SvgIcon>;
-
-// --- CONFIG ---
-const CLEAN_STEPS = ["Dry Clean", "Rinse", "Foam", "Rinse", "Post Clean Inspect", "Sanitize", "FSQ Inspection", "Swab"];
-const TOTAL_STEPS = CLEAN_STEPS.length;
-const STEP_LABELS = CLEAN_STEPS.map((s, i) => { const n = CLEAN_STEPS.slice(0, i + 1).filter(x => x === s).length; return n > 1 ? `${s} #${n}` : s; });
-const OUT_REASONS = ["PTO", "Sick", "Late", "NCNS", "Left Early"];
-const STATUS_AREAS = new Set(["pto", "sick", "late", "left early", "ncns", "unassigned"]);
-const SEND_HOURS = [0, 3, 9, 12, 15, 21];            // 12, 3, 9 AM and PM
-const AUTOSAVE_DELAY_MS = 2500;
+// --- Session cache (survives Power Apps remounts) ---
+let GLOBAL_INIT_STATUS = 'IDLE';
+let GLOBAL_DATA_CACHE: any = null;
+let GLOBAL_DRAG_PAYLOAD: string | null = null;
 const API_TIMEOUT_MS = 20000;
-const PRE_SHIFT_BUFFER_MIN = 60;
-const T = {
-  employee: ["craa5__aa_employee", "craa5_aa_employee"],
-  area: ["craa5_aa_mss_area"],
-  asset: ["craa5_aa_assets"],
-  workshift: ["craa5_workshift"],
-  task: "craa5_taskassignment",
-  report: "craa5_sanitationshiftreport",
-};
-// Fallback crew rotation (Ganttly's default) when craa5_workshift can't be read.
-const DEFAULT_SHIFT_ROTATION: Slot[] = [
-  { crew: 'A', day: 0, startHour: 6, lengthHours: 12 }, { crew: 'A', day: 1, startHour: 6, lengthHours: 12 },
-  { crew: 'A', day: 2, startHour: 6, lengthHours: 12 }, { crew: 'A', day: 3, startHour: 6, lengthHours: 6 },
-  { crew: 'B', day: 3, startHour: 12, lengthHours: 6 }, { crew: 'B', day: 4, startHour: 6, lengthHours: 12 },
-  { crew: 'B', day: 5, startHour: 6, lengthHours: 12 }, { crew: 'B', day: 6, startHour: 6, lengthHours: 12 },
-  { crew: 'C', day: 0, startHour: 18, lengthHours: 12 }, { crew: 'C', day: 1, startHour: 18, lengthHours: 12 },
-  { crew: 'C', day: 2, startHour: 18, lengthHours: 12 }, { crew: 'C', day: 3, startHour: 18, lengthHours: 6 },
-  { crew: 'D', day: 4, startHour: 0, lengthHours: 6 }, { crew: 'D', day: 4, startHour: 18, lengthHours: 12 },
-  { crew: 'D', day: 5, startHour: 18, lengthHours: 12 }, { crew: 'D', day: 6, startHour: 18, lengthHours: 12 },
-];
+const logError = (m: string, d?: any) => console.error(`[Shift Start] ${m}`, d ?? "");
 
-// --- TYPES ---
-type Slot = { crew: string; day: number; startHour: number; lengthHours: number };
-type ShiftWin = { crew: string; start: Date; end: Date; auto: boolean };
-type Job = 'tech' | 'tech3' | 'inspector' | 'clerk' | 'janitorial' | 'admin';
-type Emp = { id: string; raw: string; name: string; email: string; badge: string; crew: string; role: 'lead' | 'supervisor' | 'manager' | 'employee'; job: Job; jobName: string };
-type Asset = { id: string; name: string; pic: boolean };
-type Line = { id: string; name: string; production: boolean; everyday: boolean; manual: boolean; assets: Asset[] };
-type TaskRowRef = { rowId: string; lineId: string; hash: string };
-type Board = {
-  v: 1;
-  leads: string[];                          // lead employee ids, in column order
-  members: Record<string, string>;          // employee id -> lead id
-  overtime: string[];                       // employees pulled in from another crew
-  out: Record<string, string>;              // employee id -> PTO / Sick / ...
-  downLines: string[];                      // lines being cleaned this shift
-  manualLines: { id: string; name: string }[];
-  teamLines: Record<string, string[]>;      // lead id -> line ids the team covers
-  workerLine: Record<string, string>;       // person (member or lead) -> line they are on
-  equip: Record<string, string>;            // asset id -> person, only for lines edited by hand
-  equipManual: string[];                    // line ids with hand-placed equipment
-  equipDone: Record<string, boolean>;
-  progress: Record<string, number>;         // production: steps done (0..8). Other: 0 / 1 (in progress) / 8 (done)
-  notes: Record<string, string>;
-  autoSend: boolean;
-  sentSlots: string[];
-  lastSentAt?: string;
-  taskRows: Record<string, TaskRowRef>;     // person -> their open craa5_taskassignment row
-};
-type SaveState = { status: 'idle' | 'dirty' | 'saving' | 'saved' | 'error' | 'offline'; at?: Date; error?: string };
-type DragItem = { kind: 'emp' | 'team' | 'equip'; id: string; lineId?: string };
-type DropTarget =
-  | { type: 'pool' } | { type: 'out'; reason: string } | { type: 'lead'; leadId: string }
-  | { type: 'line'; lineId: string } | { type: 'worker'; lineId: string; empId: string } | { type: 'unassigned'; lineId: string };
+// --- CJ Schwan's theme (same as the Manager hub and Ganttly) ---
+const LOGO_URL = "";   // optional: official logo URL (e.g. a Dataverse web resource)
+const BRAND = { blue: '#0072CE', blueDark: '#00468B', blueSoft: '#E6F1FB', yellow: '#FFB81C', yellowSoft: '#FFF6E0', red: '#E4002B', redSoft: '#FDE8EC' };
+const BRAND_FONT = '"Segoe UI", system-ui, -apple-system, sans-serif';
+// Fluent brand ramp built around CJ blue (80 = primary) so Fluent buttons, checkboxes and progress bars match.
+const cjTheme = createLightTheme({
+    10: "#020A14", 20: "#04172B", 30: "#062544", 40: "#08335E", 50: "#00468B", 60: "#005399", 70: "#0062B4", 80: "#0072CE",
+    90: "#2483D6", 100: "#4294DC", 110: "#5DA4E2", 120: "#78B5E8", 130: "#93C5ED", 140: "#AED5F2", 150: "#CAE4F7", 160: "#E6F1FB",
+} as any);
 
-const emptyBoard = (): Board => ({ v: 1, leads: [], members: {}, overtime: [], out: {}, downLines: [], manualLines: [], teamLines: {}, workerLine: {}, equip: {}, equipManual: [], equipDone: {}, progress: {}, notes: {}, autoSend: false, sentSlots: [], taskRows: {} });
+function BrandLogo() {
+    if (LOGO_URL) return <img src={LOGO_URL} alt="Company logo" style={{ height: 36, width: 'auto', display: 'block', flexShrink: 0 }} />;
+    return (
+        <div aria-label="Company logo" style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 15, letterSpacing: '0.02em', color: '#1F2937', flexShrink: 0, whiteSpace: 'nowrap' }}>
+            <svg viewBox="0 0 40 40" width="32" height="32" aria-hidden="true">
+                <circle cx="15" cy="12" r="9" fill={BRAND.blue} /><circle cx="27" cy="20" r="8" fill={BRAND.yellow} /><circle cx="15" cy="29" r="8" fill={BRAND.red} />
+            </svg>
+            <span>CJ <b style={{ fontWeight: 800 }}>SCHWAN'S</b></span>
+        </div>
+    );
+}
 
-// --- UTILITIES ---
-const FMT = '@OData.Community.Display.V1.FormattedValue';
+const UserCircle = (p: any) => <svg xmlns="http://www.w3.org/2000/svg" width={20} height={20} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" {...p}><circle cx="12" cy="12" r="10"/><circle cx="12" cy="10" r="3"/><path d="M7 20.662V19a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v1.662"/></svg>;
+
+// ============================================================================
+// UTILITIES
+// ============================================================================
+function copyTextToClipboard(text: string) { if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).catch(() => fallbackCopy(text)); else fallbackCopy(text); }
+function fallbackCopy(text: string) { const ta = document.createElement("textarea"); ta.value = text; ta.style.cssText = "top:0;left:0;position:fixed;"; document.body.appendChild(ta); ta.focus(); ta.select(); try { document.execCommand('copy'); } catch (err) { logError('Fallback copy failed', err); } document.body.removeChild(ta); }
+const asyncRace = (p: any, ms: number, l: string): Promise<any> => { if (!p) return Promise.reject(new Error(`No query for ${l}`)); let t: any; return Promise.race([Promise.resolve(p), new Promise((_, r) => { t = setTimeout(() => r(new Error(`TIMEOUT: ${l}`)), ms); })]).finally(() => clearTimeout(t)); };
 function safeGetXrm() { if (typeof window === 'undefined') return null; if ((window as any).Xrm) return (window as any).Xrm; try { if (window.parent && (window.parent as any).Xrm) return (window.parent as any).Xrm; } catch (e) {} return null; }
-function getReadApi(props?: any) { const xrm = safeGetXrm(); if (xrm?.WebApi) return xrm.WebApi; if (props?.context?.webAPI) return props.context.webAPI; return props?.webAPI || null; }
-const errMsg = (e: any) => String(e?.message || e || "Unknown error");
-const norm = (v: any) => String(v ?? "").toLowerCase().trim();
-const uniq = <X,>(a: X[]) => Array.from(new Set(a));
-const getField = (obj: any, fn: string) => {
-  if (!obj) return undefined; if (obj[fn] !== undefined) return obj[fn];
-  const lf = fn.toLowerCase(), k = Object.keys(obj).find(x => x.toLowerCase() === lf);
-  return k ? obj[k] : undefined;
-};
-const isBoolTrue = (v: any) => v === true || v === 1 || /^(yes|true)$/i.test(String(v ?? ""));
-const pad = (n: number) => String(n).padStart(2, '0');
-const ymd = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-const hm = (d: Date) => d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-const byName = (a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-// "Doe, John" -> "John Doe"
-const displayName = (n: string) => { const p = String(n || "").split(","); return p.length > 1 ? `${p.slice(1).join(",").trim()} ${p[0].trim()}` : String(n || "").trim(); };
+function getWebApi(props: any) { const xrm = safeGetXrm(); if (xrm?.WebApi) return xrm.WebApi; if (props?.context?.webAPI) return props.context.webAPI; return props?.webAPI || null; }
+const formatFullName = (n?: string | null) => { if (!n) return ""; const p = n.split(","); return p.length > 1 ? `${p.slice(1).join(",").trim()} ${p[0].trim()}` : n.trim(); };
+const renderSafe = (v: any) => v === null || v === undefined ? "" : typeof v === 'object' ? String(v.Label || v.Value || v.name || JSON.stringify(v)) : String(v);
 
-function withTimeout<R = any>(p: any, ms: number, label: string): Promise<R> {
-  if (!p) return Promise.reject(new Error(`No query for ${label}`));
-  let timer: any;
-  return Promise.race([Promise.resolve(p), new Promise<R>((_, reject) => { timer = setTimeout(() => reject(new Error(`TIMEOUT: ${label}`)), ms); })]).finally(() => clearTimeout(timer));
-}
-
+// Crew letter from a choice value, number or label ("256000001", "2", "B", "Shift B").
 function normalizeShift(val: any): string {
-  if (val === undefined || val === null || val === "") return "";
-  const s = String(typeof val === 'object' ? (val.Label || val.Value || val.name || '') : val).toUpperCase().trim();
-  if (s.includes("256000000") || s === "1") return "A";
-  if (s.includes("256000001") || s === "2") return "B";
-  if (s.includes("256000002") || s === "3") return "C";
-  if (s.includes("256000003") || s === "4") return "D";
-  const m = s.match(/(?:^|[^A-Z])([ABCD])(?=$|[^A-Z])/);
-  return m ? m[1] : "";
+    if (val === undefined || val === null || val === "") return "";
+    const s = String(typeof val === 'object' ? (val.Label || val.Value || val.name || '') : val).toUpperCase().trim();
+    if (s.includes("256000000") || s === "1") return "A";
+    if (s.includes("256000001") || s === "2") return "B";
+    if (s.includes("256000002") || s === "3") return "C";
+    if (s.includes("256000003") || s === "4") return "D";
+    const m = s.match(/(?:^|[^A-Z])([ABCD])(?=$|[^A-Z])/);
+    return m ? m[1] : "";
 }
 
-// --- SHIFT DETECTION (craa5_workshift, same reading rules as Ganttly) ---
-function parseWorkShiftRows(rows: any[]): Slot[] | null {
-  const read = (r: any, n: string) => getField(r, n + FMT) ?? getField(r, n);
-  const raw = rows.map(r => ({ crew: normalizeShift(read(r, 'craa5_shiftcode')), dayName: String(read(r, 'craa5_dayname') || ''), dayNum: parseInt(read(r, 'craa5_daynumber'), 10), startH: parseInt(read(r, 'craa5_shiftstarthour'), 10), endH: parseInt(read(r, 'craa5_shiftendhour'), 10) }));
-  const hours: number[] = [];
-  raw.forEach(x => { if (!isNaN(x.startH)) hours.push(x.startH); if (!isNaN(x.endH)) hours.push(x.endH); });
-  // Dataverse can't store 0 here: midnight is 1, or every hour is stored +1 (1/7/13/19).
-  const plusOne = hours.length > 0 && hours.every(h => h >= 1 && (h - 1) % 6 === 0);
-  const hasZeroDay = raw.some(x => x.dayNum === 0);
-  const fixHour = (h: number) => plusOne ? (h - 1 + 24) % 24 : (h === 1 || h === 24) ? 0 : ((h % 24) + 24) % 24;
-  const slots: Slot[] = [], pending: Slot[] = [];
-  raw.forEach(x => {
-    const m = x.dayName.toLowerCase().match(/sun|mon|tue|wed|thu|fri|sat/);
-    let day = m ? ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].indexOf(m[0]) : (isNaN(x.dayNum) ? -1 : (hasZeroDay ? x.dayNum : x.dayNum - 1));
-    if (!x.crew || day < 0 || isNaN(x.startH) || isNaN(x.endH)) return;
-    day = ((day % 7) + 7) % 7;
-    const sH = fixHour(x.startH), eH = fixHour(x.endH);
-    const slot = { crew: x.crew, day, startHour: sH, lengthHours: ((eH - sH + 24) % 24) || 24 };
-    (sH < 4 ? pending : slots).push(slot);
-  });
-  // After-midnight rows belong to the named day or the next one, whichever overlaps the other rows less.
-  const hoursOf = (s: Slot) => Array.from({ length: s.lengthHours }, (_, h) => (s.day * 24 + s.startHour + h) % 168);
-  pending.forEach(p => {
-    const taken = new Set<number>(); slots.forEach(s => hoursOf(s).forEach(h => taken.add(h)));
-    const next = { ...p, day: (p.day + 1) % 7 };
-    const clash = (s: Slot) => hoursOf(s).filter(h => taken.has(h)).length;
-    slots.push(clash(p) < clash(next) ? p : next);
-  });
-  return slots.length ? slots : null;
+function getField(obj: any, fn: string) {
+    if (!obj) return undefined; if (obj[fn] !== undefined) return obj[fn];
+    const lf = fn.toLowerCase(), k = Object.keys(obj).find(x => x.toLowerCase() === lf);
+    return k ? obj[k] : undefined;
 }
+const getFormattedField = (obj: any, fn: string) => getField(obj, `${fn}@OData.Community.Display.V1.FormattedValue`);
+const getShiftOf = (e: any) => normalizeShift(getFormattedField(e, 'craa5_shift') || getField(e, 'craa5_shift'));
+const isBoolTrue = (v: any) => v === true || v === 1 || String(v).toLowerCase() === "yes" || String(v).toLowerCase() === "true";
+const isEmployeeUtilized = (e: any) => isBoolTrue(getField(e, 'craa5_utilized') ?? getFormattedField(e, 'craa5_Utilized'));
+const isProductionArea = (a: any) => isBoolTrue(getField(a, 'craa5_production') ?? getFormattedField(a, 'craa5_production'));
+const isEverydayArea = (a: any) => isBoolTrue(getField(a, 'craa5_everyday') ?? getFormattedField(a, 'craa5_everyday'));
+// Whole words only, so rooms like "Chocolate" or "Plate Room" aren't mistaken for "Late".
+const isStatusArea = (n?: string) => /\b(pto|sick|late|left early)\b/.test(String(n || "").toLowerCase().trim());
+const getEmployeeEmail = (e: any) => getField(e, 'craa5_email') || getField(e, 'emailaddress1') || getField(e, 'internalemailaddress') || "";
+const getEmployeeBadge = (e: any) => getField(e, 'craa5_badgenumber') || getField(e, 'badgenumber') || "";
+const roleOf = (e: any) => { const r = String(getFormattedField(e, 'craa5_role') || getField(e, 'craa5_role') || '').toLowerCase(); return /lead|256000001/.test(r) ? 'lead' : /super|256000002/.test(r) ? 'supervisor' : /manag|256000003/.test(r) ? 'manager' : 'employee'; };
+const formatMsToDurationStr = (ms: number) => ms < 0 ? "0m" : `${Math.floor(ms/3600000) > 0 ? Math.floor(ms/3600000)+'h ' : ''}${Math.floor((ms%3600000)/60000)}m`;
+const getInputValue = (e: any, d: any) => typeof d === 'string' ? d : d?.value ?? e?.target?.value ?? "";
+const getSelectionValue = (e: any, d: any): Set<any> => d?.selectedItems ?? e?.target?.selectedItems ?? new Set();
+const getAreaEmoji = (areaObj: any) => { if (!areaObj) return ""; const em = getField(areaObj, 'craa5_emoji') || getFormattedField(areaObj, 'craa5_emoji'); return em ? ` ${em}` : ""; };
 
-function findShift(slots: Slot[], now: Date): ShiftWin {
-  for (const s of slots) {
-    for (let back = 0; back <= 1; back++) {
-      const d = new Date(now); d.setDate(d.getDate() - back);
-      if (d.getDay() !== s.day) continue;
-      const start = new Date(d); start.setHours(s.startHour, 0, 0, 0);
-      const end = new Date(start.getTime() + s.lengthHours * 3600000);
-      if (now >= start && now < end) return { crew: s.crew, start, end, auto: true };
-    }
-  }
-  // Not covered by the rotation: plain 6-to-6 window, crew picked by hand.
-  const h = now.getHours(), start = new Date(now);
-  if (h < 6) start.setDate(start.getDate() - 1);
-  start.setHours(h >= 6 && h < 18 ? 6 : 18, 0, 0, 0);
-  return { crew: '', start, end: new Date(start.getTime() + 12 * 3600000), auto: false };
-}
+const isTaskDone = (r: any) =>
+    getField(r, 'craa5_percentagecomplete') === 100 || isBoolTrue(getField(r, 'craa5_complete')) || getField(r, 'statecode') === 1 ||
+    String(getField(r, 'craa5_whatisbeingdone') || getField(r, 'craa5__currentstatus')).trim().toLowerCase() === "completed";
+const taskTime = (r: any) => new Date(getField(r, 'craa5_datetimeofassignment') || getField(r, 'createdon') || 0).getTime();
+// Oldest first; on a tie the completed row comes first so the open one wins.
+const byTaskTime = (a: any, b: any) => (taskTime(a) - taskTime(b)) || ((isTaskDone(b) ? 1 : 0) - (isTaskDone(a) ? 1 : 0));
 
-// --- DATAVERSE ---
-// Xrm.WebApi first, then the generative page's dataApi. A failure only affects that one call.
-async function queryRecords(props: any, entityNames: string | string[], q: { select?: string[]; filter?: string; orderby?: string; top?: number } = {}): Promise<any[] | null> {
-  const webApi = getReadApi(props), dataApi = props?.dataApi, names = Array.isArray(entityNames) ? entityNames : [entityNames], top = q.top ?? 5000;
-  const odata = [q.select?.length ? `$select=${q.select.join(',')}` : '', q.filter ? `$filter=${q.filter}` : '', q.orderby ? `$orderby=${q.orderby}` : '', `$top=${top}`].filter(Boolean).join('&');
-  for (const en of names) {
-    if (webApi?.retrieveMultipleRecords) {
-      try {
-        const res: any = await withTimeout(webApi.retrieveMultipleRecords(en, `?${odata}`), API_TIMEOUT_MS, `Xrm.WebApi ${en}`);
-        if (Array.isArray(res?.entities)) return res.entities;
-      } catch (e) { console.warn(`[Shift Start] ${en} via Xrm.WebApi:`, errMsg(e)); }
-    }
-    if (dataApi?.queryTable) {
-      try {
-        const opts: any = { pageSize: Math.min(top, 500) };
-        if (q.select?.length) opts.select = q.select;
-        if (q.filter) opts.filter = q.filter;
-        if (q.orderby) opts.orderBy = q.orderby;
-        let page: any = await withTimeout(dataApi.queryTable(en, opts), API_TIMEOUT_MS, `dataApi ${en}`);
-        if (!Array.isArray(page?.rows)) throw new Error("no rows");
-        const rows = [...page.rows];
-        while (page?.hasMoreRows && typeof page.loadMoreRows === 'function' && rows.length < top) {
-          page = await withTimeout(page.loadMoreRows(), API_TIMEOUT_MS, `dataApi ${en}`);
-          rows.push(...(Array.isArray(page?.rows) ? page.rows : []));
-        }
-        return rows.slice(0, top);
-      } catch (e) { console.warn(`[Shift Start] ${en} via dataApi:`, errMsg(e)); }
-    }
-  }
-  return null;
-}
-
-const idOf = (res: any) => { const id = typeof res === 'string' ? res : res?.id; return id ? String(id).replace(/[{}]/g, '') : null; };
-function getWriteApi(props?: any): { create: (t: string, d: any) => Promise<string | null>; update: (t: string, id: string, d: any) => Promise<any> } | null {
-  const web = getReadApi(props), dataApi = props?.dataApi;
-  if (web?.createRecord && web?.updateRecord) return { create: async (t, d) => idOf(await web.createRecord(t, d)), update: (t, id, d) => web.updateRecord(t, id, d) };
-  if (dataApi?.createRow && dataApi?.updateRow) return { create: async (t, d) => idOf(await dataApi.createRow(t, d)), update: (t, id, d) => dataApi.updateRow(t, id, d) };
-  return null;
-}
-const hasReadApi = (props?: any) => !!(getReadApi(props)?.retrieveMultipleRecords || props?.dataApi?.queryTable);
-const odataText = (s: string) => s.replace(/'/g, "''");
-
-async function findReportRow(props: any, name: string) {
-  const rows = await queryRecords(props, T.report, { select: ['craa5_sanitationshiftreportid', 'craa5_equipmentjson', 'modifiedon'], filter: `craa5_name eq '${odataText(name)}' and statecode eq 0`, orderby: 'modifiedon desc', top: 1 });
-  if (!rows) return undefined;                  // lookup failed
-  const id = rows[0] && getField(rows[0], 'craa5_sanitationshiftreportid');
-  return id ? { id: String(id), json: getField(rows[0], 'craa5_equipmentjson'), modifiedon: getField(rows[0], 'modifiedon') } : null;
-}
-
-// --- DOMAIN ---
-function readEmployee(e: any): Emp | null {
-  const id = String(getField(e, 'craa5__aa_employeeid') || getField(e, 'craa5_aa_employeeid') || '');
-  const raw = String(getField(e, 'craa5_name') || '').trim();
-  if (!id || !raw) return null;
-  const r = norm(getField(e, 'craa5_role' + FMT) ?? getField(e, 'craa5_role'));
-  const role = /256000002|super/.test(r) ? 'supervisor' : /256000003|manag/.test(r) ? 'manager' : /256000001|lead/.test(r) ? 'lead' : 'employee';
-  const crew = normalizeShift(getField(e, 'craa5_shift' + FMT) ?? getField(e, 'craa5_shift'));
-  const jobName = String(getField(e, '_craa5_roleid_value' + FMT) ?? getField(e, '_craa5_roleid_value') ?? '').replace(/^[0-9a-f-]{36}$/i, '');
-  return { id, raw, name: displayName(raw), email: String(getField(e, 'craa5_email') || getField(e, 'emailaddress1') || getField(e, 'internalemailaddress') || ''), badge: String(getField(e, 'craa5_badgenumber') || ''), crew, role, job: jobOf(jobName), jobName };
-}
-
-// Job role (craa5__aa_role lookup on the employee). Only Sanitation Tech 1 / 2 (and anyone with no role set) get the
-// regular equipment split; Tech 3 and Inspectors only get assets whose subcategory is "1 - pic"; the rest sit in a fixed area.
-function jobOf(name: string): Job {
-  const n = norm(name);
-  if (/chem/.test(n)) return 'clerk';
-  if (/admin/.test(n)) return 'admin';
-  if (/janitor/.test(n)) return 'janitorial';
-  if (/inspect/.test(n)) return 'inspector';
-  if (/tech\w*\s*3\b/.test(n)) return 'tech3';
-  return 'tech';
-}
-const isPicOnly = (j?: Job) => j === 'inspector' || j === 'tech3';
-const isPic = (v: any) => /^1\s*[-–]?\s*pic\b/.test(norm(v));
-// Area a role is placed in automatically (inspectors only on nights).
-function fixedAreaFor(job: Job, night: boolean): string | null {
-  return job === 'clerk' ? 'chemical' : job === 'admin' ? 'admin' : job === 'janitorial' ? 'janitorial' : job === 'inspector' && night ? 'admin' : null;
-}
-const isNightShift = (sh: { start: Date }) => sh.start.getHours() >= 18 || sh.start.getHours() < 6;
-const findAreaLine = (ls: Line[], area: string) => ls.find(l => norm(l.name) === area) || ls.find(l => new RegExp(`\\b${area}`).test(norm(l.name)));
-// employee id -> job, filled at load so the pure board helpers below can see roles.
-const JOBS = new Map<string, Job>();
-
-// Each asset belongs to ONE line: exact name, else the longest line name it contains as whole words.
-function buildLines(rawAreas: any[], rawAssets: any[]): Line[] {
-  const lines: Line[] = rawAreas.map(a => ({
-    id: String(getField(a, 'craa5_aa_mss_areaid') || ''), name: String(getField(a, 'craa5_area') || '').trim(),
-    production: isBoolTrue(getField(a, 'craa5_production' + FMT) ?? getField(a, 'craa5_production')),
-    everyday: isBoolTrue(getField(a, 'craa5_everyday' + FMT) ?? getField(a, 'craa5_everyday')),
-    manual: false, assets: [] as Asset[],
-  })).filter(a => a.id && a.name && !STATUS_AREAS.has(norm(a.name)));
-  const words = (v: any) => norm(v).split(/[^a-z0-9]+/).filter(Boolean);
-  const has = (hay: string[], needle: string[]) => hay.some((_, i) => needle.length > 0 && needle.every((w, j) => hay[i + j] === w));
-  rawAssets.forEach((ast, i) => {
-    const label = String(getField(ast, 'craa5_areaname') || '');
-    let line = lines.find(l => norm(l.name) === norm(label));
-    if (!line && label) line = lines.filter(l => has(words(label), words(l.name))).sort((a, b) => words(b.name).length - words(a.name).length)[0];
-    if (line) line.assets.push({ id: String(getField(ast, 'craa5_aa_assetsid') || `${line.id}-asset-${i}`), name: String(getField(ast, 'craa5_equipmentidentifier') || 'Equipment'), pic: isPic(getField(ast, 'craa5_subcategory' + FMT) ?? getField(ast, 'craa5_subcategory')) });
-  });
-  lines.forEach(l => l.assets.sort(byName));
-  return lines.sort(byName);
-}
-
-const lineOrder = (a: Line, b: Line) => (a.production === b.production ? byName(a, b) : a.production ? -1 : 1);
-
-// People working a line (members and leads), in board order.
-function workersOn(b: Board, lineId: string): string[] {
-  const order = [...b.leads, ...Object.keys(b.members)];
-  return uniq(order).filter(id => b.workerLine[id] === lineId && !b.out[id]);
-}
-
-// Equipment split: hand-edited lines keep their placement, others are dealt out evenly by role (see jobOf).
-// Leads only get equipment when nobody else on the line is eligible.
-function equipmentFor(b: Board, line: Line): Record<string, string> {
-  const people = workersOn(b, line.id);
-  const out: Record<string, string> = {};
-  if (b.equipManual.includes(line.id)) {
-    line.assets.forEach(a => { if (b.equip[a.id] && people.includes(b.equip[a.id])) out[a.id] = b.equip[a.id]; });
-    return out;
-  }
-  const crew = people.filter(id => !b.leads.includes(id));
-  const clerks = people.filter(id => JOBS.get(id) === 'clerk');
-  if (norm(line.name) === 'chemical' && clerks.length) {   // the chemical clerk takes everything on the chemical line
-    line.assets.forEach((a, i) => { out[a.id] = clerks[i % clerks.length]; });
-    return out;
-  }
-  const regular = (list: string[]) => list.filter(id => (JOBS.get(id) || 'tech') === 'tech');
-  const picOnly = (list: string[]) => list.filter(id => isPicOnly(JOBS.get(id)));
-  const regs = regular(crew).length ? regular(crew) : regular(people);
-  const pics = picOnly(crew);
-  let r = 0, q = 0;
-  line.assets.forEach(a => {
-    if (a.pic && pics.length) out[a.id] = pics[q++ % pics.length];
-    else if (regs.length) out[a.id] = regs[r++ % regs.length];
-  });
-  return out;
-}
-
-function lineStatus(line: Line, b: Board) {
-  const p = Math.max(0, Math.min(TOTAL_STEPS, Math.round(b.progress[line.id] || 0)));
-  if (!line.production) return { done: p >= TOTAL_STEPS, pct: p >= TOTAL_STEPS ? 100 : p > 0 ? 50 : 0, label: p >= TOTAL_STEPS ? 'Done' : p > 0 ? 'In progress' : 'Not started', left: '', stepsLeft: 0, next: '' };
-  return {
-    done: p >= TOTAL_STEPS, pct: Math.round((p / TOTAL_STEPS) * 100), stepsLeft: TOTAL_STEPS - p, next: STEP_LABELS[p] || '',
-    label: p === 0 ? 'Not started' : p >= TOTAL_STEPS ? 'Complete' : `${STEP_LABELS[p - 1]} done`,
-    left: p < TOTAL_STEPS ? STEP_LABELS.slice(p).join(' → ') : '',
-  };
-}
-
-function buildUpdateText(ctx: { b: Board; lines: Line[]; shift: ShiftWin; team: string; empById: Map<string, Emp>; now: Date }): string {
-  const { b, lines, shift, team, now } = ctx;
-  const active = lines.filter(l => b.downLines.includes(l.id)).sort(lineOrder);
-  const onFloor = uniq(active.flatMap(l => workersOn(b, l.id)));
-  const ot = onFloor.filter(id => b.overtime.includes(id)).length;
-  const outCounts = OUT_REASONS.map(r => [r, Object.values(b.out).filter(x => x === r).length] as const).filter(([, n]) => n > 0);
-  const L: string[] = [];
-  L.push(`SANITATION UPDATE · ${now.toLocaleDateString(undefined, { weekday: 'short', month: 'numeric', day: 'numeric' })} · ${hm(now)}`);
-  L.push(`${shift.crew || '?'} Shift${team ? ` · Team ${team}` : ''}`);
-  L.push(`👥 ${onFloor.length} heads on the floor${ot ? ` (${ot} OT)` : ''}${outCounts.length ? ` · Out: ${outCounts.map(([r, n]) => `${n} ${r}`).join(', ')}` : ''}`);
-  const done = active.filter(l => lineStatus(l, b).done).length;
-  L.push(`✅ ${done}/${active.length} complete`);
-  const section = (title: string, list: Line[]) => {
-    if (!list.length) return;
-    L.push('', title);
-    list.forEach(l => {
-      const s = lineStatus(l, b), heads = workersOn(b, l.id).length;
-      const eq = equipmentFor(b, l), eqIds = Object.keys(eq), eqDone = eqIds.filter(id => b.equipDone[id]).length;
-      const detail = s.done ? (l.production ? '✅ Complete' : '✅ Done')
-        : l.production ? (s.pct === 0 ? 'Not started' : `${s.pct}% · ${s.label} · ${s.stepsLeft} step${s.stepsLeft === 1 ? '' : 's'} left (next: ${s.next})`) : s.label;
-      L.push(`• (${heads}) ${l.name} — ${detail}${l.production && eqIds.length && !s.done && s.pct > 0 ? ` · ${eqDone}/${eqIds.length} equipment` : ''}`);
-      if (b.notes[l.id]?.trim()) L.push(`   ↳ ${b.notes[l.id].trim()}`);
+// ============================================================================
+// CURRENT SHIFT (craa5_workshift: one row per slot — same rules as Ganttly)
+// craa5_shiftcode (A–D), craa5_dayname / craa5_daynumber (1 = Sun), craa5_shiftstarthour / craa5_shiftendhour.
+// Midnight is stored as 1, or every hour is stored +1 (1/7/13/19).
+// ============================================================================
+type Slot = { crew: string; day: number; startHour: number; lengthHours: number };
+function parseWorkShiftRows(rows: any[]): Slot[] {
+    const read = (r: any, n: string) => getFormattedField(r, n) ?? getField(r, n);
+    const raw = rows.map(r => ({ crew: normalizeShift(read(r, 'craa5_shiftcode')), dayName: String(read(r, 'craa5_dayname') || ''), dayNum: parseInt(read(r, 'craa5_daynumber'), 10), startH: parseInt(read(r, 'craa5_shiftstarthour'), 10), endH: parseInt(read(r, 'craa5_shiftendhour'), 10) }));
+    const hours: number[] = [];
+    raw.forEach(x => { if (!isNaN(x.startH)) hours.push(x.startH); if (!isNaN(x.endH)) hours.push(x.endH); });
+    const plusOne = hours.length > 0 && hours.every(h => h >= 1 && (h - 1) % 6 === 0);
+    const hasZeroDay = raw.some(x => x.dayNum === 0);
+    const fixHour = (h: number) => plusOne ? (h - 1 + 24) % 24 : (h === 1 || h === 24) ? 0 : ((h % 24) + 24) % 24;
+    const slots: Slot[] = [], pending: Slot[] = [];
+    raw.forEach(x => {
+        const m = x.dayName.toLowerCase().match(/sun|mon|tue|wed|thu|fri|sat/);
+        let day = m ? ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].indexOf(m[0]) : (isNaN(x.dayNum) ? -1 : (hasZeroDay ? x.dayNum : x.dayNum - 1));
+        if (!x.crew || day < 0 || isNaN(x.startH) || isNaN(x.endH)) return;
+        day = ((day % 7) + 7) % 7;
+        const sH = fixHour(x.startH), eH = fixHour(x.endH);
+        const slot = { crew: x.crew, day, startHour: sH, lengthHours: ((eH - sH + 24) % 24) || 24 };
+        (sH < 4 ? pending : slots).push(slot);
     });
-  };
-  section('PRODUCTION', active.filter(l => l.production));
-  section('OTHER', active.filter(l => !l.production));
-  if (!active.length) L.push('', 'No lines set for cleaning yet.');
-  return L.join('\n');
+    // After-midnight rows belong to the named day or the next one, whichever overlaps the other rows less.
+    const hoursOf = (s: Slot) => Array.from({ length: s.lengthHours }, (_, h) => (s.day * 24 + s.startHour + h) % 168);
+    pending.forEach(p => {
+        const taken = new Set<number>(); slots.forEach(s => hoursOf(s).forEach(h => taken.add(h)));
+        const next = { ...p, day: (p.day + 1) % 7 };
+        const clash = (s: Slot) => hoursOf(s).filter(h => taken.has(h)).length;
+        slots.push(clash(p) < clash(next) ? p : next);
+    });
+    return slots;
 }
 
-async function copyText(text: string): Promise<boolean> {
-  try { if (navigator?.clipboard?.writeText && window.isSecureContext) { await navigator.clipboard.writeText(text); return true; } } catch (e) {}
-  try {
-    const ta = document.createElement("textarea"); ta.value = text; ta.setAttribute("readonly", ""); ta.style.cssText = "position:fixed;top:0;left:0;opacity:0;";
-    document.body.appendChild(ta); ta.select(); const ok = document.execCommand('copy'); ta.remove(); return ok;
-  } catch (e) { return false; }
+function findCurrentShift(slots: Slot[], now = new Date()): { crew: string; startMs: number } {
+    for (const s of slots) {
+        for (let back = 0; back <= 1; back++) {
+            const d = new Date(now); d.setDate(d.getDate() - back);
+            if (d.getDay() !== s.day) continue;
+            const start = new Date(d); start.setHours(s.startHour, 0, 0, 0);
+            if (now.getTime() >= start.getTime() && now.getTime() < start.getTime() + s.lengthHours * 3600000) return { crew: s.crew, startMs: start.getTime() };
+        }
+    }
+    return { crew: "", startMs: 0 };
 }
 
-// --- SMALL COMPONENTS ---
-const Chip = ({ emp, picked, ot, extra, drag, onRemove }: any) => (
-  <div {...drag} className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-sm font-semibold cursor-grab select-none transition-colors ${picked ? 'bg-blue-600 text-white border-blue-700' : 'bg-white text-slate-700 border-slate-200 hover:border-blue-300'}`}>
-    <span className="truncate">{emp.name}</span>
-    {ot && <span className={`text-[10px] font-black px-1.5 rounded ${picked ? 'bg-white/20' : 'bg-amber-100 text-amber-800'}`}>OT</span>}
-    {extra}
-    {onRemove && <button onClick={e => { e.stopPropagation(); onRemove(); }} aria-label={`Remove ${emp.name}`} className={`ml-auto p-0.5 rounded ${picked ? 'hover:bg-white/20' : 'text-slate-400 hover:text-rose-600 hover:bg-rose-50'}`}><X className="w-3.5 h-3.5" /></button>}
-  </div>
+// ============================================================================
+// DATAVERSE READS — Xrm.WebApi first, then the generative page's dataApi.
+// A slow or failed call only falls back for that call; it never switches an API off.
+// ============================================================================
+async function queryDataApi(dataApi: any, table: string, filter: string): Promise<any[]> {
+    let page: any = await asyncRace(dataApi.queryTable(table, { filter, pageSize: 500 }), API_TIMEOUT_MS, `queryTable ${table}`);
+    if (!Array.isArray(page?.rows)) throw new Error(`queryTable ${table}: no rows`);
+    const rows = [...page.rows];
+    while (page?.hasMoreRows && typeof page.loadMoreRows === 'function' && rows.length < 5000) {
+        page = await asyncRace(page.loadMoreRows(), API_TIMEOUT_MS, `queryTable ${table}`);
+        rows.push(...(Array.isArray(page?.rows) ? page.rows : []));
+    }
+    return rows;
+}
+
+async function fetchFallbackRecords(entityNames: string | string[], props: any, filter = "statecode eq 0"): Promise<any[]> {
+    const webApi = getWebApi(props), dataApi = props?.dataApi, names = Array.isArray(entityNames) ? entityNames : [entityNames];
+    for (const en of names) {
+        if (webApi?.retrieveMultipleRecords) {
+            try { const res: any = await asyncRace(webApi.retrieveMultipleRecords(en, `?$filter=${filter}&$orderby=createdon desc&$top=5000`), API_TIMEOUT_MS, `WebApi ${en}`); if (Array.isArray(res?.entities)) return res.entities; } catch (e: any) { logError(`${en} via WebApi`, e?.message || e); }
+        }
+        if (dataApi?.queryTable) {
+            try { return await queryDataApi(dataApi, en, filter); } catch (e: any) { logError(`${en} via dataApi`, e?.message || e); }
+        }
+    }
+    return [];
+}
+
+// ============================================================================
+// SCREENS
+// ============================================================================
+const BucketColumn = ({ lead, isSupervisor, isCollapsed, onToggle, onRemoveLead, children, onDrop, onSetStatus }: any) => {
+    const nm = formatFullName(getField(lead, 'craa5_name')), roleStr = isSupervisor ? "Supervisor" : "Lead";
+    return (
+        <div onDragOver={(e) => e.preventDefault()} onDrop={onDrop} className={`flex flex-col transition-all duration-200 overflow-hidden shadow-sm box-border rounded-xl ${isCollapsed ? 'w-16 flex-none py-4 px-2' : 'w-[350px] flex-none p-4'} ${isSupervisor ? 'bg-[#E6F1FB] border-2 border-[#0072CE]' : 'bg-white border border-slate-300'}`}>
+            {isCollapsed ? (
+                <div className="flex flex-col items-center h-full">
+                    <Button appearance="subtle" size="small" onClick={onToggle} className="min-w-0 mb-3">↔️</Button>
+                    <div className="flex-1 text-center font-semibold text-slate-800 text-sm" style={{ writingMode: "vertical-rl", transform: "rotate(180deg)" }}>{nm} {isSupervisor ? `(${roleStr})` : ""}</div>
+                </div>
+            ) : (
+                <>
+                    <div className={`flex justify-between items-start pb-3 mb-3 border-b-2 shrink-0 ${isSupervisor ? 'border-[#0072CE]' : 'border-[#FFB81C]'}`}>
+                        <div className="flex flex-col overflow-hidden">
+                            <Text weight="bold" size={400} truncate style={{ color: BRAND.blueDark }}>{nm}</Text><Text size={200} color="neutralSecondary">{roleStr}</Text>
+                            {isSupervisor && onSetStatus && <div className="flex flex-wrap gap-1 mt-2">{["PTO", "Sick", "Late", "Left Early"].map(s => <Button key={s} size="small" appearance="subtle" className="px-1 text-[9px] h-5" onClick={() => onSetStatus(s)}>{s}</Button>)}</div>}
+                        </div>
+                        <div className="flex gap-1"><Button appearance="subtle" size="small" onClick={onToggle}>Collapse</Button>{!isSupervisor && onRemoveLead && <Button appearance="subtle" size="small" onClick={onRemoveLead} className="px-1 min-w-0" style={{ color: BRAND.red }}>✖</Button>}</div>
+                    </div>
+                    <div className="flex-1 overflow-y-auto block pb-5"><div className="flex flex-col gap-3">{children}</div></div>
+                </>
+            )}
+        </div>
+    );
+};
+
+const AuthBox = ({ users, onLogin }: any) => (
+    <div className="p-10 flex flex-col items-center">
+        <UserCircle className="w-16 h-16 mb-4" style={{ color: BRAND.blue }} />
+        <Text size={600} weight="bold" className="mb-2">Select Profile</Text>
+        <Text size={300} color="neutralSecondary" className="mb-6 text-center">Please select your profile to continue.</Text>
+        <select className="w-full max-w-[300px] p-3 rounded-lg border border-slate-300 outline-none text-sm focus:ring-2 focus:ring-[#0072CE]/40" onChange={(e) => { const s = users.find((u: any) => getField(u, 'craa5__aa_employeeid') === e.target.value); if (s) onLogin(s); }} defaultValue="">
+            <option value="" disabled>-- Select Profile --</option>
+            {['A', 'B', 'C', 'D', ''].map(shift => {
+                const su = users.filter((u: any) => getShiftOf(u) === shift);
+                if (su.length === 0) return null;
+                return (
+                    <optgroup key={shift || 'none'} label={shift ? `Shift ${shift}` : 'Unassigned'}>
+                        {su.sort((a: any, b: any) => (getField(a, 'craa5_name') || "").localeCompare(getField(b, 'craa5_name') || "")).map((u: any) => (
+                            <option key={getField(u, 'craa5__aa_employeeid')} value={getField(u, 'craa5__aa_employeeid')}>{formatFullName(getField(u, 'craa5_name'))} - {roleOf(u).toUpperCase()}</option>
+                        ))}
+                    </optgroup>
+                );
+            })}
+        </select>
+    </div>
 );
 
-const SAVE_BADGE: Record<SaveState['status'], { text: string; cls: string }> = {
-  idle: { text: "Not saved yet", cls: "bg-slate-100 text-slate-600 border-slate-200" },
-  dirty: { text: "Unsaved changes…", cls: "bg-amber-50 text-amber-800 border-amber-200" },
-  saving: { text: "Saving…", cls: "bg-blue-50 text-blue-800 border-blue-200" },
-  saved: { text: "Saved", cls: "bg-emerald-50 text-emerald-800 border-emerald-200" },
-  error: { text: "Save failed", cls: "bg-rose-50 text-rose-800 border-rose-200" },
-  offline: { text: "Not connected to Dataverse", cls: "bg-slate-100 text-slate-600 border-slate-200" },
-};
-
-type Tab = 'teams' | 'lines' | 'equipment' | 'manage';
-const TABS: [Tab, string][] = [['teams', '1 · Teams'], ['lines', '2 · Lines'], ['equipment', '3 · Equipment'], ['manage', '4 · Manage & Update']];
-
-export default function ShiftStartBoard(props: any) {
-  const propsRef = useRef(props); propsRef.current = props;
-
-  // Reference data
-  const [phase, setPhase] = useState<'loading' | 'ready'>('loading');
-  const [connected, setConnected] = useState(true);
-  const [emps, setEmps] = useState<Emp[]>([]);
-  const [dvLines, setDvLines] = useState<Line[]>([]);
-  const [shift, setShift] = useState<ShiftWin>(() => findShift(DEFAULT_SHIFT_ROTATION, new Date()));
-  const [supId, setSupId] = useState<string>("");
-  const [takenBy, setTakenBy] = useState<Record<string, string>>({});   // employee name -> other team this shift
-  const [loadWarning, setLoadWarning] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-
-  // The board (persisted)
-  const [board, setBoard] = useState<Board>(emptyBoard);
-  const [dirtyTick, setDirtyTick] = useState(0);
-  const [save, setSave] = useState<SaveState>({ status: 'idle' });
-
-  // UI
-  const [tab, setTab] = useState<Tab>('teams');
-  const [picked, setPicked] = useState<DragItem | null>(null);
-  const [poolSearch, setPoolSearch] = useState("");
-  const [otSearch, setOtSearch] = useState("");
-  const [lineSearch, setLineSearch] = useState("");
-  const [manualName, setManualName] = useState("");
-  const [copied, setCopied] = useState<'idle' | 'ok' | 'manual'>('idle');
-  const [sending, setSending] = useState(false);
-  const [now, setNow] = useState(() => Date.now());
-  const dragRef = useRef<DragItem | null>(null);
-  const updateBoxRef = useRef<HTMLTextAreaElement>(null);
-
-  // Save loop refs
-  const boardRef = useRef(board); boardRef.current = board;
-  const dirtyTickRef = useRef(dirtyTick); dirtyTickRef.current = dirtyTick;
-  const ctxRef = useRef<any>(null);
-  const recordIdRef = useRef<string | null>(null);
-  const savingRef = useRef(false), queuedRef = useRef(false), loadIdRef = useRef(0);
-
-  const edit = useCallback((fn: (b: Board) => Board) => { setBoard(fn); setDirtyTick(t => t + 1); }, []);
-
-  // --- DERIVED ---
-  const empById = useMemo(() => new Map(emps.map(e => [e.id, e])), [emps]);
-  const supervisors = useMemo(() => emps.filter(e => e.role === 'supervisor').sort(byName), [emps]);
-  const sup = empById.get(supId);
-  const teamName = sup?.raw || "";
-  const lines = useMemo(() => [...dvLines, ...board.manualLines.map(m => ({ id: m.id, name: m.name, production: false, everyday: false, manual: true, assets: [] as Asset[] }))], [dvLines, board.manualLines]);
-  const lineById = useMemo(() => new Map(lines.map(l => [l.id, l])), [lines]);
-  const downLines = useMemo(() => lines.filter(l => board.downLines.includes(l.id)).sort(lineOrder), [lines, board.downLines]);
-  const onBoard = useMemo(() => new Set([...board.leads, ...Object.keys(board.members), ...Object.keys(board.out)]), [board]);
-  const crewRoster = useMemo(() => emps.filter(e => e.crew === shift.crew && e.role !== 'supervisor' && e.role !== 'manager'), [emps, shift.crew]);
-  const pool = useMemo(() => {
-    const q = norm(poolSearch);
-    return [...crewRoster, ...board.overtime.map(id => empById.get(id)).filter(Boolean) as Emp[]]
-      .filter((e, i, a) => a.findIndex(x => x.id === e.id) === i)
-      .filter(e => !onBoard.has(e.id) && !takenBy[norm(e.raw)] && (!q || norm(e.name).includes(q)))
-      .sort(byName);
-  }, [crewRoster, board.overtime, empById, onBoard, takenBy, poolSearch]);
-  const hiddenTaken = crewRoster.filter(e => !onBoard.has(e.id) && takenBy[norm(e.raw)]).length;
-  const otCandidates = useMemo(() => {
-    const q = norm(otSearch); if (q.length < 2) return [];
-    return emps.filter(e => e.crew !== shift.crew && e.role !== 'supervisor' && e.role !== 'manager' && !onBoard.has(e.id) && !board.overtime.includes(e.id) && norm(e.name).includes(q)).sort(byName).slice(0, 8);
-  }, [emps, otSearch, shift.crew, onBoard, board.overtime]);
-  const leadCandidates = useMemo(() => [...crewRoster, ...board.overtime.map(id => empById.get(id)).filter(Boolean) as Emp[]]
-    .filter(e => !board.leads.includes(e.id) && !board.out[e.id] && !takenBy[norm(e.raw)])
-    .sort((a, b) => (a.role === 'lead' ? 0 : 1) - (b.role === 'lead' ? 0 : 1) || byName(a, b)), [crewRoster, board, empById, takenBy]);
-  const updateText = useMemo(() => buildUpdateText({ b: board, lines, shift, team: teamName ? displayName(teamName) : '', empById, now: new Date(now) }), [board, lines, shift, teamName, empById, now]);
-  const headsOnFloor = useMemo(() => uniq(downLines.flatMap(l => workersOn(board, l.id))).length, [downLines, board]);
-  ctxRef.current = { lines, shift, teamName, sup, empById };
-
-  // --- LOAD ---
-  const loadBoard = useCallback(async (supervisor: Emp | undefined, sh: ShiftWin, allLines: Line[]) => {
-    const loadId = ++loadIdRef.current;
-    const p = propsRef.current;
-    setLoadWarning(null);
-    const name = supervisor && sh.crew ? `Board · ${supervisor.raw} · ${sh.crew} · ${ymd(sh.start)} ${pad(sh.start.getHours())}:00` : '';
-    const since = new Date(sh.start.getTime() - PRE_SHIFT_BUFFER_MIN * 60000).toISOString().replace(/\.\d{3}Z$/, 'Z');
-    const [saved, tasks] = await Promise.all([
-      name ? findReportRow(p, name) : Promise.resolve(null),
-      queryRecords(p, T.task, { select: ['craa5_id', 'craa5_team', 'craa5_endtime', 'createdon'], filter: `createdon ge ${since}` }),
-    ]);
-    if (loadId !== loadIdRef.current) return;
-    // People already on another supervisor's open rows this shift
-    const taken: Record<string, string> = {};
-    (tasks || []).forEach(t => {
-      const team = String(getField(t, 'craa5_team') || ''), who = norm(getField(t, 'craa5_id'));
-      if (who && team && norm(team) !== norm(supervisor?.raw) && !getField(t, 'craa5_endtime')) taken[who] = team;
-    });
-    let b = emptyBoard();
-    if (saved?.json) { try { b = { ...emptyBoard(), ...JSON.parse(saved.json) }; } catch (e) {} }
-    else b.downLines = allLines.filter(l => l.everyday).map(l => l.id);   // everyday tasks are always on
-    recordIdRef.current = saved?.id || null;
-    setTakenBy(taken); setBoard(b); setDirtyTick(0);
-    setSave(saved ? { status: 'saved', at: saved.modifiedon ? new Date(saved.modifiedon) : undefined } : { status: 'idle' });
-    setTab(Object.keys(b.workerLine).length ? 'manage' : 'teams');
-    if (saved === undefined) setLoadWarning("Couldn't load this shift's saved board. Autosave is paused so it isn't overwritten.");
-  }, []);
-
-  const boot = useCallback(async () => {
-    setPhase('loading'); setNotice(null);
-    const p = propsRef.current;
-    try {
-      if (!hasReadApi(p)) { setConnected(false); setSave({ status: 'offline' }); return; }
-      const [rawEmps, rawAreas, rawAssets, rawShifts] = await Promise.all([
-        queryRecords(p, T.employee, { filter: 'statecode eq 0' }),
-        queryRecords(p, T.area, { select: ['craa5_aa_mss_areaid', 'craa5_area', 'craa5_production', 'craa5_everyday'], filter: 'statecode eq 0' })
-          .then(r => r ?? queryRecords(p, T.area, { filter: 'statecode eq 0' })),
-        queryRecords(p, T.asset, { select: ['craa5_aa_assetsid', 'craa5_equipmentidentifier', 'craa5_areaname', 'craa5_subcategory'], filter: 'statecode eq 0' })
-          .then(r => r ?? queryRecords(p, T.asset, { filter: 'statecode eq 0' })),
-        queryRecords(p, T.workshift, { filter: 'statecode eq 0' }),
-      ]);
-      const allEmps = (rawEmps || []).map(readEmployee).filter(Boolean) as Emp[];
-      const allLines = buildLines(rawAreas || [], rawAssets || []);
-      const rot = (rawShifts && parseWorkShiftRows(rawShifts)) || DEFAULT_SHIFT_ROTATION;
-      const sh = findShift(rot, new Date());
-      // Who is using the app: match the signed-in user's email to a supervisor, else the on-shift supervisor.
-      let email = "";
-      try { const xrm = safeGetXrm(); const us = xrm?.Utility?.getGlobalContext?.()?.userSettings; email = us?.userName || ""; } catch (e) {}
-      email = email || p?.context?.userSettings?.userName || p?.userEmail || "";
-      const sups = allEmps.filter(e => e.role === 'supervisor');
-      const me = sups.find(s => norm(s.email) && norm(s.email) === norm(email)) || sups.find(s => s.crew === sh.crew) || sups[0];
-      JOBS.clear(); allEmps.forEach(e => JOBS.set(e.id, e.job)); setConnected(true); setEmps(allEmps); setDvLines(allLines); setShift(sh); setSupId(me?.id || "");
-      const missing = [!rawEmps && "employees", !rawAreas && "lines", !rawAssets && "equipment"].filter(Boolean);
-      if (missing.length) setNotice(`Couldn't load ${missing.join(", ")} from Dataverse.`);
-      await loadBoard(me, sh, allLines);
-    } catch (e) {
-      console.error("[Shift Start] load failed", e);
-      setNotice(`Loading failed: ${errMsg(e)}`);
-    } finally { setPhase('ready'); }
-  }, [loadBoard]);
-
-  useEffect(() => { boot(); }, [boot]);   // once; Power Apps re-sends props often
-
-  // Clerks, admin and janitorial go to their own area automatically (inspectors join admin on nights).
-  useEffect(() => {
-    if (phase !== 'ready') return;
-    const night = isNightShift(shift), want: Record<string, string> = {};
-    [...board.leads, ...Object.keys(board.members)].forEach(id => {
-      const e = empById.get(id), area = e && fixedAreaFor(e.job, night), line = area ? findAreaLine(dvLines, area) : undefined;
-      if (line && !board.out[id] && board.workerLine[id] !== line.id) want[id] = line.id;
-    });
-    const ids = Object.keys(want); if (!ids.length) return;
-    edit(b => ({ ...b, workerLine: { ...b.workerLine, ...want }, downLines: uniq([...b.downLines, ...Object.values(want)]) }));
-  }, [phase, board.leads, board.members, board.workerLine, board.out, empById, dvLines, shift, edit]);
-
-  const switchSupervisor = (id: string) => { setSupId(id); loadBoard(empById.get(id), shift, dvLines); };
-  const switchCrew = (crew: string) => { const sh = { ...shift, crew, auto: false }; setShift(sh); loadBoard(sup, sh, dvLines); };
-
-  // --- SAVE: task rows (official record) + board row (restore) ---
-  const taskPayload = (empId: string, line: Line | null, reason: string | null, b: Board) => {
-    const c = ctxRef.current, e: Emp | undefined = c.empById.get(empId);
-    const leadId = b.leads.includes(empId) ? empId : b.members[empId];
-    const lead: Emp | undefined = leadId ? c.empById.get(leadId) : undefined;
-    const st = line ? lineStatus(line, b) : null;
-    const eq = line ? equipmentFor(b, line) : {};
-    const myEquip = line ? line.assets.filter(a => eq[a.id] === empId).map(a => `${a.name}${b.equipDone[a.id] ? ' ✓' : ''}`).join(', ') : '';
-    return {
-      craa5_id: e?.raw || '', craa5_email: e?.email || '', craa5_badgenumber: e?.badge || '', craa5__aaemp_guid: empId,
-      craa5_lead: lead?.raw || '', craa5_leademail: lead?.email || '',
-      craa5_team: c.teamName, craa5_supervisoremail: c.sup?.email || '', craa5_shift: c.shift.crew,
-      craa5_area: line ? line.name : (reason || ''), craa5_equip: myEquip,
-      craa5_percentagecomplete: st ? st.pct : 0, craa5_complete: !!st?.done,
-      craa5_whatisbeingdone: st ? st.label : (reason || ''), craa5_whatislefttodo: st?.left || '',
-    };
-  };
-
-  // Mutates `rows` as it goes, so rows created before a failure are remembered (no duplicates on retry).
-  const syncTaskRows = async (api: NonNullable<ReturnType<typeof getWriteApi>>, b: Board, rows: Record<string, TaskRowRef>) => {
-    const c = ctxRef.current, nowIso = new Date().toISOString();
-    const want: Record<string, { lineId: string; payload: any }> = {};
-    b.downLines.forEach(lid => { const line = c.lines.find((l: Line) => l.id === lid); if (line) workersOn(b, lid).forEach(id => { want[id] = { lineId: lid, payload: taskPayload(id, line, null, b) }; }); });
-    Object.entries(b.out).forEach(([id, reason]) => { want[id] = { lineId: `out:${reason}`, payload: taskPayload(id, null, reason, b) }; });
-    // Close rows for people who left a line or the board
-    for (const [id, ref] of Object.entries(rows)) {
-      if (want[id]?.lineId === ref.lineId) continue;
-      const line = c.lines.find((l: Line) => l.id === ref.lineId);
-      await api.update(T.task, ref.rowId, { craa5_endtime: nowIso, ...(line ? { craa5_complete: lineStatus(line, b).done } : {}) });
-      delete rows[id];
-    }
-    for (const [id, w] of Object.entries(want)) {
-      const hash = JSON.stringify(w.payload);
-      if (rows[id]) { if (rows[id].hash !== hash) { await api.update(T.task, rows[id].rowId, w.payload); rows[id] = { ...rows[id], hash }; } continue; }
-      const rowId = await api.create(T.task, { ...w.payload, craa5_datetimeofassignment: nowIso, craa5_starttime: nowIso });
-      if (rowId) rows[id] = { rowId, lineId: w.lineId, hash };
-    }
-  };
-
-  const boardName = () => { const c = ctxRef.current; return c.sup && c.shift.crew ? `Board · ${c.sup.raw} · ${c.shift.crew} · ${ymd(c.shift.start)} ${pad(c.shift.start.getHours())}:00` : ''; };
-
-  const persist = useCallback(async () => {
-    if (savingRef.current) { queuedRef.current = true; return; }
-    const api = getWriteApi(propsRef.current), name = boardName();
-    if (!api) { setSave({ status: 'offline' }); return; }
-    if (!name) { setSave({ status: 'error', error: 'Pick a supervisor and crew first' }); return; }
-    savingRef.current = true; setSave(s => ({ ...s, status: 'saving' }));
-    let tick = dirtyTickRef.current;
-    try {
-      do {
-        queuedRef.current = false; tick = dirtyTickRef.current;
-        const b = boardRef.current;
-        const taskRows = { ...b.taskRows };
-        try { await syncTaskRows(api, b, taskRows); }
-        finally { boardRef.current = { ...boardRef.current, taskRows }; setBoard(cur => ({ ...cur, taskRows })); }   // not an edit: no new autosave
-        const c = ctxRef.current;
-        const payload = {
-          craa5_name: name,
-          craa5_actualcrew: uniq(b.downLines.flatMap(l => workersOn(b, l))).length,
-          craa5_scheduledheadcount: emps.filter(e => e.crew === c.shift.crew && e.role !== 'supervisor' && e.role !== 'manager').length,
-          craa5_openspots: Object.keys(b.out).length,
-          craa5_handofftext: buildUpdateText({ b, lines: c.lines, shift: c.shift, team: c.teamName ? displayName(c.teamName) : '', empById: c.empById, now: new Date() }),
-          craa5_equipmentjson: JSON.stringify({ ...b, taskRows }),
-        };
-        if (!recordIdRef.current) { const existing = await findReportRow(propsRef.current, name); if (existing) recordIdRef.current = existing.id; }
-        if (recordIdRef.current) await api.update(T.report, recordIdRef.current, payload);
-        else recordIdRef.current = await api.create(T.report, payload);
-      } while (queuedRef.current);
-      setSave({ status: dirtyTickRef.current !== tick ? 'dirty' : 'saved', at: new Date() });
-    } catch (e) {
-      console.error("[Shift Start] save failed", e);
-      setSave({ status: 'error', error: errMsg(e) });
-    } finally { savingRef.current = false; }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [emps]);
-
-  const autosavePaused = !connected || !!loadWarning;
-  useEffect(() => {
-    if (!dirtyTick) return;
-    setSave(s => s.status === 'saving' ? s : { ...s, status: connected ? 'dirty' : 'offline' });
-    if (autosavePaused) return;
-    const t = setTimeout(() => { persist(); }, AUTOSAVE_DELAY_MS);
-    return () => clearTimeout(t);
-  }, [dirtyTick, autosavePaused, connected, persist]);
-
-  // --- TEAMS UPDATE ---
-  const sendToTeams = async (slotKey?: string) => {
-    const api = getWriteApi(propsRef.current);
-    if (!api) { setNotice("Not connected to Dataverse, so nothing was sent. Use Copy instead."); return; }
-    const stamp = slotKey || `${ymd(new Date())} ${pad(new Date().getHours())}:${pad(new Date().getMinutes())}`;
-    const name = `Teams Update · ${teamName ? displayName(teamName) : 'Sanitation'} · ${stamp}`;
-    setSending(true);
-    try {
-      if (slotKey && await findReportRow(propsRef.current, name)) { /* another device already sent this slot */ }
-      else await api.create(T.report, { craa5_name: name, craa5_handofftext: updateText, craa5_actualcrew: headsOnFloor });
-      edit(b => ({ ...b, lastSentAt: new Date().toISOString(), sentSlots: slotKey ? uniq([...b.sentSlots, slotKey]) : b.sentSlots }));
-      setNotice(slotKey ? `Scheduled update for ${stamp.slice(11)} sent to Teams.` : "Update sent to Teams.");
-    } catch (e) { setNotice(`Send to Teams failed: ${errMsg(e)}`); }
-    finally { setSending(false); }
-  };
-  const lastSlot = useMemo(() => {
-    const d = new Date(now); let best: Date | null = null;
-    for (let back = 0; back <= 1; back++) SEND_HOURS.forEach(h => { const s = new Date(d); s.setDate(s.getDate() - back); s.setHours(h, 0, 0, 0); if (s.getTime() <= now && (!best || s > best)) best = s; });
-    return best as Date | null;
-  }, [now]);
-  const nextSlot = useMemo(() => {
-    const d = new Date(now); let best: Date | null = null;
-    for (let fwd = 0; fwd <= 1; fwd++) SEND_HOURS.forEach(h => { const s = new Date(d); s.setDate(s.getDate() + fwd); s.setHours(h, 0, 0, 0); if (s.getTime() > now && (!best || s < best)) best = s; });
-    return best as Date | null;
-  }, [now]);
-  const sendRef = useRef(sendToTeams); sendRef.current = sendToTeams;
-  const triedSlots = useRef(new Set<string>());
-  useEffect(() => {
-    if (phase !== 'ready' || !connected || !board.autoSend || !lastSlot || sending) return;
-    const key = `${ymd(lastSlot)} ${pad(lastSlot.getHours())}:00`;
-    if (board.sentSlots.includes(key) || triedSlots.current.has(key) || lastSlot < shift.start || now - lastSlot.getTime() > 30 * 60000) return;
-    triedSlots.current.add(key);
-    sendRef.current(key);
-  }, [phase, connected, board.autoSend, board.sentSlots, lastSlot, now, shift.start, sending]);
-  useEffect(() => { const t = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(t); }, []);
-
-  const handleCopy = async () => {
-    if (await copyText(updateText)) { setCopied('ok'); setTimeout(() => setCopied('idle'), 2000); }
-    else { setCopied('manual'); setTimeout(() => { updateBoxRef.current?.focus(); updateBoxRef.current?.select(); }, 0); }
-  };
-
-  // --- BOARD ACTIONS ---
-  const addLead = (id: string) => edit(b => {
-    const members = { ...b.members }; delete members[id];
-    const out = { ...b.out }; delete out[id];
-    return { ...b, leads: uniq([...b.leads, id]), members, out };
-  });
-  const removeLead = (leadId: string) => edit(b => {
-    const members = { ...b.members }, workerLine = { ...b.workerLine }, teamLines = { ...b.teamLines };
-    Object.keys(members).forEach(m => { if (members[m] === leadId) { delete members[m]; delete workerLine[m]; } });
-    delete workerLine[leadId]; delete teamLines[leadId];
-    return { ...b, leads: b.leads.filter(x => x !== leadId), members, workerLine, teamLines };
-  });
-  const assignTeamToLine = (leadId: string, lineId: string) => edit(b => {
-    const teamLines = { ...b.teamLines, [leadId]: uniq([...(b.teamLines[leadId] || []), lineId]) };
-    const workerLine = { ...b.workerLine };
-    [leadId, ...Object.keys(b.members).filter(m => b.members[m] === leadId)].forEach(id => {
-      if (!workerLine[id] || !teamLines[leadId].includes(workerLine[id])) workerLine[id] = lineId;
-    });
-    return { ...b, teamLines, workerLine, downLines: uniq([...b.downLines, lineId]) };
-  });
-  const unassignTeamFromLine = (leadId: string, lineId: string) => edit(b => {
-    const rest = (b.teamLines[leadId] || []).filter(x => x !== lineId);
-    const workerLine = { ...b.workerLine };
-    [leadId, ...Object.keys(b.members).filter(m => b.members[m] === leadId)].forEach(id => { if (workerLine[id] === lineId) { if (rest[0]) workerLine[id] = rest[0]; else delete workerLine[id]; } });
-    return { ...b, teamLines: { ...b.teamLines, [leadId]: rest }, workerLine };
-  });
-  const toggleDown = (lineId: string) => edit(b => {
-    if (!b.downLines.includes(lineId)) return { ...b, downLines: [...b.downLines, lineId] };
-    const workerLine = { ...b.workerLine }, teamLines: Record<string, string[]> = {};
-    Object.keys(workerLine).forEach(id => { if (workerLine[id] === lineId) delete workerLine[id]; });
-    Object.entries(b.teamLines).forEach(([l, ls]) => { teamLines[l] = ls.filter(x => x !== lineId); });
-    return { ...b, downLines: b.downLines.filter(x => x !== lineId), workerLine, teamLines };
-  });
-  const addManualTask = () => {
-    const name = manualName.trim(); if (!name) return;
-    const id = `manual-${Date.now()}`;
-    edit(b => ({ ...b, manualLines: [...b.manualLines, { id, name }], downLines: [...b.downLines, id] }));
-    setManualName("");
-  };
-  const copyLastShiftTeams = async () => {
-    if (!sup || !shift.crew) return;
-    const current = boardName();
-    const rows = await queryRecords(propsRef.current, T.report, { select: ['craa5_name', 'craa5_equipmentjson'], filter: `startswith(craa5_name,'${odataText(`Board · ${sup.raw} · ${shift.crew} · `)}') and craa5_name ne '${odataText(current)}'`, orderby: 'modifiedon desc', top: 1 });
-    const prev = rows?.[0];
-    if (!prev) { setNotice(rows ? "No earlier board found for this crew." : "Couldn't reach Dataverse."); return; }
-    let old: Board; try { old = { ...emptyBoard(), ...JSON.parse(getField(prev, 'craa5_equipmentjson')) }; } catch (e) { setNotice("The last board couldn't be read."); return; }
-    const known = (id: string) => empById.has(id);
-    edit(b => {
-      const leads = old.leads.filter(known), members: Record<string, string> = {};
-      Object.entries(old.members).forEach(([m, l]) => { if (known(m) && leads.includes(l) && !b.out[m] && !takenBy[norm(empById.get(m)!.raw)]) members[m] = l; });
-      return { ...b, leads: uniq([...b.leads, ...leads]), members: { ...members, ...b.members } };
-    });
-    setNotice(`Copied teams from ${String(getField(prev, 'craa5_name')).split(' · ').slice(-1)[0]}. Adjust as needed.`);
-  };
-  const removeManualTask = (id: string) => { toggleDown(id); edit(b => ({ ...b, manualLines: b.manualLines.filter(m => m.id !== id) })); };
-
-  const handleDrop = (item: DragItem, target: DropTarget) => {
-    setPicked(null);
-    if (item.kind === 'emp') {
-      const id = item.id;
-      if (target.type === 'line' || target.type === 'worker') {
-        const lineId = target.lineId;
-        edit(b => ({ ...b, workerLine: { ...b.workerLine, [id]: lineId }, downLines: uniq([...b.downLines, lineId]) }));
-        return;
-      }
-      if (target.type === 'lead' && target.leadId === id) return;
-      edit(b => {
-        const members = { ...b.members }, out = { ...b.out }, workerLine = { ...b.workerLine }, teamLines = { ...b.teamLines };
-        delete members[id]; delete out[id]; delete workerLine[id];
-        let leads = b.leads;
-        if (b.leads.includes(id)) {   // a lead moved elsewhere stops being a lead; their people go back to the pool
-          leads = b.leads.filter(x => x !== id); delete teamLines[id];
-          Object.keys(members).forEach(m => { if (members[m] === id) { delete members[m]; delete workerLine[m]; } });
-        }
-        if (target.type === 'lead' && target.leadId !== id) { members[id] = target.leadId; const tl = b.teamLines[target.leadId]?.[0]; if (tl) workerLine[id] = tl; }
-        if (target.type === 'out') out[id] = target.reason;
-        return { ...b, leads, members, out, workerLine, teamLines };
-      });
-    } else if (item.kind === 'team' && target.type === 'line') {
-      assignTeamToLine(item.id, target.lineId);
-    } else if (item.kind === 'equip' && (target.type === 'worker' || target.type === 'unassigned') && item.lineId === target.lineId) {
-      const line = lineById.get(target.lineId); if (!line) return;
-      edit(b => {
-        const current = equipmentFor(b, line), equip = { ...b.equip };
-        line.assets.forEach(a => { if (current[a.id]) equip[a.id] = current[a.id]; else delete equip[a.id]; });   // freeze the auto split
-        if (target.type === 'worker') equip[item.id] = target.empId; else delete equip[item.id];
-        return { ...b, equip, equipManual: uniq([...b.equipManual, line.id]) };
-      });
-    }
-  };
-
-  // Drag (mouse) + tap-to-pick / tap-to-drop (tablets)
-  const dragProps = (item: DragItem) => ({
-    draggable: true,
-    onDragStart: (e: React.DragEvent) => { dragRef.current = item; e.dataTransfer.setData('text/plain', item.id); e.dataTransfer.effectAllowed = 'move'; },
-    onDragEnd: () => { dragRef.current = null; },
-    onClick: (e: React.MouseEvent) => { if (picked && picked.id !== item.id) return; e.stopPropagation(); setPicked(p => p?.id === item.id ? null : item); },
-  });
-  const dropProps = (target: DropTarget, accepts: DragItem['kind'][]) => ({
-    onDragOver: (e: React.DragEvent) => { if (dragRef.current && accepts.includes(dragRef.current.kind)) e.preventDefault(); },
-    onDrop: (e: React.DragEvent) => { e.preventDefault(); const it = dragRef.current; dragRef.current = null; if (it && accepts.includes(it.kind)) handleDrop(it, target); },
-    onClick: (e: React.MouseEvent) => { if (picked && accepts.includes(picked.kind)) { e.stopPropagation(); handleDrop(picked, target); } },
-  });
-  const zoneCls = (accepts: DragItem['kind'][]) => picked && accepts.includes(picked.kind) ? 'ring-2 ring-blue-400 ring-offset-1 cursor-pointer' : '';
-  const isPicked = (id: string) => picked?.id === id;
-
-  // --- RENDER ---
-  if (phase === 'loading') {
-    return (
-      <div className="bg-slate-50 flex flex-col items-center justify-center py-24">
-        <Loader className="w-12 h-12 text-blue-600 mb-4" />
-        <h2 className="text-xl font-bold text-slate-700">Loading shift…</h2>
-        <p className="text-slate-500">Roster, lines, equipment and today's assignments</p>
-      </div>
-    );
-  }
-
-  const badge = SAVE_BADGE[save.status];
-  const teamsOf = (lineId: string) => board.leads.filter(l => (board.teamLines[l] || []).includes(lineId));
-  const filteredLines = lines.filter(l => !norm(lineSearch) || norm(l.name).includes(norm(lineSearch))).sort(lineOrder);
-
-  const lineHeader = (line: Line) => {
-    const heads = workersOn(board, line.id).length;
-    return (
-      <div className="flex items-center gap-2 min-w-0">
-        <span className={`text-[10px] font-black uppercase px-1.5 py-0.5 rounded ${line.production ? 'bg-blue-100 text-blue-800' : line.manual ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-600'}`}>{line.production ? 'Prod' : line.manual ? 'Task' : 'Other'}</span>
-        <h3 className="font-bold text-slate-900 truncate">{line.name}</h3>
-        <span className="ml-auto shrink-0 text-sm font-bold text-slate-600 flex items-center gap-1"><Users className="w-4 h-4" />{heads}</span>
-      </div>
-    );
-  };
-
-  return (
-    <div className="bg-slate-50 text-slate-800 font-sans p-3 md:p-6">
-      <div className="max-w-7xl mx-auto">
-
-        {/* Header */}
-        <header className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 mb-3 bg-white p-4 rounded-2xl shadow-sm border border-slate-200">
-          <div className="min-w-0">
-            <h1 className="text-2xl font-extrabold text-slate-900">Shift Start</h1>
-            <div className="flex flex-wrap items-center gap-2 mt-1 text-sm text-slate-600">
-              <span className="font-bold">Crew</span>
-              <select value={shift.crew} onChange={e => switchCrew(e.target.value)} className="border border-slate-300 rounded-lg px-2 py-1 font-bold bg-white" aria-label="Crew">
-                {!shift.crew && <option value="">?</option>}
-                {['A', 'B', 'C', 'D'].map(c => <option key={c} value={c}>{c}</option>)}
-              </select>
-              <span>{shift.auto ? 'detected' : 'set by hand'} · {hm(shift.start)}–{hm(shift.end)}</span>
-              <span className="text-slate-300">|</span>
-              <span className="font-bold">Supervisor</span>
-              <select value={supId} onChange={e => switchSupervisor(e.target.value)} className="border border-slate-300 rounded-lg px-2 py-1 bg-white max-w-[12rem]" aria-label="Supervisor">
-                {!supId && <option value="">Choose…</option>}
-                {supervisors.map(s => <option key={s.id} value={s.id}>{s.name}{s.crew ? ` (${s.crew})` : ''}</option>)}
-              </select>
-            </div>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <span title={save.error || ''} className={`text-xs font-semibold px-3 py-1.5 rounded-full border flex items-center gap-1 ${badge.cls}`}>
-              {save.status === 'saving' && <Loader className="w-3 h-3" />}{badge.text}{save.status === 'saved' && save.at ? ` ${hm(save.at)}` : ''}
-            </span>
-            <span className="text-sm font-bold text-slate-700 bg-slate-100 rounded-full px-3 py-1.5 flex items-center gap-1"><Users className="w-4 h-4" />{headsOnFloor} on the floor</span>
-            <button onClick={() => persist()} disabled={!connected || !!loadWarning || save.status === 'saving'} className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold disabled:bg-slate-300">Save now</button>
-          </div>
-        </header>
-
-        {!connected && <div className="mb-3 p-3 rounded-xl border border-slate-300 bg-white text-sm flex gap-2"><Alert className="w-5 h-5 shrink-0" />Not connected to Dataverse. Open this inside the Power Apps model-driven app.</div>}
-        {loadWarning && (
-          <div className="mb-3 p-3 rounded-xl border border-amber-300 bg-amber-50 text-amber-900 text-sm flex flex-wrap items-center gap-2">
-            <Alert className="w-5 h-5 shrink-0" /><span className="flex-1">{loadWarning}</span>
-            <button onClick={() => loadBoard(sup, shift, dvLines)} className="px-3 py-1 rounded-lg bg-amber-600 text-white font-semibold">Retry</button>
-            <button onClick={() => { setLoadWarning(null); persist(); }} className="px-3 py-1 rounded-lg border border-amber-400 font-semibold">Save anyway</button>
-          </div>
-        )}
-        {save.status === 'error' && <div className="mb-3 p-3 rounded-xl border border-rose-300 bg-rose-50 text-rose-900 text-sm">Couldn't save: {save.error}. Your changes are still here, so use "Save now" to retry.</div>}
-        {notice && <div className="mb-3 p-3 rounded-xl border border-slate-200 bg-white text-sm flex items-center gap-2"><span className="flex-1">{notice}</span><button onClick={() => setNotice(null)} aria-label="Dismiss"><X className="w-4 h-4 text-slate-400" /></button></div>}
-        {picked && (
-          <div className="mb-3 p-2 rounded-xl bg-blue-600 text-white text-sm font-semibold flex items-center gap-2">
-            Moving {picked.kind === 'team' ? `team ${empById.get(picked.id)?.name}` : picked.kind === 'equip' ? lineById.get(picked.lineId || '')?.assets.find(a => a.id === picked.id)?.name : empById.get(picked.id)?.name}: tap where it should go.
-            <button onClick={() => setPicked(null)} className="ml-auto px-2 py-0.5 rounded bg-white/20">Cancel</button>
-          </div>
-        )}
-
-        {/* Tabs */}
-        <nav className="flex gap-1 mb-4 overflow-x-auto" role="tablist">
-          {TABS.map(([key, label]) => (
-            <button key={key} role="tab" aria-selected={tab === key} onClick={() => setTab(key)}
-              className={`px-4 py-2 rounded-xl font-semibold whitespace-nowrap ${tab === key ? 'bg-slate-900 text-white' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-100'}`}>{label}</button>
-          ))}
-        </nav>
-
-        {/* ===== 1. TEAMS ===== */}
-        {tab === 'teams' && (
-          <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
-            <aside className="lg:col-span-1 flex flex-col gap-4">
-              <div {...dropProps({ type: 'pool' }, ['emp'])} className={`bg-white rounded-2xl border border-slate-200 p-4 ${zoneCls(['emp'])}`}>
-                <h2 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">Crew {shift.crew} · available ({pool.length})</h2>
-                <div className="relative mb-2">
-                  <Search className="w-4 h-4 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
-                  <input value={poolSearch} onChange={e => setPoolSearch(e.target.value)} placeholder="Find someone…" className="w-full pl-8 pr-2 py-2 text-sm border border-slate-200 rounded-lg" />
-                </div>
-                <div className="flex flex-col gap-1.5 max-h-[50vh] overflow-y-auto pr-1">
-                  {pool.map(e => <Chip key={e.id} emp={e} picked={isPicked(e.id)} ot={board.overtime.includes(e.id)} drag={dragProps({ kind: 'emp', id: e.id })}
-                    extra={e.role === 'lead' ? <span className="text-[10px] font-bold text-blue-500">LEAD</span> : e.jobName ? <span className="text-[10px] font-semibold text-slate-400">{e.jobName}</span> : null} />)}
-                  {!pool.length && <p className="text-sm text-slate-400 text-center py-4">Everyone on crew {shift.crew} is placed.</p>}
-                </div>
-                {hiddenTaken > 0 && <p className="text-[11px] text-slate-400 mt-2">{hiddenTaken} already on another supervisor's board.</p>}
-              </div>
-
-              <div className="bg-white rounded-2xl border border-slate-200 p-4">
-                <h2 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">Overtime (other crews)</h2>
-                <input value={otSearch} onChange={e => setOtSearch(e.target.value)} placeholder="Type a name…" className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg" />
-                <div className="flex flex-col gap-1 mt-2">
-                  {otCandidates.map(e => (
-                    <button key={e.id} onClick={() => { edit(b => ({ ...b, overtime: uniq([...b.overtime, e.id]) })); setOtSearch(""); }} className="text-left text-sm px-3 py-1.5 rounded-lg hover:bg-amber-50 flex items-center gap-2">
-                      <Plus className="w-4 h-4 text-amber-600" />{e.name}<span className="ml-auto text-xs text-slate-400">Crew {e.crew || '?'}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div className="bg-white rounded-2xl border border-slate-200 p-4">
-                <h2 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">Out today</h2>
-                <div className="grid grid-cols-2 gap-2">
-                  {OUT_REASONS.map(r => {
-                    const people = Object.keys(board.out).filter(id => board.out[id] === r);
-                    return (
-                      <div key={r} {...dropProps({ type: 'out', reason: r }, ['emp'])} className={`rounded-xl border border-dashed border-slate-300 p-2 min-h-[3rem] ${zoneCls(['emp'])}`}>
-                        <div className="text-xs font-bold text-slate-500 mb-1">{r} ({people.length})</div>
-                        <div className="flex flex-col gap-1">{people.map(id => { const e = empById.get(id); return e ? <Chip key={id} emp={e} picked={isPicked(id)} drag={dragProps({ kind: 'emp', id })} onRemove={() => handleDrop({ kind: 'emp', id }, { type: 'pool' })} /> : null; })}</div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            </aside>
-
-            <section className="lg:col-span-3 flex flex-col gap-3">
-              <div className="bg-white rounded-2xl border border-slate-200 p-3 flex flex-wrap items-center gap-2">
-                <span className="text-sm font-bold text-slate-600">Add lead:</span>
-                <select value="" onChange={e => e.target.value && addLead(e.target.value)} className="border border-slate-300 rounded-lg px-2 py-1.5 text-sm bg-white min-w-[14rem]" aria-label="Add lead">
-                  <option value="">Choose a lead…</option>
-                  {leadCandidates.map(e => <option key={e.id} value={e.id}>{e.name}{e.role === 'lead' ? ' · Lead' : ''}{board.overtime.includes(e.id) ? ' · OT' : ''}</option>)}
-                </select>
-                <span className="text-xs text-slate-400">Then drag people under a lead, or tap a person and tap the lead's column.</span>
-                {!board.leads.length && connected && <button onClick={copyLastShiftTeams} className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-sm font-semibold">Start from last shift's teams</button>}
-                {board.leads.length > 0 && <button onClick={() => setTab('lines')} className="ml-auto px-4 py-2 rounded-xl bg-blue-600 text-white font-semibold">Next: Lines →</button>}
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-                {board.leads.map(leadId => {
-                  const lead = empById.get(leadId); if (!lead) return null;
-                  const members = Object.keys(board.members).filter(m => board.members[m] === leadId).map(id => empById.get(id)).filter(Boolean) as Emp[];
-                  return (
-                    <div key={leadId} {...dropProps({ type: 'lead', leadId }, ['emp'])} className={`bg-white rounded-2xl border border-slate-200 overflow-hidden ${zoneCls(['emp'])}`}>
-                      <div className="bg-[#004aad] text-white px-4 py-3 flex items-center gap-2">
-                        <div className="min-w-0"><div className="text-[10px] font-bold uppercase opacity-70">Lead</div><div className="font-bold truncate">{lead.name}{board.overtime.includes(leadId) ? ' · OT' : ''}</div></div>
-                        <span className="ml-auto font-bold flex items-center gap-1"><Users className="w-4 h-4" />{members.length + 1}</span>
-                        <button onClick={() => removeLead(leadId)} aria-label={`Remove lead ${lead.name}`} className="p-1 rounded hover:bg-white/20"><X className="w-4 h-4" /></button>
-                      </div>
-                      <div className="p-3 flex flex-col gap-1.5 min-h-[5rem]">
-                        {members.sort(byName).map(m => <Chip key={m.id} emp={m} picked={isPicked(m.id)} ot={board.overtime.includes(m.id)} drag={dragProps({ kind: 'emp', id: m.id })} onRemove={() => handleDrop({ kind: 'emp', id: m.id }, { type: 'pool' })} />)}
-                        {!members.length && <p className="text-sm text-slate-400 text-center py-3">Drop people here</p>}
-                      </div>
-                    </div>
-                  );
-                })}
-                {!board.leads.length && <div className="md:col-span-2 xl:col-span-3 bg-white border border-dashed border-slate-300 rounded-2xl p-10 text-center text-slate-500">Start by adding your leads for crew {shift.crew || '?'}.</div>}
-              </div>
-            </section>
-          </div>
-        )}
-
-        {/* ===== 2. LINES ===== */}
-        {tab === 'lines' && (
-          <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
-            <aside className="lg:col-span-1 flex flex-col gap-4">
-              <div className="bg-white rounded-2xl border border-slate-200 p-4">
-                <h2 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">What's down for cleaning ({board.downLines.length})</h2>
-                <input value={lineSearch} onChange={e => setLineSearch(e.target.value)} placeholder="Find a line…" className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg mb-2" />
-                <div className="flex flex-col gap-1 max-h-[55vh] overflow-y-auto pr-1">
-                  {filteredLines.filter(l => !l.manual).map((l, i, arr) => (
-                    <React.Fragment key={l.id}>
-                      {(i === 0 || arr[i - 1].production !== l.production) && <div className="text-[10px] font-black uppercase text-slate-400 mt-2">{l.production ? 'Production' : 'Non-production'}</div>}
-                      <label className="flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-slate-50 cursor-pointer text-sm">
-                        <input type="checkbox" checked={board.downLines.includes(l.id)} onChange={() => toggleDown(l.id)} className="accent-blue-600 w-4 h-4" />
-                        <span className={`truncate ${board.downLines.includes(l.id) ? 'font-bold text-slate-900' : 'text-slate-600'}`}>{l.name}</span>
-                        {l.everyday && <span className="ml-auto text-[10px] font-bold text-slate-400">DAILY</span>}
-                      </label>
-                    </React.Fragment>
-                  ))}
-                </div>
-              </div>
-              <div className="bg-white rounded-2xl border border-slate-200 p-4">
-                <h2 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">Manual task</h2>
-                <div className="flex gap-2">
-                  <input value={manualName} onChange={e => setManualName(e.target.value)} onKeyDown={e => e.key === 'Enter' && addManualTask()} placeholder="e.g. Trash run, Drains" className="flex-1 min-w-0 px-3 py-2 text-sm border border-slate-200 rounded-lg" />
-                  <button onClick={addManualTask} className="px-3 rounded-lg bg-slate-900 text-white" aria-label="Add manual task"><Plus className="w-4 h-4" /></button>
-                </div>
-              </div>
-              <div className="bg-white rounded-2xl border border-slate-200 p-4">
-                <h2 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">Teams</h2>
-                <p className="text-[11px] text-slate-400 mb-2">Drag a team onto a line (or tap, then tap the line).</p>
-                <div className="flex flex-col gap-1.5">
-                  {board.leads.map(l => { const e = empById.get(l); return e ? (
-                    <div key={l} {...dragProps({ kind: 'team', id: l })} className={`px-3 py-2 rounded-lg border text-sm font-semibold cursor-grab flex items-center gap-2 ${isPicked(l) ? 'bg-blue-600 text-white border-blue-700' : 'bg-white border-slate-200 hover:border-blue-300'}`}>
-                      <Users className="w-4 h-4" /><span className="truncate">Team {e.name}</span>
-                      <span className="ml-auto text-xs">{1 + Object.values(board.members).filter(x => x === l).length}</span>
-                    </div>) : null; })}
-                  {!board.leads.length && <button onClick={() => setTab('teams')} className="text-sm text-blue-600 font-semibold text-left">← Set up teams first</button>}
-                </div>
-              </div>
-            </aside>
-            <section className="lg:col-span-3 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 content-start">
-              {downLines.map(line => (
-                <div key={line.id} {...dropProps({ type: 'line', lineId: line.id }, ['team', 'emp'])} className={`bg-white rounded-2xl border p-4 ${line.production ? 'border-blue-200' : 'border-slate-200'} ${zoneCls(['team', 'emp'])}`}>
-                  {lineHeader(line)}
-                  <div className="flex flex-wrap gap-1.5 mt-3">
-                    {teamsOf(line.id).map(l => (
-                      <span key={l} className="text-xs font-semibold bg-blue-50 text-blue-800 border border-blue-200 rounded-full pl-3 pr-1 py-1 flex items-center gap-1">
-                        Team {empById.get(l)?.name}
-                        <button onClick={e => { e.stopPropagation(); unassignTeamFromLine(l, line.id); }} aria-label="Remove team from line" className="p-0.5 rounded-full hover:bg-blue-100"><X className="w-3 h-3" /></button>
-                      </span>
-                    ))}
-                    {!teamsOf(line.id).length && <span className="text-sm text-slate-400">No team yet</span>}
-                  </div>
-                  <div className="flex items-center justify-between mt-3 text-xs text-slate-500">
-                    <span>{line.assets.length ? `${line.assets.length} equipment` : line.manual ? 'Manual task' : 'No equipment listed'}</span>
-                    {line.manual
-                      ? <button onClick={e => { e.stopPropagation(); removeManualTask(line.id); }} className="text-rose-600 font-semibold">Delete task</button>
-                      : <button onClick={e => { e.stopPropagation(); toggleDown(line.id); }} className="text-slate-500 hover:text-rose-600 font-semibold">Not down</button>}
-                  </div>
-                </div>
-              ))}
-              {!downLines.length && <div className="md:col-span-2 xl:col-span-3 bg-white border border-dashed border-slate-300 rounded-2xl p-10 text-center text-slate-500">Tick the lines that are down for cleaning.</div>}
-              {downLines.length > 0 && <div className="md:col-span-2 xl:col-span-3 flex justify-end"><button onClick={() => setTab('equipment')} className="px-4 py-2 rounded-xl bg-blue-600 text-white font-semibold">Next: Equipment →</button></div>}
-            </section>
-          </div>
-        )}
-
-        {/* ===== 3. EQUIPMENT ===== */}
-        {tab === 'equipment' && (
-          <div className="flex flex-col gap-4">
-            {downLines.map(line => {
-              const people = workersOn(board, line.id), eq = equipmentFor(board, line);
-              const unassigned = line.assets.filter(a => !eq[a.id]);
-              const manual = board.equipManual.includes(line.id);
-              const equipChip = (a: Asset) => (
-                <React.Fragment key={a.id}>
-                <span {...dragProps({ kind: 'equip', id: a.id, lineId: line.id })} className={`text-xs font-semibold px-2 py-1 rounded-md border cursor-grab select-none ${isPicked(a.id) ? 'bg-blue-600 text-white border-blue-700' : board.equipDone[a.id] ? 'bg-emerald-50 text-emerald-800 border-emerald-200 line-through' : 'bg-slate-50 text-slate-700 border-slate-200'}`}>{a.name}</span>
-                </React.Fragment>
-              );
-              return (
-                <div key={line.id} {...dropProps({ type: 'line', lineId: line.id }, ['emp'])} className={`bg-white rounded-2xl border border-slate-200 p-4 ${zoneCls(['emp'])}`}>
-                  <div className="flex flex-wrap items-center gap-3 mb-3">
-                    <div className="flex-1 min-w-0">{lineHeader(line)}</div>
-                    {line.assets.length > 0 && (manual
-                      ? <button onClick={e => { e.stopPropagation(); edit(b => ({ ...b, equipManual: b.equipManual.filter(x => x !== line.id) })); }} className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200">Re-split automatically</button>
-                      : <span className="text-[11px] font-bold text-emerald-700 bg-emerald-50 px-2 py-1 rounded">AUTO SPLIT</span>)}
-                  </div>
-                  {!people.length ? <p className="text-sm text-slate-400">Nobody on this line yet. Assign a team on the Lines tab, or drop a person here.</p> : (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2">
-                      {people.map(id => { const e = empById.get(id); if (!e) return null; const mine = line.assets.filter(a => eq[a.id] === id); return (
-                        <div key={id} {...dropProps({ type: 'worker', lineId: line.id, empId: id }, ['equip', 'emp'])} className={`rounded-xl border border-slate-200 bg-slate-50/60 p-2 ${zoneCls(['equip'])}`}>
-                          <div {...dragProps({ kind: 'emp', id })} className={`text-sm font-bold mb-1.5 flex items-center gap-1 cursor-grab ${isPicked(id) ? 'text-blue-600' : 'text-slate-800'}`}>
-                            {e.name}{board.leads.includes(id) && <span className="text-[10px] text-blue-500">LEAD</span>}{board.overtime.includes(id) && <span className="text-[10px] text-amber-600">OT</span>}
-                            <span className="ml-auto text-xs text-slate-400">{mine.length}</span>
-                          </div>
-                          <div className="flex flex-wrap gap-1">{mine.map(equipChip)}</div>
-                        </div>); })}
-                      {(unassigned.length > 0 || manual) && line.assets.length > 0 && (
-                        <div {...dropProps({ type: 'unassigned', lineId: line.id }, ['equip'])} className={`rounded-xl border border-dashed border-amber-300 bg-amber-50/50 p-2 ${zoneCls(['equip'])}`}>
-                          <div className="text-sm font-bold text-amber-800 mb-1.5">Unassigned ({unassigned.length})</div>
-                          <div className="flex flex-wrap gap-1">{unassigned.map(equipChip)}</div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-            {!downLines.length && <div className="bg-white border border-dashed border-slate-300 rounded-2xl p-10 text-center text-slate-500">No lines down yet.</div>}
-            {downLines.length > 0 && <div className="flex justify-end"><button onClick={() => setTab('manage')} className="px-4 py-2 rounded-xl bg-blue-600 text-white font-semibold">Next: Manage →</button></div>}
-          </div>
-        )}
-
-        {/* ===== 4. MANAGE & UPDATE ===== */}
-        {tab === 'manage' && (
-          <div className="grid grid-cols-1 xl:grid-cols-5 gap-4">
-            <section className="xl:col-span-3 flex flex-col gap-3">
-              {downLines.map(line => {
-                const st = lineStatus(line, board), p = board.progress[line.id] || 0;
-                const eq = equipmentFor(board, line), eqIds = Object.keys(eq);
-                const setP = (v: number) => edit(b => ({ ...b, progress: { ...b.progress, [line.id]: v } }));
-                return (
-                  <div key={line.id} className={`bg-white rounded-2xl border p-4 ${st.done ? 'border-emerald-300' : 'border-slate-200'}`}>
-                    {lineHeader(line)}
-                    {line.production ? (
-                      <div className="mt-3">
-                        <div className="flex justify-between text-xs font-semibold mb-1">
-                          <span className={st.done ? 'text-emerald-700' : 'text-blue-700'}>{st.label} · {st.pct}%</span>
-                          {!st.done && <span className="text-slate-400">Next: {STEP_LABELS[p]}</span>}
-                        </div>
-                        <input type="range" min={0} max={TOTAL_STEPS} step={1} value={p} onChange={e => setP(Number(e.target.value))} aria-label={`${line.name} progress`} className="w-full accent-blue-600" />
-                      </div>
-                    ) : (
-                      <div className="mt-3 flex gap-1">
-                        {([[0, 'Not started'], [1, 'In progress'], [TOTAL_STEPS, 'Done']] as const).map(([v, label]) => (
-                          <button key={v} onClick={() => setP(v)} className={`flex-1 text-xs font-semibold py-1.5 rounded-lg border ${(v === 0 ? p === 0 : v === 1 ? p > 0 && p < TOTAL_STEPS : p >= TOTAL_STEPS) ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-600 border-slate-200'}`}>{label}</button>
-                        ))}
-                      </div>
-                    )}
-                    {eqIds.length > 0 && (
-                      <details className="mt-2">
-                        <summary className="text-xs font-semibold text-slate-500 cursor-pointer">Equipment {eqIds.filter(id => board.equipDone[id]).length}/{eqIds.length} done</summary>
-                        <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-1">
-                          {line.assets.filter(a => eq[a.id]).map(a => (
-                            <label key={a.id} className="flex items-center gap-2 text-sm">
-                              <input type="checkbox" checked={!!board.equipDone[a.id]} onChange={e => { const v = e.target.checked; edit(b => ({ ...b, equipDone: { ...b.equipDone, [a.id]: v } })); }} className="accent-emerald-600" />
-                              <span className={board.equipDone[a.id] ? 'line-through text-slate-400' : ''}>{a.name}</span>
-                              <span className="ml-auto text-xs text-slate-400">{empById.get(eq[a.id])?.name}</span>
-                            </label>
-                          ))}
-                        </div>
-                      </details>
-                    )}
-                    <input value={board.notes[line.id] || ''} onChange={e => { const v = e.target.value; edit(b => ({ ...b, notes: { ...b.notes, [line.id]: v } })); }} placeholder="Note for the update (optional)" className="mt-2 w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg" />
-                  </div>
-                );
-              })}
-              {!downLines.length && <div className="bg-white border border-dashed border-slate-300 rounded-2xl p-10 text-center text-slate-500">Set up teams and lines first.</div>}
-            </section>
-
-            <section className="xl:col-span-2">
-              <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden xl:sticky xl:top-4">
-                <div className="bg-slate-100 p-3 border-b border-slate-200 flex flex-wrap items-center gap-2">
-                  <h3 className="font-bold text-slate-800 mr-auto">Shift update</h3>
-                  <button onClick={handleCopy} className={`px-3 py-2 rounded-lg text-white text-sm font-semibold flex items-center gap-1.5 ${copied === 'ok' ? 'bg-green-600' : 'bg-blue-600 hover:bg-blue-700'}`}>
-                    {copied === 'ok' ? <Check className="w-4 h-4" /> : <ClipboardCopy className="w-4 h-4" />}{copied === 'ok' ? 'Copied' : 'Copy'}
-                  </button>
-                  <button onClick={() => sendToTeams()} disabled={sending || !connected} className="px-3 py-2 rounded-lg bg-[#5b5fc7] hover:bg-[#4f52b2] text-white text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
-                    {sending ? <Loader className="w-4 h-4" /> : <Send className="w-4 h-4" />}Send to Teams
-                  </button>
-                </div>
-                <div className="px-3 py-2 border-b border-slate-100 flex flex-wrap items-center gap-2 text-xs text-slate-600">
-                  <label className="flex items-center gap-1.5 font-semibold cursor-pointer">
-                    <input type="checkbox" checked={board.autoSend} onChange={e => { const v = e.target.checked; edit(b => ({ ...b, autoSend: v })); }} className="accent-[#5b5fc7]" />
-                    Auto-send at 3, 9, 12 AM/PM
-                  </label>
-                  <span className="ml-auto">{nextSlot ? `Next: ${hm(nextSlot)}` : ''}{board.lastSentAt ? ` · Last sent ${hm(new Date(board.lastSentAt))}` : ''}</span>
-                </div>
-                {copied === 'manual' && <div className="px-3 py-2 bg-amber-50 text-amber-900 text-xs">Clipboard is blocked here. The text is selected, so press Ctrl+C.</div>}
-                <textarea ref={updateBoxRef} readOnly value={updateText} onFocus={e => e.target.select()} aria-label="Shift update text" className="w-full min-h-[24rem] p-3 text-sm font-mono bg-white outline-none" />
-              </div>
-            </section>
-          </div>
-        )}
-      </div>
+const ScreenTitle = ({ children, sub }: any) => (
+    <div className="mb-1">
+        <h1 className="text-xl font-black uppercase tracking-widest" style={{ color: BRAND.blueDark }}>{children}</h1>
+        {sub && <Text size={300} color="neutralSecondary" block>{sub}</Text>}
     </div>
-  );
+);
+
+const Grid = ({ items, columns, selectionMode, selectedItems, onSelectionChange }: any) => (
+    <DataGrid items={items} columns={columns} selectionMode={selectionMode} getRowId={(item: any) => getField(item, 'craa5__aa_employeeid')} selectedItems={selectedItems} onSelectionChange={onSelectionChange} className="bg-white rounded-xl border border-slate-200 shadow-sm">
+        <DataGridHeader style={{ background: BRAND.blueSoft }}><DataGridRow>{({ renderHeaderCell }: any) => <DataGridHeaderCell>{renderHeaderCell()}</DataGridHeaderCell>}</DataGridRow></DataGridHeader>
+        <DataGridBody>{({ item }: any) => <DataGridRow key={getField(item, 'craa5__aa_employeeid')} className="cursor-pointer">{({ renderCell }: any) => <DataGridCell>{renderCell(item)}</DataGridCell>}</DataGridRow>}</DataGridBody>
+    </DataGrid>
+);
+const nameColumn = (label: string) => createTableColumn({ columnId: "craa5_name", renderHeaderCell: () => <Text weight="bold">{label}</Text>, renderCell: (item: any) => <TableCellLayout media={<span>👤</span>}>{renderSafe(formatFullName(getField(item, 'craa5_name')))}</TableCellLayout> });
+const shiftColumn = createTableColumn({ columnId: "craa5_shift", renderHeaderCell: () => <Text weight="bold">Shift</Text>, renderCell: (item: any) => <TableCellLayout>{renderSafe(getFormattedField(item, 'craa5_shift') || getField(item, 'craa5_shift') || "N/A")}</TableCellLayout> });
+
+function SupervisorSelectionScreen({ supervisors, selectedSupervisorId, onSelect }: any) {
+    const columns = useMemo(() => [
+        nameColumn("Supervisor Name"),
+        createTableColumn({ columnId: "craa5_role", renderHeaderCell: () => <Text weight="bold">Role</Text>, renderCell: (item: any) => <TableCellLayout>{renderSafe(getFormattedField(item, 'craa5_role') || getField(item, 'craa5_role') || "Supervisor")}</TableCellLayout> }),
+        shiftColumn,
+    ], []);
+    return (
+        <div className="p-5 h-full flex flex-col max-w-[800px] mx-auto w-full box-border">
+            <div className="mb-6 text-center mt-10"><span className="text-5xl block mb-4">👋</span><Text as="h1" size={600} weight="semibold" block className="mb-2" style={{ color: BRAND.blueDark }}>Welcome to Shift Assignment</Text><Text size={400} color="neutralSecondary" block>Select a Supervisor below to view or manage their board.</Text></div>
+            <Grid items={supervisors} columns={columns} selectionMode="single" selectedItems={selectedSupervisorId ? new Set([selectedSupervisorId]) : new Set()} onSelectionChange={(e: any, data: any) => { const selected = Array.from(getSelectionValue(e, data))[0]; if (selected) onSelect(selected as string); }} />
+        </div>
+    );
 }
+
+function LeadSelectionScreen({ leads, selectedLeadIds, onSelectChange, onSearchCustom }: any) {
+    const [searchText, setSearchText] = useState("");
+    const columns = useMemo(() => [nameColumn("Lead Name"), shiftColumn], []);
+    return (
+        <div className="p-5 h-full flex flex-col box-border overflow-y-auto">
+            <ScreenTitle>Select Leads</ScreenTitle>
+            <div className="flex gap-2 my-4">
+                <Input placeholder="Search custom lead..." value={searchText} onChange={(e: any, d: any) => setSearchText(getInputValue(e, d))} />
+                <Button appearance="primary" onClick={() => { onSearchCustom(searchText); setSearchText(""); }}>Add</Button>
+            </div>
+            <Grid items={leads} columns={columns} selectionMode="multiselect" selectedItems={selectedLeadIds} onSelectionChange={(e: any, data: any) => onSelectChange(getSelectionValue(e, data))} />
+        </div>
+    );
+}
+
+function AreaSelectionScreen({ areas, selectedAreaIds, onSelectChange, onAddCustomArea }: any) {
+    const [searchText, setSearchText] = useState("");
+    const [customText, setCustomText] = useState("");
+    const filtered = areas.filter((a: any) => renderSafe(getField(a, 'craa5_area')).toLowerCase().includes(searchText.toLowerCase()));
+    const assignedList = filtered.filter((a: any) => selectedAreaIds.has(getField(a, 'craa5_aa_mss_areaid')));
+    const unassignedList = filtered.filter((a: any) => !selectedAreaIds.has(getField(a, 'craa5_aa_mss_areaid')));
+    const productionList = unassignedList.filter((a: any) => isProductionArea(a));
+    const supportingList = unassignedList.filter((a: any) => !isProductionArea(a));
+
+    const handleDrop = (e: React.DragEvent, assign: boolean) => {
+        const areaId = e.dataTransfer?.getData("areaId") || GLOBAL_DRAG_PAYLOAD;
+        if (!areaId) return;
+        const next = new Set(selectedAreaIds);
+        if (assign) next.add(areaId); else next.delete(areaId);
+        onSelectChange(next);
+        GLOBAL_DRAG_PAYLOAD = null;
+    };
+
+    const renderDraggableArea = (a: any) => {
+        const aId = getField(a, 'craa5_aa_mss_areaid');
+        return (
+            <div key={aId} draggable={true} onDragStart={e => { GLOBAL_DRAG_PAYLOAD = aId; if (e.dataTransfer) e.dataTransfer.setData("areaId", aId); }} className="p-3 bg-white border border-slate-200 rounded-lg mb-2 cursor-grab text-sm font-semibold text-slate-700 shadow-sm hover:border-[#0072CE]">
+                {renderSafe(getField(a, 'craa5_area'))} {getAreaEmoji(a)}
+            </div>
+        );
+    };
+
+    const column = (title: string, list: any[], assign: boolean, cls: string, titleColor: string, empty: string) => (
+        <div onDragOver={(e) => e.preventDefault()} onDrop={(e) => handleDrop(e, assign)} className={`flex-1 rounded-xl border-2 border-dashed p-4 flex flex-col box-border ${cls}`}>
+            <Text weight="bold" className="mb-3 uppercase tracking-wider" size={300} style={{ color: titleColor }}>{title} ({list.length})</Text>
+            <div className="flex-1 overflow-y-auto pr-1 pb-6">
+                {list.map(renderDraggableArea)}
+                {list.length === 0 && <Text size={200} color="neutralSecondary" className="italic">{empty}</Text>}
+            </div>
+        </div>
+    );
+
+    return (
+        <div className="p-5 h-full flex flex-col box-border">
+            <ScreenTitle>Select Active Areas</ScreenTitle>
+            <div className="flex justify-between my-4 flex-wrap gap-3">
+                <div className="flex gap-2 flex-wrap">
+                    <Input placeholder="Filter areas..." value={searchText} onChange={(e: any, d: any) => setSearchText(getInputValue(e, d))} />
+                    <Input placeholder="Custom area..." value={customText} onChange={(e: any, d: any) => setCustomText(getInputValue(e, d))} />
+                    <Button onClick={() => { if (customText.trim()) onAddCustomArea(customText.trim()); setCustomText(""); }}>Add Custom</Button>
+                </div>
+                <Button appearance="primary" onClick={() => {
+                    const next = new Set(selectedAreaIds);
+                    areas.filter((a: any) => !isEverydayArea(a) && isProductionArea(a)).forEach((a: any) => next.add(getField(a, 'craa5_aa_mss_areaid')));
+                    onSelectChange(next);
+                }}>Auto-Complete Non-Everyday</Button>
+            </div>
+            <div className="flex gap-5 flex-1 overflow-hidden">
+                {column("Supporting Areas", supportingList, false, "bg-slate-50 border-slate-300", "#334155", "No unassigned supporting areas found.")}
+                {column("Production Areas", productionList, false, "bg-[#FFF6E0] border-[#FFB81C]", "#8A5A00", "No unassigned production areas found.")}
+                {column("Assigned For Today", assignedList, true, "bg-[#E6F1FB] border-[#0072CE]", BRAND.blueDark, "Drag areas here to assign to leads...")}
+            </div>
+        </div>
+    );
+}
+
+// ============================================================================
+// MAIN COMPONENT
+// ============================================================================
+export function MainComponent(props: any) {
+    const propsRef = useRef(props); useEffect(() => { propsRef.current = props; }, [props]);
+
+    const [msUser, setMsUser] = useState<any>(null);
+    const [presetsApplied, setPresetsApplied] = useState(false);
+    const [hasAutoAssignedEveryday, setHasAutoAssignedEveryday] = useState(false);
+    const [collapsedBuckets, setCollapsedBuckets] = useState<Set<string>>(new Set());
+    const [currentStep, setCurrentStep] = useState(0);
+    const [currentShift, setCurrentShift] = useState("");          // from craa5_workshift
+    const [shiftStartMs, setShiftStartMs] = useState(0);
+    const [refreshToggle, setRefreshToggle] = useState(0);
+    const [appHeight, setAppHeight] = useState(window.innerHeight);
+    const [isLoading, setIsLoading] = useState(GLOBAL_INIT_STATUS !== 'COMPLETE');
+    const [adminMode, setAdminMode] = useState(false);
+    const [currentUser, setCurrentUser] = useState<any>(null);
+    const [selectedSupervisorId, setSelectedSupervisorId] = useState<string | null>(null);
+
+    // Core collections
+    const [supervisors, setSupervisors] = useState<any[]>([]);
+    const [leads, setLeads] = useState<any[]>([]);
+    const [employees, setEmployees] = useState<any[]>([]);
+    const [allEmployees, setAllEmployees] = useState<any[]>([]);
+    const [areas, setAreas] = useState<any[]>([]);
+    const [presetRecords, setPresetRecords] = useState<any[]>([]);
+
+    // Board
+    const [customLeads, setCustomLeads] = useState<any[]>([]);
+    const [selectedLeadIds, setSelectedLeadIds] = useState<Set<string>>(new Set());
+    const [customEmployees, setCustomEmployees] = useState<any[]>([]);
+    const [customAreas, setCustomAreas] = useState<any[]>([]);
+    const [selectedAreaIds, setSelectedAreaIds] = useState<Set<string>>(new Set());
+    const [empSearchText, setEmpSearchText] = useState("");
+    const [searchSuggestions, setSearchSuggestions] = useState<any[]>([]);
+    const [areaAssignments, setAreaAssignments] = useState<Record<string, string>>({});
+    const [assignments, setAssignments] = useState<Record<string, string[]>>({});
+    const [areaDetails, setAreaDetails] = useState<Record<string, { currentStatus: string, futureNotes: string, includeInUpdate?: boolean }>>({});
+    const [employeeStartTimes, setEmployeeStartTimes] = useState<Record<string, string>>({});
+    const [currentTime, setCurrentTime] = useState(Date.now());
+
+    const [clipboardFormat, setClipboardFormat] = useState<"headcount" | "initials" | "fullname">("headcount");
+    const [disableAutoLogin, setDisableAutoLogin] = useState(false);
+    const [saveSuccess, setSaveSuccess] = useState(false);
+    const [submissionError, setSubmissionError] = useState<string | null>(null);
+
+    const steps = ["Leads", "Areas", "Assign Areas", "Assign Employees", "Update Teams"];
+    const allKnownEmps = useMemo(() => [...allEmployees, ...customEmployees, ...leads, ...customLeads], [allEmployees, customEmployees, leads, customLeads]);
+
+    // Writes the area "include in update" flag (Xrm.WebApi, or the generative page's dataApi).
+    const updateAreaRecord = useCallback((areaId: string, data: any) => {
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(areaId)) return;   // custom / status areas aren't in Dataverse
+        const web = getWebApi(propsRef.current), dataApi = propsRef.current?.dataApi;
+        const p = web?.updateRecord ? web.updateRecord("craa5_aa_mss_area", areaId, data) : dataApi?.updateRow ? dataApi.updateRow("craa5_aa_mss_area", areaId, data) : null;
+        if (p) Promise.resolve(p).catch((e: any) => logError('Clipboard flag update failed', e?.message || e));
+    }, []);
+
+    const resolveUserIdentity = useCallback((u: any, ed: any[]) => {
+        if (!u?.email) return null;
+        const m = ed.find(e => getEmployeeEmail(e).toLowerCase().trim() === String(u.email).toLowerCase().trim());
+        return m ? { ...m, calculatedRole: roleOf(m) } : null;
+    }, []);
+
+    const hydrateState = useCallback((c: any) => {
+        if (!c) return;
+        // Shift and user first: React 17 renders each set separately, and the board defaults read these.
+        setCurrentShift(c.shift || ""); setShiftStartMs(c.shiftStartMs || 0); setMsUser(c.msUser || null);
+        setAllEmployees(c.allEmployees || []); setSupervisors(c.supervisors || []); setLeads(c.leads || []); setAreas(c.areas || []); setPresetRecords(c.presetRecords || []);
+        if (c.resolvedUser) {
+            setCurrentUser(c.resolvedUser);
+            if (c.resolvedUser.calculatedRole === 'manager') setAdminMode(true);
+            else if (c.resolvedUser.calculatedRole === 'supervisor') setSelectedSupervisorId(getField(c.resolvedUser, 'craa5__aa_employeeid'));
+        } else if ((c.msUser?.email || '').toLowerCase().includes('admin') || (c.msUser?.name || '').toLowerCase().includes('dev')) setAdminMode(true);
+    }, []);
+
+    const triggerSoftReset = useCallback(() => {
+        setPresetsApplied(false); setHasAutoAssignedEveryday(false); setSelectedLeadIds(new Set()); setSelectedAreaIds(new Set()); setAreaAssignments({}); setAssignments({}); setAreaDetails({}); setEmployeeStartTimes({}); setCustomLeads([]); setCustomAreas([]); setCustomEmployees([]); setRefreshToggle(p => p + 1); setCurrentStep(0);
+    }, []);
+
+    useEffect(() => { const i = setInterval(() => setCurrentTime(Date.now()), 60000); return () => clearInterval(i); }, []);
+    useEffect(() => { const r = () => setAppHeight(window.innerHeight); window.addEventListener('resize', r); return () => window.removeEventListener('resize', r); }, []);
+
+    const formatDuration = useCallback((iso?: string) => {
+        if (!iso) return "0m"; const ms = new Date(iso).getTime(); if (isNaN(ms)) return "0m";
+        return formatMsToDurationStr(currentTime - Math.max(ms, shiftStartMs));
+    }, [currentTime, shiftStartMs]);
+
+    // Fast lookups
+    const employeeMap = useMemo(() => { const m = new Map(); allKnownEmps.forEach(e => { const id = getField(e, 'craa5__aa_employeeid') || getField(e, 'craa5_aa_employeeid'); if (id) m.set(id, e); }); return m; }, [allKnownEmps]);
+    const areaMap = useMemo(() => { const m = new Map(); [...areas, ...customAreas].forEach(a => { const aId = getField(a, 'craa5_aa_mss_areaid'); if (aId) m.set(aId, a); }); return m; }, [areas, customAreas]);
+    const unselectedAvailableLeads = useMemo(() => leads.filter(l => !selectedLeadIds.has(getField(l, 'craa5__aa_employeeid')) && !isEmployeeUtilized(l)), [leads, selectedLeadIds]);
+
+    // Available staff: hides anyone whose latest task in the 16-hour lookback is still open
+    const availableStaff = useMemo(() => {
+        const latestEmpState = new Map();
+        [...presetRecords].sort(byTaskTime).forEach((t: any) => {
+            const eName = (getField(t, 'craa5_id') || "").trim();
+            const eGuid = getField(t, 'craa5__aaemp_guid') || getField(t, 'craa5_aaemp_guid') || "";
+            const empKey = (eGuid || eName).toLowerCase();
+            if (!empKey || empKey.includes('unassigned')) return;
+            latestEmpState.set(empKey, { task: t, eGuid, eName });
+        });
+        const activeDbGuids = new Set<string>(), activeDbNames = new Set<string>();
+        Array.from(latestEmpState.values()).forEach((s: any) => {
+            if (isTaskDone(s.task)) return;
+            if (s.eGuid) activeDbGuids.add(s.eGuid.toLowerCase());
+            if (s.eName) activeDbNames.add(s.eName.toLowerCase());
+        });
+        const assignedIds = new Set(Object.values(assignments).flat().map(id => String(id).toLowerCase()));
+        const customIds = new Set(customEmployees.map(ce => String(getField(ce, 'craa5__aa_employeeid')).toLowerCase()));
+        return [...employees, ...customEmployees, ...unselectedAvailableLeads].filter((e: any) => {
+            const eId = String(getField(e, 'craa5__aa_employeeid') || getField(e, 'craa5_aa_employeeid') || "").toLowerCase();
+            const eName = String(getField(e, 'craa5_name') || "").toLowerCase().trim();
+            if (selectedLeadIds.has(eId) || assignedIds.has(eId)) return false;
+            if (!customIds.has(eId) && (activeDbGuids.has(eId) || activeDbNames.has(eName) || isEmployeeUtilized(e))) return false;
+            return true;
+        });
+    }, [employees, customEmployees, unselectedAvailableLeads, presetRecords, selectedLeadIds, assignments]);
+
+    const activeBuckets = useMemo(() => {
+        const m = new Map(); const s = supervisors.find(x => getField(x, 'craa5__aa_employeeid') === selectedSupervisorId); if (s) m.set(getField(s, 'craa5__aa_employeeid'), s);
+        [...leads, ...customLeads].forEach(l => { const id = getField(l, 'craa5__aa_employeeid'); if (selectedLeadIds.has(id) && id !== selectedSupervisorId) m.set(id, l); });
+        return Array.from(m.values());
+    }, [supervisors, leads, customLeads, selectedLeadIds, selectedSupervisorId]);
+    const activeSupervisorObj = useMemo(() => supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId), [supervisors, selectedSupervisorId]);
+
+    // Tailwind runtime
+    useEffect(() => { if (!document.getElementById('tailwind-cdn')) { const s = document.createElement('script'); s.id = 'tailwind-cdn'; s.src = 'https://cdn.tailwindcss.com'; document.head.appendChild(s); } }, []);
+
+    // Failsafe: never leave the user stuck behind the loading screen
+    useEffect(() => { if (!isLoading) return; const f = setTimeout(() => { logError('Loading took over 15s; unlocking the screen.'); setIsLoading(false); setAdminMode(true); }, 15000); return () => clearTimeout(f); }, [isLoading]);
+
+    // --- LOAD (once per session; remounts reuse the cache) ---
+    useEffect(() => {
+        if (GLOBAL_INIT_STATUS === 'COMPLETE') { hydrateState(GLOBAL_DATA_CACHE); setIsLoading(false); return; }
+        if (GLOBAL_INIT_STATUS === 'FETCHING') { const i = setInterval(() => { if (GLOBAL_INIT_STATUS === 'COMPLETE') { clearInterval(i); hydrateState(GLOBAL_DATA_CACHE); setIsLoading(false); } }, 200); return () => clearInterval(i); }
+
+        GLOBAL_INIT_STATUS = 'FETCHING';
+        const loadEverything = async () => {
+            setIsLoading(true);
+            try {
+                // Microsoft account of whoever opened the app
+                const ctx = propsRef.current.context?.userSettings, p = propsRef.current, xrm = safeGetXrm();
+                let uName = ctx?.userName || p.userName, uId = ctx?.userId || p.userId, uEmail = ctx?.email || p.userEmail;
+                if ((!uName || !uId) && xrm?.Utility) { try { const xc = xrm.Utility.getGlobalContext().userSettings; uName = uName || xc.userName; uId = uId || xc.userId; } catch (e) {} }
+                if (uName) {
+                    if (!uEmail && uId && xrm?.WebApi) { try { const u = await asyncRace(xrm.WebApi.retrieveRecord("systemuser", String(uId).replace(/[{}]/g, ''), "?$select=internalemailaddress"), 4000, "systemuser email"); if (u?.internalemailaddress) uEmail = u.internalemailaddress; } catch (e) {} }
+                } else { uName = "Local Developer"; uEmail = "dev@localhost"; uId = "DEV-MODE-ID"; }
+                const msUser = { name: uName, email: uEmail || "", id: uId };
+
+                // Assignments from the last 16 hours (fetched as 24h, trimmed below)
+                const sixteenHoursAgoMs = Date.now() - 16 * 3600000;
+                const loadTasks = async (): Promise<any[]> => {
+                    if (xrm?.WebApi) {
+                        const attrs = ['taskassignmentid', 'id', 'lead', 'area', 'starttime', 'endtime', 'datetimeofassignment', 'shift', 'team', 'percentagecomplete', 'complete', '_currentstatus', 'whatisbeingdone', 'whatislefttodo', '_future_or_notes', 'badgenumber', 'leademail', 'supervisoremail', 'uid_associated', '_aaemp_guid', 'email'].map(a => `<attribute name='craa5_${a}'/>`).join('');
+                        const fetchXml = `<fetch top='5000'><entity name='craa5_taskassignment'>${attrs}<attribute name='createdon'/><attribute name='statecode'/><filter><condition attribute='createdon' operator='last-x-hours' value='24'/></filter><order attribute='createdon' descending='true'/></entity></fetch>`;
+                        try { const res = await asyncRace(xrm.WebApi.retrieveMultipleRecords("craa5_taskassignment", `?fetchXml=${encodeURIComponent(fetchXml)}`), API_TIMEOUT_MS, "Tasks WebApi"); if (Array.isArray(res?.entities)) return res.entities; } catch (e: any) { logError('Tasks via WebApi', e?.message || e); }
+                    }
+                    if (p.dataApi?.queryTable) {
+                        try { return await queryDataApi(p.dataApi, "craa5_taskassignment", `createdon ge ${new Date(sixteenHoursAgoMs).toISOString().replace(/\.\d{3}Z$/, 'Z')}`); } catch (e: any) { logError('Tasks via dataApi', e?.message || e); }
+                    }
+                    return p.inputPresets || [];
+                };
+
+                const [empRaw, areaRaw, shiftRows, ft] = await Promise.all([
+                    fetchFallbackRecords(["craa5__aa_employee", "craa5_aa_employee", "craa5__aa_employees"], p),
+                    fetchFallbackRecords(["craa5_aa_mss_area", "craa5_aa_mss_areas"], p),
+                    fetchFallbackRecords("craa5_workshift", p),
+                    loadTasks(),
+                ]);
+                const empData = empRaw.length ? empRaw : (p.inputEmployees || []);
+                const areaData = areaRaw.length ? areaRaw : (p.inputAreas || []);
+                const recent = ft.filter((r: any) => taskTime(r) >= sixteenHoursAgoMs);
+                const { crew, startMs } = findCurrentShift(parseWorkShiftRows(shiftRows));
+                if (!crew) logError('No craa5_workshift row covers the current time; shift left blank.');
+
+                const sups = empData.filter((e: any) => roleOf(e) === 'supervisor').sort((a: any, b: any) => (getField(a, 'craa5_name') || "").localeCompare(getField(b, 'craa5_name') || ""));
+                const lds = empData.filter((e: any) => roleOf(e) === 'lead');
+
+                GLOBAL_DATA_CACHE = { allEmployees: empData, supervisors: sups, leads: lds, areas: areaData, presetRecords: recent, msUser, shift: crew, shiftStartMs: startMs, resolvedUser: resolveUserIdentity(msUser, empData) };
+                GLOBAL_INIT_STATUS = 'COMPLETE'; hydrateState(GLOBAL_DATA_CACHE);
+            } catch (e: any) { logError('Loading failed', e?.message || e); GLOBAL_INIT_STATUS = 'COMPLETE'; } finally { setIsLoading(false); }
+        };
+        loadEverything();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [refreshToggle, hydrateState]);
+
+    // Shift staff for the selected supervisor
+    useEffect(() => {
+        if (!selectedSupervisorId || supervisors.length === 0 || allEmployees.length === 0) return;
+        const sup = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId); if (!sup) return;
+        const ts = getShiftOf(sup) || currentShift;
+        let staff = allEmployees.filter(e => getShiftOf(e) === ts);
+        if (staff.length === 0) staff = allEmployees;
+        setLeads(staff.filter(e => roleOf(e) === 'lead' && getField(e, 'craa5__aa_employeeid') !== selectedSupervisorId));
+        setEmployees(staff.filter(e => roleOf(e) !== 'lead' && roleOf(e) !== 'supervisor' && getField(e, 'craa5__aa_employeeid') !== selectedSupervisorId));
+    }, [selectedSupervisorId, supervisors, allEmployees, refreshToggle, currentShift]);
+
+    // Default board: supervisors get their own (set at sign-in); everyone else — leads, managers,
+    // the app owner — lands on the supervisor of the current shift.
+    useEffect(() => {
+        if (isLoading || disableAutoLogin || supervisors.length === 0 || selectedSupervisorId) return;
+        const onShiftSup = (currentShift && supervisors.find(s => getShiftOf(s) === currentShift))
+            || (currentUser && supervisors.find(s => getShiftOf(s) === getShiftOf(currentUser)))
+            || supervisors[0];
+        if (onShiftSup) setSelectedSupervisorId(getField(onShiftSup, 'craa5__aa_employeeid'));
+    }, [isLoading, supervisors, selectedSupervisorId, disableAutoLogin, currentShift, currentUser]);
+
+    // Rebuild the board from this supervisor's open assignments
+    useEffect(() => {
+        if (presetsApplied || presetRecords.length === 0 || supervisors.length === 0 || areas.length === 0 || allEmployees.length === 0 || !selectedSupervisorId) return;
+        const sup = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId); if (!sup) return;
+        const targetShift = getShiftOf(sup) || currentShift;
+        const supName = (getField(sup, 'craa5_name') || "").toLowerCase();
+        const tr = presetRecords.filter(r => (getField(r, 'craa5_team') || "").toLowerCase() === supName && normalizeShift(getFormattedField(r, 'craa5_shift') || getField(r, 'craa5_shift')) === targetShift);
+        if (tr.length === 0) { setPresetsApplied(true); return; }
+
+        const nl = new Set<string>(), na = new Set<string>(selectedAreaIds), aa: any = {}, as: any = {}, ad: any = {}, est: any = {}, cl: any[] = [], ca: any[] = [], ce: any[] = [];
+        const activeEmpRecords = new Map(), latestAreaState = new Map();
+        [...tr].sort(byTaskTime).forEach(r => {
+            const id = getField(r, 'craa5_id')?.trim(), area = getField(r, 'craa5_area')?.trim();
+            if (area) latestAreaState.set(area.toLowerCase(), r);
+            if (id && !id.toLowerCase().includes('unassigned')) {
+                const empKey = getField(r, 'craa5__aaemp_guid') || id.toLowerCase();
+                if (isTaskDone(r)) activeEmpRecords.delete(empKey); else activeEmpRecords.set(empKey, r);
+            }
+        });
+
+        const ensureAreaAndLead = (r: any) => {
+            const ln = getField(r, 'craa5_lead')?.trim() || "", an = getField(r, 'craa5_area')?.trim() || "";
+            if (!ln || !an) return null;
+            const latestAreaRec = latestAreaState.get(an.toLowerCase()) || r;
+            const stat = getField(latestAreaRec, 'craa5_whatisbeingdone') || getField(latestAreaRec, 'craa5__currentstatus') || "";
+            const nts = getField(latestAreaRec, 'craa5_whatislefttodo') || getField(latestAreaRec, 'craa5__future_or_notes') || "";
+            const isSup = supName === ln.toLowerCase();
+            let lId = isSup ? selectedSupervisorId : "";
+            if (!isSup) {
+                let lo = [...leads, ...customLeads, ...cl].find(l => (getField(l, 'craa5_name') || "").trim().toLowerCase() === ln.toLowerCase());
+                if (!lo) { lo = allEmployees.find(e => (getField(e, 'craa5_name') || "").toLowerCase() === ln.toLowerCase()) || { craa5__aa_employeeid: `pl_${Date.now()}_${Math.random()}`, craa5_name: ln, craa5_role: 256000001 }; cl.push(lo); }
+                lId = getField(lo, 'craa5__aa_employeeid'); nl.add(lId);
+            }
+            if (!lId) return null;
+            let ao = [...areas, ...customAreas, ...ca].find(a => renderSafe(getField(a, 'craa5_area')).trim().toLowerCase() === an.toLowerCase());
+            if (!ao) { ao = { craa5_aa_mss_areaid: `pa_${Date.now()}_${Math.random()}`, craa5_area: an }; ca.push(ao); }
+            const aId = getField(ao, 'craa5_aa_mss_areaid');
+            na.add(aId); aa[aId] = lId;
+            if (!ad[aId]) { const cb = getField(ao, 'craa5_clipboard') ?? getFormattedField(ao, 'craa5_clipboard'); ad[aId] = { currentStatus: stat, futureNotes: nts, includeInUpdate: isBoolTrue(cb) || (cb === undefined && isProductionArea(ao)) }; }
+            return aId;
+        };
+
+        Array.from(activeEmpRecords.values()).forEach(r => {
+            const aId = ensureAreaAndLead(r); if (!aId) return;
+            const en = getField(r, 'craa5_id')?.trim() || "";
+            let eo = [...allEmployees, ...customEmployees, ...leads, ...ce].find(e => (getField(e, 'craa5_name') || "").trim().toLowerCase() === en.toLowerCase());
+            const fallbackGuid = getField(r, 'craa5__aaemp_guid') || getField(r, 'craa5_aaemp_guid') || `pe_${Date.now()}_${Math.random()}`;
+            if (eo && (nl.has(getField(eo, 'craa5__aa_employeeid')) || selectedSupervisorId === getField(eo, 'craa5__aa_employeeid'))) return;   // leads aren't crew
+            if (!eo) { eo = { craa5__aa_employeeid: fallbackGuid, craa5_name: en, craa5_email: getField(r, 'craa5_email') || "", craa5_badgenumber: getField(r, 'craa5_badgenumber') || "" }; ce.push(eo); }
+            const eid = getField(eo, 'craa5__aa_employeeid') || getField(eo, 'craa5_aa_employeeid') || fallbackGuid;
+            if (!as[aId]) as[aId] = [];
+            if (!as[aId].includes(eid)) { as[aId].push(eid); est[eid] = getField(r, 'craa5_starttime') || getField(r, 'craa5_datetimeofassignment') || new Date().toISOString(); }
+        });
+        Array.from(latestAreaState.values()).forEach(r => { if (!isTaskDone(r)) ensureAreaAndLead(r); });
+
+        if (cl.length) setCustomLeads(p => [...p, ...cl]);
+        if (ca.length) setCustomAreas(p => [...p, ...ca]);
+        if (ce.length) setCustomEmployees(p => [...p, ...ce]);
+        setSelectedLeadIds(nl); setSelectedAreaIds(na); setAreaAssignments(aa); setAssignments(as); setAreaDetails(ad); setEmployeeStartTimes(est); setPresetsApplied(true); setCurrentStep(4);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [presetRecords, presetsApplied, supervisors, areas, leads, selectedSupervisorId, allEmployees]);
+
+    // Everyday areas start in "Assigned For Today"
+    useEffect(() => {
+        if (areas.length > 0 && selectedSupervisorId && !hasAutoAssignedEveryday) {
+            const ea = areas.filter(isEverydayArea);
+            if (ea.length > 0) setSelectedAreaIds(prev => { const next = new Set(prev); ea.forEach(a => next.add(getField(a, 'craa5_aa_mss_areaid'))); return next; });
+            setHasAutoAssignedEveryday(true);
+        }
+    }, [areas, selectedSupervisorId, hasAutoAssignedEveryday]);
+
+    // ============================================================================
+    // INTERACTION HANDLERS
+    // ============================================================================
+    const isOvertimeCandidate = useCallback((e: any) => roleOf(e) !== 'supervisor' && getField(e, 'craa5__aa_employeeid') !== selectedSupervisorId && !selectedLeadIds.has(getField(e, 'craa5__aa_employeeid')), [selectedSupervisorId, selectedLeadIds]);
+
+    useEffect(() => {
+        const delay = setTimeout(() => {
+            if (empSearchText.length < 2) { setSearchSuggestions([]); return; }
+            const q = empSearchText.toLowerCase();
+            const matches = allEmployees.filter((e: any) => renderSafe(getField(e, 'craa5_name')).toLowerCase().includes(q) && isOvertimeCandidate(e));
+            setSearchSuggestions(Array.from(new Map(matches.map(item => [getField(item, 'craa5__aa_employeeid'), item])).values()));
+        }, 300);
+        return () => clearTimeout(delay);
+    }, [empSearchText, allEmployees, isOvertimeCandidate]);
+
+    const removeFromAllAreas = (ids: string[]) => setAssignments(prev => { const next = { ...prev }; Object.keys(next).forEach(areaId => { next[areaId] = next[areaId].filter(id => !ids.includes(id)); }); return next; });
+
+    const handleAddSuggestedEmployee = (emp: any) => {
+        const empId = getField(emp, 'craa5__aa_employeeid');
+        removeFromAllAreas([empId]);
+        setCustomEmployees(prev => prev.find(e => getField(e, 'craa5__aa_employeeid') === empId) ? prev : [...prev, emp]);
+        setEmpSearchText(""); setSearchSuggestions([]);
+    };
+
+    const handleSearchCustomEmployee = (name: string) => {
+        if (!name.trim()) return;
+        const found = allEmployees.filter((e: any) => renderSafe(getField(e, 'craa5_name')).toLowerCase().includes(name.toLowerCase()) && isOvertimeCandidate(e));
+        if (!found.length) { alert("No matching employees found for overtime."); return; }
+        const newEmps = found.filter((r: any) => !customEmployees.some(emp => getField(emp, 'craa5__aa_employeeid') === getField(r, 'craa5__aa_employeeid')));
+        removeFromAllAreas(newEmps.map(e => getField(e, 'craa5__aa_employeeid')));
+        setEmployeeStartTimes(prev => { const next = { ...prev }; newEmps.forEach(emp => { next[getField(emp, 'craa5__aa_employeeid')] = new Date().toISOString(); }); return next; });
+        setCustomEmployees(p => [...p, ...newEmps]); setEmpSearchText(""); setSearchSuggestions([]);
+    };
+
+    const handleSearchCustomLead = (name: string) => {
+        if (!name.trim()) return;
+        const found = allEmployees.filter((e: any) => renderSafe(getField(e, 'craa5_name')).toLowerCase().includes(name.toLowerCase()) && getField(e, 'craa5__aa_employeeid') !== selectedSupervisorId);
+        if (found.length) setCustomLeads(p => { const existing = new Set(p.map(l => getField(l, 'craa5__aa_employeeid'))); return [...p, ...found.filter((r: any) => !existing.has(getField(r, 'craa5__aa_employeeid')))]; });
+    };
+
+    const toggleBucket = (id: string) => setCollapsedBuckets(prev => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next; });
+
+    const handleRemoveLead = (leadIdToRemove: string) => {
+        const fallbackLeadId = Array.from(selectedLeadIds).find(id => id !== leadIdToRemove) || selectedSupervisorId; if (!fallbackLeadId) return;
+        setAreaAssignments(prev => { const next = { ...prev }; Object.keys(next).forEach(areaId => { if (next[areaId] === leadIdToRemove) next[areaId] = fallbackLeadId; }); return next; });
+        setSelectedLeadIds(prev => { const next = new Set(prev); next.delete(leadIdToRemove); return next; });
+    };
+
+    const handleImpersonate = (supId: string) => { setDisableAutoLogin(true); setSelectedSupervisorId(supId); triggerSoftReset(); };
+
+    const handleSetEmployeeStatus = (empId: string, status: string) => {
+        let area = [...areas, ...customAreas].find(a => renderSafe(getField(a, 'craa5_area')).toLowerCase() === status.toLowerCase());
+        if (!area) { area = { craa5_aa_mss_areaid: `status_${Date.now()}`, craa5_area: status }; setCustomAreas(p => [...p, area]); }
+        const aId = getField(area, 'craa5_aa_mss_areaid');
+        setEmployeeStartTimes(prev => ({ ...prev, [empId]: new Date().toISOString() }));
+        setSelectedAreaIds(p => new Set(p).add(aId));
+        setAreaAssignments(p => ({ ...p, [aId]: selectedSupervisorId! }));
+        setAssignments(prev => { const next = { ...prev }; Object.keys(next).forEach(k => { next[k] = next[k].filter(id => id !== empId); }); next[aId] = [...(next[aId] || []), empId]; return next; });
+    };
+
+    const toggleIncludeInUpdate = (aid: string, include: boolean) => {
+        setAreaDetails(p => ({ ...p, [aid]: { ...p[aid], includeInUpdate: include } }));
+        updateAreaRecord(aid, { craa5_clipboard: include });
+    };
+
+    const handleCopyToClipboard = useCallback(() => {
+        const inc = (id: string) => areaDetails[id]?.includeInUpdate ?? isProductionArea(areaMap.get(id));
+        // One entry per area name, only ticked areas that have people in them
+        const uniqueAreasToPrint = new Map<string, string>();
+        Object.keys(areaAssignments).forEach(id => {
+            if (!inc(id) || !assignments[id]?.length) return;
+            const an = renderSafe(getField(areaMap.get(id), 'craa5_area'));
+            if (!uniqueAreasToPrint.has(an)) uniqueAreasToPrint.set(an, id);
+        });
+        const validIds = Array.from(uniqueAreasToPrint.values());
+        const isStatus = (id: string) => isStatusArea(getField(areaMap.get(id), 'craa5_area'));
+
+        let th = 0, osh = 0;
+        activeBuckets.forEach(l => {
+            validIds.filter(id => areaAssignments[id] === getField(l, 'craa5__aa_employeeid') && !isStatus(id)).forEach(id => {
+                const ea = assignments[id] || [];
+                th += ea.length;
+                ea.forEach(eId => { const e = employeeMap.get(eId); if (e && getShiftOf(e) !== currentShift) osh++; });
+            });
+        });
+
+        const sc = validIds.filter(isStatus).reduce((a: any, id) => { const n = (getField(areaMap.get(id), 'craa5_area') || "").toLowerCase(); a[n] = (a[n] || 0) + (assignments[id]?.length || 0); return a; }, {});
+        let txt = `Shift Progress Update\nHeadcount: ${th}\n${osh > 0 ? `Off-Shift Employees Assigned: ${osh}\n` : ''}`;
+        const ats = ["pto", "sick", "late", "left early"].filter(k => sc[k]).map(k => `${k.toUpperCase()} (${sc[k]})`).join(", ");
+        if (ats) txt += `Attendance: ${ats}\n`;
+        txt += "\n";
+
+        const getInitials = (fn: string) => { const parts = (fn || "").trim().split(/\s+/).filter(Boolean); if (!parts.length) return ""; return parts.length === 1 ? parts[0].charAt(0).toUpperCase() : (parts[0].charAt(0) + parts[parts.length - 1].charAt(0)).toUpperCase(); };
+        const fes = (id: string) => { const empName = formatFullName(getField(employeeMap.get(id), 'craa5_name')); return `${clipboardFormat === 'fullname' ? empName : getInitials(empName)} [${formatDuration(employeeStartTimes[id])}]`; };
+        const rab = (id: string) => {
+            const a = areaMap.get(id), an = renderSafe(getField(a, 'craa5_area')), d = areaDetails[id] || {} as any;
+            const ns = d.futureNotes ? ` - What is left to do: ${d.futureNotes}` : (d.currentStatus ? ` - ${d.currentStatus}` : '');
+            let b = `📍 ${an} (${assignments[id]?.length || 0})${getAreaEmoji(a)}${ns}\n`;
+            if (clipboardFormat !== "headcount" && assignments[id]?.length) b += `   Personnel: ${assignments[id].map(fes).join(", ")}\n`;
+            return b;
+        };
+
+        const sa = validIds.filter(isStatus);
+        if (sa.length && clipboardFormat !== "headcount") { txt += `--- Time & Attendance ---\n`; sa.forEach(id => txt += `📍 ${renderSafe(getField(areaMap.get(id), 'craa5_area'))} (${assignments[id]?.length || 0}): ${assignments[id]?.length ? assignments[id].map(fes).join(", ") : "None"}\n`); txt += "\n"; }
+        const pa = validIds.filter(id => isProductionArea(areaMap.get(id)) && !isStatus(id));
+        if (pa.length) { txt += `--- Production Areas ---\n`; pa.forEach(id => txt += rab(id)); }
+        const ed = validIds.filter(id => !isProductionArea(areaMap.get(id)) && !isStatus(id));
+        if (ed.length) { txt += `\n--- Supporting Tasks ---\n`; ed.forEach(id => txt += rab(id)); }
+
+        copyTextToClipboard(txt); alert("Copied to clipboard!");
+    }, [areaDetails, areaMap, activeBuckets, areaAssignments, assignments, employeeMap, currentShift, clipboardFormat, employeeStartTimes, formatDuration]);
+
+    // ============================================================================
+    // SAVE PROGRESS — closes the shift's open rows and writes the current board
+    // through the new_BulkUpsertTaskAssignments plugin.
+    // ============================================================================
+    const handleSubmission = async () => {
+        setIsLoading(true); setSaveSuccess(false); setSubmissionError(null);
+        const supervisor = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId);
+        const boardShift = currentShift || getShiftOf(supervisor);
+        try {
+            Object.keys(areaAssignments).forEach(areaId => {
+                const details = areaDetails[areaId] || {} as any;
+                updateAreaRecord(areaId, { craa5_clipboard: details.includeInUpdate !== undefined ? details.includeInUpdate : isProductionArea(areaMap.get(areaId)) });
+            });
+
+            const supNameRaw = renderSafe(getField(supervisor, 'craa5_name'));
+            let fetchedTasks: any[] = [];
+            const xrmApi = safeGetXrm()?.WebApi;
+            if (xrmApi?.retrieveMultipleRecords) {
+                const attrs = ['taskassignmentid', 'id', 'lead', 'area', 'starttime', 'endtime', 'datetimeofassignment', 'shift', 'team', 'percentagecomplete', 'complete', '_currentstatus', 'whatisbeingdone', 'whatislefttodo', '_future_or_notes', 'badgenumber', 'leademail', 'supervisoremail', 'uid_associated', '_aaemp_guid', 'email'].map(a => `<attribute name='craa5_${a}'/>`).join('');
+                const fetchXml = `<fetch top='5000'><entity name='craa5_taskassignment'>${attrs}<attribute name='createdon'/><attribute name='statecode'/><filter><condition attribute='createdon' operator='last-x-hours' value='16'/><condition attribute='craa5_team' operator='eq' value='${supNameRaw.replace(/&/g, '&amp;').replace(/'/g, "&apos;")}'/></filter><order attribute='createdon' descending='true'/></entity></fetch>`;
+                try { const res = await asyncRace(xrmApi.retrieveMultipleRecords("craa5_taskassignment", "?fetchXml=" + encodeURIComponent(fetchXml)), API_TIMEOUT_MS, "Submission tasks"); if (Array.isArray(res?.entities)) fetchedTasks = res.entities; } catch (e: any) { logError('Submission tasks via WebApi', e?.message || e); }
+            }
+            if (!fetchedTasks.length && propsRef.current.dataApi?.queryTable) {
+                try { fetchedTasks = await queryDataApi(propsRef.current.dataApi, "craa5_taskassignment", `createdon ge ${new Date(Date.now() - 16 * 3600000).toISOString().replace(/\.\d{3}Z$/, 'Z')} and craa5_team eq '${supNameRaw.replace(/'/g, "''")}'`); } catch (e: any) { logError('Submission tasks via dataApi', e?.message || e); }
+            }
+
+            const findEmpByName = (name: string) => name ? allKnownEmps.find((e: any) => renderSafe(getField(e, 'craa5_name')).trim().toLowerCase() === name.trim().toLowerCase()) : null;
+            const getEmailForName = (name: string) => renderSafe(getEmployeeEmail(findEmpByName(name)));
+            const getBadgeForName = (name: string) => renderSafe(getEmployeeBadge(findEmpByName(name)));
+            const nowIso = new Date().toISOString();
+            const taskPayloads: any[] = [];
+
+            // 1. Close every still-open task already logged for this team in the shift
+            fetchedTasks.forEach((t: any) => {
+                if (isTaskDone(t)) return;
+                taskPayloads.push({
+                    taskId: t.craa5_taskassignmentid, isComplete: true, percentage: "100", currentStatus: "Completed",
+                    futureNotes: t.craa5_whatislefttodo || t.craa5__future_or_notes || "", endTime: nowIso, craa5_endtime: nowIso,
+                    area: t.craa5_area, lead: t.craa5_lead, leadEmail: t.craa5_leademail, craa5_leademail: t.craa5_leademail, "Lead Email": t.craa5_leademail,
+                    empName: t.craa5_id || "", empEmail: t.craa5_email, craa5_email: t.craa5_email, Email: t.craa5_email, empGuid: t.craa5__aaemp_guid,
+                    badgeNumber: t.craa5_badgenumber, craa5_badgenumber: t.craa5_badgenumber, badgenumber: t.craa5_badgenumber,
+                    supervisorEmail: t.craa5_supervisoremail, craa5_supervisoremail: t.craa5_supervisoremail, "supervisor email": t.craa5_supervisoremail,
+                    shift: boardShift, team: t.craa5_team, equipment: "", equipGuid: "", startTime: t.craa5_starttime, craa5_starttime: t.craa5_starttime,
+                });
+            });
+
+            // 2. Fresh rows for the whole board as it stands now
+            const supEmail = renderSafe(getEmployeeEmail(supervisor));
+            for (const areaId of Object.keys(areaAssignments)) {
+                const lead = employeeMap.get(areaAssignments[areaId]) || supervisor;
+                const leadEmail = getEmailForName(getField(lead, 'craa5_name')) || renderSafe(getEmployeeEmail(lead));
+                const details = areaDetails[areaId] || { currentStatus: '', futureNotes: '' };
+                const finished = String(details.currentStatus).trim().toLowerCase() === "completed";
+                const base: any = {
+                    taskId: "", area: renderSafe(getField(areaMap.get(areaId), 'craa5_area')), lead: renderSafe(getField(lead, 'craa5_name')),
+                    leadEmail, craa5_leademail: leadEmail, "Lead Email": leadEmail,
+                    supervisorEmail: supEmail, craa5_supervisoremail: supEmail, "supervisor email": supEmail,
+                    shift: boardShift, team: supNameRaw, equipment: "", equipGuid: "",
+                    percentage: finished ? "100" : "0", isComplete: finished, currentStatus: finished ? "Completed" : (details.currentStatus || "Working"),
+                    futureNotes: details.futureNotes || "", craa5__future_or_notes: details.futureNotes || "",
+                    endTime: finished ? nowIso : "", craa5_endtime: finished ? nowIso : "",
+                };
+                const empIds = assignments[areaId] || [];
+                if (empIds.length === 0) {
+                    taskPayloads.push({ ...base, empName: "", craa5_id: "", empEmail: "", craa5_email: "", Email: "", empGuid: "", craa5__aaemp_guid: "", badgeNumber: "", craa5_badgenumber: "", badgenumber: "", startTime: nowIso, craa5_starttime: nowIso });
+                    continue;
+                }
+                for (const eid of empIds) {
+                    const emp = employeeMap.get(eid); if (!emp) continue;
+                    const name = renderSafe(getField(emp, 'craa5_name'));
+                    const empEmail = getEmailForName(name) || renderSafe(getEmployeeEmail(emp));
+                    const empBadge = getBadgeForName(name) || renderSafe(getEmployeeBadge(emp));
+                    const empGuid = getField(emp, 'craa5__aa_employeeid') || "";
+                    const est = employeeStartTimes[eid] || nowIso;
+                    taskPayloads.push({ ...base, empName: name, craa5_id: name, empEmail, craa5_email: empEmail, Email: empEmail, empGuid, craa5__aaemp_guid: empGuid, badgeNumber: empBadge, craa5_badgenumber: empBadge, badgenumber: empBadge, startTime: est, craa5_starttime: est });
+                }
+            }
+
+            if (taskPayloads.length) {
+                const dbXrm = safeGetXrm();
+                if (!dbXrm?.WebApi?.online?.execute) throw new Error("Dataverse Action API not available.");
+                const res = await dbXrm.WebApi.online.execute({
+                    TaskPayloadJSON: JSON.stringify(taskPayloads),
+                    getMetadata: () => ({ boundParameter: null, parameterTypes: { "TaskPayloadJSON": { typeName: "Edm.String", structuralProperty: 1 } }, operationType: 0, operationName: "new_BulkUpsertTaskAssignments" }),
+                });
+                if (!res.ok) throw new Error("Plugin execution failed.");
+            }
+            setSaveSuccess(true); setCurrentStep(4);
+        } catch (err: any) {
+            logError('Save Progress failed', err?.message || err);
+            setSubmissionError(renderSafe(err?.message || err || "An unexpected error occurred while saving to Dataverse."));
+        } finally { setIsLoading(false); }
+    };
+
+    // ============================================================================
+    // RENDER
+    // ============================================================================
+    let SC;
+    if (!currentUser) SC = (
+        <div className="flex items-center justify-center min-h-full p-5">
+            <div className="bg-white shadow-lg border border-slate-200 rounded-2xl w-full max-w-[400px] overflow-hidden">
+                <div className="bg-white border-b-4 border-[#FFB81C] p-5 flex flex-col items-center gap-2"><BrandLogo /><h2 className="text-lg font-black uppercase tracking-widest" style={{ color: BRAND.blueDark }}>Supervisor Hub</h2></div>
+                <AuthBox users={allEmployees} onLogin={(u: any) => hydrateState({ ...GLOBAL_DATA_CACHE, resolvedUser: { ...u, calculatedRole: roleOf(u) } })} />
+            </div>
+        </div>
+    );
+    else if (!selectedSupervisorId) SC = <SupervisorSelectionScreen supervisors={supervisors} selectedSupervisorId={selectedSupervisorId} onSelect={handleImpersonate} />;
+    else if (currentStep === 0) SC = <LeadSelectionScreen leads={[...leads, ...customLeads]} selectedLeadIds={selectedLeadIds} onSelectChange={setSelectedLeadIds} onSearchCustom={handleSearchCustomLead} />;
+    else if (currentStep === 1) SC = <AreaSelectionScreen areas={[...areas, ...customAreas]} selectedAreaIds={selectedAreaIds} onSelectChange={setSelectedAreaIds} onAddCustomArea={(n: string) => setCustomAreas(p => [...p, { craa5_aa_mss_areaid: `c_${Date.now()}`, craa5_area: n, craa5_production: true }])} />;
+    else if (currentStep === 2 || currentStep === 3) SC = (
+        <div className="flex flex-col h-full p-5 overflow-x-auto box-border">
+            <div className="flex gap-6 flex-1 items-stretch min-h-0">
+                <div className="w-[280px] shrink-0 bg-white rounded-xl border border-slate-200 p-4 flex flex-col h-full max-h-[calc(100vh-250px)] shadow-sm">
+                    <div className="shrink-0 flex flex-col gap-3 mb-3">
+                        <Text weight="bold" className="uppercase tracking-wider" style={{ color: BRAND.blueDark }}>{currentStep === 2 ? "Select Areas" : "Available Staff"}</Text>
+                        {currentStep > 2 && (
+                            <div className="relative">
+                                <div className="flex gap-2">
+                                    <Input size="small" placeholder="Search OT staff..." value={empSearchText} onChange={(e: any, d: any) => setEmpSearchText(getInputValue(e, d))} className="flex-1" onKeyDown={(e) => { if (e.key === 'Enter') { if (searchSuggestions.length > 0) handleAddSuggestedEmployee(searchSuggestions[0]); else handleSearchCustomEmployee(empSearchText); } }} />
+                                    <Button size="small" appearance="primary" onClick={() => handleSearchCustomEmployee(empSearchText)}>Add</Button>
+                                </div>
+                                {searchSuggestions.length > 0 && (
+                                    <div className="absolute top-full left-0 right-0 bg-white border border-slate-300 rounded-lg z-50 max-h-[150px] overflow-y-auto shadow-md mt-1">
+                                        {searchSuggestions.map(s => <div key={getField(s, 'craa5__aa_employeeid')} onClick={() => handleAddSuggestedEmployee(s)} className="p-2 cursor-pointer border-b border-slate-100 hover:bg-[#E6F1FB] flex justify-between items-center"><Text>{formatFullName(getField(s, 'craa5_name'))}</Text>{getShiftOf(s) && <Badge size="small" appearance="outline" color="brand">Shift {getShiftOf(s)}</Badge>}</div>)}
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                        <Divider />
+                    </div>
+                    <div className="flex-1 overflow-y-auto pr-1">
+                        {currentStep === 2
+                            ? [...areas, ...customAreas].filter(a => selectedAreaIds.has(getField(a, 'craa5_aa_mss_areaid')) && !areaAssignments[getField(a, 'craa5_aa_mss_areaid')]).map(a => (
+                                <div key={getField(a, 'craa5_aa_mss_areaid')} draggable={true} onDragStart={e => { GLOBAL_DRAG_PAYLOAD = getField(a, 'craa5_aa_mss_areaid'); if (e.dataTransfer) e.dataTransfer.setData("areaId", getField(a, 'craa5_aa_mss_areaid')); }} className={`p-3 rounded-lg mb-2 cursor-grab text-sm font-semibold border ${isProductionArea(a) ? 'bg-[#FFF6E0] border-[#FFB81C] text-slate-800' : 'bg-slate-50 border-slate-200 text-slate-700'}`}>{renderSafe(getField(a, 'craa5_area'))} {getAreaEmoji(a)}</div>
+                            ))
+                            : availableStaff.map(e => (
+                                <div key={getField(e, 'craa5__aa_employeeid')} draggable={true} onDragStart={ev => { ev.dataTransfer.setData("empId", getField(e, 'craa5__aa_employeeid')); ev.stopPropagation(); }} className="p-3 bg-white border border-slate-200 rounded-lg mb-2 cursor-grab shadow-sm hover:border-[#0072CE]">
+                                    <Text size={200} weight="semibold" block>{formatFullName(getField(e, 'craa5_name'))}</Text>
+                                    {getField(e, 'craa5_email') && <Badge size="small" appearance="outline" color="brand">AAD Linked</Badge>}
+                                    <div className="flex flex-wrap gap-1 mt-2">{["PTO", "Sick", "Late", "Left Early"].map(s => <Button key={s} size="small" appearance="subtle" className="px-1 text-[9px] h-5" onClick={() => handleSetEmployeeStatus(getField(e, 'craa5__aa_employeeid'), s)}>{s}</Button>)}</div>
+                                </div>
+                            ))}
+                    </div>
+                </div>
+                <div className="flex gap-5 flex-1 h-full items-stretch overflow-x-auto pb-2">
+                    {activeBuckets.map(lead => {
+                        const leadId = getField(lead, 'craa5__aa_employeeid');
+                        return (
+                            <BucketColumn key={leadId} lead={lead} isSupervisor={roleOf(lead) === 'supervisor'} isCollapsed={collapsedBuckets.has(leadId)} onToggle={() => toggleBucket(leadId)} onRemoveLead={() => handleRemoveLead(leadId)}
+                                onDrop={(e: any) => { const aid = e.dataTransfer?.getData("areaId") || GLOBAL_DRAG_PAYLOAD; if (aid) setAreaAssignments(p => ({ ...p, [aid]: leadId })); GLOBAL_DRAG_PAYLOAD = null; }}
+                                onSetStatus={(s: string) => handleSetEmployeeStatus(leadId, s)}>
+                                {Object.keys(areaAssignments).filter(aid => areaAssignments[aid] === leadId).map(aid => {
+                                    const a = areaMap.get(aid);
+                                    return (
+                                        <div key={aid} draggable={true} onDragStart={ev => { GLOBAL_DRAG_PAYLOAD = aid; if (ev.dataTransfer) ev.dataTransfer.setData("areaId", aid); }} className={`p-2 bg-white rounded-lg border border-slate-200 border-l-4 relative shadow-sm cursor-grab flex flex-col ${isProductionArea(a) ? 'border-l-[#FFB81C]' : 'border-l-[#0072CE]'}`}>
+                                            <div className="flex justify-between mb-2"><Text weight="bold" size={200}>{renderSafe(getField(a, 'craa5_area'))}{getAreaEmoji(a)}</Text><Button appearance="subtle" size="small" className="min-w-0 px-1" onClick={() => setAreaAssignments(p => { const n = { ...p }; delete n[aid]; return n; })}>✖</Button></div>
+                                            <div onDragOver={e => e.preventDefault()} onDrop={e => { const eid = e.dataTransfer.getData("empId"); if (!eid) return; e.stopPropagation(); setAssignments(p => { const x = { ...p }; Object.keys(x).forEach(k => x[k] = x[k].filter(i => i !== eid)); if (!x[aid]) x[aid] = []; if (!x[aid].includes(eid)) x[aid] = [...x[aid], eid]; return x; }); setEmployeeStartTimes(s => ({ ...s, [eid]: new Date().toISOString() })); }} className="min-h-[40px] bg-slate-50 border border-dashed border-slate-300 rounded p-1 w-full">
+                                                {(assignments[aid] || []).map(eid => (
+                                                    <div key={eid} draggable={true} onDragStart={ev => { ev.dataTransfer.setData("empId", eid); ev.stopPropagation(); }} className="text-xs bg-white px-2 py-1 rounded mt-1 cursor-grab border border-slate-300 flex justify-between items-center shadow-sm">
+                                                        <div className="flex items-center gap-1 overflow-hidden"><Text truncate>{formatFullName(getField(employeeMap.get(eid), 'craa5_name'))}</Text><Badge color="brand" appearance="tint" size="small" className="text-[10px]">{formatDuration(employeeStartTimes[eid])}</Badge></div>
+                                                        <Button appearance="transparent" size="small" className="min-w-0 px-1" style={{ color: BRAND.red }} onClick={(e) => { e.stopPropagation(); setAssignments(p => ({ ...p, [aid]: p[aid].filter(i => i !== eid) })); }}>✖</Button>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </BucketColumn>
+                        );
+                    })}
+                </div>
+            </div>
+        </div>
+    );
+    else {
+        const statusIds = Object.keys(areaAssignments).filter(id => isStatusArea(getField(areaMap.get(id), 'craa5_area')));
+        SC = (
+            <div className="flex flex-col h-full p-5 overflow-y-auto flex-1 box-border">
+                {saveSuccess && <div className="bg-green-50 text-green-800 p-3 rounded-lg mb-4 border border-green-200 font-semibold">✅ Success! Assignments saved.</div>}
+                {submissionError && <div className="p-3 rounded-lg mb-4 border font-semibold" style={{ background: BRAND.redSoft, color: BRAND.red, borderColor: BRAND.red }}>❌ Submission Failed: {submissionError}</div>}
+                <ScreenTitle>Update Teams</ScreenTitle>
+                {Object.keys(areaAssignments).length === 0 ? <Text className="mt-4">No areas assigned.</Text> : (
+                    <div className="flex flex-col gap-8 mt-5">
+                        {statusIds.length > 0 && (
+                            <div>
+                                <h3 className="text-sm font-black uppercase tracking-widest mb-4 pb-1 border-b-2" style={{ color: BRAND.red, borderColor: BRAND.red }}>Time & Attendance</h3>
+                                <div className="grid grid-cols-1 gap-4">{statusIds.map(aid => {
+                                    const inc = areaDetails[aid]?.includeInUpdate ?? false;
+                                    return (
+                                        <div key={aid} className="bg-white p-3 rounded-xl border border-slate-200 flex justify-between items-center shadow-sm">
+                                            <div className="flex items-center gap-2"><Checkbox checked={inc} onChange={(e, d) => setAreaDetails(p => ({ ...p, [aid]: { ...p[aid], includeInUpdate: !!d.checked } }))} /><Text weight="bold" size={400} className="cursor-pointer" onClick={() => setAreaDetails(p => ({ ...p, [aid]: { ...p[aid], includeInUpdate: !inc } }))}>Add to Update - {renderSafe(getField(areaMap.get(aid), 'craa5_area'))}</Text></div>
+                                            <Text>{(assignments[aid] || []).map(eid => formatFullName(getField(employeeMap.get(eid), 'craa5_name'))).join(", ")}</Text>
+                                        </div>
+                                    );
+                                })}</div>
+                            </div>
+                        )}
+                        {['Production Areas', 'Everyday Tasks'].map((group, gIdx) => {
+                            const rA = Object.keys(areaAssignments).filter(id => { const a = areaMap.get(id); return !isStatusArea(getField(a, 'craa5_area')) && (gIdx === 0 ? !isEverydayArea(a) : isEverydayArea(a)); });
+                            if (rA.length === 0) return null;
+                            const accent = gIdx === 0 ? BRAND.blue : '#B27B00';
+                            return (
+                                <div key={group}>
+                                    <h3 className="text-sm font-black uppercase tracking-widest mb-4 pb-1 border-b-2" style={{ color: accent, borderColor: gIdx === 0 ? BRAND.blue : BRAND.yellow }}>{group}</h3>
+                                    <div className="grid grid-cols-1 gap-4">{rA.map(aid => {
+                                        const a = areaMap.get(aid), ld = employeeMap.get(areaAssignments[aid]) || activeSupervisorObj, d = areaDetails[aid] || {} as any;
+                                        const inc = d.includeInUpdate ?? isProductionArea(a);
+                                        return (
+                                            <div key={aid} className="bg-white p-5 rounded-xl border border-slate-200 border-l-4 shadow-sm" style={{ borderLeftColor: gIdx === 0 ? BRAND.blue : BRAND.yellow }}>
+                                                <div className="flex justify-between items-center mb-2">
+                                                    <div className="flex items-center gap-2"><Checkbox checked={inc} onChange={(e, cb) => toggleIncludeInUpdate(aid, !!cb.checked)} /><Text weight="bold" size={400} className="cursor-pointer" onClick={() => toggleIncludeInUpdate(aid, !inc)}>Add to Update - {renderSafe(getField(a, 'craa5_area'))}{getAreaEmoji(a)}</Text></div>
+                                                    <Badge appearance="filled" color="brand">Headcount: {assignments[aid]?.length || 0}</Badge>
+                                                </div>
+                                                <Text size={200} color="neutralSecondary" block className="mb-4">Lead: {formatFullName(getField(ld, 'craa5_name'))}</Text>
+                                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                    <div className="flex flex-col gap-1"><Text size={200} weight="semibold">Completed and in process</Text><Input placeholder="Enter completed and in process..." value={d.currentStatus || ""} onChange={(e: any, dObj: any) => setAreaDetails(p => ({ ...p, [aid]: { ...p[aid], currentStatus: getInputValue(e, dObj) } }))} /></div>
+                                                    <div className="flex flex-col gap-1"><Text size={200} weight="semibold">What is left to do</Text><Input placeholder="Enter what is left to do..." value={d.futureNotes || ""} onChange={(e: any, dObj: any) => setAreaDetails(p => ({ ...p, [aid]: { ...p[aid], futureNotes: getInputValue(e, dObj) } }))} /></div>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}</div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                )}
+            </div>
+        );
+    }
+
+    return (
+        <FluentProvider theme={cjTheme} style={{ background: 'transparent' }}>
+            <div style={{ width: "100%", height: `${appHeight}px`, display: "flex", flexDirection: "column", background: "#F7F9FC", overflow: "hidden", position: 'relative', fontFamily: BRAND_FONT }}>
+                {isLoading && (
+                    <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 20, background: '#F7F9FC', zIndex: 9999 }}>
+                        <BrandLogo />
+                        <Spinner size="large" label={GLOBAL_INIT_STATUS === 'COMPLETE' ? "Updating Dataverse..." : "Loading shift..."} />
+                    </div>
+                )}
+
+                <header className="bg-white border-b-4 border-[#FFB81C] shrink-0 z-20">
+                    <div className="px-5 h-[64px] flex items-center justify-between gap-4">
+                        <div className="min-w-0">
+                            <h1 className="text-lg font-black leading-tight tracking-tight truncate" style={{ color: BRAND.blueDark }}>Shift Assignment</h1>
+                            <p className="text-[11px] font-bold text-slate-500 truncate">Shift {currentShift || '?'}{activeSupervisorObj ? ` · ${formatFullName(getField(activeSupervisorObj, 'craa5_name'))}` : ''}</p>
+                        </div>
+                        <div className="flex items-center gap-3">
+                            {adminMode && (
+                                <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg border" style={{ background: BRAND.redSoft, borderColor: '#F6B3C0' }}>
+                                    <Text size={200} weight="semibold" style={{ color: BRAND.red }}>View As:</Text>
+                                    <select value={selectedSupervisorId || ""} onChange={(e) => setSelectedSupervisorId(e.target.value)} className="px-1 py-0.5 rounded border border-[#F6B3C0] text-xs outline-none bg-white"><option value="" disabled>-- Select Supervisor --</option>{supervisors.map(s => <option key={getField(s, 'craa5__aa_employeeid')} value={getField(s, 'craa5__aa_employeeid')}>{formatFullName(getField(s, 'craa5_name'))}</option>)}</select>
+                                </div>
+                            )}
+                            <div className={`flex items-center gap-1 px-2 py-0.5 rounded-lg border ${adminMode ? 'bg-[#E6F1FB] border-[#B3D4F2]' : 'border-transparent'}`}>
+                                <Checkbox checked={adminMode} onChange={(e, d) => setAdminMode(!!d.checked)} /><Text size={200} weight={adminMode ? "semibold" : "regular"} style={{ color: adminMode ? BRAND.blueDark : 'inherit', cursor: 'pointer' }} onClick={() => setAdminMode(!adminMode)}>Acting Sup.</Text>
+                            </div>
+                            <Text size={200} weight="semibold" className="hidden md:block">{selectedSupervisorId && getField(currentUser, 'craa5__aa_employeeid') !== selectedSupervisorId ? `🕵️ ${formatFullName(getField(activeSupervisorObj, 'craa5_name'))}` : `👤 ${msUser ? msUser.name : "Signing in..."}`}</Text>
+                            <Badge appearance="filled" color="brand">Shift {currentShift || '?'}</Badge>
+                            <div className="hidden sm:block pl-3 border-l border-slate-200"><BrandLogo /></div>
+                        </div>
+                    </div>
+                </header>
+
+                {selectedSupervisorId && currentUser && (
+                    <nav className="bg-white border-b border-slate-200 shrink-0 z-10">
+                        <div className="px-4 py-2 flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex gap-1.5 overflow-x-auto">
+                                {steps.map((l, i) => (
+                                    <button key={l} onClick={() => setCurrentStep(i)} className={`px-4 py-2 text-[11px] font-extrabold uppercase tracking-[0.08em] rounded-xl whitespace-nowrap transition-colors ${currentStep === i ? 'bg-[#0072CE] text-white shadow-[0_6px_14px_rgba(0,114,206,0.25)]' : 'text-slate-500 hover:bg-[#E6F1FB] hover:text-[#0072CE]'}`}>
+                                        <span className="opacity-60 mr-1">{i + 1}</span>{l}
+                                    </button>
+                                ))}
+                            </div>
+                            {currentStep === 4 && (
+                                <div className="flex items-center gap-2 bg-[#F7F9FC] border border-slate-200 px-2 py-1 rounded-xl">
+                                    <select value={clipboardFormat} onChange={(e) => setClipboardFormat(e.target.value as any)} className="px-2 py-1 rounded-lg border border-slate-300 text-xs font-semibold outline-none bg-white"><option value="headcount">Headcount</option><option value="initials">Initials</option><option value="fullname">Full Name</option></select>
+                                    <Button appearance="secondary" size="small" onClick={handleCopyToClipboard}>Copy</Button>
+                                    <Button appearance="primary" size="small" onClick={handleSubmission}>Save Progress</Button>
+                                </div>
+                            )}
+                        </div>
+                        <ProgressBar value={(currentStep + 1) / steps.length} color={currentStep === steps.length - 1 ? "success" : "brand"} />
+                    </nav>
+                )}
+
+                <main style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", position: 'relative' }}>{SC}</main>
+            </div>
+        </FluentProvider>
+    );
+}
+
+const App = (props: any) => <MainComponent {...props} />;
+export default App;
