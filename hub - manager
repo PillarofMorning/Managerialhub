@@ -666,7 +666,8 @@ function buildEmployeeProfile(rows, nowMs, opts) {
         it.capped = overCap;
         it.stop = stop;
         it.ms = it.absence ? 0 : Math.max(0, stop - it.start);
-        it.slip = !!next && (next.start - it.start) < EMP_SLIP_MS;   // the next row came within 5 minutes: this one was replaced almost at once
+        it.slip = (!!next && (next.start - it.start) < EMP_SLIP_MS)       // the next row came within 5 minutes: this one was replaced almost at once
+            || (!!opts.slipByEnd && it.end > 0 && (it.end - it.start) < EMP_SLIP_MS);   // (the room query sees one room only, so it judges by the end Shift Start stamped when the person was moved)
         it.day = empDayKey(it.start, it.night);
         it.outside = !!(opts.first && (it.day < opts.first || it.day > opts.last));
     });
@@ -781,8 +782,10 @@ function buildAreaRanking(rows, nowMs, opts) {
     order.forEach(k => {
         const g = groups[k];
         if (g.guid) return;
-        const nameKey = k.slice(2), hits = [];
-        order.forEach(k2 => { const h = groups[k2]; if (h.guid && hits.indexOf(h) === -1 && Object.keys(h.spell).some(nm => normText(nm) === nameKey)) hits.push(h); });
+        const mine = [];   // "Amy Able" and "Able, Amy" are the same person
+        Object.keys(g.spell).forEach(nm => empNameVariants(nm).forEach(v => { const nk = normText(v); if (nk && mine.indexOf(nk) === -1) mine.push(nk); }));
+        const hits = [];
+        order.forEach(k2 => { const h = groups[k2]; if (h.guid && hits.indexOf(h) === -1 && Object.keys(h.spell).some(nm => empNameVariants(nm).some(v => mine.indexOf(normText(v)) > -1))) hits.push(h); });
         if (hits.length !== 1) return;
         hits[0].rows = hits[0].rows.concat(g.rows);
         Object.keys(g.spell).forEach(nm => { hits[0].spell[nm] = (hits[0].spell[nm] || 0) + g.spell[nm]; });
@@ -794,7 +797,7 @@ function buildAreaRanking(rows, nowMs, opts) {
         if (g.merged) return;
         const names = Object.keys(g.spell).sort((a, b) => g.spell[b] - g.spell[a] || a.localeCompare(b));
         const selfNames = []; names.forEach(nm => empNameVariants(nm).forEach(v => { if (selfNames.indexOf(v) === -1) selfNames.push(v); }));
-        const p = buildEmployeeProfile(g.rows, nowMs, { first: opts.first, last: opts.last, selfNames });
+        const p = buildEmployeeProfile(g.rows, nowMs, { first: opts.first, last: opts.last, selfNames, slipByEnd: true });
         notes.noEnd += p.notes.noEnd; notes.capped += p.notes.capped; notes.toShiftEnd += p.notes.toShiftEnd; notes.slips += p.notes.slips;
         if (!p.daysWorked) return;
         const name = names[0] || '';
@@ -822,14 +825,19 @@ function empHasLeft(r) {
     const info = readEmployeeShiftInfo(r);
     return info.blank && (r.craa5_shift === null || r.craa5_shift === '' || r.craa5_Shift === null || r.craa5_Shift === '');
 }
-// The employee-list lookup for a few people at a time: by name (the employee table is small and this asks for those names only).
-function empStatusFilter(people) {
-    const names = [];
-    people.forEach(x => empNameVariants(x.name).forEach(n => { if (n && names.indexOf(n) === -1) names.push(n); }));
-    return names.map(n => `craa5_name eq '${odataStr(n)}'`).join(' or ');
+// The employee-list lookup for a few people at a time (this asks for those people only). A person whose rows carry an employee id is
+// asked for by that id, so a renamed or re-spelled employee is still found; byId false asks for everyone by name instead (a way of
+// asking that works even when the id column does not take a plain id).
+function empStatusFilter(people, byId) {
+    const names = [], ids = [];
+    people.forEach(x => {
+        if (byId && x.guid) { if (ids.indexOf(x.guid) === -1) ids.push(x.guid); return; }
+        empNameVariants(x.name).forEach(n => { if (n && names.indexOf(n) === -1) names.push(n); });
+    });
+    return ids.map(g => `craa5__aa_employeeid eq ${g}`).concat(names.map(n => `craa5_name eq '${odataStr(n)}'`)).join(' or ');
 }
 // { personKey: { known, crew, role, left } } from the employee rows found.
-function empStatusOf(people, empRows) {
+function empStatusOf(people, empRows, idOnly) {
     const byGuid = {}, byName = {};
     (empRows || []).forEach(r => {
         const id = cleanGuid(r.craa5__aa_employeeid || r.craa5_aa_employeeid);
@@ -840,9 +848,10 @@ function empStatusOf(people, empRows) {
     const out = {};
     people.forEach(x => {
         let rec = x.guid ? byGuid[x.guid] : null;
-        if (!rec) {
+        if (!rec && !(idOnly && x.guid)) {   // by name; a record with another employee's id is somebody else with the same name
             const vs = empNameVariants(x.name).map(normText);
-            for (let i = 0; i < vs.length && !rec; i++) { const l = byName[vs[i]]; if (l && l.length) rec = l.filter(r => readEmployeeShiftInfo(r).crew)[0] || l[0]; }
+            const mine = (r) => !x.guid || !cleanGuid(r.craa5__aa_employeeid || r.craa5_aa_employeeid) || cleanGuid(r.craa5__aa_employeeid || r.craa5_aa_employeeid) === x.guid;
+            for (let i = 0; i < vs.length && !rec; i++) { const l = (byName[vs[i]] || []).filter(mine); if (l.length) rec = l.filter(r => readEmployeeShiftInfo(r).crew)[0] || l[0]; }
         }
         if (!rec) { out[x.key] = { known: false, crew: '', role: '', left: false }; return; }
         out[x.key] = { known: true, crew: readEmployeeShiftInfo(rec).crew, role: EMP_ROLE_NAMES[rec.craa5_role] || '', left: empHasLeft(rec) };
@@ -1722,6 +1731,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
         let alive = true;
         const chunks = empChunks(areaWin.from, areaWin.to, EMP_AREA_CHUNK_DAYS);
         setAreaData({ key: areaKey, rows: [], loading: true, error: '', capped: 0, done: 0, total: chunks.length, at: 0 });
+        setAreaCrew('');
         // One piece of the range. The first piece settles how to ask (with the column list, or without it when the table lacks one of the
         // columns); the rest then run up to EMP_AREA_PARALLEL at a time.
         const memo = areaAccessRef.current && areaAccessRef.current.ok ? areaAccessRef.current : null;
@@ -1791,16 +1801,31 @@ export default function ScheduleApp({ dataApi, ...props }) {
             try {
                 const map = {};
                 let failed = 0;
+                // The way of asking is settled by the first batch (by id with the column list, by id without it, then by name); the
+                // other batches start from the way that worked. When no way works the employee list is out of reach: stop, do not repeat 16 failures.
+                const steps = [{ byId: true, select: true }, { byId: true, select: false }, { byId: false, select: true }, { byId: false, select: false }];
+                let step = 0, worked = false;
                 for (let i = 0; i < batches.length; i++) {
                     if (!alive) return;
-                    const q = { filter: empStatusFilter(batches[i]), top: batches[i].length * 4 };
-                    let rows = await queryRecords(TABLE_EMPLOYEE, dataApiRef.current, { ...q, select: EMP_PICK_FIELDS });
-                    if (rows === null) rows = await queryRecords(TABLE_EMPLOYEE, dataApiRef.current, q);   // a column in the list may not exist
-                    if (!alive) return;
+                    let rows = null, usedById = steps[step].byId;
+                    while (step < steps.length) {
+                        const st = steps[step];
+                        usedById = st.byId;
+                        const f = empStatusFilter(batches[i], st.byId);
+                        if (!f) { rows = []; break; }
+                        const q = { filter: f, top: batches[i].length * 4 };
+                        if (st.select) q.select = EMP_PICK_FIELDS;
+                        rows = await queryRecords(TABLE_EMPLOYEE, dataApiRef.current, q);
+                        if (!alive) return;
+                        if (rows !== null) { worked = true; break; }
+                        if (worked) break;   // it worked before: this batch failed on its own
+                        step++;
+                    }
                     if (rows === null) failed++;
-                    else { const part = empStatusOf(batches[i], rows); Object.keys(part).forEach(k => { map[k] = part[k]; }); }
+                    else { const part = empStatusOf(batches[i], rows, usedById); Object.keys(part).forEach(k => { map[k] = part[k]; }); }
                     const snapshot = Object.assign({}, map), doneNow = i + 1;
                     setAreaStatus(prev => prev.key === areaStatusKey ? { ...prev, map: snapshot, done: doneNow } : prev);
+                    if (rows === null && !worked) break;   // nothing works: the employee list cannot be read
                 }
                 if (!alive) return;
                 setAreaStatus(prev => prev.key === areaStatusKey ? { ...prev, loading: false, failed: failed > 0 } : prev);
@@ -1821,9 +1846,10 @@ export default function ScheduleApp({ dataApi, ...props }) {
         const crews = {};
         all.forEach(x => { if (x.st && x.st.crew && (areaShowLeft || !x.st.left)) crews[x.st.crew] = (crews[x.st.crew] || 0) + 1; });
         let list = areaShowLeft ? all : all.filter(x => !(x.st && x.st.left));
-        if (areaCrew) list = list.filter(x => x.st && x.st.crew === areaCrew);
+        const crewOn = areaCrew && crews[areaCrew] ? areaCrew : '';   // a crew nobody is in (after a new read) is not applied
+        if (crewOn) list = list.filter(x => x.st && x.st.crew === crewOn);
         list = sortAreaPeople(list, areaSort);
-        return { list, leftCount, crews, all };
+        return { list, leftCount, crews, all, crewOn };
     }, [areaRanking, areaStatus.key, areaStatus.map, areaStatusKey, areaSort, areaCrew, areaShowLeft]);
 
     const pickArea = (item) => {
@@ -2431,7 +2457,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
             ['Room or area', areaTitle],
             ['Days looked at', `${areaWin.first} to ${areaWin.last}`],
             ['Ranked by', rankedBy],
-            ['Crew', areaCrew ? `Crew ${areaCrew}` : 'Every crew'],
+            ['Crew', areaView && areaView.crewOn ? `Crew ${areaView.crewOn}` : 'Every crew'],
             [],
             ['Rank', 'Person', 'Crew', 'Hours there', 'Shifts there', 'First there', 'Last there', 'Usually under']
         ];
@@ -2449,10 +2475,14 @@ export default function ScheduleApp({ dataApi, ...props }) {
         const searching = areaSearchable && !!areaSuggestKey && (areaSuggest.loading || areaSuggest.key !== areaSuggestKey);
         const names = areaSuggest.key === areaSuggestKey ? areaSuggest.names : [];
         const items = names.length >= 2 ? [{ contains: true, count: names.length }].concat(names) : names;
-        const showList = areaOpen && areaSearchable && !(areaPick && areaQuery === areaPick.label);
+        const hasOptions = !searching && items.length > 0 && !areaSuggest.failed;
+        const showList = areaOpen && areaSearchable && !areaWin.error && !(areaPick && areaQuery === areaPick.label);   // bad dates are explained under the date boxes
         const reading = !!areaPick && areaData.key === areaKey && areaData.loading;
         const statusNow = areaStatus.key === areaStatusKey ? areaStatus : null;
         const checking = !!view && !!statusNow && statusNow.loading;
+        // The ranking waits for the first batch of the employee-list check (the people at the top, who matter most), so a person who has left
+        // is never crowned for a moment and then dropped. A failed check ends the wait too.
+        const waitingStatus = !!view && !!areaRanking && areaRanking.people.length > 0 && !(statusNow && (!statusNow.loading || statusNow.done >= 1));
         const onKey = (e) => {
             const n = items.length;
             if (e.key === 'ArrowDown') { e.preventDefault(); setAreaOpen(true); if (n) setAreaActive(i => (i + 1) % n); }
@@ -2467,7 +2497,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
         const maxMs = Math.max.apply(null, list.map(x => x.ms).concat([1]));
         const topHours = sortAreaPeople(list, 'hours')[0] || null, topShifts = sortAreaPeople(list, 'shifts')[0] || null, topRecent = sortAreaPeople(list, 'recent')[0] || null;
         const dayText = (ymd) => { const d = parseYMD(ymd); return d ? fmtDayYear(d) : '-'; };
-        const theirNumbers = (x) => <button type="button" onClick={() => openPersonFromArea(x)} aria-label={`See ${x.label}'s own numbers`} className="text-xs font-extrabold text-[#0072CE] hover:text-[#00468B] hover:underline">Their numbers</button>;
+        const theirNumbers = (x) => <button type="button" onClick={() => openPersonFromArea(x)} aria-label={`Their numbers: ${x.label}`} className="inline-flex items-center min-h-[24px] text-xs font-extrabold text-[#0072CE] hover:text-[#00468B] hover:underline">Their numbers</button>;
         const totalMs = list.reduce((n, x) => n + x.ms, 0);
         const n = areaRanking ? areaRanking.notes : null;
         const crewKeys = view ? ['A', 'B', 'C', 'D'].filter(c => view.crews[c]) : [];
@@ -2476,7 +2506,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
             { label: 'Most experienced here', value: topHours.label, sub: `${hrs(topHours.hours)} over ${pluralize(topHours.shifts, 'shift')}` },
             { label: 'Most shifts here', value: topShifts.label, sub: `${pluralize(topShifts.shifts, 'shift')}, ${hrs(topShifts.hours)}` },
             { label: 'Been there most recently', value: topRecent.label, sub: `last there ${dayText(topRecent.lastDay)}` },
-            { label: 'People who worked here', value: list.length, big: true, sub: `${hrs(totalMs / 3600000)} in all${areaCrew ? `, Crew ${areaCrew} only` : ''}` },
+            { label: 'People who worked here', value: list.length, big: true, sub: `${hrs(totalMs / 3600000)} in all${view.crewOn ? `, Crew ${view.crewOn} only` : ''}` },
         ] : [];
 
         return (
@@ -2511,12 +2541,9 @@ export default function ScheduleApp({ dataApi, ...props }) {
                                     </button>
                                 )}
                             </div>
-                            {showList && (
+                            {showList && (hasOptions ? (
                                 <ul id="area-suggest" role="listbox" aria-label="Matching rooms and areas" className="absolute z-30 left-0 right-0 mt-1 max-h-80 overflow-auto bg-white border border-slate-200 rounded-xl shadow-lg py-1">
-                                    {searching && <li role="presentation" className="px-4 py-3 text-sm text-slate-500">Searching...</li>}
-                                    {!searching && areaSuggest.failed && <li role="presentation" className="px-4 py-3 text-sm font-bold text-[#E4002B]">The assignments could not be searched. Try again.</li>}
-                                    {!searching && !areaSuggest.failed && items.length === 0 && <li role="presentation" className="px-4 py-3 text-sm text-slate-500">No room or area with "{areaQuery}" in its name has assignments between {areaWin.first} and {areaWin.last}.</li>}
-                                    {!searching && items.map((it, i) => (
+                                    {items.map((it, i) => (
                                         <li key={it.contains ? '*contains*' : it.name} id={`area-opt-${i}`} role="option" aria-selected={i === areaActive}
                                             onMouseDown={e => { e.preventDefault(); pickArea(it); }} onMouseEnter={() => setAreaActive(i)}
                                             className={`px-4 py-2.5 cursor-pointer flex items-center justify-between gap-3 ${i === areaActive ? 'bg-[#E6F1FB]' : 'hover:bg-slate-50'}`}>
@@ -2525,9 +2552,15 @@ export default function ScheduleApp({ dataApi, ...props }) {
                                                 : <span className="text-sm font-bold text-slate-800 truncate">{it.name}</span>}
                                         </li>
                                     ))}
-                                    {!searching && areaSuggest.capped && <li role="presentation" className="px-4 py-2 text-xs font-bold text-slate-500 border-t border-slate-100">Only the newest assignments were looked at. Type more of the name to narrow it down.</li>}
+                                    {areaSuggest.capped && <li role="presentation" className="px-4 py-2 text-xs font-bold text-slate-500 border-t border-slate-100">Only the newest assignments were looked at. Type more of the name to narrow it down.</li>}
                                 </ul>
-                            )}
+                            ) : (
+                                <div id="area-suggest" className="absolute z-30 left-0 right-0 mt-1 bg-white border border-slate-200 rounded-xl shadow-lg px-4 py-3 text-sm">
+                                    {searching && <p className="text-slate-500">Searching...</p>}
+                                    {!searching && areaSuggest.failed && <p className="font-bold text-[#E4002B]">The assignments could not be searched. Try again.</p>}
+                                    {!searching && !areaSuggest.failed && <p className="text-slate-500">No room or area with "{areaQuery}" in its name has assignments between {areaWin.first} and {areaWin.last}.</p>}
+                                </div>
+                            ))}
                             <div className="sr-only" role="status" aria-live="polite">{showList && !searching ? `${items.length} matching ${items.length === 1 ? 'choice' : 'choices'}` : ''}</div>
                         </div>
                         <div>
@@ -2571,8 +2604,8 @@ export default function ScheduleApp({ dataApi, ...props }) {
                                 {!areaWin.error && <span className="text-xs font-bold text-slate-600">{areaWin.first} to {areaWin.last} ({pluralize(areaWin.days, 'day')})</span>}
                             </div>
                         </div>
-                        {view && list.length > 0 && (
-                            <button type="button" onClick={copyAreaTable} className="px-3 py-2 text-sm font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 rounded-md transition-colors flex items-center gap-2 shadow-sm" title="Copy this ranking to paste into Excel">
+                        {view && list.length > 0 && !waitingStatus && (
+                            <button type="button" onClick={copyAreaTable} disabled={checking} className="px-3 py-2 text-sm font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 rounded-md transition-colors flex items-center gap-2 shadow-sm disabled:opacity-50 disabled:cursor-not-allowed" title={checking ? 'Wait for the check of who is still with the company to finish' : 'Copy this ranking to paste into Excel'}>
                                 <FileSpreadsheetIcon className="w-4 h-4" /> Copy for Excel
                             </button>
                         )}
@@ -2595,7 +2628,13 @@ export default function ScheduleApp({ dataApi, ...props }) {
                     </div>
                 )}
 
-                {view && areaRanking.people.length > 0 && (
+                {waitingStatus && (
+                    <div className="px-4 py-3 rounded-xl bg-[#E6F1FB] border border-[#B3D4F2] text-[#00468B] text-sm font-bold" role="status">
+                        Checking who is still with the company{statusNow && statusNow.total > 1 ? ` (${statusNow.done} of ${statusNow.total})` : ''}...
+                    </div>
+                )}
+
+                {view && areaRanking.people.length > 0 && !waitingStatus && (
                     <>
                         <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4">
                             {tiles.map(k => (
@@ -2628,8 +2667,8 @@ export default function ScheduleApp({ dataApi, ...props }) {
                                     <div>
                                         <span className={labelCls}>Crew</span>
                                         <div className="flex flex-wrap gap-1.5" role="group" aria-label="Crew">
-                                            <Chip on={areaCrew === ''} onClick={() => { setAreaCrew(''); setAreaShown(EMP_AREA_SHOWN); }}>Every crew</Chip>
-                                            {crewKeys.map(c => <Chip key={c} on={areaCrew === c} onClick={() => { setAreaCrew(c); setAreaShown(EMP_AREA_SHOWN); }}>Crew {c} ({view.crews[c]})</Chip>)}
+                                            <Chip on={!view.crewOn} onClick={() => { setAreaCrew(''); setAreaShown(EMP_AREA_SHOWN); }}>Every crew</Chip>
+                                            {crewKeys.map(c => <Chip key={c} on={view.crewOn === c} onClick={() => { setAreaCrew(c); setAreaShown(EMP_AREA_SHOWN); }}>Crew {c} ({view.crews[c]})</Chip>)}
                                         </div>
                                     </div>
                                 )}
