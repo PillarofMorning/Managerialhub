@@ -5,8 +5,10 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
  * PRODSCHEDULE: PRODUCTION SCHEDULE HUB
  * ============================================================================
  * A copy of the Manager hub trimmed to the production schedule only, plus:
- *   1. IMPORT WEEK   - paste (or upload) the weekly Excel plan and turn it into scheduled runs, using a start time
- *                      you set per line. Re-importing the same week UPDATES the runs it already made.
+ *   1. IMPORT WEEK   - paste (or upload) the weekly Excel plan and turn it into scheduled runs. Each line has a pattern
+ *                      (Breading = night shift 6 PM to 4 AM, IBL 4 = non-stop, WJ and IBL 5 = day run cleaned at night)
+ *                      that sets where its runs start and what a blank hours cell is filled to. Re-importing the same
+ *                      week UPDATES the runs it already made.
  *   2. SCHEDULE      - Gantt over 1 day to 8 weeks. Drag a run to move it (or to another line), drag its edges to
  *                      change start / stop, drag it past a neighbour to swap the order, double-click to edit,
  *                      double-click an empty spot to add a run. Undo keeps the last 30 changes.
@@ -380,11 +382,56 @@ function parseSheet(grid, opts) {
     return { week, days, lines: withItems, runCount, warnings };
 }
 
+// ----------------------------------------------------------------------------
+// HOW A LINE RUNS (the pattern). Each line on the sheet gets one, picked from its name the first time and remembered.
+//   night     runs overnight (Breading: about 6 PM to 4 AM, so a 10 h run is the whole night)
+//   dayclean  runs through the day and is cleaned at night (WJ, IBL 5): the window ends when the night clean starts
+//   nonstop   runs around the clock for days (IBL 4): every day is a full 24 h window, runs flow into each other
+//   custom    anything else: start time per day, optional end of the window
+// The window is what a blank "hours" cell is filled to, and what a run is checked against ("ends after the stop").
+// Which days a line runs on always comes from the sheet (a line may start Monday or Tuesday and finish Friday or Saturday).
+// ----------------------------------------------------------------------------
+const LINE_PATTERNS = {
+    night: { label: 'Night shift', start: '18:00', stop: '04:00' },
+    dayclean: { label: 'Day run, cleaned at night', start: '06:00', stop: '23:30' },
+    nonstop: { label: 'Non-stop, around the clock', start: '06:00', stop: '' },
+    custom: { label: 'Custom times' },
+};
+const PATTERN_ORDER = ['night', 'dayclean', 'nonstop', 'custom'];
+function presetForLabel(label) {
+    const t = String(label || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    if (/\bbread/.test(t)) return 'night';
+    if (/^ibl ?4$/.test(t)) return 'nonstop';
+    if (/^ibl ?5$/.test(t) || /^wj ?\d*$/.test(t) || /water ?jet/.test(t)) return 'dayclean';
+    return 'custom';
+}
+function patternFields(kind) {
+    const pt = LINE_PATTERNS[kind];
+    return pt && pt.start ? { pattern: kind, dayStart: pt.start, dayStop: pt.stop, chain: true } : { pattern: kind };
+}
+const fmtClock = (hhmm) => { const d = withTime(new Date(2000, 0, 1), hhmm); return d ? d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : ''; };
+// The run window of one day on a line: { start, end, cut }. start = when the day's first run begins; end = where blank hours
+// are filled to (null when the line has no window); cut = the stop time a run is checked against (null for non-stop lines).
+function dayWindow(day, cfg) {
+    const start = withTime(day, cfg.dayStart || '06:00') || withTime(day, '06:00');
+    const s = start.getTime();
+    if (cfg.pattern === 'nonstop') return { start: s, end: addDaysLocal(start, 1).getTime(), cut: null };
+    if (cfg.dayStop && withTime(day, cfg.dayStop)) {
+        let e = withTime(day, cfg.dayStop).getTime();
+        if (e <= s) e = addDaysLocal(new Date(e), 1).getTime();
+        return { start: s, end: e, cut: e };
+    }
+    return { start: s, end: null, cut: null };
+}
+const windowHours = (cfg) => { const w = dayWindow(new Date(2001, 5, 15), cfg); return w.end ? (w.end - w.start) / HOUR : null; };
+
 // Every run the sheet describes, laid out from the start times chosen per line.
-//   cfg[lineKey] = { area, line, dayStart 'HH:MM', dayStop 'HH:MM' | '', chain (back to back across days), gapMins, rate, defaultHours, skip }
+//   cfg[lineKey] = { area, line, pattern, dayStart 'HH:MM', dayStop 'HH:MM' | '', chain (back to back across days), gapMins, rate, defaultHours, skip }
 //   edits[key]   = { start 'YYYY-MM-DDTHH:mm', end 'YYYY-MM-DDTHH:mm', hours, include }
 // Items on one line and day are stacked in sheet order from the day's start time. With "chain" on, a run that is
 // still going at the next day's start pushes that day's first run back (24 h runs run back to back).
+// Hours come from the sheet, else from cases / rate. A cell with neither is filled to the end of the line's window
+// (shared out between that day's blank runs); a line with no window uses its "hours if blank" number.
 const parseLocalDT = (s) => { const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{1,2}):(\d{2})/.exec(s || ''); return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5])).getTime() : null; };
 const dtLocalValue = (ms) => `${getLocalYMD(new Date(ms))}T${hhmmOf(ms)}`;
 function planRuns(parsed, cfgs, edits) {
@@ -396,18 +443,41 @@ function planRuns(parsed, cfgs, edits) {
         let cursor = null;
         parsed.days.forEach(D => {
             const day = parseYMD(D.ymd);
-            const dayStart = withTime(day, cfg.dayStart || '06:00').getTime();
-            let dayCursor = null;
+            const win = dayWindow(day, cfg), dayStart = win.start;
+            // 1. the hours of every run on this day
+            const todays = [];
             L.items.forEach(it => {
                 const e = it.days[D.ymd];
                 if (!e) return;
                 const key = `${lk}|${D.ymd}|${it.item}|${it.row}`;
                 const ed = (edits && edits[key]) || {};
-                let hours = ed.hours !== undefined && ed.hours !== '' ? Number(ed.hours) : e.hours, hoursSource = ed.hours !== undefined && ed.hours !== '' ? 'edited' : 'sheet';
+                const typed = ed.hours !== undefined && ed.hours !== '';
+                let hours = typed ? Number(ed.hours) : e.hours, hoursSource = typed ? 'edited' : 'sheet';
                 if (!(hours > 0)) {
                     if (Number(cfg.rate) > 0 && e.cases > 0) { hours = e.cases / Number(cfg.rate); hoursSource = 'rate'; }
-                    else { hours = Number(cfg.defaultHours) || 8; hoursSource = 'default'; }
+                    else { hours = null; hoursSource = 'blank'; }
                 }
+                todays.push({ it, e, key, ed, hours, hoursSource });
+            });
+            const blanks = todays.filter(t => t.hoursSource === 'blank');
+            if (blanks.length) {
+                let rest = null;
+                if (win.end) {
+                    const known = todays.reduce((s, t) => s + (t.hours || 0), 0);
+                    const left = (win.end - win.start) / HOUR - known - (gap / HOUR) * (todays.length - 1);
+                    if (left / blanks.length >= 0.25) rest = left;
+                }
+                blanks.forEach((t, i) => {
+                    if (rest === null) { t.hours = Number(cfg.defaultHours) || 8; t.hoursSource = 'default'; return; }
+                    const h = i === blanks.length - 1 ? rest : Math.floor(rest / (blanks.length - i) * 4) / 4;
+                    t.hours = h; t.hoursSource = 'window'; rest -= h;
+                });
+            }
+            // 2. where each one starts and stops
+            let dayCursor = null;
+            todays.forEach(t => {
+                const { it, e, key, ed } = t;
+                let hours = t.hours, hoursSource = t.hoursSource;
                 let start;
                 const edStart = ed.start ? parseLocalDT(ed.start) : null;
                 if (edStart) start = edStart;
@@ -417,16 +487,11 @@ function planRuns(parsed, cfgs, edits) {
                 let end = endFromHours(start, hours);
                 const edEnd = ed.end ? parseLocalDT(ed.end) : null;
                 if (edEnd) { end = edEnd; hours = (end - start) / HOUR; hoursSource = 'edited'; }
-                let afterCutoff = false;
-                if (cfg.dayStop) {
-                    let cut = withTime(day, cfg.dayStop).getTime();
-                    if (cut <= dayStart) cut = addDaysLocal(new Date(cut), 1).getTime();
-                    afterCutoff = end > cut + 60000;
-                }
+                const afterCutoff = !!win.cut && end > win.cut + 60000;
                 out.push({
                     key, lineKey: lk, lineLabel: L.label, ymd: D.ymd, item: it.item, desc: it.desc, cases: e.cases, hours, hoursSource,
                     order: e.order, orderWarn: e.orderWarn, start, end, area: cfg.area, line: Math.max(1, parseInt(cfg.line, 10) || 1),
-                    pushedMs: !edStart && start > dayStart ? start - dayStart : 0, afterCutoff, bad: !(end > start),
+                    pushedMs: !edStart && start > dayStart ? start - dayStart : 0, afterCutoff, cutAt: win.cut, bad: !(end > start),
                 });
                 cursor = end; dayCursor = end;
             });
@@ -1078,7 +1143,13 @@ const STATUS_LOOK = {
     clash: { label: 'CLASH', cls: 'bg-[#FDE8EC] text-[#B00020] border-[#E4002B]' },
 };
 function guessLineCfg(label, areaOptions, prevCfg) {
-    if (prevCfg) return prevCfg;
+    const preset = presetForLabel(label);
+    if (prevCfg) {
+        if (prevCfg.pattern) return prevCfg;
+        // saved before line patterns existed: settings still at the old defaults take this line's pattern, anything typed by hand stays
+        const untouched = prevCfg.dayStart === '06:00' && !prevCfg.dayStop && prevCfg.chain !== false && !(Number(prevCfg.gapMins) > 0) && !prevCfg.rate && Number(prevCfg.defaultHours) === 8 && !prevCfg.skip;
+        return untouched && preset !== 'custom' ? { ...prevCfg, ...patternFields(preset) } : { ...prevCfg, pattern: 'custom' };
+    }
     const lc = label.toLowerCase().trim();
     const find = (name) => areaOptions.find(a => a.toLowerCase() === name.toLowerCase());
     let area = find(lc) || '', line = 1;
@@ -1087,7 +1158,114 @@ function guessLineCfg(label, areaOptions, prevCfg) {
         if (m && find(m[1].trim())) { area = find(m[1].trim()); line = Number(m[2]); }
     }
     if (!area) area = areaOptions.find(a => a.toLowerCase().indexOf(lc) >= 0 || lc.indexOf(a.toLowerCase()) >= 0) || '';
-    return { area, line, dayStart: '06:00', dayStop: '', chain: true, gapMins: 0, rate: '', defaultHours: 8, skip: false };
+    return { area, line, dayStart: '06:00', dayStop: '', chain: true, gapMins: 0, rate: '', defaultHours: 8, skip: false, ...patternFields(preset) };
+}
+
+const smallIn = "border border-slate-300 rounded px-1.5 py-1 text-xs bg-white focus:outline-none focus:ring-1 focus:ring-[#0072CE] ";
+const patternLook = (c) => LINE_PATTERNS[c.pattern] || LINE_PATTERNS.custom;
+function patternSummary(c) {
+    const w = windowHours(c), start = fmtClock(c.dayStart || '06:00'), stop = c.dayStop ? fmtClock(c.dayStop) : '';
+    if (c.pattern === 'nonstop') return `Runs around the clock. Each day starts at ${start}, and a 24 h run flows straight into the next day. A blank hours cell means a full 24 h.`;
+    if (c.pattern === 'night' && w) return `Each night's first run starts at ${start} and the shift ends at ${stop} (${fmtHrs(w * HOUR)} a night). A blank hours cell is filled to ${stop}.`;
+    if (c.pattern === 'dayclean' && w) return `Each day's first run starts at ${start} and the night clean starts at ${stop} (${fmtHrs(w * HOUR)} a day). A blank hours cell is filled to ${stop}. The other ${fmtHrs((24 - w) * HOUR)} is left overnight for cleaning.`;
+    if (w) return `Each day's first run starts at ${start} and the window ends at ${stop} (${fmtHrs(w * HOUR)} a day). A blank hours cell is filled to ${stop}.`;
+    return `Each day's first run starts at ${start}; the rest stack after it in sheet order. A blank hours cell uses ${Number(c.defaultHours) || 8} h.`;
+}
+function patternTag(c) {
+    const pt = patternLook(c), start = fmtClock(c.dayStart || '06:00');
+    if (c.pattern === 'nonstop') return `${pt.label} · days start ${start}`;
+    return `${pt.label} · ${start}${c.dayStop ? ` to ${fmtClock(c.dayStop)}` : ' start'}`;
+}
+// One day's hours from the sheet against the line's window: green fills it, red is longer than it, yellow falls short of it.
+function chipLook(hours, winH) {
+    if (!winH) return { cls: 'bg-slate-100 text-slate-600 border-slate-300', tip: 'Hours on the sheet for this day' };
+    if (hours > winH + 0.05) return { cls: 'bg-[#FDE8EC] text-[#B00020] border-[#E4002B]', tip: `${fmtHrs((hours - winH) * HOUR)} longer than the window: the last run ends after the stop` };
+    if (hours >= winH - 0.05) return { cls: 'bg-[#DCFCE7] text-[#166534] border-[#16A34A]', tip: 'Fills the window exactly' };
+    return { cls: 'bg-[#FFF6E0] text-slate-700 border-[#FFB81C]', tip: `${fmtHrs((winH - hours) * HOUR)} short of the window` };
+}
+
+// One sheet line: where it goes, how it runs, and what its hours add up to each day. Wraps on any screen width.
+function LineCard({ L, c, chips, setCfg }) {
+    const [more, setMore] = useState(false);
+    const kind = LINE_PATTERNS[c.pattern] ? c.pattern : 'custom';
+    const missing = !c.area && !c.skip;
+    return (
+        <div className={`border border-slate-200 rounded-xl p-3 ${c.skip ? 'opacity-50' : ''} ${missing ? 'bg-[#FDE8EC]/40' : 'bg-white'}`}>
+            <div className="flex flex-wrap items-end gap-x-3 gap-y-2">
+                <div className="w-full sm:w-40">
+                    <div className="font-black text-slate-800 text-sm">{L.label}</div>
+                    <div className="text-[10px] text-slate-400">{[L.leads, L.supervisor].filter(Boolean).join(' · ')}</div>
+                </div>
+                <Field label="Area"><input list="ps-areas-i" className={smallIn + 'w-36 ' + (missing ? 'border-[#E4002B] bg-[#FDE8EC]' : '')} value={c.area} onChange={(e) => setCfg(L.label, { area: e.target.value })} placeholder="choose area" /></Field>
+                <Field label="Line #"><input type="number" min="1" className={smallIn + 'w-16'} value={c.line} onChange={(e) => setCfg(L.label, { line: e.target.value })} /></Field>
+                <Field label="How it runs"><select className={smallIn + 'w-52'} value={kind} onChange={(e) => setCfg(L.label, patternFields(e.target.value))}>{PATTERN_ORDER.map(k => <option key={k} value={k}>{LINE_PATTERNS[k].label}</option>)}</select></Field>
+                <Field label="First run starts"><input type="time" className={smallIn} value={c.dayStart} onChange={(e) => setCfg(L.label, { dayStart: e.target.value })} /></Field>
+                {kind !== 'nonstop' && <Field label={kind === 'dayclean' ? 'Night clean starts' : kind === 'night' ? 'Shift ends' : 'Window ends (optional)'}><input type="time" className={smallIn} value={c.dayStop} onChange={(e) => setCfg(L.label, { dayStop: e.target.value })} /></Field>}
+                <label className="flex items-center gap-1.5 text-xs font-bold text-slate-600 pb-1.5"><input type="checkbox" checked={!!c.skip} onChange={(e) => setCfg(L.label, { skip: e.target.checked })} /> Skip this line</label>
+            </div>
+            <p className="text-[11px] text-slate-500 mt-2">{patternSummary(c)}</p>
+            {chips.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5 mt-2">
+                    <span className="text-[10px] font-black uppercase tracking-wider text-slate-400">Hours per day</span>
+                    {chips.map(ch => {
+                        const lk = ch.filled ? { cls: 'bg-[#FFF6E0] text-slate-700 border-[#FFB81C] border-dashed', tip: 'No hours on the sheet for this day: filled in from the line pattern. Type the real hours in step 3 if they differ.' } : chipLook(ch.hours, ch.winH);
+                        return <span key={ch.ymd} title={lk.tip} className={`px-1.5 py-0.5 rounded border text-[11px] font-bold whitespace-nowrap ${lk.cls}`}>{DOW[ch.dow]} {fmtHrs(ch.hours * HOUR)}{ch.filled ? ' (filled in)' : ch.winH ? ` of ${fmtHrs(ch.winH * HOUR)}` : ''}</span>;
+                    })}
+                </div>
+            )}
+            <button type="button" className="mt-2 text-[11px] font-bold text-[#0072CE] hover:underline" onClick={() => setMore(v => !v)}>{more ? 'Fewer settings' : 'More settings'}</button>
+            {more && (
+                <div className="flex flex-wrap items-end gap-x-4 gap-y-2 mt-2 p-2 rounded-lg bg-slate-50">
+                    <label className="flex items-center gap-1.5 text-xs font-bold text-slate-600 pb-1.5" title="A run that is still going at the next day's start pushes that day's first run later"><input type="checkbox" checked={c.chain !== false} onChange={(e) => setCfg(L.label, { chain: e.target.checked })} /> Back to back across days</label>
+                    <Field label="Gap between runs (min)"><input type="number" min="0" className={smallIn + 'w-20'} value={c.gapMins} onChange={(e) => setCfg(L.label, { gapMins: e.target.value })} /></Field>
+                    <Field label="Cases per hour" hint="works out hours when a cell has none"><input type="number" min="0" className={smallIn + 'w-24'} value={c.rate} onChange={(e) => setCfg(L.label, { rate: e.target.value })} placeholder="-" /></Field>
+                    <Field label="Hours if blank" hint="only for a line with no window"><input type="number" min="0.25" step="0.25" className={smallIn + 'w-20'} value={c.defaultHours} onChange={(e) => setCfg(L.label, { defaultHours: e.target.value })} /></Field>
+                </div>
+            )}
+        </div>
+    );
+}
+
+// One run to check: day, item and status on the first line; start, stop, hours and flags on the second. Wraps on any screen width.
+function RunRow({ r, ed, onInclude, onEdit, onReset, onFlag }) {
+    const p = r.p, look = STATUS_LOOK[r.status];
+    const edited = ed.start || ed.end || (ed.hours !== undefined && ed.hours !== '');
+    const lab = 'text-[10px] font-black uppercase tracking-wider text-slate-400';
+    const guessed = p.hoursSource === 'default' || p.hoursSource === 'window';
+    const hoursTip = p.hoursSource === 'default' ? 'No hours on the sheet: the line\'s "hours if blank" was used. Type the real hours.' : p.hoursSource === 'window' ? 'No hours on the sheet: filled to the end of the line\'s window. Type the real hours if they differ.' : p.hoursSource === 'rate' ? 'Worked out from cases and the line rate' : '';
+    const notes = [];
+    if (r.status === 'update') notes.push({ t: r.changes.join('; '), c: 'text-slate-500' });
+    if (r.status === 'clash' && r.clashWith) notes.push({ t: `overlaps ${runTitle(r.clashWith)}, ${fmtDT(r.clashWith.start)}`, c: 'text-[#B00020]' });
+    if (r.selfOverlap) notes.push({ t: 'overlaps another run on this sheet', c: 'text-[#B00020]' });
+    if (p.afterCutoff) notes.push({ t: `ends after the stop time (${fmtTime(p.cutAt)})`, c: 'text-[#B27B00]' });
+    if (p.pushedMs > 0) notes.push({ t: `pushed ${fmtHrs(p.pushedMs)} by the run before`, c: 'text-slate-400' });
+    if (guessed) notes.push({ t: p.hoursSource === 'window' ? 'no hours on the sheet: filled to the end of the window' : 'no hours on the sheet: the line default was used', c: 'text-[#B27B00]' });
+    if (p.bad) notes.push({ t: 'stop is not after start', c: 'text-[#B00020] font-bold' });
+    return (
+        <div className={`px-3 py-2 border-t border-slate-100 ${r.include ? '' : 'opacity-60'} ${p.bad || r.selfOverlap ? 'bg-[#FDE8EC]/60' : ''}`}>
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                <input type="checkbox" checked={r.include} title="Put this run on the schedule" onChange={(e) => onInclude(e.target.checked)} />
+                <span className="text-xs font-black text-slate-700 whitespace-nowrap">{fmtDay(parseYMD(p.ymd).getTime())}</span>
+                <span className="font-mono text-xs text-slate-500">{p.item}</span>
+                <span className="text-xs text-slate-800 min-w-0 flex-1 basis-48" title={p.desc}>{p.desc}</span>
+                <span className={`inline-block px-1.5 py-0.5 rounded border text-[10px] font-black whitespace-nowrap ${look.cls}`}>{look.label}</span>
+            </div>
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 mt-1.5 pl-6">
+                <label className="flex items-center gap-1"><span className={lab}>Start</span><input type="datetime-local" className={smallIn} value={dtLocalValue(p.start)} onChange={(e) => e.target.value && onEdit({ start: e.target.value })} /></label>
+                <label className="flex items-center gap-1"><span className={lab}>Stop</span><input type="datetime-local" className={smallIn} value={dtLocalValue(p.end)} onChange={(e) => e.target.value && onEdit({ end: e.target.value })} /></label>
+                <label className="flex items-center gap-1"><span className={lab}>Hours</span>
+                    <input type="number" step="0.25" min="0.25" className={smallIn + 'w-16 ' + (guessed ? 'border-[#FFB81C] bg-[#FFF6E0]' : '')} value={Math.round(p.hours * 100) / 100} title={hoursTip} onChange={(e) => onEdit({ hours: e.target.value, end: '' })} /></label>
+                {edited && <button type="button" className="text-[10px] text-slate-400 hover:text-[#E4002B] underline" title="Back to the sheet values" onClick={onReset}>reset</button>}
+                <span className="whitespace-nowrap text-xs">
+                    <label className="mr-2" title="Allergen run"><input type="checkbox" checked={r.allergen} onChange={(e) => onFlag({ allergen: e.target.checked })} /> A</label>
+                    <label title="Crumb clean"><input type="checkbox" checked={r.crumb} onChange={(e) => onFlag({ crumb: e.target.checked })} /> C</label>
+                </span>
+                <span className="text-[11px] text-slate-500 whitespace-nowrap">{p.cases !== null && p.cases !== undefined ? `${fmtNum(p.cases)} cases` : ''}{p.order ? ` · order # ${p.order}` : ''}{p.orderWarn && <span className="ml-1 text-[#B27B00]" title="This does not look like an order number. It is saved as typed.">⚠</span>}</span>
+                {r.gap && <span className="inline-block px-1.5 py-0.5 rounded border text-[10px] font-black whitespace-nowrap" style={{ background: GAP_STYLE[r.gap.status].bg, borderColor: GAP_STYLE[r.gap.status].border, color: GAP_STYLE[r.gap.status].text }} title={gapText(r.gap)}>{r.gap.status === 'overlap' ? 'OVERLAP' : r.gap.req.mins <= 0 ? 'same product' : `clean ${fmtHrs(r.gap.gapMs)} / needs ${fmtMins(r.gap.req.mins)}`}</span>}
+            </div>
+            {notes.length > 0 && <div className="mt-1 pl-6 text-[10px] flex flex-wrap gap-x-3">{notes.map((n, i) => <span key={i} className={n.c}>{n.t}</span>)}</div>}
+        </div>
+    );
 }
 
 function ImportView({ areaOptions, settings, updateSettings, api, gapCtx, onDone, onView, apiReady }) {
@@ -1115,7 +1293,7 @@ function ImportView({ areaOptions, settings, updateSettings, api, gapCtx, onDone
     }, [parsed, settings.lineMap, areaOptions]);
     const setCfg = (label, patch) => updateSettings(s => ({ ...s, lineMap: { ...s.lineMap, [lineCfgKey(label)]: { ...guessLineCfg(label, areaOptions, s.lineMap[lineCfgKey(label)]), ...patch } } }));
 
-    const readText = (t) => { setResult(null); setEdits({}); setInc({}); setFlags({}); setRemoveIds({}); setGrid(t && t.trim() ? parseDelimited(t) : null); };
+    const readText = (t) => { setResult(null); setEdits({}); setInc({}); setFlags({}); setRemoveIds({}); setExisting({ key: '', byLine: {}, failed: false, loading: false }); setGrid(t && t.trim() ? parseDelimited(t) : null); };
     const readFile = (file) => {
         if (!file) return;
         setFileName(file.name); setReading(true); setResult(null);
@@ -1146,7 +1324,7 @@ function ImportView({ areaOptions, settings, updateSettings, api, gapCtx, onDone
                     if (!p.error || p.needWeekStart) rows = g;
                 }
                 if (!rows) { done('No sheet in that workbook has a Sunday ... Saturday header row.'); return; }
-                setText(''); setGrid(rows); done();
+                setText(''); setEdits({}); setInc({}); setFlags({}); setRemoveIds({}); setExisting({ key: '', byLine: {}, failed: false, loading: false }); setGrid(rows); done();
             } catch (e) { done(`Could not read that workbook: ${e && e.message ? e.message : e}`); }
         });
         fr.onerror = () => done('Could not read that file.');
@@ -1191,7 +1369,12 @@ function ImportView({ areaOptions, settings, updateSettings, api, gapCtx, onDone
     // Status of every planned run against what exists.
     const view = useMemo(() => {
         const out = { rows: [], orphans: [], counts: { new: 0, update: 0, same: 0, clash: 0, selected: 0 }, shortClean: 0 };
-        if (!ok || existing.key !== needKey || existing.loading) return { ...out, pending: true };
+        // Until the first read of a sheet finishes there is nothing to show. After that the last statuses stay on screen (dimmed)
+        // while a changed plan is checked again, and Apply stays off until the check matches what is on screen.
+        if (!ok) return { ...out, pending: true };
+        if (!needKey) return { ...out, pending: false };   // nothing planned (every line skipped): nothing to check
+        if (!existing.key) return { ...out, pending: true };
+        out.pending = existing.key !== needKey || existing.loading;
         const matchedIds = {};
         const rows = planned.map(p => {
             const lk = lineKeyOf(p.area, p.line), list = existing.byLine[lk] || [];
@@ -1307,9 +1490,33 @@ function ImportView({ areaOptions, settings, updateSettings, api, gapCtx, onDone
     };
 
     const setEdit = (key, patch) => setEdits(e => ({ ...e, [key]: { ...(e[key] || {}), ...patch } }));
-    const dayCount = ok ? parsed.days.length : 0;
-    const cellCls = "px-1.5 py-1 border-b border-slate-100 align-middle";
-    const smallIn = "border border-slate-300 rounded px-1.5 py-1 text-xs bg-white focus:outline-none focus:ring-1 focus:ring-[#0072CE] ";
+    // hours per line and day (after the pattern and any edits), for the chips on each line card and the group headers
+    const lineStats = useMemo(() => {
+        const m = {};
+        planned.forEach(p => {
+            const g = m[p.lineKey] = m[p.lineKey] || { days: {}, count: 0, hours: 0 };
+            const d = g.days[p.ymd] = g.days[p.ymd] || { hours: 0, filled: false };
+            d.hours += p.hours; g.count++; g.hours += p.hours;
+            if (p.hoursSource === 'window' || p.hoursSource === 'default') d.filled = true;
+        });
+        return m;
+    }, [planned]);
+    const chipsFor = (L) => {
+        const lk = lineCfgKey(L.label), st = lineStats[lk], c = cfgs[lk];
+        if (!st || !c) return [];
+        const wh = windowHours(c);
+        return parsed.days.filter(D => st.days[D.ymd]).map(D => ({ ymd: D.ymd, dow: parseYMD(D.ymd).getDay(), hours: st.days[D.ymd].hours, filled: st.days[D.ymd].filled, winH: wh }));
+    };
+    // the runs to check, grouped by sheet line (first appearance order)
+    const groups = useMemo(() => {
+        const g = [], idx = {};
+        (view.rows || []).forEach(r => {
+            const k = r.p.lineKey;
+            if (idx[k] === undefined) { idx[k] = g.length; g.push({ key: k, label: r.p.lineLabel, area: r.p.area, line: r.p.line, rows: [], hours: 0 }); }
+            const G = g[idx[k]]; G.rows.push(r); G.hours += r.p.hours;
+        });
+        return g;
+    }, [view.rows]);
 
     return (
         <div className="space-y-5">
@@ -1344,33 +1551,10 @@ function ImportView({ areaOptions, settings, updateSettings, api, gapCtx, onDone
 
             {ok && (
                 <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
-                    <h2 className="text-base font-black text-[#00468B] uppercase tracking-widest mb-1">2. Where each line runs, and when it starts</h2>
-                    <p className="text-sm text-slate-500 mb-3">Runs on a line and day are stacked in sheet order from the <b>day start</b>. With <b>back to back</b> on, a run that is still going at the next day's start pushes that day later (a 24 h run flows straight into the next). Settings are remembered for next week.</p>
-                    <div className="overflow-x-auto">
-                        <table className="w-full text-xs">
-                            <thead><tr className="text-left text-[10px] uppercase tracking-wider text-slate-500">
-                                {['Sheet line', 'Area', 'Line #', 'Day start', 'Day stop (warn)', 'Back to back', 'Gap (min)', 'Cases/hr', 'Hours if blank', 'Skip'].map(h => <th key={h} className="px-1.5 py-1 font-black">{h}</th>)}
-                            </tr></thead>
-                            <tbody>
-                                {parsed.lines.filter(L => L.items.length).map(L => {
-                                    const c = cfgs[lineCfgKey(L.label)];
-                                    return (
-                                        <tr key={L.label} className={c.skip ? 'opacity-50' : ''}>
-                                            <td className={cellCls}><div className="font-black text-slate-800">{L.label}</div><div className="text-[10px] text-slate-400">{[L.leads, L.supervisor].filter(Boolean).join(' · ')}</div></td>
-                                            <td className={cellCls}><input list="ps-areas-i" className={smallIn + 'w-36 ' + (!c.area && !c.skip ? 'border-[#E4002B] bg-[#FDE8EC]' : '')} value={c.area} onChange={(e) => setCfg(L.label, { area: e.target.value })} placeholder="choose area" /></td>
-                                            <td className={cellCls}><input type="number" min="1" className={smallIn + 'w-14'} value={c.line} onChange={(e) => setCfg(L.label, { line: e.target.value })} /></td>
-                                            <td className={cellCls}><input type="time" className={smallIn} value={c.dayStart} onChange={(e) => setCfg(L.label, { dayStart: e.target.value })} /></td>
-                                            <td className={cellCls}><input type="time" className={smallIn} value={c.dayStop} onChange={(e) => setCfg(L.label, { dayStop: e.target.value })} /></td>
-                                            <td className={cellCls}><input type="checkbox" checked={c.chain !== false} onChange={(e) => setCfg(L.label, { chain: e.target.checked })} /></td>
-                                            <td className={cellCls}><input type="number" min="0" className={smallIn + 'w-14'} value={c.gapMins} onChange={(e) => setCfg(L.label, { gapMins: e.target.value })} /></td>
-                                            <td className={cellCls}><input type="number" min="0" className={smallIn + 'w-16'} value={c.rate} onChange={(e) => setCfg(L.label, { rate: e.target.value })} placeholder="-" /></td>
-                                            <td className={cellCls}><input type="number" min="0.25" step="0.25" className={smallIn + 'w-14'} value={c.defaultHours} onChange={(e) => setCfg(L.label, { defaultHours: e.target.value })} /></td>
-                                            <td className={cellCls}><input type="checkbox" checked={!!c.skip} onChange={(e) => setCfg(L.label, { skip: e.target.checked })} /></td>
-                                        </tr>
-                                    );
-                                })}
-                            </tbody>
-                        </table>
+                    <h2 className="text-base font-black text-[#00468B] uppercase tracking-widest mb-1">2. How each line runs</h2>
+                    <p className="text-sm text-slate-500 mb-3">Pick how each line runs. <b>First run starts</b> is where every day begins and the rest of that day's runs stack after it in sheet order. Which days a line runs on comes from the sheet. The chips compare each day's hours with the line's window. Settings are remembered for next week.</p>
+                    <div className="space-y-3">
+                        {parsed.lines.filter(L => L.items.length).map(L => <LineCard key={L.label} L={L} c={cfgs[lineCfgKey(L.label)]} chips={chipsFor(L)} setCfg={setCfg} />)}
                     </div>
                     <datalist id="ps-areas-i">{areaOptions.map(a => <option key={a} value={a} />)}</datalist>
                     {unmapped.length > 0 && <p className="mt-2 text-xs font-bold text-[#E4002B]">Choose an area for: {unmapped.map(l => l.label).join(', ')} (or tick Skip).</p>}
@@ -1387,52 +1571,24 @@ function ImportView({ areaOptions, settings, updateSettings, api, gapCtx, onDone
                         </div>}
                     </div>
                     {existing.failed && <div className="mb-2 p-2 rounded-lg bg-[#FDE8EC] border border-[#E4002B]/40 text-xs font-bold text-[#B00020]">Could not read what is already scheduled on these lines, so duplicates cannot be ruled out. Press Reload (top right) and try again.</div>}
-                    {view.pending && !existing.failed && <p className="text-sm text-slate-500">Checking what is already on the schedule...</p>}
-                    {!view.pending && (
-                        <div className="overflow-x-auto">
-                            <table className="w-full text-xs border-collapse">
-                                <thead><tr className="text-left text-[10px] uppercase tracking-wider text-slate-500 bg-slate-50">
-                                    {['Add', 'Line', 'Day', 'Item', 'Description', 'Cases', 'Order #', 'Start', 'Stop', 'Hours', 'Allergen', 'Status', 'Cleaning before'].map(h => <th key={h} className="px-1.5 py-1.5 font-black whitespace-nowrap">{h}</th>)}
-                                </tr></thead>
-                                <tbody>
-                                    {view.rows.map(r => {
-                                        const p = r.p, ed = edits[p.key] || {}, look = STATUS_LOOK[r.status], edited = ed.start || ed.end || (ed.hours !== undefined && ed.hours !== '');
-                                        return (
-                                            <tr key={p.key} className={`${r.include ? '' : 'opacity-60'} ${p.bad || r.selfOverlap ? 'bg-[#FDE8EC]/60' : ''}`}>
-                                                <td className={cellCls}><input type="checkbox" checked={r.include} onChange={(e) => setInc(i => ({ ...i, [p.key]: e.target.checked }))} /></td>
-                                                <td className={cellCls + ' font-bold whitespace-nowrap'}>{p.lineLabel}</td>
-                                                <td className={cellCls + ' whitespace-nowrap'}>{fmtDay(parseYMD(p.ymd).getTime())}</td>
-                                                <td className={cellCls + ' font-mono'}>{p.item}</td>
-                                                <td className={cellCls + ' max-w-[230px] truncate'} title={p.desc}>{p.desc}</td>
-                                                <td className={cellCls + ' text-right'}>{fmtNum(p.cases)}</td>
-                                                <td className={cellCls + ' whitespace-nowrap'}>{p.order}{p.orderWarn && <span className="ml-1 text-[#B27B00]" title="This does not look like an order number. It is saved as typed.">⚠</span>}</td>
-                                                <td className={cellCls}><input type="datetime-local" className={smallIn} value={dtLocalValue(p.start)} onChange={(e) => e.target.value && setEdit(p.key, { start: e.target.value })} /></td>
-                                                <td className={cellCls}><input type="datetime-local" className={smallIn} value={dtLocalValue(p.end)} onChange={(e) => e.target.value && setEdit(p.key, { end: e.target.value })} /></td>
-                                                <td className={cellCls}>
-                                                    <input type="number" step="0.25" min="0.25" className={smallIn + 'w-16 ' + (p.hoursSource === 'default' ? 'border-[#FFB81C] bg-[#FFF6E0]' : '')} value={Math.round(p.hours * 100) / 100}
-                                                        title={p.hoursSource === 'default' ? 'No hours on the sheet: the line default was used. Type the real hours.' : p.hoursSource === 'rate' ? 'Worked out from cases and the line rate' : ''}
-                                                        onChange={(e) => setEdit(p.key, { hours: e.target.value, end: '' })} />
-                                                    {edited && <button type="button" className="ml-1 text-[10px] text-slate-400 hover:text-[#E4002B]" title="Back to the sheet values" onClick={() => setEdits(e => { const n = { ...e }; delete n[p.key]; return n; })}>reset</button>}
-                                                </td>
-                                                <td className={cellCls + ' whitespace-nowrap'}>
-                                                    <label className="mr-2" title="Allergen run"><input type="checkbox" checked={r.allergen} onChange={(e) => setFlags(f => ({ ...f, [p.key]: { ...(f[p.key] || {}), allergen: e.target.checked } }))} /> A</label>
-                                                    <label title="Crumb clean"><input type="checkbox" checked={r.crumb} onChange={(e) => setFlags(f => ({ ...f, [p.key]: { ...(f[p.key] || {}), crumb: e.target.checked } }))} /> C</label>
-                                                </td>
-                                                <td className={cellCls}>
-                                                    <span className={`inline-block px-1.5 py-0.5 rounded border text-[10px] font-black whitespace-nowrap ${look.cls}`}>{look.label}</span>
-                                                    {r.status === 'update' && <div className="text-[10px] text-slate-500 max-w-[220px]">{r.changes.join('; ')}</div>}
-                                                    {r.status === 'clash' && r.clashWith && <div className="text-[10px] text-[#B00020] max-w-[220px]">overlaps {runTitle(r.clashWith)}, {fmtDT(r.clashWith.start)}</div>}
-                                                    {r.selfOverlap && <div className="text-[10px] text-[#B00020]">overlaps another run on this sheet</div>}
-                                                    {p.afterCutoff && <div className="text-[10px] text-[#B27B00]">ends after the day stop</div>}
-                                                    {p.pushedMs > 0 && <div className="text-[10px] text-slate-400">pushed {fmtHrs(p.pushedMs)} by the run before</div>}
-                                                    {p.bad && <div className="text-[10px] text-[#B00020] font-bold">stop is not after start</div>}
-                                                </td>
-                                                <td className={cellCls}>{r.gap ? <span className="inline-block px-1.5 py-0.5 rounded border text-[10px] font-black whitespace-nowrap" style={{ background: GAP_STYLE[r.gap.status].bg, borderColor: GAP_STYLE[r.gap.status].border, color: GAP_STYLE[r.gap.status].text }} title={gapText(r.gap)}>{r.gap.status === 'overlap' ? 'OVERLAP' : r.gap.req.mins <= 0 ? 'same product' : `${fmtHrs(r.gap.gapMs)} / needs ${fmtMins(r.gap.req.mins)}`}</span> : <span className="text-slate-300">-</span>}</td>
-                                            </tr>
-                                        );
-                                    })}
-                                </tbody>
-                            </table>
+                    {view.pending && !existing.failed && <p className="text-sm text-slate-500 mb-2">Checking what is already on the schedule...</p>}
+                    {view.rows.length > 0 && (
+                        <div className={`space-y-4 transition-opacity ${view.pending ? 'opacity-50' : ''}`}>
+                            {groups.map(G => (
+                                <div key={G.key} className="border border-slate-200 rounded-xl overflow-hidden">
+                                    <div className="px-3 py-2 bg-[#E6F1FB] flex flex-wrap items-center gap-x-3 gap-y-0.5">
+                                        <span className="text-sm font-black text-[#00468B]">{G.label}</span>
+                                        <span className="text-xs font-bold text-slate-600">{lineLabelOf(G.area, G.line)}</span>
+                                        <span className="text-[11px] text-slate-500">{patternTag(cfgs[G.key])}</span>
+                                        <span className="ml-auto text-[11px] font-bold text-slate-600">{G.rows.length} run{G.rows.length === 1 ? '' : 's'} · {fmtHrs(G.hours * HOUR)}</span>
+                                    </div>
+                                    {G.rows.map(r => <RunRow key={r.p.key} r={r} ed={edits[r.p.key] || {}}
+                                        onInclude={(v) => setInc(i => ({ ...i, [r.p.key]: v }))}
+                                        onEdit={(patch) => setEdit(r.p.key, patch)}
+                                        onReset={() => setEdits(e => { const n = { ...e }; delete n[r.p.key]; return n; })}
+                                        onFlag={(patch) => setFlags(f => ({ ...f, [r.p.key]: { ...(f[r.p.key] || {}), ...patch } }))} />)}
+                                </div>
+                            ))}
                         </div>
                     )}
                     {ok && parsed.lines.some(L => L.notes.length || L.items.some(it => it.notes.length)) && (
@@ -1455,13 +1611,15 @@ function ImportView({ areaOptions, settings, updateSettings, api, gapCtx, onDone
                             <p className="text-[10px] text-slate-400 mt-1">Left alone unless ticked. Ticked runs are deleted when you apply.</p>
                         </div>
                     )}
-                    <div className="flex flex-wrap items-center gap-3 mt-4">
-                        <Btn onClick={apply} disabled={!canApply}>{applying ? `Saving ${applying.done} of ${applying.total}...` : `Apply to schedule (${toApply.length} run${toApply.length === 1 ? '' : 's'}${toRemove.length ? `, remove ${toRemove.length}` : ''})`}</Btn>
-                        {!apiReady && <span className="text-xs text-[#B27B00] font-bold">Preview mode: nothing is saved to Dataverse.</span>}
-                        {result && result.changes && result.changes.length > 0 && !applying && <Btn kind="danger" onClick={undoImport} disabled={result.busy}>{result.busy ? 'Undoing...' : result.confirmUndo ? 'Really undo this import?' : 'Undo this import'}</Btn>}
-                        {result && result.type === 'success' && ok && <Btn kind="ghost" onClick={() => onView(parseYMD(parsed.days[0].ymd).getTime())}>View week on the schedule</Btn>}
+                    <div className="sticky bottom-0 z-30 -mx-4 -mb-4 mt-4 px-4 py-3 bg-white/95 border-t border-slate-200 rounded-b-xl shadow-[0_-6px_14px_rgba(15,23,42,0.08)]">
+                        {result && <div className={`mb-2 p-2.5 rounded-lg border text-sm font-semibold ${result.type === 'success' ? 'bg-[#DCFCE7] border-[#16A34A]/50 text-[#166534]' : 'bg-[#FDE8EC] border-[#E4002B]/40 text-[#B00020]'}`}>{result.message}</div>}
+                        <div className="flex flex-wrap items-center gap-3">
+                            <Btn onClick={apply} disabled={!canApply}>{applying ? `Saving ${applying.done} of ${applying.total}...` : `Apply to schedule (${toApply.length} run${toApply.length === 1 ? '' : 's'}${toRemove.length ? `, remove ${toRemove.length}` : ''})`}</Btn>
+                            {!apiReady && <span className="text-xs text-[#B27B00] font-bold">Preview mode: nothing is saved to Dataverse.</span>}
+                            {result && result.changes && result.changes.length > 0 && !applying && <Btn kind="danger" onClick={undoImport} disabled={result.busy}>{result.busy ? 'Undoing...' : result.confirmUndo ? 'Really undo this import?' : 'Undo this import'}</Btn>}
+                            {result && result.type === 'success' && ok && <Btn kind="ghost" onClick={() => onView(parseYMD(parsed.days[0].ymd).getTime())}>View week on the schedule</Btn>}
+                        </div>
                     </div>
-                    {result && <div className={`mt-3 p-3 rounded-lg border text-sm font-semibold ${result.type === 'success' ? 'bg-[#DCFCE7] border-[#16A34A]/50 text-[#166534]' : 'bg-[#FDE8EC] border-[#E4002B]/40 text-[#B00020]'}`}>{result.message}</div>}
                 </div>
             )}
         </div>
@@ -2114,7 +2272,7 @@ export default function ProductionScheduleApp({ dataApi }) {
             <div className="bg-white border-b border-slate-200 px-4 py-2 flex flex-wrap items-center gap-4 sticky top-0 z-40">
                 <BrandLogo />
                 <div className="leading-tight"><div className="text-sm font-black uppercase tracking-widest text-[#00468B]">Production Schedule</div><div className="text-[10px] text-slate-400">plan · import · shifts · cleaning</div></div>
-                <div className="flex gap-1.5 overflow-x-auto brand-tabs ml-2">
+                <div className="flex flex-wrap gap-1.5 ml-2">
                     {TABS.map(t => { const I = t.icon; return (
                         <button key={t.id} type="button" onClick={() => setTab(t.id)} className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-xs font-extrabold border whitespace-nowrap transition-colors ${tab === t.id ? 'bg-[#0072CE] text-white border-[#0072CE]' : 'bg-white text-slate-600 border-slate-300 hover:bg-[#E6F1FB]'}`}><I className="w-4 h-4" />{t.label}</button>); })}
                 </div>
