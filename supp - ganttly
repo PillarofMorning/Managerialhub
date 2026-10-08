@@ -646,13 +646,14 @@ function buildShiftWindows(slots, planStart, horizonMins) {
         .sort(function(a, b) { return a.start - b.start || a.crew.localeCompare(b.crew); });
 }
 
-// Ganttly (current): the past 12 hours and the next 24 by the clock, from the top of the hour (Gerald, Oct 8), as one window
-// { date, hour, hours, startMs } of 36 hours that moves on every hour. Shifts are cut at its edges; `startMs` is the window's
-// own clock-in ms (DST-safe), the shift keys are built from it.
+// Ganttly (current): the past 12 hours and the next 24 by the clock (Gerald, Oct 8), as one window { date, hour, hours, startMs }
+// that starts 12 hours before the top of this hour and runs to the top of the hour after the next 24 hours, so it always shows
+// at least 12 hours back and 24 ahead (37 hours) and moves on every hour. Shifts are cut at its edges; `startMs` is the
+// window's own clock-in ms (DST-safe), the shift keys are built from it.
 const LIVE_HOURS_BACK = 12, LIVE_HOURS_AHEAD = 24;
 function currentShiftWindow(now) {
     const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours() - LIVE_HOURS_BACK, 0, 0);
-    return { date: getLocalYMD(start), hour: start.getHours(), hours: LIVE_HOURS_BACK + LIVE_HOURS_AHEAD, startMs: start.getTime() };
+    return { date: getLocalYMD(start), hour: start.getHours(), hours: LIVE_HOURS_BACK + LIVE_HOURS_AHEAD + 1, startMs: start.getTime() };
 }
 
 // Working minutes inside [start, end) once breaks / downtimes (possibly overlapping) are removed.
@@ -719,14 +720,14 @@ function formatClockTime(shiftDateStr, startHour, elapsedMinutes) {
     return m + '/' + (dd < 10 ? '0'+dd : dd) + ' ' + h + ':' + (mins < 10 ? '0'+mins : mins) + ' ' + ampm;
 }
 
-// "Mon 11:30 PM" for an absolute time (the Dashboard's "cleaned / due again" chip).
+// "Mon 10/5 11:30 PM" for an absolute time (the Dashboard's "cleaned / due again" chip).
 function formatDayClock(ms) {
     const d = new Date(ms);
     if (isNaN(d.getTime())) return '';
     let h = d.getHours();
     const mins = d.getMinutes(), ampm = h >= 12 ? 'PM' : 'AM';
     h = h % 12; h = h ? h : 12;
-    return DAY_NAMES[d.getDay()] + ' ' + h + ':' + (mins < 10 ? '0' + mins : mins) + ' ' + ampm;
+    return DAY_NAMES[d.getDay()] + ' ' + (d.getMonth() + 1) + '/' + d.getDate() + ' ' + h + ':' + (mins < 10 ? '0' + mins : mins) + ' ' + ampm;
 }
 
 function formatGanttHeaderTime(shiftDateStr, startHour, elapsedMinutes) {
@@ -1011,6 +1012,24 @@ const CLEAN_TYPE_ORDER = ['craa5_dailyclean', 'craa5_midweek', 'craa5_weeklyclea
 // shortest cadence among the yes columns that put the equipment in its room's type of clean (`types`; none picked = all of its
 // yes columns). A column not listed here, or no yes column at all, counts as daily.
 const CLEAN_CADENCE_DAYS = { craa5_dailyclean: 1, craa5_midweek: 7, craa5_weeklyclean: 7, craa5_monthlyclean: 30, craa5_month: 30, craa5_quarterly: 91, craa5_annually: 365 };
+// Ganttly: the check-offs of one piece of equipment, oldest first, cut into finished cleans (`history`) and the clean under way
+// (`tail`). A clean is finished when its parts add up to the equipment's work and the last of them is done; `lastDoneMs` is
+// when the newest finished clean ended and `lastDoneStartMs` when its last part started.
+function splitCleanCycles(frozen, rawWork) {
+    const history = [];
+    let tail = [], work = 0, lastDoneMs = 0, lastDoneStartMs = 0;
+    frozen.forEach(function(b) {
+        tail.push(b);
+        work += Number(b.workMins) || 0;
+        if (b.status === 'done' && work >= rawWork - 1) {
+            history.push(tail);
+            lastDoneMs = b.startMs + (Number(b.durationMins) || 0) * 60000;
+            lastDoneStartMs = b.startMs;
+            tail = []; work = 0;
+        }
+    });
+    return { history: history, tail: tail, lastDoneMs: lastDoneMs, lastDoneStartMs: lastDoneStartMs };
+}
 function cadenceDaysOf(flags, types) {
     const all = Array.isArray(flags) ? flags : [];
     const inType = types && types.length ? all.filter(function(k) { return types.indexOf(k) > -1; }) : all;
@@ -1721,7 +1740,7 @@ export default function App(props) {
             // Absent for the plan (PBED) or for this shift (current app): not counted on the room, dealt no equipment.
             const absentW = absentByShift[w.key] || {};
             const keep = function(id) { return !!empById[id] && !absentEmployees[id] && !absentW[id]; };
-            const whyOut = function(id) { return absentEmployees[id] ? 'marked absent in Ganttly' : absentW[id] ? 'marked absent for this shift in Ganttly' : (rosterInfo.whyIgnored[id] || 'not on the Ganttly roster'); };
+            const whyOut = function(id) { return absentEmployees[id] ? 'marked absent in PBED' : absentW[id] ? 'marked absent for this shift in Ganttly' : (rosterInfo.whyIgnored[id] || 'not on the ' + (IS_CURRENT ? 'Ganttly' : 'PBED') + ' roster'); };
             const night = isNightHour(new Date(globalStartMs + w.shiftStart * 60000).getHours());
             const mb = sb.merged;
             const lineOf = function(lid) { return lineById[lid] || (mb.manualNames[lid] ? { id: lid, name: mb.manualNames[lid] } : null); };
@@ -1821,7 +1840,19 @@ export default function App(props) {
     const inPlan = function(a) { return !a.removed && inCleanType(a); };
     // Ganttly (current): how long a check-off counts for, in ms. Daily equipment is once a day, weekly once a week, and so on
     // (the shortest cadence among the yes columns that put it in its room's type of clean). A custom task is done once.
-    const cadenceMsOf = function(a) { return Array.isArray(a.flags) ? cadenceDaysOf(a.flags, roomCleanTypes(a.area)) * 86400000 : Infinity; };
+    const cadenceMsOf = function(a) {
+        if (Array.isArray(a.flags)) return cadenceDaysOf(a.flags, roomCleanTypes(a.area)) * 86400000;
+        return String(a.id).indexOf('custom_') === 0 ? Infinity : 86400000;   // custom tasks are done once; sample data counts as daily
+    };
+    // Counted from the clock-in of the shift the clean was done in (not from the minute it ended), so a daily clean comes due
+    // at the same shift again the next day and does not drift later every day.
+    const shiftClockInOf = function(ms) {
+        const base = new Date(ms - 2 * 86400000);
+        const spanStart = new Date(base.getFullYear(), base.getMonth(), base.getDate(), 0, 0, 0);
+        const off = (ms - spanStart.getTime()) / 60000;
+        const w = buildShiftWindows(shiftRotation, spanStart, 5 * 1440).filter(function(x) { return off >= x.shiftStart && off < x.shiftEnd; }).sort(function(a, b) { return b.shiftStart - a.shiftStart; })[0];
+        return w ? spanStart.getTime() + w.shiftStart * 60000 : ms;
+    };
     const toggleCleanType = function(k) {
         setCleanTypes(function(prev) { const cur = prev.filter(function(x) { return cleanTypeCols.indexOf(x) > -1; }); return cur.indexOf(k) > -1 ? cur.filter(function(x) { return x !== k; }) : cur.concat([k]); });
     };
@@ -2453,24 +2484,37 @@ export default function App(props) {
                 inspectMins: includeInspection ? baseMins * 0.10 : 0,
                 transitMins: includeTransit ? 10 * t.heads : 0,
                 blocks: [], unscheduledWork: 0, removed: !!rawT.removed,   // removed: taken out on the Dashboard, only its started / done parts kept
-                lastDoneMs: 0, dueAgainMin: null   // Ganttly: when the last check-off ended; the minute the next clean was planned from (null = not due in the window)
+                lastDoneMs: 0, dueMs: 0, dueAgainMin: null,   // Ganttly: when the last finished clean ended and when it is due again; the minute the next clean was planned from (null = not planned in the window)
+                keepIds: null   // Ganttly: ids of the check-offs that still matter (the newest finished clean and the one under way); older ones are pruned
             };
             parents.push(parent);
 
             // Pass 0: frozen (started / done) blocks.
             const frozen = (statusByParent[t.parentId] || []).sort(function(a, b) { return a.startMs - b.startMs; });
             let frozenWork = 0;
-            const drawn = [];   // the frozen blocks inside the window
+            // Ganttly: the check-offs split into finished cleans and the clean under way (PBED: all of them are one clean).
+            let cyc = { history: [], tail: frozen, lastDoneMs: 0, lastDoneStartMs: 0 };
+            if (IS_CURRENT) {
+                cyc = splitCleanCycles(frozen, t.rawWorkloadMins);
+                parent.lastDoneMs = cyc.lastDoneMs;
+                parent.keepIds = {};
+                (cyc.history.length ? cyc.history[cyc.history.length - 1] : []).concat(cyc.tail).forEach(function(b) { parent.keepIds[b.id] = true; });
+                if (cyc.lastDoneMs > 0) {
+                    const cadMs = cadenceMsOf(rawT);
+                    parent.dueMs = cadMs === Infinity ? Infinity : shiftClockInOf(cyc.lastDoneStartMs) + cadMs;
+                }
+            }
+            const inTail = {};
+            cyc.tail.forEach(function(b) { inTail[b.id] = true; });
+            const counted = [];   // the blocks of the clean under way that count toward its work
             frozen.forEach(function(b) {
                 const endMs = b.startMs + (Number(b.durationMins) || 0) * 60000;
-                if (b.status === 'done') parent.lastDoneMs = Math.max(parent.lastDoneMs, endMs);
                 if (IS_CURRENT && endMs <= startMs) {
-                    // Before the window. A finished clean still counts for its cadence (the prune below keeps it until then), so
-                    // the equipment is not planned again; nothing is drawn. A block started but never finished is dropped.
-                    if (b.status === 'done') frozenWork += b.workMins;
+                    // Before the window: nothing is drawn. A part of the clean under way that was finished still counts; a block
+                    // started but never finished is dropped, and finished cleans only matter for when the next one is due.
+                    if (b.status === 'done' && inTail[b.id]) { frozenWork += b.workMins; counted.push(b); }
                     return;
                 }
-                drawn.push(b);
                 const blk = Object.assign(Object.create(Object.getPrototypeOf(t)), t);
                 blk.id = b.id;
                 blk.name = b.name || t.baseName;
@@ -2492,36 +2536,35 @@ export default function App(props) {
                 blk.segments = [{ startMin: blk.startMin, duration: blk.finalDuration }];
                 blk.crew = blk.assignedLanes.length ? workers[blk.assignedLanes[0]].crew : '';
                 blk.assignedLanes.forEach(function(l) { workers[l].assign(blk.startMin, blk.startMin + blk.finalDuration, blk.id, area); });
-                frozenWork += b.workMins;
+                if (inTail[b.id]) { frozenWork += b.workMins; counted.push(b); }
                 allTasks.push(blk);
             });
             if (rawT.removed) return;
 
-            if (drawn.length > 0 || frozenWork > 0) {
+            if (counted.length > 0) {
                 const remaining = t.rawWorkloadMins - frozenWork;
-                if (remaining <= 1) {
-                    // Fully covered by started / done work. Ganttly: a finished clean is due again its cadence after the last
-                    // check-off (daily = a day, weekly = a week); when that falls inside the window, the next clean is planned
-                    // from then as a new block (its own id, so the check-off of the last one is left alone).
-                    if (!IS_CURRENT || !parent.lastDoneMs) return;
-                    const cad = cadenceMsOf(rawT);
-                    const dueMin = cad === Infinity ? Infinity : Math.round((parent.lastDoneMs + cad - startMs) / 60000);
-                    if (dueMin >= planHorizonMins) return;
-                    parent.dueAgainMin = dueMin;
-                    t.id = t.parentId + '_n' + simpleHash(frozen.filter(function(b) { return b.status === 'done'; }).map(function(b) { return b.id; }).sort().join('|'));
-                    t.ptOffset = 0;
-                    t.earliestStart = Math.max(0, dueMin);
-                } else {
-                    t.workOverrideMins = remaining;
-                    t.id = t.parentId + '_g' + simpleHash(drawn.map(function(b) { return b.id; }).sort().join('|'));
-                    t.ptOffset = drawn.length;
-                    t.name = t.baseName + ' (Pt ' + (drawn.length + 1) + ')';
-                    t.isTransitActive = false;
-                    t.isInspectionActive = false;
-                    t.isSplitPart2 = true;
-                    // The rest of the job picks up where the last started / finished part left off.
-                    t.earliestStart = drawn.length ? Math.max(0, Math.max.apply(null, drawn.map(function(b) { return Math.round((b.startMs - startMs) / 60000) + b.durationMins; }))) : 0;
-                }
+                if (remaining <= 1) return; // fully covered by started / done work
+                t.workOverrideMins = remaining;
+                t.id = t.parentId + '_g' + simpleHash(counted.map(function(b) { return b.id; }).sort().join('|'));
+                t.ptOffset = counted.length;
+                t.name = t.baseName + ' (Pt ' + (counted.length + 1) + ')';
+                t.isTransitActive = false;
+                t.isInspectionActive = false;
+                t.isSplitPart2 = true;
+                // The rest of the job picks up where the last started / finished part left off.
+                t.earliestStart = Math.max(0, Math.max.apply(null, counted.map(function(b) { return Math.round((b.startMs - startMs) / 60000) + b.durationMins; })));
+            } else if (IS_CURRENT && cyc.lastDoneMs > 0) {
+                // Ganttly: a finished clean and none under way. It is due again its cadence after the shift it was done in
+                // started (daily = a day, weekly = a week; custom tasks never). When that falls inside the window, with room
+                // for the clean before the window ends, the next clean is planned from then as a new block (its id carries
+                // the end of the last clean, so it stays the same while the older check-offs are pruned).
+                if (parent.dueMs === Infinity) return;
+                const dueMin = Math.round((parent.dueMs - startMs) / 60000);
+                if (dueMin + Math.min(t.rawWorkloadMins, 240) >= planHorizonMins) return;
+                parent.dueAgainMin = dueMin;
+                t.id = t.parentId + '_n' + Math.floor(cyc.lastDoneMs / 60000).toString(36);
+                t.ptOffset = 0;
+                t.earliestStart = Math.max(0, dueMin);
             } else {
                 t.ptOffset = 0;
             }
@@ -3461,7 +3504,7 @@ export default function App(props) {
             parentById: parentById,
             taskById: taskById
         };
-    }, [assets, cleanTypes, roomCleanType, cleanTypeCols, roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, overrides, taskStatus, targetDowntimes, allInterrupts, includeTransit, includeInspection, pbMode, hiddenRooms, roomSource, shiftStartLines, areaLine, customOnlyAreas, windowPlans, laneByEmpCrew, shiftWindows, laneRoster, maxCrewSize, planHorizonMins, handoverMins, tailFillMins, reforecastFrom, ganttStartDate, ganttStartHour]);
+    }, [assets, cleanTypes, roomCleanType, cleanTypeCols, roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, overrides, taskStatus, targetDowntimes, allInterrupts, includeTransit, includeInspection, pbMode, hiddenRooms, roomSource, shiftStartLines, areaLine, customOnlyAreas, windowPlans, laneByEmpCrew, shiftWindows, laneRoster, maxCrewSize, planHorizonMins, handoverMins, tailFillMins, reforecastFrom, ganttStartDate, ganttStartHour, shiftRotation]);
 
     // ============================================================================
     // LIVE TRACKING ACTIONS (check-off, start, reassign, move)
@@ -3484,6 +3527,9 @@ export default function App(props) {
                 startMin = nowMin;
                 duration = task.calculateDuration(nowMin, task.customInterrupts, task.appliedHeads);
             }
+            // Ganttly: checked off without having been started, while the block is planned for later (or, with Live Reforecast off,
+            // earlier): it was done now, so it is recorded as just finished instead of at its planned time.
+            if (IS_CURRENT && status === 'done' && !existing && nowMin >= 0 && (startMin > nowMin || startMin + duration <= nowMin)) { startMin = nowMin; duration = 5; }
             // Finished early → free the workers from now on.
             if (status === 'done' && nowMin > startMin && nowMin < startMin + duration) duration = nowMin - startMin;
             return Object.assign({}, prev, { [task.id]: {
@@ -3564,13 +3610,14 @@ export default function App(props) {
         document.body.removeChild(link);
     };
 
-    // Ganttly (current): a check-off counts for the equipment's cadence (daily = a day, weekly = a week after it ended; see
-    // cadenceMsOf), so a finished clean stays out of the plan that long and then is due again. The check-off is kept until the
-    // window's start has passed that due time (so the next clean keeps its block id, moves and check-off, and the Dashboard
-    // keeps saying when it was last cleaned); a block started but never finished, a move or a downtime goes once its time is
-    // before the window. Marks for a shift go a day after its clock-in has left the window (a shift cut at the window's start
-    // still shows), custom tasks a day after they were added has left it. Not before the Dataverse data is in: the cadence
-    // needs the equipment's yes columns.
+    // Ganttly (current): a check-off counts for the equipment's cadence (daily = a day, weekly = a week, counted from the shift
+    // it was done in; see cadenceMsOf), so a finished clean stays out of the plan that long and then is due again. The check-offs
+    // of the newest finished clean (older finished cleans go at once) are kept until the window's start has passed that due time (so the next clean keeps its block id, moves and check-off, and
+    // the Dashboard keeps saying when it was last cleaned); a block started but never finished, a move or a downtime goes once
+    // its time is before the window. Marks for a shift go a day after its clock-in has left the window (a shift cut at the
+    // window's start still shows). A custom task goes a day after it was added has left the window, unless a check-off of it is
+    // still inside it; it keeps its check-offs while it exists. Not before the Dataverse data is in: the cadence needs the
+    // equipment's yes columns.
     useEffect(function() {
         if (!IS_CURRENT || isLoading) return;
         const DAY = 86400000;
@@ -3581,14 +3628,24 @@ export default function App(props) {
             Object.keys(prev).forEach(function(k) { if (test(k, prev[k])) next[k] = prev[k]; else changed = true; });
             return changed ? next : prev;
         };
-        const taskKeep = function(a) { return !(a && a.createdMs && a.createdMs < globalStartMs - DAY); };   // custom tasks
-        const cadById = {};
-        assets.filter(taskKeep).forEach(function(a) { cadById[a.id] = cadenceMsOf(a); });
+        const inWindow = {};   // parents with a check-off still inside the window
+        Object.keys(taskStatus).forEach(function(k) { const b = taskStatus[k]; if (b && b.startMs + (Number(b.durationMins) || 0) * 60000 >= globalStartMs) inWindow[b.parentId] = true; });
+        const taskKeep = function(a) { return !(a && a.createdMs && a.createdMs < globalStartMs - DAY) || !!inWindow[a && a.id]; };   // custom tasks
+        const keptCustom = {}, cadById = {};
+        assets.forEach(function(a) {
+            cadById[a.id] = cadenceMsOf(a);
+            if (String(a.id).indexOf('custom_') === 0 && taskKeep(a)) keptCustom[a.id] = true;
+        });
         setTaskStatus(function(prev) { return prune(prev, function(k, b) {
             if (!b) return true;
             const endMs = b.startMs + (Number(b.durationMins) || 0) * 60000;
             if (endMs >= globalStartMs) return true;
-            return b.status === 'done' && endMs + (cadById[b.parentId] !== undefined ? cadById[b.parentId] : DAY) > globalStartMs;
+            if (b.status !== 'done') return false;
+            if (String(b.parentId).indexOf('custom_') === 0) return !!keptCustom[b.parentId];   // done once: stays while the task does
+            const p = scheduleData.parentById ? scheduleData.parentById[b.parentId] : null;
+            if (p && p.keepIds && !p.keepIds[k]) return false;   // an older finished clean: only the newest one matters
+            if (p && p.dueMs) return p.dueMs > globalStartMs;   // the finished clean's check-offs expire together, when it is due again
+            return endMs + (cadById[b.parentId] !== undefined ? cadById[b.parentId] : DAY) > globalStartMs;
         }); });
         setOverrides(function(prev) { return prune(prev, function(k, ov) { return !ov || ov.startMs === undefined || ov.startMs >= globalStartMs; }); });
         const dtKeep = function(dt) { const t = new Date(dt.dateTimeStr).getTime(); return isNaN(t) || t + (Number(dt.duration) || 0) * 60000 >= globalStartMs; };
@@ -3795,7 +3852,7 @@ export default function App(props) {
             room: room, start: start === Infinity ? 0 : start, end: end, manpowerMins: mp,
             pct: wt > 0 ? Math.round((wd / wt) * 100) : 0, late: late, overflow: overflow.length,
             equipCount: parentsHere.length,
-            equipDone: parentsHere.filter(function(p) { return (p.blocks.length > 0 || p.lastDoneMs > 0) && p.unscheduledWork === 0 && p.blocks.every(function(b) { return b.isComplete; }); }).length
+            equipDone: parentsHere.filter(function(p) { return (p.blocks.length > 0 || (IS_CURRENT && p.lastDoneMs > 0)) && p.unscheduledWork === 0 && p.blocks.every(function(b) { return b.isComplete; }); }).length
         };
     });
 
@@ -4071,8 +4128,7 @@ export default function App(props) {
                                     const p = IS_CURRENT ? scheduleData.parentById[a.id] : null;
                                     if (!p || !p.lastDoneMs || p.unscheduledWork > 0) return null;
                                     if (p.dueAgainMin === null && p.blocks.some(function(b) { return !b.isComplete; })) return null;
-                                    const cad = cadenceMsOf(a);
-                                    return { doneMs: p.lastDoneMs, dueMs: cad === Infinity ? null : p.lastDoneMs + cad, planned: p.dueAgainMin !== null };
+                                    return { doneMs: p.lastDoneMs, dueMs: p.dueMs && p.dueMs !== Infinity ? p.dueMs : null, planned: p.dueAgainMin !== null };
                                 };
                                 const typed = assets.filter(function(a) { return a.area === room && inCleanType(a); });
                                 const roomTasks = typed.filter(function(a) { return !a.removed; });
@@ -4120,7 +4176,7 @@ export default function App(props) {
                                                             return (
                                                                 <tr key={task.id} className="hover:bg-slate-50">
                                                                     <td className="p-3 font-bold text-slate-800">{task.name}{di && (
-                                                                        <span data-done-chip={task.id} className={`block text-[10px] font-bold ${di.planned ? 'text-amber-700' : 'text-emerald-700'}`}>✓ Cleaned {formatDayClock(di.doneMs)}{di.dueMs ? (di.planned ? ' · next clean planned' : ' · due again ' + formatDayClock(di.dueMs)) : ''}</span>
+                                                                        <span data-done-chip={task.id} className={`block text-[10px] font-bold ${di.planned ? 'text-amber-700' : 'text-emerald-700'}`}>✓ Cleaned {formatDayClock(di.doneMs)}{di.dueMs ? (di.planned ? ' · next clean planned (due ' + formatDayClock(di.dueMs) + ')' : ' · due again ' + formatDayClock(di.dueMs)) : ''}</span>
                                                                     )}</td>
                                                                     <td className="p-3">
                                                                         <input type="number" min="0" value={task.minutesRequired} onChange={function(e) { handleBaseMinsChange(task.id, e.target.value); }} className={`w-full text-center border rounded p-1 outline-none no-pan font-bold ${!roomAllergen[room] ? 'border-[#8FC0EC] bg-[#E6F1FB] text-[#00468B]' : 'border-slate-200'}`} />
