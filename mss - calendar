@@ -21,6 +21,9 @@ import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react'
   8. Paperwork: a log row with a picture or file attached shows a paper clip on its marker; a click opens the
      picture in a popout with a Download button. The bytes come from the Dataverse File column, not the row.
   9. Company theme (blue / yellow / red), shared with the other apps in this project.
+ 10. Completion percentages: two rows under the day headers (done % per day; on every Sunday, done % for that
+     Monday-to-Sunday week) and, above the grid, the figure for the slicer timeframe and for the year to date. Every
+     frequency letter on an equipment is one job per period (see COMPLETION PERCENTAGES below).
   =============================================================================
 */
 
@@ -161,6 +164,8 @@ const ASSET_FREQ_COLUMNS = FREQS.reduce((cols, f) => cols.concat(f.flags.filter(
 const LOG_TYPE_COLUMNS = ['craa5_daily', 'craa5_weekly', 'craa5_monthly'];   // bits 1, 2, 4
 const logTypeBits = (log) => LOG_TYPE_COLUMNS.reduce((bits, c, i) => bits | (isTrue(log[c]) ? (1 << i) : 0), 0);   // exact column names: no case-insensitive scan per row
 const bitsRank = (bits) => !bits ? 9 : (bits & 4) ? 3 : (bits & 2) ? 2 : 1;   // 9: no kind recorded, counts for everything
+// The rank of a day's entry: the best of its logs, so a log with no kind keeps counting for everything even when another log that day names one.
+const entryRank = (e) => e.rank !== undefined ? e.rank : bitsRank(e.types);
 const logTypeLabel = (bits) => !bits ? '' : LOG_TYPE_COLUMNS.map((c, i) => (bits & (1 << i)) ? ['Daily', 'Weekly', 'Monthly'][i] : '').filter(Boolean).join(' + ');
 // "Oct–Dec 2025, Jan–Aug 2026" for a list of [year, monthIndex] pairs.
 const fmtMonths = (pairs) => {
@@ -170,7 +175,7 @@ const fmtMonths = (pairs) => {
   return byYear.map(({ y, m }) => monthRuns(m).map(([a, b]) => MONTHS[a].slice(0, 3) + (b > a ? '–' + MONTHS[b].slice(0, 3) : '')).join(', ') + ' ' + y).join(', ');
 };
 
-// Builds { byAsset: Map<assetId, Map<dateStr, {log, via, types, file}>>, unmapped, stats }. `types` holds the kinds of
+// Builds { byAsset: Map<assetId, Map<dateStr, {log, via, types, rank, file}>>, unmapped, stats }. `types` holds the kinds of
 // clean recorded that day (bits: daily 1, weekly 2, monthly 4), merged from every log of that equipment and day;
 // `file` is the paperwork attached to one of those logs ({ rowId, name }), or null.
 // textLinks (Map<logKey, assetId>) holds the text fallback, computed once when a log is loaded.
@@ -204,16 +209,271 @@ const buildCompletionIndex = (assets, logs, textLinks) => {
     const days = byAsset.get(assetId);
     const existing = days.get(date);
     const types = logTypeBits(log) | (existing ? existing.types : 0);
+    const rank = Math.max(bitsRank(logTypeBits(log)), existing && existing.rank ? existing.rank : 0);
     const file = logFile(log) || (existing ? existing.file : null);   // the day's paperwork, from whichever log has one
     // One marker per equipment and day: the loser is counted as a duplicate, not silently dropped, and the kind
     // of clean it recorded (and its paperwork) still count.
-    if (existing && existing.via === 'id' && via === 'text') { existing.types = types; existing.file = file; stats.duplicate++; return; }
+    if (existing && existing.via === 'id' && via === 'text') { existing.types = types; existing.rank = rank; existing.file = file; stats.duplicate++; return; }
     if (existing) { stats[existing.via]--; stats.duplicate++; }
-    days.set(date, { log, via, types, file });
+    days.set(date, { log, via, types, rank, file });
     stats[via]++;
   });
   return { byAsset, unmapped, stats };
 };
+
+// BEGIN COMPLETION PERCENTAGES
+// Every frequency letter on an equipment is one job per period: D one per day, MW and W one per Monday-to-Sunday week,
+// M one per calendar month, Q one per calendar quarter, A one per calendar year. A job is done when the equipment has a
+// clean of at least that kind (the medallion's ranks) dated inside its period, missed when every month the period
+// touches has been read for the equipment and there is none, and left out while a month is unread.
+//  - a day cell shows the Daily jobs of that day, a Sunday cell every job of that Monday-to-Sunday week (the daily jobs
+//    of its days and the mid-week and weekly ones);
+//  - the top figures count the jobs whose period ended inside the months on screen / in the year so far; a period that is
+//    still running counts only once done, so nothing is called missed before its time is up.
+// The Daily jobs are counted per month (every equipment that has read a month has one on each of its days) and per log, not
+// per equipment and day, which keeps a recompute cheap with thousands of equipment.
+const PCT_GOOD = 90;   // a figure at or above this is green, at or above PCT_WARN yellow, below that red
+const PCT_WARN = 70;
+const JOBS_NOTE = 'A job is one cleaning letter (D, MW, W, M, Q, A) of one equipment for one period: D per day, MW and W per week, M per month, Q per quarter, A per year. The day and Sunday cells show only the daily, mid-week and weekly jobs; this figure also counts the monthly, quarterly and annual ones. ';
+const DAILY_ON = [true, true, true, true, true, true, true];   // Sunday to Saturday: the days on which a Daily (D) job falls due
+
+// A month is read for an equipment once its id slice is in (with the id column) and its name slice is in too: old
+// entries whose stored id is blank or wrong arrive only through the name request. Without the id column the name
+// slice is all there is.
+const monthIsRead = (loaded, idColumn, id, name, y, m) => (idColumn ? loaded.has(`id|${y}|${m}|${id}`) : !!name) && (!name || loaded.has(`name|${y}|${m}|${name}`));
+
+// Whole percent; 100 only when every job is done, 0 only when none is.
+const pctOf = (done, due) => !due ? null : done >= due ? 100 : Math.min(99, Math.max(done > 0 ? 1 : 0, Math.round(100 * done / due)));
+const pctTone = (pct) => pct === null ? 'none' : pct >= PCT_GOOD ? 'good' : pct >= PCT_WARN ? 'warn' : 'bad';
+
+const computeCompletion = ({ assets, byAsset, loaded, idColumn, year, today, visibleMonths }) => {
+  const todayStr = normalizeDateStr(today);
+  const todayYear = today.getFullYear();
+  const dayOf = (y, m, d) => normalizeDateStr(new Date(y, m, d));
+  const tfMonth = {};
+  visibleMonths.forEach(m => { tfMonth[m] = true; });
+
+  // Every day from the Monday on or before 1 January to the Sunday on or after 31 December, so no week is cut short.
+  const first = new Date(year, 0, 1);
+  first.setDate(first.getDate() - ((first.getDay() + 6) % 7));
+  const last = new Date(year, 11, 31);
+  last.setDate(last.getDate() + ((7 - last.getDay()) % 7));
+  const days = [], dayIndex = {};
+  // One new Date per day: stepping a timestamp forward by a day can land on 01:00 where a clock change skips midnight,
+  // which would drop the last day and leave a short week.
+  const nDays = Math.round((last.getTime() - first.getTime()) / 864e5) + 1;
+  for (let n = 0; n < nDays; n++) {
+    const c = new Date(first.getFullYear(), first.getMonth(), first.getDate() + n);
+    const date = normalizeDateStr(c);
+    dayIndex[date] = days.length;
+    days.push({ date, y: c.getFullYear(), m: c.getMonth(), k: c.getFullYear() * 12 + c.getMonth(), dow: c.getDay(), inYear: c.getFullYear() === year, week: Math.floor(days.length / 7), future: date > todayStr, closed: date < todayStr, due: 0, done: 0, all: 0 });
+  }
+  const weeks = [];
+  for (let w = 0; w * 7 < days.length; w++) {
+    const mon = days[w * 7], sun = days[w * 7 + 6];
+    const touched = [], seen = {};
+    for (let i = w * 7; i < w * 7 + 7; i++) {   // the months this week reaches, up to today
+      const d = days[i];
+      if (d.future) break;
+      const k = d.y * 12 + d.m;
+      if (!seen[k]) { seen[k] = true; touched.push([d.y, d.m]); }
+    }
+    weeks.push({ monday: mon.date, sunday: sun.date, started: !mon.future, closed: sun.date < todayStr, inYear: sun.inYear, inTf: sun.inYear && !!tfMonth[sun.m], touched, due: 0, done: 0, all: 0 });
+  }
+  // The days a Daily job can fall on (up to today), counted per calendar month: every equipment that has read a month
+  // has one job on each of them, so the cells and the top figures take it from these counts instead of walking the days
+  // once per equipment.
+  const mInfo = {}, mKeys = [], dRead = {};
+  days.forEach(d => {
+    if (d.future || !DAILY_ON[d.dow]) return;
+    let o = mInfo[d.k];
+    if (!o) { o = mInfo[d.k] = { y: d.y, m: d.m, closed: 0, inYear: d.inYear, inTf: d.inYear && !!tfMonth[d.m] }; mKeys.push(d.k); }
+    if (d.closed) o.closed += 1;
+  });
+  const months = [];
+  for (let m = 0; m < 12; m++) months.push({ started: dayOf(year, m, 1) <= todayStr, closed: dayOf(year, m + 1, 0) < todayStr, inTf: !!tfMonth[m], touched: [[year, m]] });
+  const tfDue = visibleMonths.filter(m => months[m].started);
+  const quarters = [];
+  for (let q = 0; q < 4; q++) {
+    const touched = [];
+    for (let m = q * 3; m < q * 3 + 3; m++) if (months[m].started) touched.push([year, m]);
+    quarters.push({ started: months[q * 3].started, closed: months[q * 3 + 2].closed, inTf: !!tfMonth[q * 3 + 2], touched });
+  }
+  const yearTouched = [];
+  for (let m = 0; m < 12; m++) if (months[m].started) yearTouched.push([year, m]);
+  const wholeYear = { started: months[0].started, closed: months[11].closed, inTf: !!tfMonth[11], touched: yearTouched };
+
+  const tf = { due: 0, done: 0 }, ytd = { due: 0, done: 0 };
+  const nJobs = { D: 0, MW: 0, W: 0, M: 0, Q: 0, A: 0 };
+  const ids = [];
+  let readTf = 0, readYtd = 0;
+  const endM = year < todayYear ? 11 : year === todayYear ? today.getMonth() : -1;   // last month of the year so far
+  const reachesPrev = first.getFullYear() < year;   // the first week starts in December of the year before: its jobs need that month read
+  // A job that can be judged: it goes to its day or week cell, and to the top figures once its period is over (or done).
+  const settle = (done, closed, inYear, inTf, cellA, cellB) => {
+    if (cellA) { cellA.due += 1; if (done) cellA.done += 1; }
+    if (cellB) { cellB.due += 1; if (done) cellB.done += 1; }
+    if (inYear && (done || closed)) {
+      ytd.due += 1; if (done) ytd.done += 1;
+      if (inTf) { tf.due += 1; if (done) tf.done += 1; }
+    }
+  };
+  const weekMax = [], monthMax = [], quarterMax = [];
+
+  assets.forEach(asset => {
+    const id = getAssetId(asset);
+    const name = safeString(getProp(asset, 'craa5_equipmentidentifier')).trim().toLowerCase();
+    if (!id || (!idColumn && !name)) return;   // nothing could ever be asked for it
+    const freqs = FREQS.filter(f => f.flags.some(c => isTrue(asset[c])));
+    if (!freqs.length) return;
+    ids.push(id);
+    freqs.forEach(f => { nJobs[f.code] += 1; });
+    const rm = {};
+    const isRead = (y, m) => { const k = y * 12 + m; if (rm[k] === undefined) rm[k] = monthIsRead(loaded, idColumn, id, name, y, m); return rm[k]; };
+    const touchedRead = (touched) => touched.every(t => isRead(t[0], t[1]));
+    if (tfDue.every(m => isRead(year, m))) readTf += 1;   // a month that has not started has nothing to read
+    {
+      let all = true;
+      if (endM >= 0) {
+        if (reachesPrev && !isRead(year - 1, 11)) all = false;
+        for (let m = 0; m <= endM && all; m++) if (!isRead(year, m)) all = false;
+      }
+      if (all) readYtd += 1;
+    }
+    const logged = byAsset.get(id);
+    let any = !!logged;
+    for (let m = 0; m < 12 && !any; m++) if (isRead(year, m)) any = true;
+    if (!any && (isRead(year - 1, 11) || isRead(year + 1, 0))) any = true;
+    if (!any) return;   // nothing read and nothing logged: none of its jobs can be judged yet
+
+    // The best kind of clean (rank) logged in each week, month and quarter, and in the year.
+    for (let i = 0; i < weeks.length; i++) weekMax[i] = 0;
+    for (let i = 0; i < 12; i++) monthMax[i] = 0;
+    for (let i = 0; i < 4; i++) quarterMax[i] = 0;
+    let yearMax = 0;
+    if (logged) logged.forEach((entry, date) => {
+      const i = dayIndex[date];
+      if (i === undefined) return;
+      const d = days[i];
+      if (d.future) return;
+      const r = entryRank(entry);
+      if (r > weekMax[d.week]) weekMax[d.week] = r;
+      if (d.inYear) {
+        if (r > monthMax[d.m]) monthMax[d.m] = r;
+        const q = Math.floor(d.m / 3);
+        if (r > quarterMax[q]) quarterMax[q] = r;
+        if (r > yearMax) yearMax = r;
+      }
+    });
+
+    freqs.forEach(f => {
+      if (f.code === 'D') {
+        // a month read for this equipment gives it one Daily job on each day of that month: judged (and counted in the
+        // top figures once the day is over) whether or not a log exists
+        for (let q = 0; q < mKeys.length; q++) {
+          const o = mInfo[mKeys[q]];
+          if (!isRead(o.y, o.m)) continue;
+          dRead[mKeys[q]] = (dRead[mKeys[q]] || 0) + 1;
+          if (o.inYear) { ytd.due += o.closed; if (o.inTf) tf.due += o.closed; }
+        }
+        // a log on a day is a done job; when its month was not read for this equipment, or the day is not over, it
+        // is not in those counts yet
+        if (logged) logged.forEach((entry, date) => {
+          const i = dayIndex[date];
+          if (i === undefined) return;
+          const d = days[i];
+          if (d.future || !DAILY_ON[d.dow]) return;
+          const counted = d.closed && isRead(d.y, d.m);
+          const wk = weeks[d.week];
+          d.done += 1; wk.done += 1;
+          if (!isRead(d.y, d.m)) { d.due += 1; wk.due += 1; }
+          if (d.inYear) {
+            ytd.done += 1; if (!counted) ytd.due += 1;
+            if (tfMonth[d.m]) { tf.done += 1; if (!counted) tf.due += 1; }
+          }
+        });
+      } else if (f.code === 'MW' || f.code === 'W') {
+        weeks.forEach((wk, w) => {
+          if (!wk.started) return;
+          const done = weekMax[w] >= f.rank;
+          if (!done && !touchedRead(wk.touched)) return;
+          settle(done, wk.closed, wk.inYear, wk.inTf, wk, null);
+        });
+      } else if (f.code === 'M') {
+        months.forEach((mo, m) => {
+          if (!mo.started) return;
+          const done = monthMax[m] >= f.rank;
+          if (!done && !touchedRead(mo.touched)) return;
+          settle(done, mo.closed, true, mo.inTf, null, null);
+        });
+      } else if (f.code === 'Q') {
+        quarters.forEach((qu, q) => {
+          if (!qu.started) return;
+          const done = quarterMax[q] >= f.rank;
+          if (!done && !touchedRead(qu.touched)) return;
+          settle(done, qu.closed, true, qu.inTf, null, null);
+        });
+      } else if (wholeYear.started) {
+        const done = yearMax >= f.rank;
+        if (done || touchedRead(wholeYear.touched)) settle(done, wholeYear.closed, true, wholeYear.inTf, null, null);
+      }
+    });
+  });
+
+  days.forEach(d => {
+    const n = d.future || !DAILY_ON[d.dow] ? 0 : dRead[d.k];
+    if (n) { d.due += n; weeks[d.week].due += n; }
+  });
+  // How many jobs each cell would have if every equipment were read: what is left out of it is "not read yet".
+  weeks.forEach(wk => { wk.all = wk.started ? nJobs.MW + nJobs.W : 0; });
+  days.forEach(d => {
+    d.all = (!d.future && DAILY_ON[d.dow]) ? nJobs.D : 0;
+    weeks[d.week].all += d.all;
+  });
+  return { year, todayStr, days, weeks, dayIndex, tf, ytd, equipment: ids.length, readTf, readYtd, ids, endM, nJobs, reachesPrev };
+};
+
+// "7 Sep" from "2026-09-07".
+const shortDate = (date) => `${Number(date.slice(8, 10))} ${MONTHS[Number(date.slice(5, 7)) - 1].slice(0, 3)}`;
+
+// The two rows under the day headers, one cell per day on screen: done % of that day's Daily jobs, and on a Sunday
+// done % of that Monday-to-Sunday week. A cell is blank when nothing could be judged, italic grey while its day or week
+// is not over, and dotted when part of what it covers is not read yet.
+const completionCells = (comp, timelineDays) => {
+  const dayCells = [], weekCells = [];
+  timelineDays.forEach(td => {
+    const i = comp.dayIndex[td.dateStr];
+    const d = i === undefined ? null : comp.days[i];
+    let dayCell = { pct: null, cls: '', text: '', title: '' };
+    let weekCell = { pct: null, cls: '', text: '', title: '' };
+    if (d) {
+      const pct = pctOf(d.done, d.due);
+      if (pct !== null) {
+        const open = !d.closed, part = d.due < d.all;
+        dayCell = {
+          pct, text: String(pct), cls: `${open ? 'open' : pctTone(pct)}${part ? ' part' : ''}`,
+          title: `${td.label} ${td.month.slice(0, 3)} · ${d.done} of ${d.due} daily jobs done (${pct}%)${part ? ` · ${d.all - d.due} not read yet` : ''}${open ? ' · the day is not over' : ''}`
+        };
+      }
+      if (d.dow === 0) {
+        const wk = comp.weeks[d.week];
+        const wpct = pctOf(wk.done, wk.due);
+        if (wpct !== null) {
+          const open = !wk.closed, part = wk.due < wk.all;
+          weekCell = {
+            pct: wpct, text: String(wpct), cls: `${open ? 'open' : pctTone(wpct)}${part ? ' part' : ''}`,
+            title: `Week ${td.week}, ${shortDate(wk.monday)} to ${shortDate(wk.sunday)} · ${wk.done} of ${wk.due} jobs done (${wpct}%): the daily jobs of each day and the mid-week and weekly ones${part ? ` · ${wk.all - wk.due} not read yet` : ''}${open ? ' · the week is not over' : ''}`
+          };
+        }
+      }
+    }
+    if (td.isToday) { dayCell.cls = (dayCell.cls + ' today').trim(); weekCell.cls = (weekCell.cls + ' today').trim(); }
+    dayCells.push(dayCell);
+    weekCells.push(weekCell);
+  });
+  return { dayCells, weekCells };
+};
+// END COMPLETION PERCENTAGES
 
 // Text fallback for logs whose equipment id is blank or matches no equipment row.
 // Exact normalized name first, then a name contained in exactly one equipment name; when several
@@ -284,7 +544,7 @@ const LOG_FILE_NAME_COLUMN = LOG_FILE_COLUMN + '_name';
 const LOG_OPTIONAL = ["craa5_sap", "craa5_hoursworked", "craa5_room", "craa5_area"].concat(LOG_TYPE_COLUMNS, [LOG_FILE_COLUMN, LOG_FILE_NAME_COLUMN]); // each is dropped on its own if the table lacks it
 const missingLogColumns = new Set();
 const logSelect = (withId) => [LOG_CORE, ...LOG_OPTIONAL.filter(c => !missingLogColumns.has(c)), withId ? LOG_ASSET_ID_SELECT : ''].filter(Boolean).join(',');
-const BUILD = 'id loader r9';    // shown beside the counters and on Payload Diagnostics so a pasted version can be told apart
+const BUILD = 'id loader r10';    // shown beside the counters and on Payload Diagnostics so a pasted version can be told apart
 const ASSET_CORE = "craa5_aa_assetsid,craa5_equipmentidentifier,craa5_roomname,craa5_areaname";
 const missingAssetColumns = new Set();   // frequency columns this equipment table turned out not to have
 const assetSelect = () => [ASSET_CORE].concat(ASSET_FREQ_COLUMNS.filter(c => !missingAssetColumns.has(c))).join(',');
@@ -545,6 +805,32 @@ const FreqMedallion = React.memo(({ st }) => {
   );
 });
 
+// One header row of percentages: a cell per day on screen (see completionCells).
+const PctTier = React.memo(({ cells, dayColWidth, testid, last }) => (
+  <div className={`pct-tier${last ? ' last' : ''}`} data-testid={testid}>
+    {cells.map((c, i) => (<div key={i} className={`cell-pct${c.cls ? ' ' + c.cls : ''}`} style={{ width: dayColWidth }} title={c.title || undefined} data-pct={c.pct === null ? undefined : c.pct}>{c.text}</div>))}
+  </div>
+));
+
+// A figure above the grid: done % of the jobs counted, how many jobs, and how much of the plant was read to get there.
+const PctTile = React.memo(({ testid, label, sub, stat, equipment, read, hint, action, busy }) => {
+  const pct = pctOf(stat.done, stat.due);
+  const partial = equipment > 0 && read < equipment;
+  return (
+    <div className={`pct-tile ${busy ? 'none' : pctTone(pct)}`} data-testid={testid} data-busy={busy ? '1' : undefined} title={hint}>
+      <div className="pct-tile-head"><b>{label}</b><span>{sub}</span></div>
+      <div className="pct-tile-body">
+        <span className="pct-tile-num" data-testid={`${testid}-pct`}>{pct === null ? '–' : `${pct}%`}</span>
+        <span className="pct-tile-detail">
+          <span data-testid={`${testid}-jobs`}>{stat.due ? `${stat.done.toLocaleString()} of ${stat.due.toLocaleString()} jobs done` : equipment ? 'no job can be judged yet' : 'no equipment in this list has a frequency'}</span>
+          <span data-testid={`${testid}-read`} className={partial ? 'pct-partial' : ''}>{equipment ? `${read.toLocaleString()} of ${equipment.toLocaleString()} equipment read` : ''}</span>
+        </span>
+        {action}
+      </div>
+    </div>
+  );
+});
+
 // The progress bar beside a room or area name, by the done-or-blank method: an equipment is cleaned when any day on
 // screen has a log for it, missed when every month on screen has been read and none has, not read otherwise.
 // Green check: everything read was cleaned; yellow check: some cleaned, some missed; red: nothing cleaned; grey: not
@@ -688,6 +974,7 @@ export default function App() {
   // that moment, so the area loads without being opened. A run is dropped once the queue drains (loaded or failed),
   // by Stop reading, by Cancel and by Sync; later month or year changes load only what is on screen.
   const [pinnedRuns, setPinnedRuns] = useState([]);
+  const lastYearRunsRef = useRef([]);   // the runs of the last Read year to date, so Retry can ask for the slices that failed
   const pinnedSet = useMemo(() => { const s = new Set(); pinnedRuns.forEach(r => r.ids.forEach(id => s.add(id))); return s; }, [pinnedRuns]);
   const pendingKeysRef = useRef([]);                   // read slices waiting for the flush that applies their rows
   const [loadedTick, setLoadedTick] = useState(0);   // bumped when loaded log rows (or an empty result) have been applied
@@ -759,6 +1046,7 @@ export default function App() {
     setLoadAllOn(false);
     setLoadAll(null);
     setPinnedRuns(prev => prev.length ? [] : prev);
+    lastYearRunsRef.current = [];
 
     try {
       let fetchedAssets = [];
@@ -988,7 +1276,7 @@ export default function App() {
       // A month is read once its id slice is in (with the id column) and the name slice is in too: old entries whose
       // stored id is blank or wrong arrive only through the name request, which is queued after the id one and can
       // fail on its own. Without the id column the name slice is all there is.
-      const isRead = (y, m) => (idColumn ? loaded.has(`id|${y}|${m}|${id}`) : !!name) && (!name || loaded.has(`name|${y}|${m}|${name}`));
+      const isRead = (y, m) => monthIsRead(loaded, idColumn, id, name, y, m);
       const unreadable = !idColumn && !name;     // nothing could ever be asked for this equipment
       const latest = [null, null, null, null];   // newest clean of at least rank 1, 2, 3 (dated today or earlier)
       const days = completionIndex.byAsset.get(id);
@@ -996,7 +1284,7 @@ export default function App() {
       if (days) days.forEach((entry, date) => {
         if (visiblePrefixes.includes(date.slice(0, 7))) doneVisible += 1;
         if (date > todayStr) return;
-        const r = bitsRank(entry.types);
+        const r = entryRank(entry);
         for (let k = 1; k <= 3; k++) if (r >= k && (!latest[k] || date > latest[k])) latest[k] = date;
       });
       const badges = unreadable ? [] : freqWindows.filter(f => f.flags.some(c => isTrue(asset[c]))).map(f => {
@@ -1051,6 +1339,42 @@ export default function App() {
     });
     return groups;
   }, [filteredTreeData, freqStatus, completionIndex, visiblePrefixes]);
+
+  // --- Completion percentages (see COMPLETION PERCENTAGES) ---
+  // Over the equipment listed after the search filter, from the logs read so far; what has not been read is left out
+  // and counted as "not read yet". The focused dialog gets its own figures for the room or area it shows.
+  const completion = useMemo(() => {
+    if (activeTab !== 'master') return null;
+    const list = [];
+    Object.keys(filteredTreeData).forEach(room => Object.keys(filteredTreeData[room]).forEach(area => filteredTreeData[room][area].forEach(a => list.push(a))));
+    return computeCompletion({ assets: list, byAsset: completionIndex.byAsset, loaded: loadedRef.current, idColumn, year: anchorYear, today, visibleMonths });
+    // loadedTick stands in for loadedRef.current, which is not state.
+    // eslint-disable-next-line
+  }, [activeTab, filteredTreeData, completionIndex, loadedTick, idColumn, anchorYear, today, visibleMonths]);
+  const completionModal = useMemo(() => {
+    if (!modalContext) return null;
+    const list = [];
+    Object.keys(filteredTreeData)
+      .filter(r => modalContext.type === 'room' ? r === modalContext.value : filteredTreeData[r][modalContext.value])
+      .forEach(room => Object.keys(filteredTreeData[room])
+        .filter(a => modalContext.type === 'area' ? a === modalContext.value : true)
+        .forEach(area => filteredTreeData[room][area].forEach(a => list.push(a))));
+    return computeCompletion({ assets: list, byAsset: completionIndex.byAsset, loaded: loadedRef.current, idColumn, year: anchorYear, today, visibleMonths });
+    // eslint-disable-next-line
+  }, [modalContext, filteredTreeData, completionIndex, loadedTick, idColumn, anchorYear, today, visibleMonths]);
+  const pctCells = useMemo(() => completion ? completionCells(completion, timelineDays) : null, [completion, timelineDays]);
+  const pctCellsModal = useMemo(() => completionModal ? completionCells(completionModal, timelineDays) : null, [completionModal, timelineDays]);
+  // Read year to date: the months of this year so far, quarter by quarter (at most 3 months in a request), for the
+  // equipment the figures cover, through the same paced queue as Read and Load all (at most 3 requests at a time).
+  const readYear = useCallback(() => {
+    if (typeof Xrm === 'undefined' || !completion || completion.endM < 0 || !completion.ids.length) return;
+    const runs = [];
+    for (let q = 0; q * 3 <= completion.endM; q++) runs.push({ ids: completion.ids, year: anchorYear, months: [q * 3, q * 3 + 1, q * 3 + 2].filter(m => m <= completion.endM) });
+    if (completion.reachesPrev) runs.push({ ids: completion.ids, year: anchorYear - 1, months: [11] });   // the week that holds 1 January starts in December
+    lastYearRunsRef.current = runs;
+    setLoadErrors([]);
+    setPinnedRuns(prev => prev.concat(runs));
+  }, [completion, anchorYear]);
 
   // Name slices are keyed by one spelling, since the loader requests each name once however the equipment rows spell it.
   const sliceKey = (kind, year, m, item) => `${kind}|${year}|${m}|${kind === 'name' ? item.toLowerCase() : item}`;
@@ -1148,7 +1472,8 @@ export default function App() {
           const missing = months.filter(m => !loaded.has(keyOf(item, m)) && !inflight.has(keyOf(item, m)));
           if (missing.length) {
             const sig = missing.slice().sort((x, y) => x - y).join(',');
-            bySignature.set(sig, (bySignature.get(sig) || []).concat(item));
+            const group = bySignature.get(sig);   // push, not concat: copying the group for every item is quadratic
+            if (group) group.push(item); else bySignature.set(sig, [item]);
           }
         });
         bySignature.forEach((sigItems, sig) => {
@@ -1179,7 +1504,12 @@ export default function App() {
     // eslint-disable-next-line
   }, [visibleKey, visibleMonths, anchorYear, idColumn, assets, isLoading, retryTick, loadAllOn, allIds, pinnedRuns]);
 
-  const retryLoads = () => { setLoadErrors([]); setRetryTick(t => t + 1); };
+  const retryLoads = () => {
+    setLoadErrors([]);
+    const again = lastYearRunsRef.current;
+    if (again.length) setPinnedRuns(prev => prev.concat(again));   // a year read that lost slices asks for them again; the loaded ones are skipped
+    setRetryTick(t => t + 1);
+  };
   // Read on a bar: a run for these ids and the months on screen now. A press after a failed request queues the
   // missing months again, since the failed slices are neither read nor in flight.
   const readIds = useCallback((ids) => {
@@ -1187,7 +1517,7 @@ export default function App() {
     setLoadErrors([]);
     setPinnedRuns(prev => prev.concat({ ids, year: anchorYear, months: visibleMonths }));
   }, [anchorYear, visibleMonths]);
-  const stopReading = () => setPinnedRuns(prev => prev.length ? [] : prev);
+  const stopReading = () => { lastYearRunsRef.current = []; setPinnedRuns(prev => prev.length ? [] : prev); };
   // What a room or area bar needs: its counts, the months they cover, and whether its equipment is loading now.
   const onScreenSet = useMemo(() => new Set(visibleKeyNow ? visibleKeyNow.split(',') : []), [visibleKeyNow]);
   const monthsLabel = visibleMonths.length ? `${visibleMonths.map(m => MONTHS[m].slice(0, 3)).join(', ')} ${anchorYear}` : `${anchorYear}, no months selected`;
@@ -1392,20 +1722,48 @@ export default function App() {
           position: sticky; left: 0; z-index: 510;
           background: #f8fafc; width: ${frozenWidth}px;
           flex-shrink: 0; border-right: 2px solid ${BRAND.blueLine};
-          height: 120px;
+          min-height: 120px;
         }
-        .corner { height: 120px; border-bottom: 2px solid ${BRAND.blueLine}; background: ${BRAND.blueSoft}; display: flex; flex-direction: column; justify-content: center; padding: 0 16px; font-weight: 800; font-size: 11px; color: ${BRAND.blueDark}; letter-spacing: 0.08em; }
+        .corner { min-height: 120px; border-bottom: 2px solid ${BRAND.blueLine}; background: ${BRAND.blueSoft}; display: flex; flex-direction: column; justify-content: flex-start; padding: 0; font-weight: 800; font-size: 11px; color: ${BRAND.blueDark}; letter-spacing: 0.08em; }
+        .corner-top { flex: 0 0 120px; box-sizing: border-box; display: flex; flex-direction: column; justify-content: center; padding: 0 16px; }
+        .corner-pct { height: 22px; border-bottom: 1px solid #cbd5e1; display: flex; align-items: center; justify-content: flex-end; padding: 0 16px; font-size: 8px; font-weight: 800; letter-spacing: 0.06em; color: ${BRAND.blueDark}; background: #fff; flex-shrink: 0; }
+        .corner-pct.last { border-bottom: none; height: 20px; }   /* the corner's own 2px bottom border completes the 22px the timeline row has */
         .corner-legend { display: block; margin-top: 6px; font-size: 9px; font-weight: 600; color: #475569; letter-spacing: 0; line-height: 1.5; }
 
         .header-blocks { display: flex; flex-direction: column; }
         .month-tier { display: flex; height: 30px; border-bottom: 1px solid #cbd5e1; }
         .week-tier { display: flex; height: 25px; border-bottom: 1px solid #cbd5e1; }
-        .day-tier { display: flex; height: 65px; border-bottom: 2px solid ${BRAND.blueLine}; }
+        .day-tier { display: flex; height: 65px; border-bottom: 1px solid #cbd5e1; }
+        .pct-tier { display: flex; height: 22px; border-bottom: 1px solid #cbd5e1; background: #fff; }
+        .pct-tier.last { border-bottom: 2px solid ${BRAND.blueLine}; }
+        .cell-pct { flex-shrink: 0; border-right: 1px solid #e2e8f0; display: flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 800; letter-spacing: -0.02em; color: #94a3b8; cursor: default; }
+        .cell-pct.good { background: ${BRAND.greenSoft}; color: #15803d; }
+        .cell-pct.warn { background: ${BRAND.yellowSoft}; color: #92400e; }
+        .cell-pct.bad { background: ${BRAND.redSoft}; color: #9f1239; }
+        .cell-pct.open { background: #f8fafc; color: #64748b; font-style: italic; }
+        .cell-pct.part { text-decoration: underline dotted; text-underline-offset: 2px; }
+        .cell-pct.today { background: ${BRAND.blueSoft}; }
+        .cell-pct.open.today { color: #475569; }
+        .pct-strip { display: flex; gap: 12px; padding: 10px 16px; background: #fff; border-bottom: 1px solid #e2e8f0; overflow-x: auto; flex-shrink: 0; }
+        .pct-tile { display: flex; flex-direction: column; gap: 4px; min-width: 300px; padding: 8px 14px; border: 1px solid #e2e8f0; border-left-width: 5px; border-radius: 10px; background: #fff; }
+        .pct-tile.good { border-left-color: ${BRAND.green}; }
+        .pct-tile.warn { border-left-color: ${BRAND.yellow}; }
+        .pct-tile.bad { border-left-color: ${BRAND.red}; }
+        .pct-tile.none { border-left-color: #cbd5e1; }
+        .pct-tile-head { display: flex; align-items: baseline; gap: 10px; font-size: 10px; font-weight: 900; letter-spacing: 0.08em; color: ${BRAND.blueDark}; }
+        .pct-tile-head span { font-weight: 700; letter-spacing: 0; color: #64748b; }
+        .pct-tile-body { display: flex; align-items: center; gap: 6px 14px; flex-wrap: wrap; }
+        .pct-tile-num { font-size: 28px; font-weight: 900; line-height: 1; min-width: 74px; color: #64748b; }
+        .pct-tile.good .pct-tile-num { color: #15803d; }
+        .pct-tile.warn .pct-tile-num { color: #92400e; }
+        .pct-tile.bad .pct-tile-num { color: #9f1239; }
+        .pct-tile-detail { display: flex; flex-direction: column; gap: 2px; font-size: 11px; font-weight: 600; color: #475569; }
+        .pct-partial { color: #b45309; }
 
         .cell-month { flex-shrink: 0; border-right: 1px solid #cbd5e1; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 900; background: #fff; color: ${BRAND.blueDark}; text-transform: uppercase; letter-spacing: 0.06em; }
         .cell-week { flex-shrink: 0; border-right: 1px solid #e2e8f0; display: flex; align-items: center; justify-content: center; font-size: 9px; color: #64748b; font-weight: bold; background: #fcfcfc; }
         .cell-day { flex-shrink: 0; border-right: 1px solid #e2e8f0; display: flex; align-items: flex-end; justify-content: center; padding-bottom: 6px; font-size: 10px; }
-        .cell-day span { transform: rotate(-90deg); white-space: nowrap; font-weight: bold; color: #475569; }
+        .cell-day span { writing-mode: vertical-rl; transform: rotate(180deg); white-space: nowrap; font-weight: bold; color: #475569; }   /* laid out vertically (not rotated after layout) so a long label like "Wed 16" stops 6px above the row under it */
 
         .data-body { display: flex; flex-direction: column; width: max-content; }
         .asset-row { display: flex; min-height: 42px; border-bottom: 1px solid #e2e8f0; width: max-content; align-items: stretch; }
@@ -1618,11 +1976,13 @@ export default function App() {
             <div className="flex-1 overflow-hidden flex flex-col bg-white">
                 <div className="viewport">
                   <div className="header-row">
-                    <div className="frozen-column-group corner"><span>FOCUSED HIERARCHY</span><span className="corner-legend">D daily · MW mid-week · W weekly · M monthly<br />Q quarterly · A annual · red letter: overdue · dotted: not read yet<br />✓ on a room or area: cleaned that day</span></div>
+                    <div className="frozen-column-group corner"><div className="corner-top"><span>FOCUSED HIERARCHY</span><span className="corner-legend">D daily · MW mid-week · W weekly · M monthly<br />Q quarterly · A annual · red letter: overdue · dotted: not read yet<br />✓ on a room or area: cleaned that day</span></div><div className="corner-pct" title="Daily jobs done that day, as a percentage of the daily jobs due (blank: none could be judged yet)">DONE % · DAY</div><div className="corner-pct last" title="On every Sunday: the jobs of that Monday-to-Sunday week done, as a percentage of the jobs due (the daily jobs of each day and the mid-week and weekly ones)">DONE % · WEEK (SUNDAY)</div></div>
                     <div className="header-blocks">
                       <div className="month-tier">{monthSpans.map((m, i) => (<div key={i} className="cell-month" style={{ width: m.count * dayColWidth }}>{m.month}</div>))}</div>
                       <div className="week-tier">{weekSpans.map((w, i) => (<div key={i} className="cell-week" style={{ width: w.count * dayColWidth }}>W{w.week}</div>))}</div>
                       <div className="day-tier">{timelineDays.map((d, i) => (<div key={i} className="cell-day" style={{ width: dayColWidth, background: d.isToday ? BRAND.blueSoft : 'transparent' }}><span>{d.label}</span></div>))}</div>
+                      {pctCellsModal && <PctTier cells={pctCellsModal.dayCells} dayColWidth={dayColWidth} testid="pct-day" />}
+                      {pctCellsModal && <PctTier cells={pctCellsModal.weekCells} dayColWidth={dayColWidth} testid="pct-week" last />}
                     </div>
                   </div>
                   <div className="data-body">
@@ -1743,6 +2103,36 @@ export default function App() {
           </div>
       )}
 
+      {activeTab === 'master' && completion && assets.length > 0 && (() => {
+        const thisYear = today.getFullYear();
+        const busy = pinnedRuns.length > 0;
+        const reading = pinnedRuns.some(r => r.year === anchorYear || r.year === anchorYear - 1);
+        const kept = 'Only equipment with a cleaning frequency counts. Each counts for the months already read; months not read yet are left out, not counted as missed.';
+        return (
+        <div className="pct-strip shrink-0" data-testid="pct-strip">
+          <PctTile
+            testid="pct-timeframe" label="SLICER TIMEFRAME" sub={monthsLabel} busy={busy}
+            stat={completion.tf} equipment={completion.equipment} read={completion.readTf}
+            hint={`${JOBS_NOTE}Jobs done as a percentage of the jobs whose period ended inside the months on screen (a period still running counts only once done). ${kept} A quarterly or annual job, and the first week of the months on screen, reach into earlier months: until those are read only the ones already done count. ${completion.readTf.toLocaleString()} of ${completion.equipment.toLocaleString()} have every month on screen read. Load all reads the rest for these months; Read year to date covers the earlier ones.`}
+          />
+          <PctTile
+            testid="pct-ytd" busy={busy}
+            label={anchorYear === thisYear ? 'YEAR TO DATE' : anchorYear < thisYear ? `WHOLE YEAR ${anchorYear}` : `YEAR ${anchorYear}`}
+            sub={anchorYear === thisYear ? `1 Jan – ${shortDate(completion.todayStr)}` : anchorYear < thisYear ? '1 Jan – 31 Dec' : 'not started'}
+            stat={completion.ytd} equipment={completion.equipment} read={completion.readYtd}
+            hint={anchorYear > thisYear
+              ? `${anchorYear} has not started, so no job period has ended and nothing can be judged yet.`
+              : `${JOBS_NOTE}Jobs done as a percentage of the jobs whose period ended ${anchorYear === thisYear ? 'since 1 January' : `in ${anchorYear}`} (a period still running counts only once done). ${kept} ${completion.readYtd.toLocaleString()} of ${completion.equipment.toLocaleString()} have every month of ${anchorYear === thisYear ? 'the year so far' : anchorYear} read${completion.reachesPrev ? ', and the December before it, where the first week of the year starts' : ''}.`}
+            action={completion.endM >= 0 && completion.readYtd < completion.equipment && typeof Xrm !== 'undefined' && (
+              reading
+                ? <span data-testid="pct-ytd-reading" style={{ fontSize: '11px', fontWeight: 700, color: '#64748b' }}>Reading… {(queueRef.current.length + activeRef.current).toLocaleString()} requests left</span>
+                : <button className="sync-btn outline" data-testid="pct-ytd-readbtn" onClick={readYear} disabled={isLoading || isSaving || loadAllOn} title={`Reads the log for these equipment for every month of ${anchorYear === thisYear ? 'the year so far' : 'the year'}${completion.reachesPrev ? ' and the December before it' : ''}, in small paced requests (at most 3 at a time, 3 months each). It can take a while with thousands of equipment; Stop reading ends it and what has loaded stays.`}>{anchorYear === thisYear ? 'Read year to date' : 'Read the whole year'}</button>
+            )}
+          />
+        </div>
+        );
+      })()}
+
       {activeTab === 'master' && assets.length > 0 && roomKeys.length > 0 && !visibleKeyNow && !isLoading && typeof Xrm !== 'undefined' && (
         <div data-testid="expand-hint" style={{ padding: '6px 24px', fontSize: '12px', color: BRAND.blueDark, background: BRAND.blueSoft, borderBottom: `1px solid ${BRAND.blueLine}` }}>Click an area name to open it, or press Read on a room or area bar. Completions are read from the log for the equipment you open, so nothing shows until an area is open.</div>
       )}
@@ -1767,6 +2157,7 @@ export default function App() {
                 {missingAssetColumns.size > 0 && <p style={{ color: '#b45309' }}>These equipment columns do not exist in this table and are left out: {Array.from(missingAssetColumns).join(', ')}. They hold the cleaning frequencies the medallion checks.</p>}
                 <p style={{ color: '#64748b' }}>Frequency check: an equipment's Yes/No frequency columns (daily, mid-week, weekly, monthly, quarterly, annual) set its medallion. A frequency is within its window when a clean of at least that kind (a weekly log counts for daily and mid-week, a monthly log for everything, a log with no kind set for everything) is dated within 1 / 7 / 7 / 31 / 92 / 366 days of today, overdue when none is and every month of that window has been read for the equipment, and not read yet otherwise.</p>
                 <p style={{ color: '#64748b' }}>Room and area rows use the done-or-blank method: a check on every day on which any of their equipment was cleaned, and a bar counting the equipment cleaned on at least one day on screen, missed (every month on screen read, no log) or not read yet. Paperwork: a marker with a paper clip has a picture or file attached (the log's {LOG_FILE_COLUMN} column); a click reads it from Dataverse and shows it with a Download button.</p>
+                <p style={{ color: '#64748b' }}>Completion percentages: every frequency letter on an equipment is one job per period (D per day, MW and W per Monday-to-Sunday week, M per month, Q per quarter, A per year). A job is done when a clean of at least that kind (same ranks as the medallion) is dated inside its period, missed when every month it touches has been read for the equipment and there is none, and left out while a month is unread. The day row shows the Daily jobs of that day; the Sunday cell every daily, mid-week and weekly job of that week (the monthly, quarterly and annual jobs appear only in the two top figures). The two top figures count the jobs whose period ended inside the months on screen, and since 1 January (a period still running counts only once done). A figure in italics is for a day or week not over yet, a dotted one leaves out jobs of equipment not read yet. 90% and above is green, 70% and above yellow, below red (PCT_GOOD and PCT_WARN at the top of the file); DAILY_ON lists the weekdays on which a Daily job falls due. They follow the search filter. Only equipment with a cleaning frequency has jobs (the room and area bars, Load all and Equipment loaded count every equipment). They cover only the months read from the log so far: a month not read yet is left out, not counted as missed, and a job that reaches into a month not read yet (a quarterly or annual job, the first week of the year or of the months on screen) counts only once it is done. Read year to date also reads the December before the year, where the first week of the year starts.</p>
                 <p style={{ color: '#64748b' }}>Logs load per visible equipment and month, never the whole table: a log is shown on the equipment whose id is stored in its craa5_equipmentguid. Old entries whose id is blank or matches no equipment are matched by equipment name (amber). Nothing loads until an area is expanded on the Compliance Matrix tab.</p>
                 <p>Equipment open on the matrix: {new Set(onMatrix.grid.concat(onMatrix.dialog)).size} · equipment-month slices read from the log: {loadedRef.current.size}</p>
                 {reqLog.length > 0 && (
@@ -1851,11 +2242,13 @@ export default function App() {
           <main className="matrix-outer-container">
             <div className="viewport">
               <div className="header-row">
-                <div className="frozen-column-group corner"><span>FACILITY HIERARCHY</span><span className="corner-legend">D daily · MW mid-week · W weekly · M monthly<br />Q quarterly · A annual · red letter: overdue · dotted: not read yet<br />✓ on a room or area: cleaned that day</span></div>
+                <div className="frozen-column-group corner"><div className="corner-top"><span>FACILITY HIERARCHY</span><span className="corner-legend">D daily · MW mid-week · W weekly · M monthly<br />Q quarterly · A annual · red letter: overdue · dotted: not read yet<br />✓ on a room or area: cleaned that day</span></div><div className="corner-pct" title="Daily jobs done that day, as a percentage of the daily jobs due (blank: none could be judged yet)">DONE % · DAY</div><div className="corner-pct last" title="On every Sunday: the jobs of that Monday-to-Sunday week done, as a percentage of the jobs due (the daily jobs of each day and the mid-week and weekly ones)">DONE % · WEEK (SUNDAY)</div></div>
                 <div className="header-blocks">
                   <div className="month-tier">{monthSpans.map((m, i) => (<div key={i} className="cell-month" style={{ width: m.count * dayColWidth }}>{m.month}</div>))}</div>
                   <div className="week-tier">{weekSpans.map((w, i) => (<div key={i} className="cell-week" style={{ width: w.count * dayColWidth }}>W{w.week}</div>))}</div>
                   <div className="day-tier">{timelineDays.map((d, i) => (<div key={i} className="cell-day" style={{ width: dayColWidth, background: d.isToday ? BRAND.blueSoft : 'transparent' }}><span>{d.label}</span></div>))}</div>
+                  {pctCells && <PctTier cells={pctCells.dayCells} dayColWidth={dayColWidth} testid="pct-day" />}
+                  {pctCells && <PctTier cells={pctCells.weekCells} dayColWidth={dayColWidth} testid="pct-week" last />}
                 </div>
               </div>
 
