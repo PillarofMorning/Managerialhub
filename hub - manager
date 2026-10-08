@@ -12,6 +12,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
  * - Version 5.1: Unified the Daily Shifts / Personnel Gantt logic. Added an editable "Lookback Timeframe" (default 24h) that dynamically scales both the table and the Gantt view. Built strict Shift Boundary clipping to ensure personnel aren't logging time outside of their shift schedules.
  * - Version 5.2: Unified the individual "Shift Gantt" popouts into a single, comprehensive "Personnel Gantt" that defaults to the editable timeframe and allows users to filter by shift directly inside the modal.
  * - Version 6.0: "Prod Gantt" became "Prod Weekly", a Ganttly-style timeline (a lane per line, runs as colored bars, color key, now line, double-click an empty spot to schedule there). "Daily Shifts" became "Employee Query": type a name and see how often, and for how long, that person was assigned to each area, days and hours worked, a recommended strongest area and the team they were on most. The Personnel Gantt popout is still opened from a day in "Shift Cal".
+ * - Version 6.1: Employee Query has a second way in, "By room or area": type a room or area and see who has spent the most time there (hours, shifts, first and last day, whose team), with the most experienced first. Only that area's assignments are read, in 14-day pieces, three at a time, and nothing is read until an area is picked.
  * * 🗺️ DATAVERSE MAPPING CHEAT SHEET:
  * | Logical Name             | Purpose in App                                      |
  * |--------------------------|-----------------------------------------------------|
@@ -301,6 +302,7 @@ const lineOf = (r) => parseInt(r.craa5_line || r.craa5_Line, 10) || 1;
 const odataStr = (s) => String(s).replace(/'/g, "''");
 const fmtDay = (d) => d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
 const fmtTime = (d) => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+const fmtDayYear = (d) => d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
 // Last day of a repeat: "1 week" means 7 days counting the start day; "end of month" is the start date's month.
 const untilYMD = (startYmd, until) => {
     if (until.k === 'weeks') return addDaysYMD(startYmd, until.n * 7 - 1);
@@ -500,6 +502,13 @@ const EMP_CHUNK_DAYS = 60;                 // a long range is read in pieces thi
 const EMP_MAX_DAYS = 800;
 const EMP_RANGES = [{ k: '30', days: 30, label: 'Last 30 days' }, { k: '90', days: 90, label: 'Last 90 days' }, { k: '180', days: 180, label: 'Last 6 months' }, { k: '365', days: 365, label: 'Last year' }];
 const EMP_SUGGEST_MAX = 15;
+const EMP_AREA_CHUNK_DAYS = 14;            // the room / area ranking reads this many days per request (every person's rows are in it, so the pieces are small)
+const EMP_AREA_PARALLEL = 3;               // ... and at most this many requests at once
+const EMP_AREA_SAMPLE_ROWS = 500;          // name suggestions look at this many of the newest matching rows
+const EMP_AREA_PEOPLE_MAX = 120;           // only the people with the most hours are checked against the employee list
+const EMP_AREA_SHOWN = 15;
+const EMP_STATUS_BATCH = 15;               // employee-list lookups, this many people per request
+const EMP_AREA_SUGGEST_FIELDS = ['craa5_area', 'craa5_equip', 'craa5__aaemp_guid'];
 const EMP_PICK_FIELDS = ['craa5__aa_employeeid', 'craa5_name', 'craa5_shift', 'craa5_role', 'statecode'];
 // How the assignment reads are tried, in order, until one works: the employee id as text, then without the column list
 // (a column the table does not have fails the whole read), then the id as a bare guid, then by name only.
@@ -530,9 +539,9 @@ function empShiftEnd(startMs, night) {
     return end > startMs ? end : 0;
 }
 // "Kevin Heldermon" finds "Heldermon, Kevin R": every word typed has to appear somewhere in the name.
+const empWords = (text) => String(text || '').replace(/[,&#%+]/g, ' ').split(/\s+/).filter(Boolean).slice(0, 4);
 function empSearchFilter(text) {
-    const words = String(text || '').replace(/[,&#%+]/g, ' ').split(/\s+/).filter(Boolean).slice(0, 4);
-    return words.map(w => `contains(craa5_name,'${odataStr(w)}')`).join(' and ');
+    return empWords(text).map(w => `contains(craa5_name,'${odataStr(w)}')`).join(' and ');
 }
 function empNameVariants(rawName) {
     const out = [];
@@ -561,10 +570,10 @@ function empWindowOf(range, todayYmd) {
     return { from, to, days, first: getLocalYMD(first), last: getLocalYMD(last), key: `${from}-${to}` };
 }
 // A long range read in pieces (newest piece first), so each piece is filtered, capped and shown on its own.
-function empChunks(from, to) {
-    const out = [];
+function empChunks(from, to, days) {
+    const out = [], span = days || EMP_CHUNK_DAYS;
     for (let f = to; f > from;) {
-        const s = Math.max(from, addDaysLocal(new Date(f), -EMP_CHUNK_DAYS).getTime());
+        const s = Math.max(from, addDaysLocal(new Date(f), -span).getTime());
         out.push([s, f]);
         f = s;
     }
@@ -572,13 +581,15 @@ function empChunks(from, to) {
 }
 // The Dataverse filter for one person and one piece of the range: their employee id and/or name, saved in the window
 // (by assignment time, or by creation time when that is blank). Closed rows (after a shift is closed) are included on purpose.
+function empWhenClause(f, t) {
+    return `((craa5_datetimeofassignment ge ${isoZ(f)} and craa5_datetimeofassignment lt ${isoZ(t)}) or (craa5_datetimeofassignment eq null and createdon ge ${isoZ(f)} and createdon lt ${isoZ(t)}))`;
+}
 function empAssignmentFilter(pick, step, f, t) {
     const who = [];
     if (step.guid === 'quoted' && pick.guid) who.push(`craa5__aaemp_guid eq '${odataStr(pick.guid)}'`);
     if (step.guid === 'bare' && pick.guid) who.push(`craa5__aaemp_guid eq ${pick.guid}`);
     empNameVariants(pick.name).forEach(n => who.push(`craa5_id eq '${odataStr(n)}'`));
-    const when = `((craa5_datetimeofassignment ge ${isoZ(f)} and craa5_datetimeofassignment lt ${isoZ(t)}) or (craa5_datetimeofassignment eq null and createdon ge ${isoZ(f)} and createdon lt ${isoZ(t)}))`;
-    return `(${who.join(' or ')}) and ${when}`;
+    return `(${who.join(' or ')}) and ${empWhenClause(f, t)}`;
 }
 // The crew letter from the employee table's Shift column (the same reading Ganttly uses). Blank = left the company.
 function crewOfValue(val) {
@@ -715,6 +726,130 @@ function buildEmployeeProfile(rows, nowMs, opts) {
     };
 }
 
+// ----------------------------------------------------------------------------
+// THE ROOM / AREA QUERY: who has spent the most time in one room or area. The same assignment rows as the employee query, but all the
+// people of one area (and only that area) are read, in small pieces of days, never the whole table.
+// ----------------------------------------------------------------------------
+// Every word typed has to appear in the area name.
+function empAreaTextFilter(text) {
+    return empWords(text).map(w => `contains(craa5_area,'${odataStr(w)}')`).join(' and ');
+}
+// One room / area and one piece of the range. A picked name lists every spelling seen (a trailing space is a different text);
+// "contains" takes every area with the typed words in its name.
+function empAreaFilter(pick, f, t) {
+    const who = pick.mode === 'contains'
+        ? empAreaTextFilter(pick.text)
+        : (pick.variants && pick.variants.length ? pick.variants : [pick.text]).map(v => `craa5_area eq '${odataStr(v)}'`).join(' or ');
+    return `(${who}) and ${empWhenClause(f, t)}`;
+}
+// The distinct area names found in a sample of rows (busiest first). PTO, Sick and the other absence words are not areas, and the
+// progress rows the equipment screens write (an equipment name and no employee) are not assignments.
+function empAreaNames(rows) {
+    const by = {};
+    rows.forEach(r => {
+        const raw = String(r.craa5_area || ''), name = raw.trim(), key = normText(name);
+        if (!key || OUT_AREA_NAMES.indexOf(key) > -1) return;
+        if (String(r.craa5_equip || r.craa5_equipment || '').trim() && !cleanGuid(r.craa5__aaemp_guid)) return;
+        const e = by[key] || (by[key] = { n: 0, spell: {}, raws: {} });
+        e.n++; e.spell[name] = (e.spell[name] || 0) + 1; e.raws[raw.toLowerCase()] = true;
+    });
+    return Object.keys(by).map(k => {
+        const e = by[k], names = Object.keys(e.spell).sort((a, b) => e.spell[b] - e.spell[a] || a.localeCompare(b));
+        return { name: names[0], n: e.n, variants: Object.keys(e.raws).slice(0, 6) };
+    }).sort((a, b) => b.n - a.n || a.name.localeCompare(b.name));
+}
+// One person per employee id (rows saved with a name but no id join the one person of that name who has an id). Each person's hours,
+// shifts and days come from buildEmployeeProfile, so they follow exactly the same rules as the employee query. Hours are worked out
+// from the rows of this area alone: Shift Start stamps an end time on the row of someone who is MOVED, so the rows still
+// have their end; a row with no end ran to the end of that shift.
+// opts: { first, last } the days asked for.
+function buildAreaRanking(rows, nowMs, opts) {
+    opts = opts || {};
+    const notes = { rows: rows.length, hubRows: 0, away: 0, nobody: 0, noEnd: 0, capped: 0, toShiftEnd: 0, slips: 0 };
+    const groups = {}, order = [];
+    rows.forEach(r => {
+        const guid = cleanGuid(r.craa5__aaemp_guid), nm = String(r.craa5_id || '').trim();
+        if (String(r.craa5_equip || r.craa5_equipment || '').trim() && !guid) { notes.hubRows++; return; }
+        if (OUT_AREA_NAMES.indexOf(normText(r.craa5_area)) > -1) { notes.away++; return; }
+        const key = guid ? 'g:' + guid : nm ? 'n:' + normText(nm) : '';
+        if (!key) { notes.nobody++; return; }
+        let g = groups[key];
+        if (!g) { g = groups[key] = { key, guid, rows: [], spell: {}, merged: false }; order.push(key); }
+        g.rows.push(r);
+        if (nm) g.spell[nm] = (g.spell[nm] || 0) + 1;
+    });
+    order.forEach(k => {
+        const g = groups[k];
+        if (g.guid) return;
+        const nameKey = k.slice(2), hits = [];
+        order.forEach(k2 => { const h = groups[k2]; if (h.guid && hits.indexOf(h) === -1 && Object.keys(h.spell).some(nm => normText(nm) === nameKey)) hits.push(h); });
+        if (hits.length !== 1) return;
+        hits[0].rows = hits[0].rows.concat(g.rows);
+        Object.keys(g.spell).forEach(nm => { hits[0].spell[nm] = (hits[0].spell[nm] || 0) + g.spell[nm]; });
+        g.merged = true;
+    });
+    const people = [];
+    order.forEach(k => {
+        const g = groups[k];
+        if (g.merged) return;
+        const names = Object.keys(g.spell).sort((a, b) => g.spell[b] - g.spell[a] || a.localeCompare(b));
+        const selfNames = []; names.forEach(nm => empNameVariants(nm).forEach(v => { if (selfNames.indexOf(v) === -1) selfNames.push(v); }));
+        const p = buildEmployeeProfile(g.rows, nowMs, { first: opts.first, last: opts.last, selfNames });
+        notes.noEnd += p.notes.noEnd; notes.capped += p.notes.capped; notes.toShiftEnd += p.notes.toShiftEnd; notes.slips += p.notes.slips;
+        if (!p.daysWorked) return;
+        const name = names[0] || '';
+        people.push({
+            key: k, guid: g.guid, name, label: formatFullName(name) || name || '(no name on the row)', dupName: false,
+            ms: p.totalMs, hours: p.hours, shifts: p.daysWorked, firstDay: p.firstDay, lastDay: p.lastDay,
+            team: p.topTeam ? p.topTeam.label : '', teamSup: p.topTeam && !p.topTeam.held ? p.topTeam.supName : ''
+        });
+    });
+    const seen = {};
+    people.forEach(x => { const nk = normText(x.label); (seen[nk] = seen[nk] || []).push(x); });
+    Object.keys(seen).forEach(nk => { if (seen[nk].length > 1) seen[nk].forEach(x => { x.dupName = true; }); });
+    return { people: sortAreaPeople(people, 'hours'), totalPeople: people.length, totalMs: people.reduce((n, x) => n + x.ms, 0), notes };
+}
+// 'hours' (the default: who has spent the most time there), 'shifts' (most separate shifts), 'recent' (been there most recently).
+function sortAreaPeople(list, mode) {
+    const byName = (a, b) => a.label.localeCompare(b.label) || String(a.key).localeCompare(String(b.key));
+    const cmp = mode === 'shifts' ? (a, b) => b.shifts - a.shifts || b.ms - a.ms || b.lastDay.localeCompare(a.lastDay) || byName(a, b)
+        : mode === 'recent' ? (a, b) => b.lastDay.localeCompare(a.lastDay) || b.ms - a.ms || b.shifts - a.shifts || byName(a, b)
+        : (a, b) => b.ms - a.ms || b.shifts - a.shifts || b.lastDay.localeCompare(a.lastDay) || byName(a, b);
+    return list.slice().sort(cmp);
+}
+// A blank Shift on the employee record means the person has left (a column that was not read is not blank).
+function empHasLeft(r) {
+    const info = readEmployeeShiftInfo(r);
+    return info.blank && (r.craa5_shift === null || r.craa5_shift === '' || r.craa5_Shift === null || r.craa5_Shift === '');
+}
+// The employee-list lookup for a few people at a time: by name (the employee table is small and this asks for those names only).
+function empStatusFilter(people) {
+    const names = [];
+    people.forEach(x => empNameVariants(x.name).forEach(n => { if (n && names.indexOf(n) === -1) names.push(n); }));
+    return names.map(n => `craa5_name eq '${odataStr(n)}'`).join(' or ');
+}
+// { personKey: { known, crew, role, left } } from the employee rows found.
+function empStatusOf(people, empRows) {
+    const byGuid = {}, byName = {};
+    (empRows || []).forEach(r => {
+        const id = cleanGuid(r.craa5__aa_employeeid || r.craa5_aa_employeeid);
+        if (id) byGuid[id] = r;
+        const nk = normText(r.craa5_name);
+        if (nk) (byName[nk] = byName[nk] || []).push(r);
+    });
+    const out = {};
+    people.forEach(x => {
+        let rec = x.guid ? byGuid[x.guid] : null;
+        if (!rec) {
+            const vs = empNameVariants(x.name).map(normText);
+            for (let i = 0; i < vs.length && !rec; i++) { const l = byName[vs[i]]; if (l && l.length) rec = l.filter(r => readEmployeeShiftInfo(r).crew)[0] || l[0]; }
+        }
+        if (!rec) { out[x.key] = { known: false, crew: '', role: '', left: false }; return; }
+        out[x.key] = { known: true, crew: readEmployeeShiftInfo(rec).crew, role: EMP_ROLE_NAMES[rec.craa5_role] || '', left: empHasLeft(rec) };
+    });
+    return out;
+}
+
 // Keeps Tab inside a dialog: from the last control it goes to the first, and Shift+Tab the other way.
 function trapTabKey(e) {
     if (e.key !== 'Tab') return;
@@ -786,6 +921,26 @@ export default function ScheduleApp({ dataApi, ...props }) {
     const empAccessRef = useRef({ i: 0, ok: false });             // which of EMP_ACCESS_STEPS is in use, and whether it has worked
     const empDataRef = useRef(empData);
     const empInputRef = useRef(null);
+    // The second way into Employee Query: type a room or area and see who has spent the most time there.
+    const emptyAreaData = { key: '', rows: [], loading: false, error: '', capped: 0, done: 0, total: 0, at: 0 };
+    const emptyAreaStatus = { key: '', map: {}, loading: false, failed: false, done: 0, total: 0 };
+    const [empMode, setEmpMode] = useState('person');                 // 'person' | 'area'
+    const [areaText, setAreaText] = useState('');                     // what is typed in the room / area box
+    const [areaSuggest, setAreaSuggest] = useState({ key: '', names: [], loading: false, failed: false, capped: false });
+    const [areaOpen, setAreaOpen] = useState(false);                  // suggestion list shown
+    const [areaActive, setAreaActive] = useState(-1);                 // keyboard-highlighted suggestion
+    const [areaPick, setAreaPick] = useState(null);                   // { mode: 'exact' | 'contains', text, label, variants }
+    const [areaRange, setAreaRange] = useState({ k: '180', from: '', to: '' });
+    const [areaData, setAreaData] = useState(emptyAreaData);
+    const [areaStatus, setAreaStatus] = useState(emptyAreaStatus);    // who is still here: the employee list, asked a few names at a time
+    const [areaSort, setAreaSort] = useState('hours');                // 'hours' | 'shifts' | 'recent'
+    const [areaCrew, setAreaCrew] = useState('');                     // '' = every crew
+    const [areaShowLeft, setAreaShowLeft] = useState(false);
+    const [areaShown, setAreaShown] = useState(EMP_AREA_SHOWN);
+    const areaDataRef = useRef(areaData);
+    const areaStatusRef = useRef(areaStatus);
+    const areaInputRef = useRef(null);
+    const areaAccessRef = useRef({ i: 0, ok: false });                // the select-list way of reading that worked
 
     // --- PERSONNEL GANTT (popout from Shift Cal) ---
     const [shiftLookbackHours, setShiftLookbackHours] = useState(24);
@@ -1530,6 +1685,167 @@ export default function ScheduleApp({ dataApi, ...props }) {
         () => (empKey && empData.key === empKey && empData.total > 0) ? buildEmployeeProfile(empData.rows, currentTime, { first: empWin.first, last: empWin.last, selfNames: empPick ? empNameVariants(empPick.name) : [] }) : null,
         [empData.rows, empData.key, empData.total, empKey, currentTime, empWin.first, empWin.last, empPick && empPick.name]);
 
+    // ------------------------------------------------------------------------
+    // ROOM / AREA QUERY: area name suggestions, then ONE area's assignment rows for the chosen days (in pieces of 14 days, at most 3 at
+    // once), then the employee list is asked about the people found (a few names per request) to tell who has left. Nothing is read
+    // until an area is typed, and only that area's rows are asked for.
+    // ------------------------------------------------------------------------
+    const areaQuery = areaText.trim();
+    const areaSearchable = areaQuery.length >= 2 && empWords(areaQuery).length > 0;
+    const areaWin = useMemo(() => empWindowOf(areaRange, todayYmd), [areaRange.k, areaRange.from, areaRange.to, todayYmd]);
+    const areaSuggestKey = areaWin.key ? `${areaQuery}|${areaWin.key}|${reloadTick}` : '';
+    const areaKey = areaPick && areaWin.key ? `${areaPick.mode}|${normText(areaPick.text)}|${areaWin.key}|${reloadTick}` : '';
+    areaDataRef.current = areaData;
+    areaStatusRef.current = areaStatus;
+
+    useEffect(() => {
+        if (activeTab !== 'employee' || empMode !== 'area' || !apiReady) return;
+        if (!areaSearchable || !areaSuggestKey) { setAreaSuggest(p => (p.names.length || p.loading || p.failed) ? { key: '', names: [], loading: false, failed: false, capped: false } : p); return; }
+        if (areaPick && areaQuery === areaPick.label) return;   // the box shows the area already picked
+        let alive = true;
+        const timer = setTimeout(async () => {
+            setAreaSuggest(p => ({ ...p, key: areaSuggestKey, loading: true, failed: false }));
+            const q = { filter: `(${empAreaTextFilter(areaQuery)}) and ${empWhenClause(areaWin.from, areaWin.to)}`, orderby: 'createdon desc', top: EMP_AREA_SAMPLE_ROWS };
+            let rows = await queryRecords(TABLE_TASK, dataApiRef.current, { ...q, select: EMP_AREA_SUGGEST_FIELDS });
+            if (rows === null) rows = await queryRecords(TABLE_TASK, dataApiRef.current, q);   // a column in the list may not exist
+            if (!alive) return;
+            setAreaSuggest({ key: areaSuggestKey, names: rows ? empAreaNames(rows) : [], loading: false, failed: rows === null, capped: !!rows && rows.length >= EMP_AREA_SAMPLE_ROWS });
+            setAreaActive(-1);
+        }, 250);
+        return () => { alive = false; clearTimeout(timer); };
+    }, [activeTab, empMode, apiReady, areaQuery, areaPick && areaPick.label, areaSuggestKey]);
+
+    useEffect(() => {
+        if (activeTab !== 'employee' || empMode !== 'area' || !apiReady || !areaPick || !areaKey) return;
+        const cur = areaDataRef.current;
+        if (cur.key === areaKey && !cur.loading && !cur.error && Date.now() - cur.at < 300000) return;   // read a moment ago: don't read it again
+        let alive = true;
+        const chunks = empChunks(areaWin.from, areaWin.to, EMP_AREA_CHUNK_DAYS);
+        setAreaData({ key: areaKey, rows: [], loading: true, error: '', capped: 0, done: 0, total: chunks.length, at: 0 });
+        // One piece of the range. The first piece settles how to ask (with the column list, or without it when the table lacks one of the
+        // columns); the rest then run up to EMP_AREA_PARALLEL at a time.
+        const memo = areaAccessRef.current && areaAccessRef.current.ok ? areaAccessRef.current : null;
+        let cursor = memo ? memo.i : 0, worked = !!memo, dead = false;
+        const readPiece = async (f, t) => {
+            while (!dead) {
+                if (!alive) return null;
+                const at = cursor;
+                const rows = await queryRecords(TABLE_TASK, dataApiRef.current, {
+                    filter: empAreaFilter(areaPick, f, t), orderby: 'createdon desc', top: RANGE_LIMIT, select: at === 0 ? EMP_TASK_FIELDS : undefined });
+                if (rows !== null) { worked = true; if (alive) areaAccessRef.current = { i: at, ok: true }; return rows; }
+                if (!alive || worked) return null;                // it worked before: this one is a real failure, not the wrong way of asking
+                if (at >= 1) { dead = true; return null; }        // both ways failed: the other pieces are not tried again
+                cursor = at + 1;
+            }
+            return null;
+        };
+        const timer = setTimeout(() => { (async () => {
+            try {
+                const seen = {};
+                let kept = [], capped = 0, failed = 0, done = 0;
+                const take = (rows) => {
+                    done++;
+                    if (rows === null) { failed++; return; }
+                    if (rows.length >= RANGE_LIMIT) capped++;
+                    const add = [];
+                    rows.forEach(r => { const id = r.craa5_taskassignmentid; if (id && seen[id]) return; if (id) seen[id] = true; add.push(r); });
+                    kept = kept.concat(add);
+                };
+                const progress = () => { const snapshot = kept, doneNow = done, cappedNow = capped; setAreaData(prev => prev.key === areaKey ? { ...prev, rows: snapshot, done: doneNow, capped: cappedNow } : prev); };
+                take(await readPiece(chunks[0][0], chunks[0][1]));
+                if (!alive) return;
+                progress();
+                for (let i = 1; i < chunks.length; i += EMP_AREA_PARALLEL) {
+                    const batch = chunks.slice(i, i + EMP_AREA_PARALLEL);
+                    const got = await Promise.all(batch.map(c => readPiece(c[0], c[1])));
+                    if (!alive) return;
+                    got.forEach(take);
+                    progress();
+                }
+                if (!alive) return;
+                const error = failed ? (failed === chunks.length ? 'The assignments could not be loaded.' : `Part of this range could not be loaded (${failed} of ${chunks.length} pieces), so the numbers below are incomplete.`) : '';
+                setAreaData(prev => prev.key === areaKey ? { ...prev, loading: false, error, at: Date.now() } : prev);
+            } catch (err) {
+                console.error('[Manager] Area query failed', err);
+                if (alive) setAreaData(prev => prev.key === areaKey ? { ...prev, loading: false, error: `The assignments could not be loaded: ${err?.message || err}`, at: Date.now() } : prev);
+            }
+        })(); }, 300);
+        return () => { alive = false; clearTimeout(timer); };
+    }, [activeTab, empMode, apiReady, areaKey]);
+
+    // Everyone found, ranked by hours. Only worked out once the whole range has been read, so the order never jumps around while it loads.
+    const areaRanking = useMemo(
+        () => (areaKey && areaData.key === areaKey && areaData.total > 0 && !areaData.loading) ? buildAreaRanking(areaData.rows, currentTime, { first: areaWin.first, last: areaWin.last }) : null,
+        [areaData.rows, areaData.key, areaData.total, areaData.loading, areaKey, currentTime, areaWin.first, areaWin.last]);
+    const areaStatusKey = areaRanking ? `${areaKey}|${areaData.at}` : '';
+
+    useEffect(() => {
+        if (!areaStatusKey || !apiReady || !areaRanking) return;
+        if (areaStatusRef.current.key === areaStatusKey) return;   // already asked for this result
+        let alive = true;
+        const people = areaRanking.people.slice(0, EMP_AREA_PEOPLE_MAX);
+        const batches = [];
+        for (let i = 0; i < people.length; i += EMP_STATUS_BATCH) batches.push(people.slice(i, i + EMP_STATUS_BATCH));
+        setAreaStatus({ key: areaStatusKey, map: {}, loading: batches.length > 0, failed: false, done: 0, total: batches.length });
+        (async () => {
+            try {
+                const map = {};
+                let failed = 0;
+                for (let i = 0; i < batches.length; i++) {
+                    if (!alive) return;
+                    const q = { filter: empStatusFilter(batches[i]), top: batches[i].length * 4 };
+                    let rows = await queryRecords(TABLE_EMPLOYEE, dataApiRef.current, { ...q, select: EMP_PICK_FIELDS });
+                    if (rows === null) rows = await queryRecords(TABLE_EMPLOYEE, dataApiRef.current, q);   // a column in the list may not exist
+                    if (!alive) return;
+                    if (rows === null) failed++;
+                    else { const part = empStatusOf(batches[i], rows); Object.keys(part).forEach(k => { map[k] = part[k]; }); }
+                    const snapshot = Object.assign({}, map), doneNow = i + 1;
+                    setAreaStatus(prev => prev.key === areaStatusKey ? { ...prev, map: snapshot, done: doneNow } : prev);
+                }
+                if (!alive) return;
+                setAreaStatus(prev => prev.key === areaStatusKey ? { ...prev, loading: false, failed: failed > 0 } : prev);
+            } catch (err) {
+                console.error('[Manager] Employee list check failed', err);
+                if (alive) setAreaStatus(prev => prev.key === areaStatusKey ? { ...prev, loading: false, failed: true } : prev);
+            }
+        })();
+        return () => { alive = false; };
+    }, [areaStatusKey, apiReady]);
+
+    // The ranking as shown: people who have left are hidden unless asked for, a crew can be picked, and the order follows "Rank by".
+    const areaView = useMemo(() => {
+        if (!areaRanking) return null;
+        const statusMap = areaStatus.key === areaStatusKey ? areaStatus.map : {};
+        const all = areaRanking.people.map(x => ({ ...x, st: statusMap[x.key] || null }));
+        const leftCount = all.filter(x => x.st && x.st.left).length;
+        const crews = {};
+        all.forEach(x => { if (x.st && x.st.crew && (areaShowLeft || !x.st.left)) crews[x.st.crew] = (crews[x.st.crew] || 0) + 1; });
+        let list = areaShowLeft ? all : all.filter(x => !(x.st && x.st.left));
+        if (areaCrew) list = list.filter(x => x.st && x.st.crew === areaCrew);
+        list = sortAreaPeople(list, areaSort);
+        return { list, leftCount, crews, all };
+    }, [areaRanking, areaStatus.key, areaStatus.map, areaStatusKey, areaSort, areaCrew, areaShowLeft]);
+
+    const pickArea = (item) => {
+        const q = areaQuery;
+        if (item.contains) setAreaPick({ mode: 'contains', text: q, label: q, variants: [] });
+        else { setAreaPick({ mode: 'exact', text: item.name, label: item.name, variants: item.variants || [] }); setAreaText(item.name); }
+        setAreaOpen(false); setAreaActive(-1); setAreaShown(EMP_AREA_SHOWN); setAreaCrew('');
+    };
+    const clearArea = () => {
+        setAreaPick(null); setAreaText(''); setAreaOpen(false); setAreaActive(-1); setAreaCrew(''); setAreaShown(EMP_AREA_SHOWN);
+        setAreaData(emptyAreaData); setAreaStatus(emptyAreaStatus);
+        if (areaInputRef.current) areaInputRef.current.focus();
+    };
+    // From a row of the ranking to that person's own numbers (same days).
+    const openPersonFromArea = (x) => {
+        const st = x.st || {};
+        setEmpPick({ id: x.guid || x.name, guid: x.guid, name: x.name, label: x.label, crew: st.crew || '', left: !!st.left, role: st.role || '' });
+        setEmpText(x.label); setEmpOpen(false); setEmpActive(-1); setEmpListShown(25); setEmpListOpen(false);
+        setEmpRange({ k: areaRange.k, from: areaRange.from, to: areaRange.to });
+        setEmpMode('person');
+    };
+
     const pickEmployee = (r) => {
         const id = String(r.craa5__aa_employeeid || r.craa5_aa_employeeid || '').replace(/[{}]/g, '');
         const name = renderSafe(r.craa5_name).trim();
@@ -2106,6 +2422,307 @@ export default function ScheduleApp({ dataApi, ...props }) {
         } catch (err) { notify('Could not copy. Your browser may be blocking clipboard access.', 'error'); }
     };
 
+    const areaTitle = areaPick ? (areaPick.mode === 'contains' ? `Every area with "${areaPick.text}" in its name` : areaPick.text) : '';
+    const copyAreaTable = () => {
+        if (!areaView || !areaPick) return;
+        const num = (n, d) => (Math.round(n * Math.pow(10, d)) / Math.pow(10, d)).toFixed(d);
+        const rankedBy = areaSort === 'shifts' ? 'Most shifts' : areaSort === 'recent' ? 'Been there most recently' : 'Most hours';
+        const rows = [
+            ['Room or area', areaTitle],
+            ['Days looked at', `${areaWin.first} to ${areaWin.last}`],
+            ['Ranked by', rankedBy],
+            ['Crew', areaCrew ? `Crew ${areaCrew}` : 'Every crew'],
+            [],
+            ['Rank', 'Person', 'Crew', 'Hours there', 'Shifts there', 'First there', 'Last there', 'Usually under']
+        ];
+        areaView.list.forEach((x, i) => rows.push([i + 1, x.label, x.st && x.st.crew ? x.st.crew : '', num(x.hours, 1), x.shifts, x.firstDay, x.lastDay, x.team]));
+        const tsv = rows.map(r => r.join('\t')).join('\n');
+        try {
+            navigator.clipboard.writeText(tsv).then(
+                () => notify('Copied. Press Ctrl+V to paste it into Excel.', 'success'),
+                () => notify('Could not copy. Your browser may be blocking clipboard access.', 'error'));
+        } catch (err) { notify('Could not copy. Your browser may be blocking clipboard access.', 'error'); }
+    };
+
+    const renderAreaQuery = ({ inputCls, labelCls, cardHead, th, hrs, pct, header }) => {
+        const view = areaView;
+        const searching = areaSearchable && !!areaSuggestKey && (areaSuggest.loading || areaSuggest.key !== areaSuggestKey);
+        const names = areaSuggest.key === areaSuggestKey ? areaSuggest.names : [];
+        const items = names.length >= 2 ? [{ contains: true, count: names.length }].concat(names) : names;
+        const showList = areaOpen && areaSearchable && !(areaPick && areaQuery === areaPick.label);
+        const reading = !!areaPick && areaData.key === areaKey && areaData.loading;
+        const statusNow = areaStatus.key === areaStatusKey ? areaStatus : null;
+        const checking = !!view && !!statusNow && statusNow.loading;
+        const onKey = (e) => {
+            const n = items.length;
+            if (e.key === 'ArrowDown') { e.preventDefault(); setAreaOpen(true); if (n) setAreaActive(i => (i + 1) % n); }
+            else if (e.key === 'ArrowUp') { e.preventDefault(); if (n) setAreaActive(i => (i <= 0 ? n - 1 : i - 1)); }
+            else if (e.key === 'Enter') {
+                const it = showList && !searching ? (areaActive >= 0 ? items[areaActive] : (n === 1 ? items[0] : null)) : null;
+                if (it) { e.preventDefault(); pickArea(it); }
+            }
+            else if (e.key === 'Escape') { setAreaOpen(false); setAreaActive(-1); }
+        };
+        const list = view ? view.list : [];
+        const maxMs = Math.max.apply(null, list.map(x => x.ms).concat([1]));
+        const topHours = sortAreaPeople(list, 'hours')[0] || null, topShifts = sortAreaPeople(list, 'shifts')[0] || null, topRecent = sortAreaPeople(list, 'recent')[0] || null;
+        const dayText = (ymd) => { const d = parseYMD(ymd); return d ? fmtDayYear(d) : '-'; };
+        const theirNumbers = (x) => <button type="button" onClick={() => openPersonFromArea(x)} aria-label={`See ${x.label}'s own numbers`} className="text-xs font-extrabold text-[#0072CE] hover:text-[#00468B] hover:underline">Their numbers</button>;
+        const totalMs = list.reduce((n, x) => n + x.ms, 0);
+        const n = areaRanking ? areaRanking.notes : null;
+        const crewKeys = view ? ['A', 'B', 'C', 'D'].filter(c => view.crews[c]) : [];
+        const badge = "text-[10px] font-extrabold uppercase tracking-wider px-2 py-0.5 rounded-full border";
+        const tiles = topHours ? [
+            { label: 'Most experienced here', value: topHours.label, sub: `${hrs(topHours.hours)} over ${pluralize(topHours.shifts, 'shift')}` },
+            { label: 'Most shifts here', value: topShifts.label, sub: `${pluralize(topShifts.shifts, 'shift')}, ${hrs(topShifts.hours)}` },
+            { label: 'Been there most recently', value: topRecent.label, sub: `last there ${dayText(topRecent.lastDay)}` },
+            { label: 'People who worked here', value: list.length, big: true, sub: `${hrs(totalMs / 3600000)} in all${areaCrew ? `, Crew ${areaCrew} only` : ''}` },
+        ] : [];
+
+        return (
+            <div className="animate-in fade-in duration-300 flex flex-col gap-4">
+                {header}
+
+                <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 md:p-5">
+                    <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] items-start">
+                        <div className="relative">
+                            <label htmlFor="area-search" className={labelCls}>Room or area</label>
+                            <div className="relative">
+                                <SearchIcon className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                                <input
+                                    id="area-search" ref={areaInputRef} type="text" autoComplete="off" spellCheck={false}
+                                    role="combobox" aria-expanded={showList} aria-controls="area-suggest" aria-autocomplete="list"
+                                    aria-activedescendant={showList && areaActive >= 0 ? `area-opt-${areaActive}` : undefined}
+                                    placeholder="Type a room or area, for example Breading or Fryer"
+                                    value={areaText}
+                                    onChange={e => {
+                                        const v = e.target.value;
+                                        setAreaText(v); setAreaOpen(true); setAreaActive(-1);
+                                        if (areaPick && v.trim() !== areaPick.label) { setAreaPick(null); setAreaData(emptyAreaData); setAreaStatus(emptyAreaStatus); setAreaCrew(''); }   // typing over the area: the old numbers go away
+                                    }}
+                                    onFocus={() => setAreaOpen(true)}
+                                    onBlur={() => setAreaOpen(false)}
+                                    onKeyDown={onKey}
+                                    className={`${inputCls} pl-9 pr-10 placeholder:text-slate-500`}
+                                />
+                                {areaText && (
+                                    <button type="button" aria-label="Clear the room or area" onClick={clearArea} className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 rounded-full text-slate-400 hover:text-slate-700 hover:bg-slate-100">
+                                        <XIcon className="w-4 h-4" />
+                                    </button>
+                                )}
+                            </div>
+                            {showList && (
+                                <ul id="area-suggest" role="listbox" aria-label="Matching rooms and areas" className="absolute z-30 left-0 right-0 mt-1 max-h-80 overflow-auto bg-white border border-slate-200 rounded-xl shadow-lg py-1">
+                                    {searching && <li role="presentation" className="px-4 py-3 text-sm text-slate-500">Searching...</li>}
+                                    {!searching && areaSuggest.failed && <li role="presentation" className="px-4 py-3 text-sm font-bold text-[#E4002B]">The assignments could not be searched. Try again.</li>}
+                                    {!searching && !areaSuggest.failed && items.length === 0 && <li role="presentation" className="px-4 py-3 text-sm text-slate-500">No room or area with "{areaQuery}" in its name has assignments between {areaWin.first} and {areaWin.last}.</li>}
+                                    {!searching && items.map((it, i) => (
+                                        <li key={it.contains ? '*contains*' : it.name} id={`area-opt-${i}`} role="option" aria-selected={i === areaActive}
+                                            onMouseDown={e => { e.preventDefault(); pickArea(it); }} onMouseEnter={() => setAreaActive(i)}
+                                            className={`px-4 py-2.5 cursor-pointer flex items-center justify-between gap-3 ${i === areaActive ? 'bg-[#E6F1FB]' : 'hover:bg-slate-50'}`}>
+                                            {it.contains
+                                                ? <span className="text-sm font-bold text-[#00468B]">All {it.count} areas with "{areaQuery}" in their name</span>
+                                                : <span className="text-sm font-bold text-slate-800 truncate">{it.name}</span>}
+                                        </li>
+                                    ))}
+                                    {!searching && areaSuggest.capped && <li role="presentation" className="px-4 py-2 text-xs font-bold text-slate-500 border-t border-slate-100">Only the newest assignments were looked at. Type more of the name to narrow it down.</li>}
+                                </ul>
+                            )}
+                            <div className="sr-only" role="status" aria-live="polite">{showList && !searching ? `${items.length} matching ${items.length === 1 ? 'choice' : 'choices'}` : ''}</div>
+                        </div>
+                        <div>
+                            <span className={labelCls}>Days to look at</span>
+                            <div className="flex flex-wrap gap-1.5" role="group" aria-label="Days to look at">
+                                {EMP_RANGES.map(r => <Chip key={r.k} on={areaRange.k === r.k} onClick={() => setAreaRange({ k: r.k, from: areaRange.from, to: areaRange.to })}>{r.label}</Chip>)}
+                                <Chip on={areaRange.k === 'custom'} onClick={() => setAreaRange({ k: 'custom', from: areaRange.from || areaWin.first || '', to: areaRange.to || areaWin.last || '' })}>Pick dates</Chip>
+                            </div>
+                        </div>
+                    </div>
+                    {areaRange.k === 'custom' && (
+                        <div className="mt-4 flex flex-wrap items-end gap-3">
+                            <div>
+                                <label htmlFor="area-from" className={labelCls}>From</label>
+                                <input id="area-from" type="date" value={areaRange.from} onChange={e => setAreaRange(r => ({ ...r, from: e.target.value }))} className={inputCls} />
+                            </div>
+                            <div>
+                                <label htmlFor="area-to" className={labelCls}>To (included)</label>
+                                <input id="area-to" type="date" value={areaRange.to} onChange={e => setAreaRange(r => ({ ...r, to: e.target.value }))} className={inputCls} />
+                            </div>
+                            {areaWin.error && <p role="alert" className="text-sm font-bold text-[#E4002B] pb-2">{areaWin.error}</p>}
+                        </div>
+                    )}
+                    {!apiReady && <p className="mt-3 text-sm font-bold text-[#00468B] bg-[#FFF6E0] border border-[#FFB81C] rounded-lg px-3 py-2">Preview mode: there is no Dataverse connection here, so rooms and areas cannot be searched.</p>}
+                </div>
+
+                {!areaPick && (
+                    <div className="bg-white rounded-xl border border-dashed border-slate-300 px-6 py-10 text-center">
+                        <SearchIcon className="w-8 h-8 text-[#0072CE] mx-auto mb-3" />
+                        <p className="text-sm font-black text-[#00468B] uppercase tracking-widest">Search for a room or area</p>
+                        <p className="text-sm text-slate-500 mt-2 max-w-xl mx-auto">You will see who has spent the most time there, how many shifts, when each person was last there and whose team they usually work under. People who have left the company are hidden.</p>
+                    </div>
+                )}
+
+                {areaPick && (
+                    <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 md:p-5 flex flex-wrap items-center gap-4">
+                        <div aria-hidden="true" className="h-12 w-12 rounded-full bg-[#CFE3F7] text-[#00468B] flex items-center justify-center flex-shrink-0"><SearchIcon className="w-5 h-5" /></div>
+                        <div className="min-w-0 flex-1">
+                            <h3 className="text-lg font-black text-[#00468B] leading-tight break-words">{areaTitle}</h3>
+                            <div className="flex flex-wrap items-center gap-1.5 mt-1">
+                                {!areaWin.error && <span className="text-xs font-bold text-slate-600">{areaWin.first} to {areaWin.last} ({pluralize(areaWin.days, 'day')})</span>}
+                            </div>
+                        </div>
+                        {view && list.length > 0 && (
+                            <button type="button" onClick={copyAreaTable} className="px-3 py-2 text-sm font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 rounded-md transition-colors flex items-center gap-2 shadow-sm" title="Copy this ranking to paste into Excel">
+                                <FileSpreadsheetIcon className="w-4 h-4" /> Copy for Excel
+                            </button>
+                        )}
+                    </div>
+                )}
+
+                {reading && (
+                    <div className="px-4 py-3 rounded-xl bg-[#E6F1FB] border border-[#B3D4F2] text-[#00468B] text-sm font-bold" role="status">
+                        Reading the assignments in {areaTitle}{areaData.total > 1 ? ` (part ${Math.min(areaData.done + 1, areaData.total)} of ${areaData.total})` : ''}...
+                        <div className="mt-2 h-1.5 rounded-full bg-white overflow-hidden"><div className="h-1.5 bg-[#0072CE] transition-all" style={{ width: `${Math.round(((areaData.done || 0) / Math.max(1, areaData.total)) * 100)}%` }} /></div>
+                    </div>
+                )}
+                {areaPick && areaData.key === areaKey && areaData.error && <div role="alert" className="px-4 py-3 rounded-xl bg-[#FDE8EC] border border-[#E4002B]/40 text-[#B80022] text-sm font-bold">{areaData.error}</div>}
+                {areaPick && areaData.key === areaKey && areaData.capped > 0 && <div role="alert" className="px-4 py-3 rounded-xl border border-[#FFB81C] bg-[#FFF6E0] text-slate-800 text-sm">{areaData.capped === 1 ? 'One stretch of this range holds' : `${areaData.capped} stretches of this range hold`} more than {RANGE_LIMIT.toLocaleString()} rows, so the oldest rows there are missing. Pick fewer days for exact numbers.</div>}
+
+                {view && areaRanking.people.length === 0 && !reading && !areaData.error && (
+                    <div className="bg-white rounded-xl border border-slate-200 px-6 py-8 text-center">
+                        <p className="text-sm font-black text-[#00468B] uppercase tracking-widest">No assignments found</p>
+                        <p className="text-sm text-slate-500 mt-2 max-w-xl mx-auto">Nobody has a Shift Start assignment in {areaTitle} between {areaWin.first} and {areaWin.last}. Try more days, or check the spelling of the room or area.</p>
+                    </div>
+                )}
+
+                {view && areaRanking.people.length > 0 && (
+                    <>
+                        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4">
+                            {tiles.map(k => (
+                                <div key={k.label} className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 flex flex-col justify-between min-w-0">
+                                    <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest">{k.label}</p>
+                                    <p className={`${k.big ? 'text-3xl' : 'text-lg'} font-black text-[#0072CE] leading-tight mt-1 break-words`}>{k.value}</p>
+                                    <p className="text-xs text-slate-500 mt-1">{k.sub}</p>
+                                </div>
+                            ))}
+                            {tiles.length === 0 && (
+                                <div className="col-span-2 lg:col-span-4 bg-white rounded-xl border border-slate-200 px-6 py-6 text-center text-sm text-slate-600">Nobody matches the choices below. Try another crew, or include the people who have left.</div>
+                            )}
+                        </div>
+
+                        <section aria-labelledby="area-rank-h" className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+                            <div className={cardHead}>
+                                <h3 id="area-rank-h" className="text-sm font-black text-[#00468B] uppercase tracking-widest">Who has the most experience here</h3>
+                                <span className="text-xs font-bold text-slate-600">{pluralize(list.length, 'person', 'people')}</span>
+                            </div>
+                            <div className="px-5 py-3 border-b border-slate-100 flex flex-wrap items-end gap-x-8 gap-y-3">
+                                <div>
+                                    <span className={labelCls}>Rank by</span>
+                                    <div className="flex flex-wrap gap-1.5" role="group" aria-label="Rank by">
+                                        <Chip on={areaSort === 'hours'} onClick={() => setAreaSort('hours')}>Most hours</Chip>
+                                        <Chip on={areaSort === 'shifts'} onClick={() => setAreaSort('shifts')}>Most shifts</Chip>
+                                        <Chip on={areaSort === 'recent'} onClick={() => setAreaSort('recent')}>Been there most recently</Chip>
+                                    </div>
+                                </div>
+                                {crewKeys.length > 0 && (
+                                    <div>
+                                        <span className={labelCls}>Crew</span>
+                                        <div className="flex flex-wrap gap-1.5" role="group" aria-label="Crew">
+                                            <Chip on={areaCrew === ''} onClick={() => { setAreaCrew(''); setAreaShown(EMP_AREA_SHOWN); }}>Every crew</Chip>
+                                            {crewKeys.map(c => <Chip key={c} on={areaCrew === c} onClick={() => { setAreaCrew(c); setAreaShown(EMP_AREA_SHOWN); }}>Crew {c} ({view.crews[c]})</Chip>)}
+                                        </div>
+                                    </div>
+                                )}
+                                {view.leftCount > 0 && (
+                                    <label className="inline-flex items-center gap-2 text-sm font-semibold text-slate-700 cursor-pointer pb-1.5">
+                                        <input type="checkbox" checked={areaShowLeft} onChange={e => { setAreaShowLeft(e.target.checked); setAreaShown(EMP_AREA_SHOWN); }} className="h-4 w-4 rounded border-slate-300 accent-[#0072CE]" />
+                                        Include {pluralize(view.leftCount, 'person who has', 'people who have')} left the company
+                                    </label>
+                                )}
+                            </div>
+                            {checking && <div role="status" className="px-5 py-2 text-xs font-bold text-[#00468B] bg-[#E6F1FB]/60 border-b border-slate-100">Checking who is still with the company ({statusNow.done} of {statusNow.total})...</div>}
+                            {statusNow && !statusNow.loading && statusNow.failed && <div role="alert" className="px-5 py-2 text-xs font-bold text-[#B80022] bg-[#FDE8EC] border-b border-slate-100">The employee list could not be checked, so people who have left may still be shown and crews are missing.</div>}
+                            <div className="overflow-x-auto">
+                                <table className="min-w-full text-sm">
+                                    <caption className="sr-only">People ranked by their experience in {areaTitle}: hours, shifts, first and last time there, and the team they usually work under</caption>
+                                    <thead className="bg-slate-50"><tr>
+                                        <th scope="col" className={th}>#</th>
+                                        <th scope="col" className={th}>Person</th>
+                                        <th scope="col" className={th}>Hours there</th>
+                                        <th scope="col" className={`${th} text-right hidden md:table-cell`}>Shifts there</th>
+                                        <th scope="col" className={`${th} hidden md:table-cell`}>First there</th>
+                                        <th scope="col" className={`${th} hidden md:table-cell`}>Last there</th>
+                                        <th scope="col" className={`${th} hidden md:table-cell`}>Usually under</th>
+                                        <th scope="col" className={`${th} hidden md:table-cell`}><span className="sr-only">Their own numbers</span></th>
+                                    </tr></thead>
+                                    <tbody className="divide-y divide-slate-100">
+                                        {list.slice(0, areaShown).map((x, i) => (
+                                            <tr key={x.key} className={i === 0 && areaSort === 'hours' ? 'bg-[#FFF6E0]/60' : 'hover:bg-slate-50'}>
+                                                <td className="px-4 py-2.5 font-black text-slate-500 tabular-nums">{i + 1}</td>
+                                                <td className="px-4 py-2.5">
+                                                    <div className="font-bold text-slate-800">{x.label}{i === 0 && areaSort === 'hours' && <span className="ml-2 text-[10px] font-extrabold uppercase tracking-wider px-2 py-0.5 rounded-full bg-[#FFB81C] text-slate-900">Most experienced</span>}</div>
+                                                    <div className="flex flex-wrap items-center gap-1.5 mt-0.5 empty:hidden">
+                                                        {x.st && x.st.role && <span className={`${badge} bg-[#FFF6E0] text-slate-700 border-[#FFB81C]`}>{x.st.role}</span>}
+                                                        {x.st && x.st.crew && <span className={`${badge} bg-[#E6F1FB] text-[#00468B] border-[#B3D4F2]`}>Crew {x.st.crew}</span>}
+                                                        {x.st && x.st.left && <span className={`${badge} bg-slate-100 text-slate-600 border-slate-200`}>Left the company</span>}
+                                                        {x.st && !x.st.known && !x.st.left && statusNow && !statusNow.loading && !statusNow.failed && <span className={`${badge} bg-slate-100 text-slate-600 border-slate-200`}>Not in the employee list</span>}
+                                                        {x.dupName && <span className={`${badge} bg-slate-100 text-slate-600 border-slate-200`}>Another employee has this name</span>}
+                                                    </div>
+                                                    <div className="md:hidden mt-1 text-xs text-slate-600">{x.team ? `Usually under ${x.team}. ` : ''}There {dayText(x.firstDay)} to {dayText(x.lastDay)}.</div>
+                                                    <div className="md:hidden mt-1">{theirNumbers(x)}</div>
+                                                </td>
+                                                <td className="px-4 py-2.5">
+                                                    <div className="flex items-center gap-2 sm:min-w-[150px]">
+                                                        <div className="hidden sm:block flex-1 h-2 rounded-full bg-slate-100 overflow-hidden"><div className="h-2 rounded-full bg-[#0072CE]" style={{ width: `${Math.max(2, Math.round((x.ms / maxMs) * 100))}%` }} /></div>
+                                                        <span className="text-sm font-bold text-slate-700 w-16 text-right tabular-nums">{hrs(x.hours)}</span>
+                                                    </div>
+                                                    <div className="md:hidden text-right text-xs font-bold text-[#0072CE] tabular-nums">{pluralize(x.shifts, 'shift', 'shifts')}</div>
+                                                </td>
+                                                <td className="px-4 py-2.5 text-right font-black text-[#0072CE] tabular-nums hidden md:table-cell">{x.shifts}</td>
+                                                <td className="px-4 py-2.5 text-slate-600 whitespace-nowrap hidden md:table-cell">{dayText(x.firstDay)}</td>
+                                                <td className="px-4 py-2.5 text-slate-600 whitespace-nowrap hidden md:table-cell">{dayText(x.lastDay)}</td>
+                                                <td className="px-4 py-2.5 text-slate-600 hidden md:table-cell">{x.team || '-'}</td>
+                                                <td className="px-4 py-2.5 text-right whitespace-nowrap hidden md:table-cell">{theirNumbers(x)}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                            {list.length > areaShown && (
+                                <div className="p-3 border-t border-slate-200 flex justify-center bg-slate-50/80">
+                                    <button type="button" onClick={() => setAreaShown(c => c + 25)} className="text-sm font-semibold text-[#0072CE] hover:text-[#00468B] bg-white border border-[#B3D4F2] hover:bg-[#E6F1FB] px-6 py-2 rounded-full shadow-sm transition-colors">
+                                        Show more ({list.length - areaShown} left)
+                                    </button>
+                                </div>
+                            )}
+                        </section>
+
+                        {(n.noEnd > 0 || n.capped > 0 || n.slips > 0 || areaRanking.totalPeople > EMP_AREA_PEOPLE_MAX) && (
+                            <div className="px-4 py-3 rounded-xl border border-[#FFB81C] bg-[#FFF6E0] text-slate-800 text-sm space-y-1">
+                                {n.noEnd > 0 && <p>{pluralize(n.noEnd, 'assignment')} had no end time and nothing to show when {n.noEnd === 1 ? 'it' : 'they'} ended, so {n.noEnd === 1 ? 'it adds' : 'they add'} no hours.</p>}
+                                {n.capped > 0 && <p>{pluralize(n.capped, 'assignment')} ran longer than {EMP_MAX_ROW_MS / 3600000} hours and {n.capped === 1 ? 'is' : 'are'} counted as {EMP_MAX_ROW_MS / 3600000} hours.</p>}
+                                {n.slips > 0 && <p>{pluralize(n.slips, 'move')} lasting under {EMP_SLIP_MS / 60000} minutes {n.slips === 1 ? 'was' : 'were'} ignored.</p>}
+                                {areaRanking.totalPeople > EMP_AREA_PEOPLE_MAX && <p>Only the {EMP_AREA_PEOPLE_MAX} people with the most hours were checked against the employee list for crew and for who has left.</p>}
+                            </div>
+                        )}
+
+                        <details className="bg-white rounded-xl border border-slate-200 shadow-sm px-5 py-3 text-sm text-slate-600">
+                            <summary className="cursor-pointer text-sm font-black text-[#00468B] uppercase tracking-widest">How this ranking is worked out</summary>
+                            <ul className="mt-3 space-y-1.5 list-disc pl-5">
+                                <li>Every time Shift Start puts someone in a room or area it saves a row. Only the rows for the room or area typed are read, a few days at a time.</li>
+                                <li><b>Hours there</b> run from the start of an assignment to its end time. Shift Start stamps an end time when someone is moved, so an assignment with no end time ran to the end of that shift (6 PM for days, 6 AM for nights). Never more than {EMP_MAX_ROW_MS / 3600000} hours for one assignment, and a move that is undone within {EMP_SLIP_MS / 60000} minutes is ignored.</li>
+                                <li><b>Shifts there</b> counts each shift once, even when the person was moved in and out. A night shift (6 PM to 6 AM) counts for the day it began.</li>
+                                <li>The default order is <b>most hours</b>: time spent in the room or area, not how well the work went. Switch to most shifts, or to who was there most recently, to see someone who has been away from it for a while.</li>
+                                <li>The employee list is asked about the people found, a few names at a time. A blank Shift there means the person has left the company, so they are hidden unless you include them. A crew can be picked once the list has been checked.</li>
+                                <li>"Their numbers" opens that person in the employee query for the same days.</li>
+                            </ul>
+                        </details>
+                    </>
+                )}
+            </div>
+        );
+    };
+
     const renderEmployeeTab = () => {
         const p = empProfile;
         const inputCls = "w-full border border-slate-300 rounded-lg py-2 px-3 text-sm font-semibold focus:outline-none focus:ring-2 focus:ring-[#0072CE]/40 focus:border-[#0072CE] bg-white";
@@ -2139,12 +2756,23 @@ export default function ScheduleApp({ dataApi, ...props }) {
             </div>
         );
 
+        const header = (
+            <div>
+                <h2 className="text-base font-black text-[#00468B] uppercase tracking-widest">Employee Query</h2>
+                <p className="text-sm text-slate-500">{empMode === 'area'
+                    ? 'Type a room or area to see who has spent the most time there, and when and under whom. Built from the assignments saved by Shift Start.'
+                    : 'Type a name to see where that person was assigned, for how long, and whose team they were on. Built from the assignments saved by Shift Start.'}</p>
+                <div className="mt-3 flex flex-wrap gap-1.5" role="group" aria-label="Look up by">
+                    <Chip on={empMode === 'person'} onClick={() => setEmpMode('person')}>By employee</Chip>
+                    <Chip on={empMode === 'area'} onClick={() => setEmpMode('area')}>By room or area</Chip>
+                </div>
+            </div>
+        );
+        if (empMode === 'area') return renderAreaQuery({ inputCls, labelCls, cardHead, th, hrs, pct, header });
+
         return (
             <div className="animate-in fade-in duration-300 flex flex-col gap-4">
-                <div>
-                    <h2 className="text-base font-black text-[#00468B] uppercase tracking-widest">Employee Query</h2>
-                    <p className="text-sm text-slate-500">Type a name to see where that person was assigned, for how long, and whose team they were on. Built from the assignments saved by Shift Start.</p>
-                </div>
+                {header}
 
                 <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 md:p-5">
                     <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] items-start">
@@ -3201,7 +3829,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
                             onChange={(e) => { if (e.target.value) setSelectedDate(e.target.value); }}
                             className="border border-slate-300 rounded-lg py-1.5 px-2 text-sm font-bold focus:outline-none focus:ring-2 focus:ring-[#0072CE]/40 focus:border-[#0072CE]"
                         />
-                        <button onClick={() => { loadedRef.current = { task: [], prod: [], keys: new Set() }; setAllAssignments([]); setProdSchedules([]); setRangeIssues({}); empAccessRef.current = { i: 0, ok: false }; setReloadTick(t => t + 1); }} disabled={isLoading} className="text-[11px] font-extrabold uppercase tracking-wider text-[#0072CE] bg-white border border-[#B3D4F2] hover:bg-[#E6F1FB] rounded-lg px-3 py-2 disabled:opacity-50 whitespace-nowrap">{rangeBusy > 0 ? 'Loading…' : 'Reload data'}</button>
+                        <button onClick={() => { loadedRef.current = { task: [], prod: [], keys: new Set() }; setAllAssignments([]); setProdSchedules([]); setRangeIssues({}); empAccessRef.current = { i: 0, ok: false }; areaAccessRef.current = { i: 0, ok: false }; setReloadTick(t => t + 1); }} disabled={isLoading} className="text-[11px] font-extrabold uppercase tracking-wider text-[#0072CE] bg-white border border-[#B3D4F2] hover:bg-[#E6F1FB] rounded-lg px-3 py-2 disabled:opacity-50 whitespace-nowrap">{rangeBusy > 0 ? 'Loading…' : 'Reload data'}</button>
                     </div>
                 </div>
             </nav>
