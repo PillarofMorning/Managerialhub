@@ -7,6 +7,8 @@ import { FluentProvider, createLightTheme, Button, Text, DataGrid, DataGridHeade
 // Signs in with the Microsoft account; anyone who isn't a supervisor (leads,
 // managers) lands on the board of the supervisor on the current shift.
 // The current shift comes from craa5_workshift (same reading rules as Ganttly).
+// Save Progress writes the whole board to craa5_taskassignment; every time the app opens
+// (or View As switches supervisor) the board is rebuilt from what that supervisor saved in the last 16 hours.
 // ============================================================================
 
 // --- Session cache (survives Power Apps remounts) ---
@@ -90,6 +92,70 @@ const isTaskDone = (r: any) =>
 const taskTime = (r: any) => new Date(getField(r, 'craa5_datetimeofassignment') || getField(r, 'createdon') || 0).getTime();
 // Oldest first; on a tie the completed row comes first so the open one wins.
 const byTaskTime = (a: any, b: any) => (taskTime(a) - taskTime(b)) || ((isTaskDone(b) ? 1 : 0) - (isTaskDone(a) ? 1 : 0));
+const normText = (v: any) => String(v ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+const sameText = (a: any, b: any) => normText(a) === normText(b);
+
+// The crew a supervisor's board draws from: employees on the supervisor's shift (everyone, if that shift matches nobody).
+function crewOf(sup: any, everyone: any[], fallbackShift: string) {
+    const ts = getShiftOf(sup) || fallbackShift, supId = getField(sup, 'craa5__aa_employeeid');
+    let staff = everyone.filter(e => getShiftOf(e) === ts);
+    if (staff.length === 0) staff = everyone;
+    return {
+        leads: staff.filter(e => roleOf(e) === 'lead' && getField(e, 'craa5__aa_employeeid') !== supId),
+        employees: staff.filter(e => roleOf(e) !== 'lead' && roleOf(e) !== 'supervisor' && getField(e, 'craa5__aa_employeeid') !== supId),
+    };
+}
+
+// ============================================================================
+// SAVED ASSIGNMENTS (craa5_taskassignment)
+// Save Progress writes one row per person per area (plus an empty row for an area nobody is in). Opening the app reads the last
+// 24 hours, keeps the last 16, and rebuilds a supervisor's board from the rows whose team is that supervisor.
+// Rows are matched by team, never by shift letter: the letter on a row comes from whichever app wrote it, and they don't agree.
+// ============================================================================
+const TASK_TABLE = "craa5_taskassignment";
+const TASK_FETCH_HOURS = 24;
+const TASK_LOOKBACK_MS = 16 * 3600000;
+const TASK_TIMEOUT_MS = 10000;
+const TASK_COLUMNS = ['craa5_taskassignmentid', 'craa5_id', 'craa5_lead', 'craa5_area', 'craa5_starttime', 'craa5_endtime', 'craa5_datetimeofassignment', 'createdon', 'craa5_shift', 'craa5_team', 'craa5_percentagecomplete', 'craa5_complete', 'statecode', 'craa5__currentstatus', 'craa5_whatisbeingdone', 'craa5_whatislefttodo', 'craa5__future_or_notes', 'craa5_badgenumber', 'craa5_leademail', 'craa5_supervisoremail', 'craa5_uid_associated', 'craa5__aaemp_guid', 'craa5_email'];
+// What the board itself needs; used when this environment refuses the longer list above (a column it doesn't have).
+const TASK_CORE_COLUMNS = ['craa5_taskassignmentid', 'craa5_id', 'craa5_lead', 'craa5_area', 'craa5_starttime', 'craa5_endtime', 'craa5_datetimeofassignment', 'createdon', 'craa5_shift', 'craa5_team', 'craa5_percentagecomplete', 'craa5_complete', 'statecode', 'craa5_whatisbeingdone', 'craa5_whatislefttodo', 'craa5__aaemp_guid'];
+const noSavedNote = (others: number) => others ? `No saved assignments for this supervisor in the last 16 h (${others} saved rows belong to other teams)` : 'No saved assignments from anyone in the last 16 h';
+const odataDate = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+const rowBelongsTo = (r: any, sup: any) => {
+    const name = getField(sup, 'craa5_name'), email = getEmployeeEmail(sup);
+    return (!!name && sameText(getField(r, 'craa5_team'), name)) || (!!email && sameText(getField(r, 'craa5_supervisoremail'), email));
+};
+
+type TaskStatus = { ok: boolean; error: string; source: string; read: number };
+
+// Saved rows from the last 24 hours, newest first (only one team's when a team name is given). Each way of reading only falls through
+// to the next when it fails; ok is false only when every way failed, so an empty list with ok = true really means nothing was saved.
+async function fetchTaskRows(props: any, team: string = ""): Promise<{ rows: any[]; status: TaskStatus }> {
+    const xrm = safeGetXrm(), webApi = getWebApi(props), dataApi = props?.dataApi, since = odataDate(Date.now() - TASK_FETCH_HOURS * 3600000), problems: string[] = [];
+    const quoted = team.replace(/'/g, "''");
+    const failed = (where: string, e: any) => { const m = String(e?.message || e || "failed"); logError(`Saved assignments via ${where}`, m); problems.push(`${where}: ${m}`); };
+    const got = (rows: any[], source: string) => ({ rows, status: { ok: true, error: "", source, read: rows.length } });
+
+    if (xrm?.WebApi?.retrieveMultipleRecords) {
+        const attrs = TASK_COLUMNS.map(c => `<attribute name='${c}'/>`).join('');
+        const fetchXml = `<fetch top='5000'><entity name='${TASK_TABLE}'>${attrs}<filter><condition attribute='createdon' operator='last-x-hours' value='${TASK_FETCH_HOURS}'/>${team ? `<condition attribute='craa5_team' operator='eq' value='${team.replace(/&/g, '&amp;').replace(/'/g, '&apos;').replace(/</g, '&lt;')}'/>` : ''}</filter><order attribute='createdon' descending='true'/></entity></fetch>`;
+        try { const res: any = await asyncRace(xrm.WebApi.retrieveMultipleRecords(TASK_TABLE, `?fetchXml=${encodeURIComponent(fetchXml)}`), TASK_TIMEOUT_MS, "FetchXML"); if (Array.isArray(res?.entities)) return got(res.entities, "FetchXML"); failed("FetchXML", "no rows came back"); } catch (e: any) { failed("FetchXML", e); }
+    }
+    if (webApi?.retrieveMultipleRecords) {
+        try { const res: any = await asyncRace(webApi.retrieveMultipleRecords(TASK_TABLE, `?$select=${TASK_CORE_COLUMNS.join(',')}&$filter=createdon ge ${since}${team ? ` and craa5_team eq '${encodeURIComponent(quoted)}'` : ''}&$orderby=createdon desc&$top=5000`), TASK_TIMEOUT_MS, "OData"); if (Array.isArray(res?.entities)) return got(res.entities, "OData"); failed("OData", "no rows came back"); } catch (e: any) { failed("OData", e); }
+    }
+    if (dataApi?.queryTable) {
+        try { return got(await queryDataApi(dataApi, TASK_TABLE, `createdon ge ${since}${team ? ` and craa5_team eq '${quoted}'` : ''}`), "data API"); } catch (e: any) { failed("data API", e); }
+    }
+    if (Array.isArray(props?.inputPresets) && props.inputPresets.length) return got(props.inputPresets, "page input");
+    return { rows: [], status: { ok: false, error: problems.join("; ") || "no Dataverse connection", source: "", read: 0 } };
+}
+
+// The rows the board is built from (last 16 hours) and how the read went.
+async function readSavedAssignments(props: any, team: string = ""): Promise<{ recent: any[]; status: TaskStatus }> {
+    const { rows, status } = await fetchTaskRows(props, team), cutoff = Date.now() - TASK_LOOKBACK_MS;
+    return { recent: rows.filter(r => taskTime(r) >= cutoff), status };
+}
 
 // ============================================================================
 // CURRENT SHIFT (craa5_workshift: one row per slot — same rules as Ganttly)
@@ -335,9 +401,8 @@ export function MainComponent(props: any) {
     const [currentStep, setCurrentStep] = useState(0);
     const [currentShift, setCurrentShift] = useState("");          // from craa5_workshift
     const [shiftStartMs, setShiftStartMs] = useState(0);
-    const [refreshToggle, setRefreshToggle] = useState(0);
     const [appHeight, setAppHeight] = useState(window.innerHeight);
-    const [isLoading, setIsLoading] = useState(GLOBAL_INIT_STATUS !== 'COMPLETE');
+    const [isLoading, setIsLoading] = useState(true);   // the saved assignments are read on every open, so there is always a short load
     const [adminMode, setAdminMode] = useState(false);
     const [currentUser, setCurrentUser] = useState<any>(null);
     const [selectedSupervisorId, setSelectedSupervisorId] = useState<string | null>(null);
@@ -367,7 +432,11 @@ export function MainComponent(props: any) {
     const [clipboardFormat, setClipboardFormat] = useState<"headcount" | "initials" | "fullname">("headcount");
     const [disableAutoLogin, setDisableAutoLogin] = useState(false);
     const [saveSuccess, setSaveSuccess] = useState(false);
+    const [saveWarning, setSaveWarning] = useState("");
     const [submissionError, setSubmissionError] = useState<string | null>(null);
+    const [busyLabel, setBusyLabel] = useState("Loading shift...");
+    const [taskStatus, setTaskStatus] = useState<TaskStatus | null>(null);                        // how the last read of the saved assignments went
+    const [boardNote, setBoardNote] = useState<{ tone: 'ok' | 'none'; text: string } | null>(null);   // how the board got its contents
 
     const steps = ["Leads", "Areas", "Assign Areas", "Assign Employees", "Update Teams"];
     const allKnownEmps = useMemo(() => [...allEmployees, ...customEmployees, ...leads, ...customLeads], [allEmployees, customEmployees, leads, customLeads]);
@@ -390,7 +459,7 @@ export function MainComponent(props: any) {
         if (!c) return;
         // Shift and user first: React 17 renders each set separately, and the board defaults read these.
         setCurrentShift(c.shift || ""); setShiftStartMs(c.shiftStartMs || 0); setMsUser(c.msUser || null);
-        setAllEmployees(c.allEmployees || []); setSupervisors(c.supervisors || []); setLeads(c.leads || []); setAreas(c.areas || []); setPresetRecords(c.presetRecords || []);
+        setAllEmployees(c.allEmployees || []); setSupervisors(c.supervisors || []); setLeads(c.leads || []); setAreas(c.areas || []); setTaskStatus(c.taskStatus || null); setPresetRecords(c.presetRecords || []);
         if (c.resolvedUser) {
             setCurrentUser(c.resolvedUser);
             if (c.resolvedUser.calculatedRole === 'manager') setAdminMode(true);
@@ -398,9 +467,24 @@ export function MainComponent(props: any) {
         } else if ((c.msUser?.email || '').toLowerCase().includes('admin') || (c.msUser?.name || '').toLowerCase().includes('dev')) setAdminMode(true);
     }, []);
 
-    const triggerSoftReset = useCallback(() => {
-        setPresetsApplied(false); setHasAutoAssignedEveryday(false); setSelectedLeadIds(new Set()); setSelectedAreaIds(new Set()); setAreaAssignments({}); setAssignments({}); setAreaDetails({}); setEmployeeStartTimes({}); setCustomLeads([]); setCustomAreas([]); setCustomEmployees([]); setRefreshToggle(p => p + 1); setCurrentStep(0);
+    // Empties the board (and the rows it was built from) so the next supervisor's saved rows can be rebuilt into it.
+    const resetBoard = useCallback(() => {
+        setPresetsApplied(false); setHasAutoAssignedEveryday(false); setPresetRecords([]); setBoardNote(null); setSaveSuccess(false); setSaveWarning(""); setSubmissionError(null);
+        setSelectedLeadIds(new Set()); setSelectedAreaIds(new Set()); setAreaAssignments({}); setAssignments({}); setAreaDetails({}); setEmployeeStartTimes({}); setCustomLeads([]); setCustomAreas([]); setCustomEmployees([]); setCurrentStep(0);
     }, []);
+
+    // View As: another supervisor's board, rebuilt from what they saved — the same as if they had opened the app themselves.
+    const switchBoard = useCallback(async (supId: string) => {
+        if (!supId) return;
+        setDisableAutoLogin(true); resetBoard(); setSelectedSupervisorId(supId);
+        setBusyLabel("Reading saved assignments..."); setIsLoading(true);
+        try {
+            const t = await readSavedAssignments(propsRef.current);
+            if (GLOBAL_DATA_CACHE) GLOBAL_DATA_CACHE = { ...GLOBAL_DATA_CACHE, presetRecords: t.recent, taskStatus: t.status };
+            setTaskStatus(t.status); setPresetRecords(t.recent);
+        } catch (e: any) { logError('Reading saved assignments failed', e?.message || e); setTaskStatus({ ok: false, error: String(e?.message || e), source: "", read: 0 }); }
+        finally { setIsLoading(false); }
+    }, [resetBoard]);
 
     useEffect(() => { const i = setInterval(() => setCurrentTime(Date.now()), 60000); return () => clearInterval(i); }, []);
     useEffect(() => { const r = () => setAppHeight(window.innerHeight); window.addEventListener('resize', r); return () => window.removeEventListener('resize', r); }, []);
@@ -448,6 +532,13 @@ export function MainComponent(props: any) {
         return Array.from(m.values());
     }, [supervisors, leads, customLeads, selectedLeadIds, selectedSupervisorId]);
     const activeSupervisorObj = useMemo(() => supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId), [supervisors, selectedSupervisorId]);
+    // The line under the title: whether the saved board could be read, and what it was rebuilt with.
+    const headerNote = useMemo((): { tone: 'ok' | 'none' | 'error'; text: string } | null => {
+        if (!selectedSupervisorId || isLoading || !taskStatus) return null;
+        if (!taskStatus.ok) return { tone: 'error', text: `Saved assignments could not be read (${String(taskStatus.error).slice(0, 140)})` };
+        if (boardNote) return boardNote;
+        return presetRecords.length === 0 ? { tone: 'none', text: noSavedNote(0) } : null;
+    }, [selectedSupervisorId, isLoading, taskStatus, boardNote, presetRecords]);
 
     // Tailwind runtime
     useEffect(() => { if (!document.getElementById('tailwind-cdn')) { const s = document.createElement('script'); s.id = 'tailwind-cdn'; s.src = 'https://cdn.tailwindcss.com'; document.head.appendChild(s); } }, []);
@@ -455,17 +546,33 @@ export function MainComponent(props: any) {
     // Failsafe: never leave the user stuck behind the loading screen
     useEffect(() => { if (!isLoading) return; const f = setTimeout(() => { logError('Loading took over 15s; unlocking the screen.'); setIsLoading(false); setAdminMode(true); }, 15000); return () => clearTimeout(f); }, [isLoading]);
 
-    // --- LOAD (once per session; remounts reuse the cache) ---
+    // --- LOAD ---
+    // Employees, areas and the work shift are read once per session (remounts reuse them). The saved assignments are read
+    // again every time the app opens or resets, so the board always comes back the way it was last saved.
     useEffect(() => {
-        if (GLOBAL_INIT_STATUS === 'COMPLETE') { hydrateState(GLOBAL_DATA_CACHE); setIsLoading(false); return; }
-        if (GLOBAL_INIT_STATUS === 'FETCHING') { const i = setInterval(() => { if (GLOBAL_INIT_STATUS === 'COMPLETE') { clearInterval(i); hydrateState(GLOBAL_DATA_CACHE); setIsLoading(false); } }, 200); return () => clearInterval(i); }
+        if (GLOBAL_INIT_STATUS === 'FETCHING') {
+            const i = setInterval(() => {
+                if (GLOBAL_INIT_STATUS === 'FETCHING') return;
+                clearInterval(i); if (GLOBAL_INIT_STATUS === 'COMPLETE') hydrateState(GLOBAL_DATA_CACHE); setIsLoading(false);
+            }, 200);
+            return () => clearInterval(i);
+        }
 
-        GLOBAL_INIT_STATUS = 'FETCHING';
         const loadEverything = async () => {
-            setIsLoading(true);
+            const cached = GLOBAL_INIT_STATUS === 'COMPLETE' && !!GLOBAL_DATA_CACHE;
+            setBusyLabel(cached ? "Reading saved assignments..." : "Loading shift..."); setIsLoading(true);
             try {
+                const p = propsRef.current;
+                if (cached) {
+                    const saved = await readSavedAssignments(p);
+                    GLOBAL_DATA_CACHE = { ...GLOBAL_DATA_CACHE, presetRecords: saved.recent, taskStatus: saved.status };
+                    hydrateState(GLOBAL_DATA_CACHE);
+                    return;
+                }
+
+                GLOBAL_INIT_STATUS = 'FETCHING';
                 // Microsoft account of whoever opened the app
-                const ctx = propsRef.current.context?.userSettings, p = propsRef.current, xrm = safeGetXrm();
+                const ctx = p.context?.userSettings, xrm = safeGetXrm();
                 let uName = ctx?.userName || p.userName, uId = ctx?.userId || p.userId, uEmail = ctx?.email || p.userEmail;
                 if ((!uName || !uId) && xrm?.Utility) { try { const xc = xrm.Utility.getGlobalContext().userSettings; uName = uName || xc.userName; uId = uId || xc.userId; } catch (e) {} }
                 if (uName) {
@@ -473,99 +580,98 @@ export function MainComponent(props: any) {
                 } else { uName = "Local Developer"; uEmail = "dev@localhost"; uId = "DEV-MODE-ID"; }
                 const msUser = { name: uName, email: uEmail || "", id: uId };
 
-                // Assignments from the last 16 hours (fetched as 24h, trimmed below)
-                const sixteenHoursAgoMs = Date.now() - 16 * 3600000;
-                const loadTasks = async (): Promise<any[]> => {
-                    if (xrm?.WebApi) {
-                        const attrs = ['taskassignmentid', 'id', 'lead', 'area', 'starttime', 'endtime', 'datetimeofassignment', 'shift', 'team', 'percentagecomplete', 'complete', '_currentstatus', 'whatisbeingdone', 'whatislefttodo', '_future_or_notes', 'badgenumber', 'leademail', 'supervisoremail', 'uid_associated', '_aaemp_guid', 'email'].map(a => `<attribute name='craa5_${a}'/>`).join('');
-                        const fetchXml = `<fetch top='5000'><entity name='craa5_taskassignment'>${attrs}<attribute name='createdon'/><attribute name='statecode'/><filter><condition attribute='createdon' operator='last-x-hours' value='24'/></filter><order attribute='createdon' descending='true'/></entity></fetch>`;
-                        try { const res = await asyncRace(xrm.WebApi.retrieveMultipleRecords("craa5_taskassignment", `?fetchXml=${encodeURIComponent(fetchXml)}`), API_TIMEOUT_MS, "Tasks WebApi"); if (Array.isArray(res?.entities)) return res.entities; } catch (e: any) { logError('Tasks via WebApi', e?.message || e); }
-                    }
-                    if (p.dataApi?.queryTable) {
-                        try { return await queryDataApi(p.dataApi, "craa5_taskassignment", `createdon ge ${new Date(sixteenHoursAgoMs).toISOString().replace(/\.\d{3}Z$/, 'Z')}`); } catch (e: any) { logError('Tasks via dataApi', e?.message || e); }
-                    }
-                    return p.inputPresets || [];
-                };
-
-                const [empRaw, areaRaw, shiftRows, ft] = await Promise.all([
+                const [empRaw, areaRaw, shiftRows, saved] = await Promise.all([
                     fetchFallbackRecords(["craa5__aa_employee", "craa5_aa_employee", "craa5__aa_employees"], p),
                     fetchFallbackRecords(["craa5_aa_mss_area", "craa5_aa_mss_areas"], p),
                     fetchFallbackRecords("craa5_workshift", p),
-                    loadTasks(),
+                    readSavedAssignments(p),
                 ]);
                 const empData = empRaw.length ? empRaw : (p.inputEmployees || []);
                 const areaData = areaRaw.length ? areaRaw : (p.inputAreas || []);
-                const recent = ft.filter((r: any) => taskTime(r) >= sixteenHoursAgoMs);
                 const { crew, startMs } = findCurrentShift(parseWorkShiftRows(shiftRows));
                 if (!crew) logError('No craa5_workshift row covers the current time; shift left blank.');
 
                 const sups = empData.filter((e: any) => roleOf(e) === 'supervisor').sort((a: any, b: any) => (getField(a, 'craa5_name') || "").localeCompare(getField(b, 'craa5_name') || ""));
                 const lds = empData.filter((e: any) => roleOf(e) === 'lead');
 
-                GLOBAL_DATA_CACHE = { allEmployees: empData, supervisors: sups, leads: lds, areas: areaData, presetRecords: recent, msUser, shift: crew, shiftStartMs: startMs, resolvedUser: resolveUserIdentity(msUser, empData) };
+                GLOBAL_DATA_CACHE = { allEmployees: empData, supervisors: sups, leads: lds, areas: areaData, presetRecords: saved.recent, taskStatus: saved.status, msUser, shift: crew, shiftStartMs: startMs, resolvedUser: resolveUserIdentity(msUser, empData) };
                 GLOBAL_INIT_STATUS = 'COMPLETE'; hydrateState(GLOBAL_DATA_CACHE);
-            } catch (e: any) { logError('Loading failed', e?.message || e); GLOBAL_INIT_STATUS = 'COMPLETE'; } finally { setIsLoading(false); }
+            } catch (e: any) { logError('Loading failed', e?.message || e); GLOBAL_INIT_STATUS = GLOBAL_DATA_CACHE ? 'COMPLETE' : 'IDLE'; } finally { setIsLoading(false); }
         };
         loadEverything();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [refreshToggle, hydrateState]);
+    }, [hydrateState]);
 
     // Shift staff for the selected supervisor
     useEffect(() => {
         if (!selectedSupervisorId || supervisors.length === 0 || allEmployees.length === 0) return;
         const sup = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId); if (!sup) return;
-        const ts = getShiftOf(sup) || currentShift;
-        let staff = allEmployees.filter(e => getShiftOf(e) === ts);
-        if (staff.length === 0) staff = allEmployees;
-        setLeads(staff.filter(e => roleOf(e) === 'lead' && getField(e, 'craa5__aa_employeeid') !== selectedSupervisorId));
-        setEmployees(staff.filter(e => roleOf(e) !== 'lead' && roleOf(e) !== 'supervisor' && getField(e, 'craa5__aa_employeeid') !== selectedSupervisorId));
-    }, [selectedSupervisorId, supervisors, allEmployees, refreshToggle, currentShift]);
+        const crew = crewOf(sup, allEmployees, currentShift);
+        setLeads(crew.leads); setEmployees(crew.employees);
+    }, [selectedSupervisorId, supervisors, allEmployees, currentShift]);
 
-    // Default board: supervisors get their own (set at sign-in); everyone else — leads, managers,
-    // the app owner — lands on the supervisor of the current shift.
+    // Default board: supervisors get their own (set at sign-in); everyone else — leads, managers, the app owner — lands on the
+    // supervisor on shift now. The shift letters in craa5_workshift and in the employee table don't always line up, so when the
+    // supervisor matched by letter has saved nothing this shift but another supervisor has, the one who saved is on shift.
     useEffect(() => {
         if (isLoading || disableAutoLogin || supervisors.length === 0 || selectedSupervisorId) return;
-        const onShiftSup = (currentShift && supervisors.find(s => getShiftOf(s) === currentShift))
-            || (currentUser && supervisors.find(s => getShiftOf(s) === getShiftOf(currentUser)))
-            || supervisors[0];
-        if (onShiftSup) setSelectedSupervisorId(getField(onShiftSup, 'craa5__aa_employeeid'));
-    }, [isLoading, supervisors, selectedSupervisorId, disableAutoLogin, currentShift, currentUser]);
+        const byLetter = (l: string) => (l ? supervisors.find(s => getShiftOf(s) === l) : undefined);
+        const since = shiftStartMs || Date.now() - 4 * 3600000;   // only saves made during this shift count (the last hour of the shift before is the outgoing supervisor's)
+        const savedSince = (s: any, from: number) => presetRecords.some(r => taskTime(r) >= from && rowBelongsTo(r, s));
+        const newestSaver = (from: number) => {
+            let best: any = null, bestT = 0;
+            presetRecords.forEach(r => { const t = taskTime(r); if (t < from || t <= bestT) return; const s = supervisors.find(x => rowBelongsTo(r, x)); if (s) { best = s; bestT = t; } });
+            return best;
+        };
+        const onShift = byLetter(currentShift);
+        const pick = (onShift && savedSince(onShift, since)) ? onShift : (newestSaver(since) || onShift || newestSaver(0) || byLetter(currentUser ? getShiftOf(currentUser) : "") || supervisors[0]);
+        if (pick) setSelectedSupervisorId(getField(pick, 'craa5__aa_employeeid'));
+    }, [isLoading, supervisors, selectedSupervisorId, disableAutoLogin, currentShift, shiftStartMs, currentUser, presetRecords]);
 
-    // Rebuild the board from this supervisor's open assignments
+    // Rebuild the board from this supervisor's saved rows
     useEffect(() => {
         if (presetsApplied || presetRecords.length === 0 || supervisors.length === 0 || areas.length === 0 || allEmployees.length === 0 || !selectedSupervisorId) return;
         const sup = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId); if (!sup) return;
-        const targetShift = getShiftOf(sup) || currentShift;
-        const supName = (getField(sup, 'craa5_name') || "").toLowerCase();
-        const tr = presetRecords.filter(r => (getField(r, 'craa5_team') || "").toLowerCase() === supName && normalizeShift(getFormattedField(r, 'craa5_shift') || getField(r, 'craa5_shift')) === targetShift);
-        if (tr.length === 0) { setPresetsApplied(true); return; }
+        const supName = String(getField(sup, 'craa5_name') || "");
+        // Employee-hub progress rows share this table and the team name but never carry an employee id (Shift Start always saves it),
+        // so they are left out of the board. If none of the team's rows has an id, nothing is left out.
+        const mine = presetRecords.filter(r => rowBelongsTo(r, sup)), idOfRow = (r: any) => String(getField(r, 'craa5__aaemp_guid') || getField(r, 'craa5_aaemp_guid') || "").trim();
+        const hasIds = mine.some(r => idOfRow(r));
+        const tr = mine.filter(r => !hasIds || !String(getField(r, 'craa5_id') || "").trim() || idOfRow(r));
+        if (tr.length === 0) { setBoardNote({ tone: 'none', text: noSavedNote(presetRecords.length) }); setPresetsApplied(true); return; }
 
+        const shiftLeads = crewOf(sup, allEmployees, currentShift).leads;
+        const idOf = (e: any) => getField(e, 'craa5__aa_employeeid') || getField(e, 'craa5_aa_employeeid');
         const nl = new Set<string>(), na = new Set<string>(selectedAreaIds), aa: any = {}, as: any = {}, ad: any = {}, est: any = {}, cl: any[] = [], ca: any[] = [], ce: any[] = [];
-        const activeEmpRecords = new Map(), latestAreaState = new Map();
+        const activeEmpRecords = new Map(), latestAreaState = new Map(), latestOpenArea = new Map();
+        // Replay oldest to newest: a finished row takes the person off the board, an open row puts them (back) on it.
         [...tr].sort(byTaskTime).forEach(r => {
-            const id = getField(r, 'craa5_id')?.trim(), area = getField(r, 'craa5_area')?.trim();
-            if (area) latestAreaState.set(area.toLowerCase(), r);
+            const id = String(getField(r, 'craa5_id') || "").trim(), area = String(getField(r, 'craa5_area') || "").trim();
+            if (area) { latestAreaState.set(normText(area), r); if (!isTaskDone(r)) latestOpenArea.set(normText(area), r); }
             if (id && !id.toLowerCase().includes('unassigned')) {
-                const empKey = getField(r, 'craa5__aaemp_guid') || id.toLowerCase();
-                if (isTaskDone(r)) activeEmpRecords.delete(empKey); else activeEmpRecords.set(empKey, r);
+                const guid = String(getField(r, 'craa5__aaemp_guid') || "").toLowerCase(), nameKey = normText(id), empKey = guid || nameKey;
+                if (isTaskDone(r)) { activeEmpRecords.delete(empKey); activeEmpRecords.delete(nameKey); }
+                else { if (guid) activeEmpRecords.delete(nameKey); activeEmpRecords.set(empKey, r); }
             }
         });
 
         const ensureAreaAndLead = (r: any) => {
-            const ln = getField(r, 'craa5_lead')?.trim() || "", an = getField(r, 'craa5_area')?.trim() || "";
+            const ln = String(getField(r, 'craa5_lead') || "").trim(), an = String(getField(r, 'craa5_area') || "").trim();
             if (!ln || !an) return null;
-            const latestAreaRec = latestAreaState.get(an.toLowerCase()) || r;
+            // The area's status and notes come from its newest open row, so a finished row never turns a working area into "Completed" (Save would close it).
+            const latestAreaRec = latestOpenArea.get(normText(an)) || r;
             const stat = getField(latestAreaRec, 'craa5_whatisbeingdone') || getField(latestAreaRec, 'craa5__currentstatus') || "";
             const nts = getField(latestAreaRec, 'craa5_whatislefttodo') || getField(latestAreaRec, 'craa5__future_or_notes') || "";
-            const isSup = supName === ln.toLowerCase();
+            const isSup = sameText(supName, ln);
             let lId = isSup ? selectedSupervisorId : "";
             if (!isSup) {
-                let lo = [...leads, ...customLeads, ...cl].find(l => (getField(l, 'craa5_name') || "").trim().toLowerCase() === ln.toLowerCase());
-                if (!lo) { lo = allEmployees.find(e => (getField(e, 'craa5_name') || "").toLowerCase() === ln.toLowerCase()) || { craa5__aa_employeeid: `pl_${Date.now()}_${Math.random()}`, craa5_name: ln, craa5_role: 256000001 }; cl.push(lo); }
+                // A lead who isn't one of the shift's leads (overtime, another crew) joins as a custom lead so their column shows.
+                let lo = [...shiftLeads, ...customLeads, ...cl].find(l => sameText(getField(l, 'craa5_name'), ln));
+                if (!lo) { lo = allEmployees.find(e => sameText(getField(e, 'craa5_name'), ln)) || { craa5__aa_employeeid: `pl_${Date.now()}_${Math.random()}`, craa5_name: ln, craa5_role: 256000001 }; cl.push(lo); }
                 lId = getField(lo, 'craa5__aa_employeeid'); nl.add(lId);
             }
             if (!lId) return null;
-            let ao = [...areas, ...customAreas, ...ca].find(a => renderSafe(getField(a, 'craa5_area')).trim().toLowerCase() === an.toLowerCase());
+            let ao = [...areas, ...customAreas, ...ca].find(a => sameText(renderSafe(getField(a, 'craa5_area')), an));
             if (!ao) { ao = { craa5_aa_mss_areaid: `pa_${Date.now()}_${Math.random()}`, craa5_area: an }; ca.push(ao); }
             const aId = getField(ao, 'craa5_aa_mss_areaid');
             na.add(aId); aa[aId] = lId;
@@ -575,12 +681,14 @@ export function MainComponent(props: any) {
 
         Array.from(activeEmpRecords.values()).forEach(r => {
             const aId = ensureAreaAndLead(r); if (!aId) return;
-            const en = getField(r, 'craa5_id')?.trim() || "";
-            let eo = [...allEmployees, ...customEmployees, ...leads, ...ce].find(e => (getField(e, 'craa5_name') || "").trim().toLowerCase() === en.toLowerCase());
-            const fallbackGuid = getField(r, 'craa5__aaemp_guid') || getField(r, 'craa5_aaemp_guid') || `pe_${Date.now()}_${Math.random()}`;
+            const en = String(getField(r, 'craa5_id') || "").trim(), rowGuid = String(getField(r, 'craa5__aaemp_guid') || getField(r, 'craa5_aaemp_guid') || "");
+            const pool = [...allEmployees, ...customEmployees, ...ce];
+            // The employee id saved on the row is the surest match; the name covers rows saved without one.
+            let eo = (rowGuid && pool.find(e => String(idOf(e) || "").toLowerCase() === rowGuid.toLowerCase())) || pool.find(e => sameText(getField(e, 'craa5_name'), en));
+            const fallbackGuid = rowGuid || `pe_${Date.now()}_${Math.random()}`;
             if (eo && (nl.has(getField(eo, 'craa5__aa_employeeid')) || selectedSupervisorId === getField(eo, 'craa5__aa_employeeid'))) return;   // leads aren't crew
             if (!eo) { eo = { craa5__aa_employeeid: fallbackGuid, craa5_name: en, craa5_email: getField(r, 'craa5_email') || "", craa5_badgenumber: getField(r, 'craa5_badgenumber') || "" }; ce.push(eo); }
-            const eid = getField(eo, 'craa5__aa_employeeid') || getField(eo, 'craa5_aa_employeeid') || fallbackGuid;
+            const eid = idOf(eo) || fallbackGuid;
             if (!as[aId]) as[aId] = [];
             if (!as[aId].includes(eid)) { as[aId].push(eid); est[eid] = getField(r, 'craa5_starttime') || getField(r, 'craa5_datetimeofassignment') || new Date().toISOString(); }
         });
@@ -589,9 +697,12 @@ export function MainComponent(props: any) {
         if (cl.length) setCustomLeads(p => [...p, ...cl]);
         if (ca.length) setCustomAreas(p => [...p, ...ca]);
         if (ce.length) setCustomEmployees(p => [...p, ...ce]);
-        setSelectedLeadIds(nl); setSelectedAreaIds(na); setAreaAssignments(aa); setAssignments(as); setAreaDetails(ad); setEmployeeStartTimes(est); setPresetsApplied(true); setCurrentStep(4);
+        setSelectedLeadIds(nl); setSelectedAreaIds(na); setAreaAssignments(aa); setAssignments(as); setAreaDetails(ad); setEmployeeStartTimes(est); setPresetsApplied(true);
+        const areaCount = Object.keys(aa).length, people = Object.keys(as).reduce((n, k) => n + as[k].length, 0);
+        if (areaCount > 0) { setBoardNote({ tone: 'ok', text: `Restored ${people} ${people === 1 ? 'person' : 'people'} in ${areaCount} ${areaCount === 1 ? 'area' : 'areas'} from the last save` }); setCurrentStep(4); }
+        else setBoardNote({ tone: 'none', text: 'Everything this supervisor saved in the last 16 h is already finished' });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [presetRecords, presetsApplied, supervisors, areas, leads, selectedSupervisorId, allEmployees]);
+    }, [presetRecords, presetsApplied, supervisors, areas, selectedSupervisorId, allEmployees, currentShift]);
 
     // Everyday areas start in "Assigned For Today"
     useEffect(() => {
@@ -649,8 +760,6 @@ export function MainComponent(props: any) {
         setAreaAssignments(prev => { const next = { ...prev }; Object.keys(next).forEach(areaId => { if (next[areaId] === leadIdToRemove) next[areaId] = fallbackLeadId; }); return next; });
         setSelectedLeadIds(prev => { const next = new Set(prev); next.delete(leadIdToRemove); return next; });
     };
-
-    const handleImpersonate = (supId: string) => { setDisableAutoLogin(true); setSelectedSupervisorId(supId); triggerSoftReset(); };
 
     const handleSetEmployeeStatus = (empId: string, status: string) => {
         let area = [...areas, ...customAreas].find(a => renderSafe(getField(a, 'craa5_area')).toLowerCase() === status.toLowerCase());
@@ -719,9 +828,10 @@ export function MainComponent(props: any) {
     // through the new_BulkUpsertTaskAssignments plugin.
     // ============================================================================
     const handleSubmission = async () => {
-        setIsLoading(true); setSaveSuccess(false); setSubmissionError(null);
+        setBusyLabel("Updating Dataverse..."); setIsLoading(true); setSaveSuccess(false); setSaveWarning(""); setSubmissionError(null);
         const supervisor = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId);
-        const boardShift = currentShift || getShiftOf(supervisor);
+        // Rows carry the supervisor's own crew letter (the letter the employee table uses); the work shift stands in when there is none.
+        const boardShift = getShiftOf(supervisor) || currentShift;
         try {
             Object.keys(areaAssignments).forEach(areaId => {
                 const details = areaDetails[areaId] || {} as any;
@@ -729,16 +839,16 @@ export function MainComponent(props: any) {
             });
 
             const supNameRaw = renderSafe(getField(supervisor, 'craa5_name'));
-            let fetchedTasks: any[] = [];
-            const xrmApi = safeGetXrm()?.WebApi;
-            if (xrmApi?.retrieveMultipleRecords) {
-                const attrs = ['taskassignmentid', 'id', 'lead', 'area', 'starttime', 'endtime', 'datetimeofassignment', 'shift', 'team', 'percentagecomplete', 'complete', '_currentstatus', 'whatisbeingdone', 'whatislefttodo', '_future_or_notes', 'badgenumber', 'leademail', 'supervisoremail', 'uid_associated', '_aaemp_guid', 'email'].map(a => `<attribute name='craa5_${a}'/>`).join('');
-                const fetchXml = `<fetch top='5000'><entity name='craa5_taskassignment'>${attrs}<attribute name='createdon'/><attribute name='statecode'/><filter><condition attribute='createdon' operator='last-x-hours' value='16'/><condition attribute='craa5_team' operator='eq' value='${supNameRaw.replace(/&/g, '&amp;').replace(/'/g, "&apos;")}'/></filter><order attribute='createdon' descending='true'/></entity></fetch>`;
-                try { const res = await asyncRace(xrmApi.retrieveMultipleRecords("craa5_taskassignment", "?fetchXml=" + encodeURIComponent(fetchXml)), API_TIMEOUT_MS, "Submission tasks"); if (Array.isArray(res?.entities)) fetchedTasks = res.entities; } catch (e: any) { logError('Submission tasks via WebApi', e?.message || e); }
-            }
-            if (!fetchedTasks.length && propsRef.current.dataApi?.queryTable) {
-                try { fetchedTasks = await queryDataApi(propsRef.current.dataApi, "craa5_taskassignment", `createdon ge ${new Date(Date.now() - 16 * 3600000).toISOString().replace(/\.\d{3}Z$/, 'Z')} and craa5_team eq '${supNameRaw.replace(/'/g, "''")}'`); } catch (e: any) { logError('Submission tasks via dataApi', e?.message || e); }
-            }
+            // The rows this team saved in the last 16 hours: the ones the board is rebuilt from, plus the team's own query (as the original
+            // did) so a busy table can't push them out of the newest 5000. The open ones are closed below.
+            const [earlier, ownRows] = await Promise.all([readSavedAssignments(propsRef.current), supNameRaw ? readSavedAssignments(propsRef.current, supNameRaw) : Promise.resolve(null)]);
+            const readStatus = earlier.status.ok || !ownRows ? earlier.status : ownRows.status;
+            const seenIds: Record<string, boolean> = {}, fetchedTasks: any[] = [];
+            earlier.recent.concat(ownRows ? ownRows.recent : []).forEach((r: any) => {
+                const rid = r.craa5_taskassignmentid; if (!rid || seenIds[rid] || !rowBelongsTo(r, supervisor)) return;
+                seenIds[rid] = true; fetchedTasks.push(r);
+            });
+            setTaskStatus(readStatus);
 
             const findEmpByName = (name: string) => name ? allKnownEmps.find((e: any) => renderSafe(getField(e, 'craa5_name')).trim().toLowerCase() === name.trim().toLowerCase()) : null;
             const getEmailForName = (name: string) => renderSafe(getEmployeeEmail(findEmpByName(name)));
@@ -802,6 +912,8 @@ export function MainComponent(props: any) {
                 if (!res.ok) throw new Error("Plugin execution failed.");
             }
             setSaveSuccess(true); setCurrentStep(4);
+            setBoardNote({ tone: 'ok', text: `Saved ${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` });
+            if (!readStatus.ok) setSaveWarning(`The earlier assignments could not be read, so they were not closed (${String(readStatus.error).slice(0, 140)}).`);
         } catch (err: any) {
             logError('Save Progress failed', err?.message || err);
             setSubmissionError(renderSafe(err?.message || err || "An unexpected error occurred while saving to Dataverse."));
@@ -820,7 +932,7 @@ export function MainComponent(props: any) {
             </div>
         </div>
     );
-    else if (!selectedSupervisorId) SC = <SupervisorSelectionScreen supervisors={supervisors} selectedSupervisorId={selectedSupervisorId} onSelect={handleImpersonate} />;
+    else if (!selectedSupervisorId) SC = <SupervisorSelectionScreen supervisors={supervisors} selectedSupervisorId={selectedSupervisorId} onSelect={switchBoard} />;
     else if (currentStep === 0) SC = <LeadSelectionScreen leads={[...leads, ...customLeads]} selectedLeadIds={selectedLeadIds} onSelectChange={setSelectedLeadIds} onSearchCustom={handleSearchCustomLead} />;
     else if (currentStep === 1) SC = <AreaSelectionScreen areas={[...areas, ...customAreas]} selectedAreaIds={selectedAreaIds} onSelectChange={setSelectedAreaIds} onAddCustomArea={(n: string) => setCustomAreas(p => [...p, { craa5_aa_mss_areaid: `c_${Date.now()}`, craa5_area: n, craa5_production: true }])} />;
     else if (currentStep === 2 || currentStep === 3) SC = (
@@ -893,6 +1005,7 @@ export function MainComponent(props: any) {
         SC = (
             <div className="flex flex-col h-full p-5 overflow-y-auto flex-1 box-border">
                 {saveSuccess && <div className="bg-green-50 text-green-800 p-3 rounded-lg mb-4 border border-green-200 font-semibold">✅ Success! Assignments saved.</div>}
+                {saveWarning && <div className="p-3 rounded-lg mb-4 border font-semibold" style={{ background: BRAND.yellowSoft, color: '#8A5A00', borderColor: BRAND.yellow }}>⚠️ {saveWarning}</div>}
                 {submissionError && <div className="p-3 rounded-lg mb-4 border font-semibold" style={{ background: BRAND.redSoft, color: BRAND.red, borderColor: BRAND.red }}>❌ Submission Failed: {submissionError}</div>}
                 <ScreenTitle>Update Teams</ScreenTitle>
                 {Object.keys(areaAssignments).length === 0 ? <Text className="mt-4">No areas assigned.</Text> : (
@@ -950,7 +1063,7 @@ export function MainComponent(props: any) {
                 {isLoading && (
                     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 20, background: '#F7F9FC', zIndex: 9999 }}>
                         <BrandLogo />
-                        <Spinner size="large" label={GLOBAL_INIT_STATUS === 'COMPLETE' ? "Updating Dataverse..." : "Loading shift..."} />
+                        <Spinner size="large" label={busyLabel} />
                     </div>
                 )}
 
@@ -958,13 +1071,13 @@ export function MainComponent(props: any) {
                     <div className="px-5 h-[64px] flex items-center justify-between gap-4">
                         <div className="min-w-0">
                             <h1 className="text-lg font-black leading-tight tracking-tight truncate" style={{ color: BRAND.blueDark }}>Shift Assignment</h1>
-                            <p className="text-[11px] font-bold text-slate-500 truncate">Shift {currentShift || '?'}{activeSupervisorObj ? ` · ${formatFullName(getField(activeSupervisorObj, 'craa5_name'))}` : ''}</p>
+                            <p className="text-[11px] font-bold text-slate-500 truncate" title={headerNote ? headerNote.text : undefined}>Shift {currentShift || '?'}{activeSupervisorObj ? ` · ${formatFullName(getField(activeSupervisorObj, 'craa5_name'))}` : ''}{headerNote && <span style={{ color: headerNote.tone === 'error' ? BRAND.red : headerNote.tone === 'ok' ? BRAND.blue : undefined }}>{` · ${headerNote.text}`}</span>}</p>
                         </div>
                         <div className="flex items-center gap-3">
                             {adminMode && (
                                 <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg border" style={{ background: BRAND.redSoft, borderColor: '#F6B3C0' }}>
                                     <Text size={200} weight="semibold" style={{ color: BRAND.red }}>View As:</Text>
-                                    <select value={selectedSupervisorId || ""} onChange={(e) => setSelectedSupervisorId(e.target.value)} className="px-1 py-0.5 rounded border border-[#F6B3C0] text-xs outline-none bg-white"><option value="" disabled>-- Select Supervisor --</option>{supervisors.map(s => <option key={getField(s, 'craa5__aa_employeeid')} value={getField(s, 'craa5__aa_employeeid')}>{formatFullName(getField(s, 'craa5_name'))}</option>)}</select>
+                                    <select value={selectedSupervisorId || ""} onChange={(e) => switchBoard(e.target.value)} className="px-1 py-0.5 rounded border border-[#F6B3C0] text-xs outline-none bg-white"><option value="" disabled>-- Select Supervisor --</option>{supervisors.map(s => <option key={getField(s, 'craa5__aa_employeeid')} value={getField(s, 'craa5__aa_employeeid')}>{formatFullName(getField(s, 'craa5_name'))}</option>)}</select>
                                 </div>
                             )}
                             <div className={`flex items-center gap-1 px-2 py-0.5 rounded-lg border ${adminMode ? 'bg-[#E6F1FB] border-[#B3D4F2]' : 'border-transparent'}`}>
