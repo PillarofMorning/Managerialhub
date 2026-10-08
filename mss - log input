@@ -215,9 +215,10 @@ const LINE_PROBLEM = /highlighted line|equipment line|Two lines|needs hours grea
 
 const splitHours = (total, n) => {
   if (!n || !(total > 0)) return [];
-  const each = Math.floor((total / n) * 100) / 100;
-  const out = Array(n).fill(each);
-  out[n - 1] = Math.round((total - each * (n - 1)) * 100) / 100;
+  const cents = Math.round(total * 100);
+  const each = Math.floor(cents / n);
+  const out = Array(n).fill(each / 100);
+  out[n - 1] = (cents - each * (n - 1)) / 100;
   return out;
 };
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
@@ -1431,6 +1432,23 @@ const textParts = (text) => {
   const list = out.filter(x => { const k = canonName(x); if (!k || seen.has(k)) return false; seen.add(k); return true; });
   return list.length >= 2 ? list : [];
 };
+// Equipment records with the same name, room and area (twins, which the Unify tab merges) are one piece: the one more log
+// entries already use, else the first
+const oneOfTwins = async (store, list) => {
+  const key = (a) => [canonName(a.name), placeKey(a.room), placeKey(a.area)].join('|');
+  const sets = new Map(); // key -> its records, in the order first seen
+  list.forEach(a => { const k = key(a); if (!sets.has(k)) sets.set(k, []); sets.get(k).push(a); });
+  const keys = Array.from(sets.keys());
+  const picked = await pool(keys, 3, async (k) => {
+    const twins = sets.get(k).slice().sort((x, y) => (x.id < y.id ? -1 : 1));
+    if (twins.length === 1) return twins[0];
+    const uses = await pool(twins, 3, (a) => store.logUse(a.id));
+    let best = 0;
+    twins.forEach((a, i) => { if (uses[i].ok && (!uses[best].ok || uses[i].value.n > uses[best].value.n)) best = i; });
+    return twins[best];
+  });
+  return picked.map((r, i) => (r.ok ? r.value : sets.get(keys[i])[0]));
+};
 // Equipment an old entry may now be spread over: the things its text lists, or else the equipment whose names start from the
 // entry's own name ("Smock Racking" -> "Smock Racking left" and "Smock Racking right"). Only equipment in the entry's own room
 // and area, only for entries that name both, and never when equipment with the entry's own name is there (that is the match).
@@ -1438,16 +1456,18 @@ const textParts = (text) => {
 const suggestPieces = async (store, g) => {
   if (!(placeKey(g.room) && placeKey(g.area)) || !canonName(g.equipment)) return null;
   const here = (a) => samePlace(g.room, a.room) && samePlace(g.area, a.area);
-  if ((g.ranked || []).some(c => c.score >= 0.999 && here(c.asset))) return null;
+  if ((g.ranked || []).some(c => canonName(c.asset.name) === canonName(g.equipment) && here(c.asset))) return null;
   const parts = textParts(g.equipment);
   if (parts.length) {
     const rs = await pool(parts, 3, async (part) => {
       const q = nameProfile(part);
       const want = { equipment: part, room: g.room, area: g.area };
-      const best = (await store.assetsLikeName(q, g.room)).filter(here)
+      const scored = (await store.assetsLikeName(q, g.room)).filter(here)
         .map(a => ({ a, s: scoreAsset(want, a, q) })).filter(c => c.s >= 0.8)
-        .sort((x, y) => y.s - x.s || (x.a.id < y.a.id ? -1 : 1))[0];
-      return best ? best.a : null;
+        .sort((x, y) => y.s - x.s || (x.a.id < y.a.id ? -1 : 1));
+      if (!scored.length) return null;
+      // Equally good records (twins) are one piece: the one the log uses
+      return (await oneOfTwins(store, scored.filter(c => c.s >= scored[0].s - 1e-9).map(c => c.a)))[0];
     });
     const assets = uniqueById(rs.filter(r => r.ok && r.value).map(r => r.value));
     return assets.length >= 2 ? { how: 'text', assets, missing: parts.filter((x, i) => !(rs[i].ok && rs[i].value)) } : null;
@@ -1456,17 +1476,21 @@ const suggestPieces = async (store, g) => {
   const stems = (words) => words.map(w => (w.length > 3 ? w.replace(/s$/, '') : w));
   const mine = stems(p.words);
   if (!mine.length) return null;
-  // Every word and number of the entry's name, and at least one more word or number ("Racking" -> "Racking left", "Racking 2")
-  const kids = (await store.assetsLikeName(p, g.room)).filter(here).filter(a => {
+  const found = await store.assetsLikeName(p, g.room);
+  // The room has more equipment with this word than one search returns: a partial list would look complete
+  if (found.length >= LIMITS.assetNames) return null;
+  // Names that start with the entry's words and numbers and have at least one more word or number ("Racking" -> "Racking left", "Racking 2")
+  const kids = found.filter(here).filter(a => {
     const q = nameProfile(a.name);
     const theirs = stems(q.words);
-    return mine.every(w => theirs.indexOf(w) >= 0) && p.numList.every(n => q.numList.indexOf(n) >= 0)
+    return mine.every((w, i) => theirs[i] === w) && p.numList.every(n => q.numList.indexOf(n) >= 0)
       && theirs.length + q.numList.length > mine.length + p.numList.length;
   }).sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
+  const pieces = await oneOfTwins(store, kids);
   // Many more than a handful is a guess, not a suggestion: the admin picks the pieces
-  return kids.length >= 2 && kids.length <= LIMITS.splitPieces ? { how: 'name', assets: kids, missing: [] } : null;
+  return pieces.length >= 2 && pieces.length <= LIMITS.splitPieces ? { how: 'name', assets: pieces, missing: [] } : null;
 };
-const pieceFields = (a) => ({ craa5_equipmentguid: a.id, craa5_equipment: a.name, craa5_room: a.room, craa5_area: a.area });
+const pieceFields = (a, row) => ({ craa5_equipmentguid: a.id, craa5_equipment: a.name, craa5_room: a.room || safeString(row && row.craa5_room), craa5_area: a.area || safeString(row && row.craa5_area) });
 // Hours of the old entry for one piece: its share when they can be shared out, else the entry's own value (null: none)
 const hoursFor = (row, count, index) => {
   const raw = row.craa5_hoursworked;
@@ -1477,7 +1501,7 @@ const hoursFor = (row, count, index) => {
 };
 // A new entry for another piece: what the old entry says (date, SAP order, initials), with the piece in place of the equipment
 const entryForPiece = (row, a, hours) => {
-  const e = pieceFields(a);
+  const e = pieceFields(a, row);
   if (safeString(row.craa5_sap)) e.craa5_sap = row.craa5_sap;
   if (safeString(row.craa5_lastcleaned)) e.craa5_lastcleaned = row.craa5_lastcleaned;
   if (safeString(row.craa5_lastcleanedby)) e.craa5_lastcleanedby = row.craa5_lastcleanedby;
@@ -1527,10 +1551,11 @@ const planSplits = async (api, jobs) => {
     if (!row) return { id: j.id, gone: true, pieces: j.pieces, todo: [] };
     const sap = normCode(row.craa5_sap);
     const day = dayKey(row.craa5_lastcleaned);
+    if (!day) return { id: j.id, row, pieces: j.pieces, todo: [], undated: true };
     const claim = (x) => `${cleanGuid(x.id)}|${sap}|${day}`;
-    const have = (x) => !!day && (claimed.has(claim(x)) || (logged.get(x.id) || []).some(e => e.day === day && e.sap === sap && cleanGuid(e.id) !== cleanGuid(row.craa5__log_id)));
+    const have = (x) => claimed.has(claim(x)) || (logged.get(x.id) || []).some(e => e.day === day && e.sap === sap && cleanGuid(e.id) !== cleanGuid(row.craa5__log_id));
     const todo = j.pieces.filter(x => !have(x));
-    if (day) todo.forEach(x => claimed.add(claim(x)));
+    todo.forEach(x => claimed.add(claim(x)));
     return { id: j.id, row, pieces: j.pieces, todo };
   });
   return { items, capped };
@@ -1538,13 +1563,14 @@ const planSplits = async (api, jobs) => {
 // Saves the new entries first, then points the old entry at the first piece: an entry that could not get all its new
 // entries stays as it was and can be applied again (pieces already saved are found and skipped the next time).
 const runSplits = async (api, items, onStep) => {
-  const out = { rows: 0, created: 0, failedRows: 0, error: '', fixedIds: [], pieceSkips: 0, leftAlone: 0, gone: 0 };
+  const out = { rows: 0, created: 0, failedRows: 0, error: '', fixedIds: [], pieceSkips: 0, leftAlone: 0, gone: 0, undated: 0 };
   let done = 0;
   await pool(items, 4, async (it) => {
     try {
       if (it.gone) { out.gone += 1; return; }
-      out.pieceSkips += it.pieces.length - it.todo.length;
+      if (it.undated) { out.undated += 1; return; }
       if (!it.todo.length) { out.leftAlone += 1; return; }
+      out.pieceSkips += it.pieces.length - it.todo.length;
       const at = (x) => it.pieces.indexOf(x);
       let failed = 0;
       for (let i = 1; i < it.todo.length; i++) {
@@ -1553,10 +1579,19 @@ const runSplits = async (api, items, onStep) => {
       }
       if (failed) { out.failedRows += 1; return; }
       const first = it.todo[0];
-      const payload = pieceFields(first);
+      const payload = pieceFields(first, it.row);
       const h = hoursFor(it.row, it.pieces.length, at(first));
       if (h !== null && h !== undefined && h !== it.row.craa5_hoursworked) payload.craa5_hoursworked = h;
-      await api.update(LOG_TABLE, it.id, payload);
+      try { await api.update(LOG_TABLE, it.id, payload); }
+      catch (e) {
+        // A save can be applied although it reported an error (a timeout after it went through): look before calling it a failure,
+        // or applying again would share the hours out a second time
+        let now = null;
+        try { now = (await readEntries(api, [it.id])).get(cleanGuid(it.id)); } catch (_) { now = null; }
+        const applied = !!now && cleanGuid(now.craa5_equipmentguid) === cleanGuid(first.id) && safeString(now.craa5_equipment) === safeString(payload.craa5_equipment)
+          && (payload.craa5_hoursworked === undefined || Number(now.craa5_hoursworked) === Number(payload.craa5_hoursworked));
+        if (!applied) throw e;
+      }
       out.rows += 1; out.fixedIds.push(it.id);
     } catch (e) { out.failedRows += 1; if (!out.error) out.error = errText(e); }
     finally { done += 1; if (onStep) onStep(done); }
@@ -1570,8 +1605,9 @@ const splitStats = (items) => {
     rows: live.length,
     creates: live.reduce((n, it) => n + it.todo.length - 1, 0),
     pieceSkips: live.reduce((n, it) => n + it.pieces.length - it.todo.length, 0),
-    leftAlone: items.filter(it => !it.gone && !it.todo.length).length,
+    leftAlone: items.filter(it => !it.gone && !it.undated && !it.todo.length).length,
     gone: items.filter(it => it.gone).length,
+    undated: items.filter(it => it.undated).length,
   };
 };
 
@@ -1720,7 +1756,7 @@ const BrandLogo = () => {
 };
 
 // --- EQUIPMENT PICKER: server search as you type, small result list ---
-const AssetPicker = ({ store, onPick, exclude, initialQuery = '', ariaLabel = 'Search equipment', actionLabel = 'Add', placeholder = 'Start typing a name, room or area…', disabled = false, autoFocus = false }) => {
+const AssetPicker = ({ store, onPick, exclude, initialQuery = '', ariaLabel = 'Search equipment', actionLabel = 'Add', placeholder = 'Start typing a name, room or area…', disabled = false, autoFocus = false, idTails = false }) => {
   const styles = useStyles();
   const [q, setQ] = useState(initialQuery);
   const [res, setRes] = useState([]);
@@ -1740,6 +1776,10 @@ const AssetPicker = ({ store, onPick, exclude, initialQuery = '', ariaLabel = 'S
   }, [q, store]);
 
   const shown = res.filter(a => !exclude || !exclude.has(a.id));
+  // Records that look the same (same name, room and area) show the end of their ID, so the right one can be picked
+  const looks = (a) => normName(`${a.name}|${placeText(a)}`);
+  const twins = new Map();
+  if (idTails) shown.forEach(a => twins.set(looks(a), (twins.get(looks(a)) || 0) + 1));
   return (
     <div>
       <div className={styles.field} style={{ maxWidth: 420 }}>
@@ -1757,9 +1797,9 @@ const AssetPicker = ({ store, onPick, exclude, initialQuery = '', ariaLabel = 'S
               <tbody>
                 {shown.map(a => (
                   <tr key={a.id}>
-                    <td className={styles.td}><strong>{a.name}</strong></td><td className={styles.td}>{a.room}</td><td className={styles.td}>{a.area}</td>
+                    <td className={styles.td}><strong>{a.name}</strong>{twins.get(looks(a)) > 1 && <span className={styles.hint}> · ID …{shortId(a.id)}</span>}</td><td className={styles.td}>{a.room}</td><td className={styles.td}>{a.area}</td>
                     <td className={styles.td} style={{ textAlign: 'right' }}>
-                      <Button size="small" appearance="primary" className={styles.btnPrimary} disabled={disabled} aria-label={`${actionLabel} ${a.name} (${placeText(a)})`} onClick={() => onPick(a)}>{actionLabel}</Button>
+                      <Button size="small" appearance="primary" className={styles.btnPrimary} disabled={disabled} aria-label={`${actionLabel} ${a.name} (${placeText(a)})${twins.get(looks(a)) > 1 ? ` ID …${shortId(a.id)}` : ''}`} onClick={() => onPick(a)}>{actionLabel}</Button>
                     </td>
                   </tr>
                 ))}
@@ -2683,12 +2723,13 @@ const INFO = '__info-';
 const splitSummary = (s) => [
   s.rows > 0 && `Broke up ${plural(s.rows, 'entry', 'entries')} and saved ${plural(s.created, 'new entry', 'new entries')} for the other pieces${s.extra ? `, including ${plural(s.extra, 'more entry', 'more entries')} found in the log with the same name, room and area` : ''}.`,
   s.rows === 0 && s.failedRows === 0 && 'Nothing was broken up.',
-  s.failedRows > 0 && `${plural(s.failedRows, 'entry', 'entries')} could not be broken up${s.error ? ` (${s.error})` : ''}. Anything saved for ${s.failedRows === 1 ? 'it' : 'them'} stays; apply again to finish ${s.failedRows === 1 ? 'it' : 'them'}.`,
+  s.failedRows > 0 && `${plural(s.failedRows, 'entry', 'entries')} could not be broken up${s.error ? ` (${s.error})` : ''}. Anything saved for ${s.failedRows === 1 ? 'it' : 'them'} stays. Apply again to finish ${s.failedRows === 1 ? 'it' : 'them'} (scan again if ${s.failedRows === 1 ? 'it is' : 'they are'} not in the list).`,
 ].filter(Boolean).join(' ');
 const splitNotes = (s) => [
   s.pieceSkips > 0 && `${plural(s.pieceSkips, 'piece was', 'pieces were')} not saved again because ${s.pieceSkips === 1 ? 'it was' : 'they were'} already logged for that order and date.`,
   s.leftAlone > 0 && `${plural(s.leftAlone, 'entry was', 'entries were')} left as ${s.leftAlone === 1 ? 'it is' : 'they are'} because every piece was already logged for that order and date.`,
   s.gone > 0 && `${plural(s.gone, 'entry was', 'entries were')} not found (removed since the scan).`,
+  s.undated > 0 && `${plural(s.undated, 'entry has', 'entries have')} no date, so ${s.undated === 1 ? 'it was' : 'they were'} not broken up: there is no date to check the pieces against.`,
 ].filter(Boolean).join(' ');
 
 // Break-up of one entry: the pieces so far, each with a remove button, and a search to add more
@@ -2697,6 +2738,7 @@ const PiecesEditor = ({ store, g, list, disabled, onChange }) => {
   const label = g.equipment || 'blank entry';
   const acted = useRef(false); // set once the admin adds or removes a piece here, so the search box takes the focus again (not when rows first appear)
   const change = (next) => { acted.current = true; onChange(next); };
+  useEffect(() => { acted.current = false; }); // the flag is used by the render the action caused, then cleared
   const sig = (a) => normName(`${a.name}|${placeText(a)}`);
   const count = new Map();
   list.forEach(a => count.set(sig(a), (count.get(sig(a)) || 0) + 1));
@@ -2711,7 +2753,7 @@ const PiecesEditor = ({ store, g, list, disabled, onChange }) => {
         </div>
       ))}
       <div style={{ marginTop: '4px' }}>
-        <AssetPicker key={list.length} autoFocus={acted.current} store={store} exclude={new Set(list.map(a => a.id))} ariaLabel={`Search equipment to add as a piece of ${label}`} placeholder="Search to add a piece…" disabled={disabled} onPick={(a) => change(list.concat([a]))} />
+        <AssetPicker key={list.length} autoFocus={acted.current} idTails store={store} exclude={new Set(list.map(a => a.id))} ariaLabel={`Search equipment to add as a piece of ${label}`} placeholder="Search to add a piece…" disabled={disabled} onPick={(a) => change(list.concat([a]))} />
       </div>
       <Button size="small" appearance="transparent" disabled={disabled} aria-label={`Break up ${label} into one piece only`} onClick={() => onChange(null)}>One piece only</Button>
     </div>
@@ -2809,7 +2851,7 @@ const RepairIds = ({ ctx, onCount }) => {
       if (!live()) return;
       const added = todo.map((g, i) => ({ ...g, ...(ranks[i].ok ? ranks[i].value : { ranked: [], tier: 'none', ambiguous: false, conflict: false, check: null, lookupError: errText(ranks[i].error) }) }));
       // Equipment an entry may now be spread over (the things its text lists, or equipment named after it): only a hint
-      const hints = await pool(added, 3, (g) => (g.tier === 'high' && !textParts(g.equipment).length ? null : suggestPieces(store, g)));
+      const hints = await pool(added, 3, (g) => suggestPieces(store, g));
       if (!live()) return;
       added.forEach((g, i) => { g.suggest = hints[i].ok ? hints[i].value : null; });
       // A name (same room and area) already in the list keeps the equipment chosen there (or the pieces it is broken up into), if its rows agree
@@ -2839,7 +2881,8 @@ const RepairIds = ({ ctx, onCount }) => {
       // High confidence is ticked (not when it differs from the choice made for the name); entries whose ID points elsewhere are always left for the admin to tick
       setApply(prev => { const x = { ...prev }; added.forEach(g => { const a = inherited.get(g.key); x[g.key] = g.tier === 'high' && mode !== 'place' && !(mode === 'several' && g.current) && !g.suggest && !inheritedPieces.has(g.key) && (!a || a.id === own(g)); }); return x; });
       setExtraOpts(prev => { const x = { ...prev }; added.forEach(g => { const a = inherited.get(g.key); if (a && !g.ranked.some(r => r.asset.id === a.id)) x[g.key] = [a]; }); return x; });
-      setPieces(prev => { const x = { ...prev }; inheritedPieces.forEach((list, key) => { x[key] = list; }); return x; });
+      // A fresh group never starts with pieces left over from an earlier row that had the same key
+      setPieces(prev => { const x = { ...prev }; added.forEach(g => { delete x[g.key]; }); inheritedPieces.forEach((list, key) => { x[key] = list; }); return x; });
       setGroups(() => {
         const merged = Array.from(prior.values()).concat(added);
         const order = { high: 0, medium: 1, low: 2, none: 3 };
@@ -2974,7 +3017,19 @@ const RepairIds = ({ ctx, onCount }) => {
     const out = { ...pd.out };
     if (withMore) pd.more.forEach(j => { if (!jobs.has(j.id)) { jobs.set(j.id, j); out.moreIds.push(j.id); } });
     else if (pd.more.length) out.declined = true;
-    await writeJobs(Array.from(jobs.values()).filter(j => !j.pieces), out, pd.plan ? pd.plan.items.filter(it => jobs.has(it.id)) : []);
+    // Entries to break up are read again now: pieces saved or entries removed while the question was open are not missed
+    let items = [];
+    const splitJobs = Array.from(jobs.values()).filter(j => j.pieces);
+    if (pd.plan && splitJobs.length) {
+      setBusy('apply'); setProgress('Checking which pieces are already logged…');
+      try { items = (await planSplits(api, splitJobs)).items; }
+      catch (e) {
+        setResult({ ok: 0, failed: 0, error: '', ...out, extra: 0, split: null, planError: errText(e) });
+        setProgress(''); setBusy('');
+        return;
+      }
+    }
+    await writeJobs(Array.from(jobs.values()).filter(j => !j.pieces), out, items);
   };
 
   // all: entries given one piece of equipment { id, payload }; splitItems: entries broken up into pieces (from the plan)
@@ -3044,6 +3099,8 @@ const RepairIds = ({ ctx, onCount }) => {
   const failedLookups = groups.filter(g => g.lookupError).length;
   // What breaking up would do: for the ticked entries, and for all of them with the other entries of the same names
   const planned = pending && pending.plan ? { ticked: splitStats(pending.plan.items.filter(it => pending.jobs.has(it.id))), all: splitStats(pending.plan.items), others: pending.listed - Array.from(pending.jobs.values()).filter(j => j.pieces).length } : null;
+  // Nothing would be written (every piece is already logged, the entries are gone or have no date, and no other entry is ticked)
+  const idle = !!planned && planned.all.rows === 0 && planned.others === 0 && pending.more.every(j => j.pieces);
 
   return (
     <div>
@@ -3076,12 +3133,13 @@ const RepairIds = ({ ctx, onCount }) => {
         <div role="alertdialog" aria-label={pending.plan ? 'Break up these entries?' : 'Update the other entries with the same names?'} style={{ border: `2px solid ${BRAND.yellow}`, backgroundColor: '#FFF6E5', borderRadius: '6px', padding: '10px 12px', marginBottom: '10px' }}>
           {planned && (
             <div style={{ marginBottom: pending.more.length ? 8 : 0 }}>
-              <Text block weight="semibold">Break up {plural(planned.ticked.rows, 'entry', 'entries')} into pieces?</Text>
-              <Text className={styles.hint} block>The first piece stays on the existing entry and {plural(planned.ticked.creates, 'new entry', 'new entries')} {planned.ticked.creates === 1 ? 'is' : 'are'} saved for the other pieces, each with the entry’s date, SAP order and initials. The hours are shared out evenly.</Text>
+              <Text block weight="semibold">{planned.ticked.rows > 0 ? `Break up ${plural(planned.ticked.rows, 'entry', 'entries')} into pieces?` : 'Nothing can be broken up here.'}</Text>
+              {planned.ticked.rows > 0 && <Text className={styles.hint} block>The first piece stays on the existing entry and {plural(planned.ticked.creates, 'new entry', 'new entries')} {planned.ticked.creates === 1 ? 'is' : 'are'} saved for the other pieces, each with the entry’s date, SAP order and initials. The hours are shared out evenly.</Text>}
               {planned.others > 0 && <Text className={styles.hint} block>The other {plural(planned.others, 'ticked entry', 'ticked entries')} {planned.others === 1 ? 'is' : 'are'} updated with the equipment chosen for {planned.others === 1 ? 'it' : 'them'}.</Text>}
               {planned.ticked.pieceSkips > 0 && <Text className={styles.hint} block>{plural(planned.ticked.pieceSkips, 'piece already has', 'pieces already have')} an entry for that order and date and {planned.ticked.pieceSkips === 1 ? 'is' : 'are'} not saved again.</Text>}
               {planned.ticked.leftAlone > 0 && <Text className={styles.hint} block>{plural(planned.ticked.leftAlone, 'entry stays', 'entries stay')} as {planned.ticked.leftAlone === 1 ? 'it is' : 'they are'}, because every piece is already logged for that order and date.</Text>}
               {planned.ticked.gone > 0 && <Text className={styles.hint} block>{plural(planned.ticked.gone, 'entry was', 'entries were')} not found (removed since the scan).</Text>}
+              {planned.ticked.undated > 0 && <Text className={styles.hint} block>{plural(planned.ticked.undated, 'entry has', 'entries have')} no date and will not be broken up: there is no date to check the pieces against.</Text>}
               {pending.plan.capped.length > 0 && <Text className={styles.hint} block>{plural(pending.plan.capped.length, 'piece has', 'pieces have')} more entries than could be checked for earlier dates, so a piece could be saved twice.</Text>}
             </div>
           )}
@@ -3091,15 +3149,21 @@ const RepairIds = ({ ctx, onCount }) => {
           {pending.out.held > 0 && <Text className={styles.hint} block>{plural(pending.out.held, 'entry', 'entries')} with those names {pending.out.held === 1 ? 'has' : 'have'} a row in this list with other equipment (or No match) chosen and will be left out.</Text>}
           {pending.out.kept > 0 && <Text className={styles.hint} block>{pending.out.keptMore ? 'At least ' : ''}{plural(pending.out.kept, 'entry', 'entries')} with those names already {pending.out.kept === 1 ? 'points' : 'point'} at other existing equipment and will be left as {pending.out.kept === 1 ? 'it is' : 'they are'}.</Text>}
           <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px' }}>
-            {pending.more.length > 0 ? (
-              <>
-                <Button appearance="primary" className={styles.btnCta} onClick={() => answerPending(true)}>{`Update all ${pending.listed + pending.more.length}`}</Button>
-                <Button onClick={() => answerPending(false)}>{`Only the ${pending.listed} ticked`}</Button>
-              </>
+            {idle ? (
+              <Button appearance="primary" className={styles.btnCta} onClick={() => answerPending(null)}>Close</Button>
             ) : (
-              <Button appearance="primary" className={styles.btnCta} onClick={() => answerPending(true)}>{`Apply ${pending.listed}`}</Button>
+              <>
+                {pending.more.length > 0 ? (
+                  <>
+                    <Button appearance="primary" className={styles.btnCta} onClick={() => answerPending(true)}>{`Update all ${pending.listed + pending.more.length}`}</Button>
+                    <Button onClick={() => answerPending(false)}>{`Only the ${pending.listed} ticked`}</Button>
+                  </>
+                ) : (
+                  <Button appearance="primary" className={styles.btnCta} onClick={() => answerPending(true)}>{`Apply ${pending.listed}`}</Button>
+                )}
+                <Button appearance="subtle" onClick={() => answerPending(null)}>Cancel</Button>
+              </>
             )}
-            <Button appearance="subtle" onClick={() => answerPending(null)}>Cancel</Button>
           </div>
         </div>
       )}
@@ -3111,7 +3175,7 @@ const RepairIds = ({ ctx, onCount }) => {
         {result && !result.planError && (result.ok > 0 || result.failed > 0 || !result.split) && <Text className={result.failed ? styles.errorText : styles.okText} block>{plural(result.ok, 'entry', 'entries')} updated{result.extra ? `, including ${plural(result.extra, 'more entry', 'more entries')} found in the log with the same name, room and area` : ''}{result.failed ? `; ${result.failed} failed (${result.error})` : ''}.</Text>}
         {result && result.split && <Text className={result.split.failedRows ? styles.errorText : styles.okText} block>{splitSummary(result.split)}</Text>}
         {result && result.split && splitNotes(result.split) && <Text className={styles.warnText} block>{splitNotes(result.split)}</Text>}
-        {result && (result.kept > 0 || result.mixed > 0 || result.unplaced > 0 || result.held > 0 || (result.capped && !result.declined) || result.failedNames.length > 0 || result.declined) && (
+        {result && !result.planError && (result.kept > 0 || result.mixed > 0 || result.unplaced > 0 || result.held > 0 || (result.capped && !result.declined) || result.failedNames.length > 0 || result.declined) && (
           <Text className={styles.warnText} block>
             {[
               result.declined && 'Only the ticked entries were updated.',
@@ -3125,8 +3189,8 @@ const RepairIds = ({ ctx, onCount }) => {
           </Text>
         )}
       </div>
-      {scan.started && <Text className={styles.hint} block style={{ marginBottom: 8 }}>{scan.scanned} entries checked. {totalRows} need an ID, in {plural(groups.length, 'distinct equipment group', 'distinct equipment groups')}.{scan.done ? ' The whole log has been checked.' : ' More entries remain: scan the next batch.'}</Text>}
-      {scan.started && scan.done && groups.length === 0 && <Text className={styles.okText} block>Every checked entry has a valid equipment ID.</Text>}
+      {scan.started && <Text className={styles.hint} block style={{ marginBottom: 8 }}>{scan.scanned} entries checked. {mode === 'several' ? `${totalRows} list several pieces` : `${totalRows} need an ID`}, in {plural(groups.length, 'distinct equipment group', 'distinct equipment groups')}.{scan.done ? ' The whole log has been checked.' : ' More entries remain: scan the next batch.'}</Text>}
+      {scan.started && scan.done && groups.length === 0 && <Text className={styles.okText} block>{mode === 'several' ? 'No entry lists several pieces of equipment.' : 'Every checked entry has a valid equipment ID.'}</Text>}
       {hidden > 0 && (
         <Text className={styles.hint} block style={{ marginBottom: 8 }}>
           {plural(hidden, 'group has', 'groups have')} no suggested match. <Button size="small" appearance="transparent" onClick={() => setShowAll(true)}>Show them to map by hand</Button>
@@ -3156,7 +3220,7 @@ const RepairIds = ({ ctx, onCount }) => {
                     <td className={styles.td}>{g.sap}</td>
                     <td className={styles.td}>{g.ids.length}</td>
                     <td className={styles.td}>
-                      <span className={mergeClasses(styles.tag, g.kind === 'missing id' ? styles.tagWarn : styles.tagBad)}>{g.kind}</span>
+                      <span className={mergeClasses(styles.tag, g.kind === 'missing id' ? styles.tagWarn : g.kind === 'several pieces' ? styles.tagInfo : styles.tagBad)}>{g.kind}</span>
                       {g.current && <div className={styles.hint}>ID is {g.current.name} · {placeText(g.current)}</div>}
                     </td>
                     <td className={styles.td} style={{ minWidth: 280 }}>
@@ -3169,12 +3233,12 @@ const RepairIds = ({ ctx, onCount }) => {
                           {g.suggest && (
                             <div className={styles.hint} style={{ marginTop: 4 }}>
                               {g.suggest.how === 'text' ? 'This entry lists several things. Found: ' : 'Equipment here that starts with this name: '}<strong>{g.suggest.assets.map(a => a.name).join(', ')}</strong>.
-                              {g.suggest.missing.length > 0 && ` No equipment found for ${g.suggest.missing.map(x => `“${x}”`).join(', ')}: search for it after.`}{' '}
-                              <Button size="small" appearance="primary" className={styles.btnPrimary} disabled={!!busy} aria-label={`Break up ${g.equipment || 'blank entry'} like this`} onClick={() => breakUp(g, g.suggest.assets)}>Break up like this</Button>
+                              {g.suggest.missing.length > 0 && ` No equipment found for ${g.suggest.missing.map(x => `“${x}”`).join(', ')}: choose Break up like this, then search to add ${g.suggest.missing.length === 1 ? 'it' : 'them'}.`}{' '}
+                              <Button size="small" appearance="primary" className={styles.btnPrimary} disabled={!!busy} aria-label={`Break up like this: ${g.equipment || 'blank entry'}`} onClick={() => breakUp(g, g.suggest.assets)}>Break up like this</Button>
                             </div>
                           )}
                           <div style={{ marginTop: 2 }}>
-                            <Button size="small" appearance="transparent" disabled={!!busy} aria-label={`Break up ${g.equipment || 'blank entry'} into several pieces`} onClick={() => breakUp(g, [])}>Break up into several pieces…</Button>
+                            <Button size="small" appearance="transparent" disabled={!!busy} aria-label={`Break up into several pieces: ${g.equipment || 'blank entry'}`} onClick={() => breakUp(g, [])}>Break up into several pieces…</Button>
                           </div>
                         </>
                       )}
