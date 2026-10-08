@@ -34,15 +34,18 @@ LEARNINGS & CHAT CONTEXT LOG
   * Assets tab (table craa5_aa_assets): the placed assets are pins on the map; a search list (Dataverse queries, 50 rows a page, never the
     whole table) finds any asset; "+ New asset" creates one with or without a map spot.
   * Smart snap: the map picture is read once into dark lines / light floor (Otsu threshold, small door gaps closed, every light area
-    numbered). A click inside an outlined area highlights that area and puts the pin in its middle; a click on a solid black shape takes
-    the shape; text labels and lines find the area around them; open floor (reaching the picture edge) does not snap. Off = exact click.
+    numbered; big pictures are shrunk keeping each cell's darkest pixel so thin walls survive). A click inside an outlined area highlights
+    that area and the pin stays where it was clicked; a click on a solid black shape takes the shape; text labels and lines find the
+    area around them (pin in its middle); open floor (reaching the picture edge) does not snap. Off = exact click. Pins on the same
+    point are fanned out so each can be clicked.
   * Map spots are saved as JSON text {"v":1,"m":"MAIN","x":..,"y":..,"b":[l,t,w,h],"s":1} (percent of the picture) in the Assets text
     column found by name ("Map Location", craa5_maplocation) or pinned in ASSET_MAP_COLUMN. Without that column the tab still lists and
     edits assets and says which column to add.
   * Asset editor: every readable column of the table from its metadata, by type (text, numbers with limits, yes/no switches for the
     cleaning frequencies, choices, dates by their behaviour, lookups via their navigation property), File and Image columns with upload /
     open / remove (their own requests). Saves send only the changed columns with the row's etag (If-Match), so someone else's newer change
-    is never overwritten silently ("Save mine anyway" overrides). Unsaved edits are never dropped without asking.
+    is never overwritten silently ("Save mine anyway" overrides). Unsaved edits are never dropped without asking; the Assets tab stays
+    alive (hidden) when another tab is opened, so its edits are still there on the way back. Fields are locked while a save runs.
 =======================================================================
 */
 
@@ -511,6 +514,9 @@ const dayBucket = (iso) => {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('overview');
+  // The Assets tab stays alive once opened (hidden on other tabs), so an asset being edited keeps its unsaved changes
+  const [assetsOpened, setAssetsOpened] = useState(false);
+  useEffect(() => { if (activeTab === 'assets') setAssetsOpened(true); }, [activeTab]);
   const [submissions, setSubmissions] = useState([]);
   const [mainMapImage, setMainMapImage] = useState(null);
   
@@ -955,7 +961,8 @@ export default function App() {
              equipmentColumns={equipmentColumns}
            />
         )}
-        {activeTab === 'assets' && (
+        {(activeTab === 'assets' || assetsOpened) && (
+          <div className={activeTab === 'assets' ? 'h-full' : 'hidden'}>
            <AssetsTab
              mapImage={mainMapImage}
              setMainMapImage={setMainMapImage}
@@ -966,6 +973,7 @@ export default function App() {
              setAssetPins={setAssetPins}
              logEvent={logEvent}
            />
+          </div>
         )}
         {activeTab === 'gallery' && (
            <GalleryTab
@@ -3256,7 +3264,22 @@ async function buildSnapGrid(src) {
   const ctx = canvas.getContext('2d');
   ctx.fillStyle = '#FFFFFF'; // see-through parts count as light floor
   ctx.fillRect(0, 0, w, h);
-  ctx.drawImage(img, 0, 0, w, h);
+  if (scale < 1) {
+    // Shrinking blends thin walls with the floor around them into light grey, and they would stop counting as walls.
+    // Keep each cell's darkest pixel instead: draw the picture once per offset inside a cell, unsmoothed, keeping the darker colour.
+    const cell = 1 / scale;
+    const k = Math.min(8, Math.ceil(cell));
+    ctx.imageSmoothingEnabled = false;
+    ctx.globalCompositeOperation = 'darken';
+    for (let oy = 0; oy < k; oy += 1) {
+      for (let ox = 0; ox < k; ox += 1) {
+        ctx.drawImage(img, (ox * cell) / k, (oy * cell) / k, w * cell, h * cell, 0, 0, w, h);
+      }
+    }
+    ctx.globalCompositeOperation = 'source-over';
+  } else {
+    ctx.drawImage(img, 0, 0, w, h);
+  }
   let pixels;
   try {
     pixels = ctx.getImageData(0, 0, w, h).data;
@@ -3388,10 +3411,18 @@ function describeRegion(grid, pixels, kind, clickIndex) {
     y: ((cy + 0.5) / h) * 100,
     box: [(minX / w) * 100, (minY / h) * 100, (bw / w) * 100, (bh / h) * 100],
     mask: { w: bw, h: bh, data: mask },
+    origin: [minX, minY],
     area: pixels.length,
     gridW: w
   };
 }
+
+// Is grid pixel (px, py) part of the region?
+const regionHas = (region, px, py) => {
+  const x = px - region.origin[0];
+  const y = py - region.origin[1];
+  return x >= 0 && y >= 0 && x < region.mask.w && y < region.mask.h && region.mask.data[y * region.mask.w + x] === 1;
+};
 
 // The outlined area (or solid shape) at a click, or null when there is none
 function snapAt(grid, xPct, yPct) {
@@ -3406,8 +3437,14 @@ function snapAt(grid, xPct, yPct) {
   // 'room' = an outlined area, 'open' = open floor (reaches the edge or is huge), 'speck' = too small
   const kindOf = (label) => (edges[label] || sizes[label] > maxArea ? 'open' : (sizes[label] < minArea ? 'speck' : 'room'));
 
-  // The area of a light seed, grown back over the strip the gap closing took, up to the real lines
+  // The area of a light seed, grown back over the strip the gap closing took, up to the real lines.
+  // `inside`: the click itself is in the area (not on its wall or label), so the pin can stay where it was clicked.
   const roomFrom = (seed) => {
+    const region = growRoom(seed);
+    if (region) region.inside = regionHas(region, px, py);
+    return region;
+  };
+  const growRoom = (seed) => {
     const room = floodFill(closed, w, h, seed, 0, maxArea);
     if (!room) return null;
     const inside = new Uint8Array(n);
@@ -3757,14 +3794,20 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
   }, [meta.status, loadAssetMeta]);
   const metaDone = meta.status === 'ready' || meta.status === 'error';
 
-  // 2. Placed assets for the map
+  // 2. Placed assets for the map. Spots saved while the pages are still coming in win over what those pages said.
+  const pinSaves = useRef(null);
   const loadPins = useCallback(async () => {
     if (!mapColumn) return;
+    pinSaves.current = {};
     setAssetPins(p => ({ ...p, status: 'loading', error: '' }));
     try {
       const r = await loadAssetPins(set, mapColumn, logEvent);
-      setAssetPins({ status: 'ready', rows: r.rows, capped: r.capped, error: '' });
+      const saved = pinSaves.current || {};
+      pinSaves.current = null;
+      const savedRows = Object.keys(saved).map(id => saved[id]).filter(p => p.location);
+      setAssetPins({ status: 'ready', rows: r.rows.filter(p => !saved[p.id]).concat(savedRows), capped: r.capped, error: '' });
     } catch (error) {
+      pinSaves.current = null;
       logEvent(`Placed assets could not be loaded: ${error.message}`, 'error');
       setAssetPins(p => ({ ...p, status: 'error', error: error.message }));
     }
@@ -3816,6 +3859,7 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
 
   // Keep the pins and the list in step with a saved asset
   const applySummary = useCallback((summary, isNewRow) => {
+    if (pinSaves.current) pinSaves.current[summary.id] = summary;
     setAssetPins(p => {
       const rows = p.rows.filter(r => r.id !== summary.id);
       return { ...p, rows: summary.location ? rows.concat([summary]) : rows };
@@ -3833,6 +3877,25 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
     pinWords.length === 0 ? pinsHere : pinsHere.filter(p => { const t = `${p.name} ${p.room} ${p.area}`.toLowerCase(); return pinWords.every(w => t.includes(w)); })
   ), [pinsHere, pinWords]);
   const otherMapPins = assetPins.rows.length - pinsHere.length;
+  // Pins on the same point (older spots, or two assets on one machine) are fanned out a little so each can be clicked
+  const pinOffsets = useMemo(() => {
+    const groups = {};
+    visiblePins.forEach(p => {
+      const k = `${Math.round(p.location.x * 5)}:${Math.round(p.location.y * 5)}`;
+      (groups[k] = groups[k] || []).push(p.id);
+    });
+    const out = {};
+    Object.keys(groups).forEach(k => {
+      const ids = groups[k];
+      if (ids.length < 2) return;
+      const radius = Math.max(9, ids.length * 2);
+      ids.forEach((id, i) => {
+        const a = (2 * Math.PI * i) / ids.length - Math.PI / 2;
+        out[id] = [Math.round(Math.cos(a) * radius), Math.round(Math.sin(a) * radius)];
+      });
+    });
+    return out;
+  }, [visiblePins]);
 
   const selectedPin = selectedId ? assetPins.rows.find(p => p.id === selectedId) || null : null;
   const selectedLocation = selectedPin && pinOnMap(selectedPin.location, mapKey) ? selectedPin.location : null;
@@ -3864,14 +3927,19 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
     setTimeout(() => centerMapOn(containerRef.current, loc.x, loc.y), 60);
   };
 
-  const openAsset = (asset, center) => guard(() => {
-    setCreating(null);
-    setSpot(null);
-    setPlacingFor(null);
-    setActionError('');
-    setSelectedId(asset.id);
-    if (center && asset.location && pinOnMap(asset.location, mapKey)) centerOn(asset.location);
-  });
+  const openAsset = (asset, center) => {
+    const go = () => {
+      setCreating(null);
+      setSpot(null);
+      setPlacingFor(null);
+      setActionError('');
+      setSelectedId(asset.id);
+      if (center && asset.location && pinOnMap(asset.location, mapKey)) centerOn(asset.location);
+    };
+    // The asset already open: nothing to lose, its form stays as it is
+    if (asset.id === selectedId && !creating) go();
+    else guard(go);
+  };
 
   const closePanel = () => guard(() => {
     setSelectedId(null);
@@ -3914,10 +3982,12 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
       if (seq === clickSeq.current) setSnapBusy(false);
     } else if (snapOn && !mapImage) note = 'nomap';
     if (seq !== clickSeq.current) return; // a later click won
+    // Inside the area the pin stays where it was clicked (so several assets in one room don't sit on one point);
+    // a click on a line, a label or a solid shape puts it in the middle
     const next = region
-      ? { x: region.x, y: region.y, box: region.box, snapped: true, region, note: '' }
+      ? { x: region.inside ? x : region.x, y: region.inside ? y : region.y, box: region.box, snapped: true, region, note: '' }
       : { x, y, box: null, snapped: false, region: null, note };
-    logEvent(region ? `Smart snap found an outlined area at ${round2(region.x)}%, ${round2(region.y)}%.` : `Map spot picked at ${round2(x)}%, ${round2(y)}% (${note || 'smart snap off'}).`, 'debug');
+    logEvent(region ? `Smart snap found an outlined area around ${round2(next.x)}%, ${round2(next.y)}%.` : `Map spot picked at ${round2(x)}%, ${round2(y)}% (${note || 'smart snap off'}).`, 'debug');
     if (placingFor) { setSpot(next); return; }
     // Nothing being placed: this starts "assign this spot" (unsaved edits are kept unless the user lets them go)
     guard(() => {
@@ -3941,7 +4011,7 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
   const confirmPlacing = async () => {
     if (!spot || !placingFor) return;
     if (placingFor.id === 'new') {
-      setCreating(c => ({ ...(c || {}), location: spot }));
+      if (creating) setCreating(c => ({ ...(c || {}), location: spot }));
       setPlacingFor(null);
       setSpot(null);
       return;
@@ -3989,7 +4059,7 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
   return (
     <div className="h-full flex flex-col md:flex-row bg-slate-100 p-4 md:p-6 overflow-y-auto md:overflow-hidden gap-4">
       {/* Map */}
-      <div className="flex-1 flex flex-col min-h-[60vh] md:min-h-0 overflow-hidden">
+      <div className="flex-1 flex flex-col md:min-h-0 md:overflow-hidden">
         <div className="mb-3 shrink-0 flex flex-wrap items-end justify-between gap-3">
           <div>
             <h2 className="text-2xl font-black text-[#00468B]">Assets</h2>
@@ -4002,7 +4072,7 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
             on={snapOn}
             onChange={setSnapOn}
             label="Smart snap"
-            title={snapOn ? 'A click finds the outlined area around it and puts the pin in its middle.' : 'A click puts the pin exactly where you click.'}
+            title={snapOn ? 'A click finds the outlined area around it. A click on a wall or a label puts the pin in the middle of the area.' : 'A click puts the pin exactly where you click.'}
           />
           <span className="text-xs text-slate-600" role="status">{pinsLine}</span>
           {assetPins.status === 'error' && <button type="button" onClick={loadPins} className="text-xs text-[#0072CE] underline hover:text-[#00468B]">Try again</button>}
@@ -4038,6 +4108,7 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
               {visiblePins.map(pin => {
                 const selected = pin.id === selectedId;
                 const moving = placingFor && placingFor.id === pin.id;
+                const off = pinOffsets[pin.id];
                 return (
                   <button
                     type="button"
@@ -4045,11 +4116,11 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
                     data-asset-pin={pin.id}
                     aria-label={`Asset ${pin.name}`}
                     onClick={(e) => { e.stopPropagation(); logEvent(`Asset pin clicked: ${pin.name}`, 'info'); openAsset(pin, false); }}
-                    className={`absolute transform -translate-x-1/2 -translate-y-1/2 group p-1 ${selected ? 'z-20' : 'z-10'} ${moving ? 'opacity-40' : ''}`}
-                    style={{ left: `${pin.location.x}%`, top: `${pin.location.y}%` }}
+                    className={`absolute transform -translate-x-1/2 -translate-y-1/2 group p-1 ${selected ? 'z-20' : 'z-10'} ${moving ? 'opacity-40' : ''} ${placingFor ? 'pointer-events-none' : ''}`}
+                    style={{ left: `${pin.location.x}%`, top: `${pin.location.y}%`, marginLeft: off ? off[0] : 0, marginTop: off ? off[1] : 0 }}
                   >
                     <span className={`block rounded-full border-2 shadow transition-transform ${selected ? 'w-5 h-5 bg-[#FFB81C] border-[#00468B]' : 'w-3.5 h-3.5 bg-[#0072CE] border-white group-hover:scale-125'}`} />
-                    <span className={`absolute bottom-full left-1/2 transform -translate-x-1/2 mb-1 bg-slate-900/90 text-white text-xs text-left px-2 py-1 rounded w-max max-w-[16rem] break-words pointer-events-none shadow-lg ${selected ? 'block' : 'hidden group-hover:block'}`}>
+                    <span className={`absolute ${pin.location.y < 15 ? 'top-full mt-1' : 'bottom-full mb-1'} left-1/2 transform -translate-x-1/2 bg-slate-900/90 text-white text-xs text-left px-2 py-1 rounded w-max max-w-[16rem] break-words pointer-events-none shadow-lg ${selected ? 'block' : 'hidden group-hover:block'}`}>
                       <span className="font-bold block">{pin.name}</span>
                       {(pin.room || pin.area) && <span className="text-slate-300">{[pin.room, pin.area].filter(Boolean).join(' · ')}</span>}
                     </span>
@@ -4129,6 +4200,8 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
               applySummary(summary, true);
               setDirty(false);
               setCreating(null);
+              setPlacingFor(null);
+              setSpot(null);
               setSelectedId(summary.id);
               logEvent(`Created asset ${summary.name} (${summary.id}).`, 'success');
             }}
@@ -4180,7 +4253,7 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
 // What smart snap made of a click
 function SpotNote({ spot }) {
   let text;
-  if (spot.snapped) text = spot.region && spot.region.kind === 'shape' ? 'Smart snap picked the solid shape you clicked (highlighted).' : 'Smart snap found the outlined area you clicked in (highlighted). The pin goes in its middle.';
+  if (spot.snapped) text = spot.region && spot.region.kind === 'shape' ? 'Smart snap picked the solid shape you clicked (highlighted).' : (spot.region && spot.region.inside ? 'Smart snap found the outlined area you clicked in (highlighted).' : 'Smart snap found the outlined area next to your click (highlighted). The pin goes in its middle.');
   else if (spot.note === 'none') text = 'No closed outline here, so the pin goes exactly where you clicked.';
   else if (spot.note === 'nomap') text = 'There is no map picture to snap to, so the pin goes where you clicked.';
   else if (spot.note && spot.note.indexOf('error:') === 0) text = `Smart snap is not available (${spot.note.slice(6)}), so the pin goes where you clicked.`;
@@ -4380,6 +4453,9 @@ function AssetEditor({ meta, set, assetId, createLocation, mapKey, pinLocation, 
   };
   const [load, setLoad] = useState({ status: isNew ? 'ready' : 'loading', error: '', row: null, etag: '' });
   const [form, setForm] = useState(emptyForm);
+  const formRef = useRef(form);
+  formRef.current = form;
+  const clashRef = useRef(false); // kept until the next save or full reload
   const imageColumns = useMemo(() => fields.filter(f => f.kind === 'image').map(f => f.name), [fields]);
   const rowRef = useRef(null);
   const [errors, setErrors] = useState({});
@@ -4400,6 +4476,18 @@ function AssetEditor({ meta, set, assetId, createLocation, mapKey, pinLocation, 
     rowRef.current = row;
     const server = {};
     fields.forEach(f => { server[f.name] = toEditValue(f, row); });
+    // Someone else changed a field the user is still editing: keep the version the edit started from, so Save
+    // reports the clash ("Someone else changed this asset") instead of quietly writing over their change
+    let clash = false;
+    if (keepEdits) {
+      const prev = formRef.current;
+      fields.forEach(f => {
+        const was = editKey(f, prev.initial[f.name]);
+        const mine = editKey(f, prev.values[f.name]);
+        const now = editKey(f, server[f.name]);
+        if (mine !== was && now !== was && now !== mine) clash = true;
+      });
+    }
     setForm(prev => {
       const values = { ...server };
       if (keepEdits) {
@@ -4409,7 +4497,10 @@ function AssetEditor({ meta, set, assetId, createLocation, mapKey, pinLocation, 
       }
       return { initial: server, values };
     });
-    setLoad({ status: 'ready', error: '', row, etag: row['@odata.etag'] || '' });
+    if (!keepEdits) clashRef.current = false;
+    else if (clash) clashRef.current = true;
+    const keepEtag = clashRef.current;
+    setLoad(l => ({ status: 'ready', error: '', row, etag: keepEtag && l.etag ? l.etag : (row['@odata.etag'] || '') }));
   }, [fields, imageColumns]);
 
   const reload = useCallback(async (keepEdits) => {
@@ -4492,6 +4583,9 @@ function AssetEditor({ meta, set, assetId, createLocation, mapKey, pinLocation, 
 
   const discard = () => {
     setForm(prev => ({ initial: prev.initial, values: { ...prev.initial } }));
+    // Nothing of the user's is left to clash with the newer version on screen
+    clashRef.current = false;
+    setLoad(l => ({ ...l, etag: (l.row && l.row['@odata.etag']) || l.etag }));
     setErrors({});
     setSaveError('');
     setStale(false);
@@ -4572,7 +4666,8 @@ function AssetEditor({ meta, set, assetId, createLocation, mapKey, pinLocation, 
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+      {/* Locked while saving: what is typed during the save would be replaced by the saved row */}
+      <fieldset disabled={saving} className="flex-1 overflow-y-auto p-4 space-y-4 min-w-0 m-0 border-0">
         {load.status === 'loading' && <p className="text-sm text-slate-500">Loading the asset...</p>}
         {load.status === 'error' && (
           <div className="text-sm text-[#C4001F]" role="alert">
@@ -4621,7 +4716,7 @@ function AssetEditor({ meta, set, assetId, createLocation, mapKey, pinLocation, 
         {isNew && fields.some(f => f.kind === 'file' || f.kind === 'image') && (
           <p className="text-xs text-slate-500">Pictures and files can be added once the asset is created.</p>
         )}
-      </div>
+      </fieldset>
 
       <div className="p-3 border-t border-slate-200 bg-white shrink-0 space-y-2">
         {saveError && <p className="text-xs text-[#C4001F]" role="alert">{saveError}</p>}
@@ -4633,13 +4728,13 @@ function AssetEditor({ meta, set, assetId, createLocation, mapKey, pinLocation, 
         )}
         {notice && !saveError && <p className="text-xs text-green-700" role="status">{notice}</p>}
         <div className="flex items-center justify-between gap-2">
-          <span className="text-xs text-slate-500">{isDirty ? `${changed.length} unsaved change${changed.length === 1 ? '' : 's'}` : (isNew ? '' : 'No changes')}</span>
+          <span className="text-xs text-slate-500">{isNew && placing ? 'Use the spot or Cancel on the map first.' : (isDirty ? `${changed.length} unsaved change${changed.length === 1 ? '' : 's'}` : (isNew ? '' : 'No changes'))}</span>
           <div className="flex gap-2">
             {isDirty && !isNew && <button type="button" onClick={discard} disabled={saving} className="px-3 py-1.5 rounded-md text-sm font-semibold border border-slate-300 text-slate-700 hover:bg-slate-100">Discard</button>}
             <button
               type="button"
               onClick={() => save(false)}
-              disabled={saving || load.status !== 'ready' || (!isNew && !isDirty)}
+              disabled={saving || load.status !== 'ready' || (!isNew && !isDirty) || (isNew && placing)}
               className="px-4 py-1.5 rounded-md text-sm font-bold bg-[#0072CE] text-white hover:bg-[#00468B] disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
             >
               {saving ? 'Saving...' : (isNew ? 'Create asset' : 'Save changes')}
@@ -4853,7 +4948,7 @@ function AssetFileField({ f, row, set, assetId, isNew, canWrite, onChanged, logE
     try {
       await work();
       if (mounted.current) setConfirmDelete(false);
-      onChanged();
+      if (kind !== 'open') onChanged(); // a download does not change the row
     } catch (e) {
       logEvent(`${f.label}: ${kind} failed: ${e.message}`, 'error');
       if (mounted.current) setError(e.message);
