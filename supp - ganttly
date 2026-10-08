@@ -647,25 +647,29 @@ function buildShiftWindows(slots, planStart, horizonMins) {
 }
 
 // Ganttly (current): the shift running at `now` (any crew), the shift that clocked in before it and the one that clocks in
-// next, as one window { date, hour, hours } (whole shifts, so the Gantt never shows a shift cut into a stub). With no shift
-// running now: 12 hours back and forward by the clock, from the top of the hour.
+// next, as one window { date, hour, hours, startMs } (whole shifts, so the Gantt never shows a shift cut into a stub). With no
+// shift running now (a gap in the rotation): from the clock-in of the last shift that finished, when that was within a day, so
+// that shift stays whole, with its check-offs, until the next one clocks in (else 12 hours back by the clock, from the top of
+// the hour); to the end of the next shift, and 12 hours ahead at least.
 function currentShiftWindow(slots, now) {
     const spanStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 2, 0, 0, 0);
     const wins = buildShiftWindows(slots, spanStart, 5 * 1440);
     const nowOff = (now.getTime() - spanStart.getTime()) / 60000;
+    const nowHr = Math.floor(nowOff / 60) * 60;
     const cur = wins.filter(function(w) { return nowOff >= w.shiftStart && nowOff < w.shiftEnd; }).sort(function(a, b) { return b.shiftStart - a.shiftStart; })[0];
+    const next = wins.filter(function(w) { return w.shiftStart > nowOff; }).sort(function(a, b) { return a.shiftStart - b.shiftStart; })[0];
     let startOff, endOff;
     if (cur) {
         const prev = wins.filter(function(w) { return w.shiftStart < cur.shiftStart; }).sort(function(a, b) { return b.shiftStart - a.shiftStart; })[0];
-        const next = wins.filter(function(w) { return w.shiftStart > nowOff; }).sort(function(a, b) { return a.shiftStart - b.shiftStart; })[0];
         startOff = prev ? prev.shiftStart : cur.shiftStart - 720;
         endOff = next ? next.shiftEnd : cur.shiftEnd + 720;
     } else {
-        startOff = Math.floor(nowOff / 60) * 60 - 720;
-        endOff = startOff + 1440;
+        const last = wins.filter(function(w) { return w.shiftEnd <= nowOff && w.shiftEnd > nowOff - 1440; }).sort(function(a, b) { return b.shiftEnd - a.shiftEnd || a.shiftStart - b.shiftStart; })[0];
+        startOff = last ? last.shiftStart : nowHr - 720;
+        endOff = Math.max(next ? next.shiftEnd : 0, nowHr + 720, startOff + 1440);
     }
     const start = new Date(spanStart.getTime() + startOff * 60000);
-    return { date: getLocalYMD(start), hour: start.getHours(), hours: Math.max(1, Math.min(336, Math.round((endOff - startOff) / 60))) };
+    return { date: getLocalYMD(start), hour: start.getHours(), hours: Math.max(1, Math.min(336, Math.round((endOff - startOff) / 60))), startMs: start.getTime() };
 }
 
 // Working minutes inside [start, end) once breaks / downtimes (possibly overlapping) are removed.
@@ -1243,7 +1247,8 @@ export default function App(props) {
     const [shiftTableInfo, setShiftTableInfo] = useState(null);
     const [newSlot, setNewSlot] = useState({});
     const [crewHeadcountOverrides, setCrewHeadcountOverrides] = useState(initialSettings.crewHeadcountOverrides || {});
-    const [absentEmployees, setAbsentEmployees] = useState(initialSettings.absentEmployees || {});
+    // Plan-wide absent marks (Planner). The current app never reads the Planner's: it marks per shift (below).
+    const [absentEmployees, setAbsentEmployees] = useState(IS_CURRENT ? {} : (initialSettings.absentEmployees || {}));
     // Ganttly (current): absent is marked per shift ({ shiftKey: { empId: true } }), so a mark never carries over to another day.
     const [absentByShift, setAbsentByShift] = useState(initialCurrent.absentByShift || {});
     // People put on a shift by hand ({ shiftKey: [empId] }): someone from another crew working this shift, whom Shift Start can't
@@ -1585,7 +1590,8 @@ export default function App(props) {
     };
 
     const planHorizonMins = Math.max(60, Math.round(Number(planHours) || 12) * 60);
-    const globalStartMs = getGlobalStart(ganttStartDate, ganttStartHour).getTime();
+    // The live window keeps its own clock-in ms: on the night the clocks go back, date + hour name two different hours.
+    const globalStartMs = liveWindow ? liveWindow.startMs : getGlobalStart(ganttStartDate, ganttStartHour).getTime();
     const nowMin = Math.round((liveTime.getTime() - globalStartMs) / 60000);
     // Rounded to 15 min so the plan only re-flows a few times an hour.
     const reforecastFrom = liveReforecast && nowMin > 0 ? Math.ceil(nowMin / 15) * 15 : 0;
@@ -1593,9 +1599,9 @@ export default function App(props) {
     // Shift Start's saved task assignments for the shifts in this plan that have started (an hour early counts), read again
     // whenever the plan window moves, every 5 minutes, and on "Reload from Shift Start". Never more than a few days back.
     const shiftWindows = useMemo(function() {
-        return buildShiftWindows(shiftRotation, getGlobalStart(ganttStartDate, ganttStartHour), planHorizonMins)
+        return buildShiftWindows(shiftRotation, new Date(globalStartMs), planHorizonMins)
             .map(function(w) { return Object.assign({}, w, { key: w.crew + '|' + (globalStartMs + w.shiftStart * 60000) }); });   // key = crew + real clock-in
-    }, [shiftRotation, ganttStartDate, ganttStartHour, planHorizonMins, globalStartMs]);
+    }, [shiftRotation, planHorizonMins, globalStartMs]);
     // From the earliest clock-in of a shift in the plan (a plan can start mid-shift), an hour early.
     const taskSinceMs = shiftWindows.reduce(function(m, w) { return Math.min(m, globalStartMs + w.shiftStart * 60000); }, globalStartMs) - TASK_PRE_SHIFT_MIN * 60000;
     const taskReqRef = useRef(0);
@@ -1699,12 +1705,14 @@ export default function App(props) {
         // A lead in the employee table who is on someone's crew in Shift Start does regular cleaning that shift. Shift Start's
         // own split never deals equipment to a board's leads; equipment hand-placed on one stays when the lead setting allows it.
         const kindOn = function(board) { return function(id) { const r = empById[id]; if (r && r.isLead) return board.leads.indexOf(id) === -1 ? 'general' : 'leadership'; return kindOf(id); }; };
-        const keep = function(id) { return !!empById[id] && !absentEmployees[id]; };
         const nameOf = function(id) { return rosterInfo.namesById[id] || 'Unknown'; };
-        const whyOut = function(id) { return absentEmployees[id] ? 'marked absent in Ganttly' : (rosterInfo.whyIgnored[id] || 'not on the Ganttly roster'); };
         shiftWindows.forEach(function(w) {
             const sb = shiftBoards[w.key];
             if (!sb) return;
+            // Absent for the plan (Planner) or for this shift (current app): not counted on the room, dealt no equipment.
+            const absentW = absentByShift[w.key] || {};
+            const keep = function(id) { return !!empById[id] && !absentEmployees[id] && !absentW[id]; };
+            const whyOut = function(id) { return absentEmployees[id] ? 'marked absent in Ganttly' : absentW[id] ? 'marked absent for this shift in Ganttly' : (rosterInfo.whyIgnored[id] || 'not on the Ganttly roster'); };
             const night = isNightHour(new Date(globalStartMs + w.shiftStart * 60000).getHours());
             const mb = sb.merged;
             const lineOf = function(lid) { return lineById[lid] || (mb.manualNames[lid] ? { id: lid, name: mb.manualNames[lid] } : null); };
@@ -1770,7 +1778,7 @@ export default function App(props) {
             out[w.key] = plan;
         });
         return out;
-    }, [shiftBoards, shiftWindows, lineById, lineAssets, empById, rosterInfo, absentEmployees, globalStartMs, leadKind]);
+    }, [shiftBoards, shiftWindows, lineById, lineAssets, empById, rosterInfo, absentEmployees, absentByShift, globalStartMs, leadKind]);
     // Lines with someone set up on them in any board of this plan; null when nobody is set up on a room yet (then every room is shown).
     const shiftStartLines = useMemo(function() {
         const set = {};
@@ -1879,9 +1887,14 @@ export default function App(props) {
             const people = {};
             // Absent on this shift: marked for the plan (Planner) or for that shift (current app). A person is registered even
             // when absent, so the Crew tab can un-mark them; they get no window for the shifts they are absent from.
-            const absentOn = function(id, win) { return !!absentEmployees[id] || !!(absentByShift[win.key] && absentByShift[win.key][id]); };
-            const addPerson = function(rec, win) {
-                if (!people[rec.id]) people[rec.id] = { rec: rec, windows: [], absent: false };
+            const absentOn = function(id, win) {
+                if (absentByShift[win.key] && absentByShift[win.key][id]) return true;
+                if ((extraPeople[win.key] || []).indexOf(id) > -1) return false;   // put on this shift by hand: that wins over a plan-wide mark
+                return !!absentEmployees[id];
+            };
+            const addPerson = function(rec, win, extra) {
+                if (!people[rec.id]) people[rec.id] = { rec: rec, windows: [], absent: false, extra: false };
+                if (extra) people[rec.id].extra = true;
                 if (absentOn(rec.id, win)) return;
                 if (people[rec.id].windows.some(function(x) { return x.start === win.start && x.end === win.end; })) return;
                 people[rec.id].windows.push({ start: win.start, end: win.end });
@@ -1894,12 +1907,13 @@ export default function App(props) {
                     return !!ow && ow.crew !== crew && ow.start < win.end && ow.end > win.start;
                 });
             };
-            // People put on this shift by hand (a lead added this way works as crew, like one placed on a crew in Shift Start).
-            const addExtras = function(win, outAny) {
+            // People put on this shift by hand (a lead added this way works as crew, like one placed on a crew in Shift Start). The
+            // pick is deliberate, so it stands even when a Shift Start board marks that person out.
+            const addExtras = function(win) {
                 (extraPeople[win.key] || []).forEach(function(id) {
                     const rec = empById[id];
-                    if (!rec || (outAny && outAny[id])) return;
-                    addPerson(rec.isLead ? Object.assign({}, rec, { kind: 'general', isLead: false, jobRole: 'Lead, added to this shift' }) : rec, win);
+                    if (!rec) return;
+                    addPerson(rec.isLead ? Object.assign({}, rec, { kind: 'general', isLead: false, jobRole: 'Lead, added to this shift' }) : rec, win, true);
                 });
             };
             let teams = null;
@@ -1909,7 +1923,7 @@ export default function App(props) {
                 if (boards.length === 0) {
                     crewRosters[crew].forEach(function(p) { if (!borrowedAt(p.id, win)) addPerson(p, win); });
                     leadRosters[crew].forEach(function(p) { if (!borrowedAt(p.id, win)) addPerson(p, win); });
-                    addExtras(win, null);
+                    addExtras(win);
                     return;
                 }
                 boardWins++;
@@ -1922,7 +1936,7 @@ export default function App(props) {
                     const ids = leadsB.concat(Object.keys(members), Array.isArray(bd.overtime) ? bd.overtime : []);
                     const seen = {};
                     ids.forEach(function(id) {
-                        if (seen[id] || outB[id]) return;
+                        if (seen[id] || outB[id] || borrowedAt(id, win)) return;   // on another crew's shift by hand at this time
                         seen[id] = true;
                         const rec = empById[id];
                         if (!rec) return;
@@ -1940,7 +1954,7 @@ export default function App(props) {
                 const outAny = {};
                 boards.forEach(function(b) { if (b.board.out && typeof b.board.out === 'object') Object.assign(outAny, b.board.out); });
                 crewRosters[crew].forEach(function(p) { if (SPECIALIST_KINDS.indexOf(p.kind) > -1 && !outAny[p.id] && !borrowedAt(p.id, win)) addPerson(p, win); });
-                addExtras(win, outAny);
+                addExtras(win);
                 if (!teams) teams = theseTeams;   // the first shift with a board decides the grouping
             });
             if (!teams) {
@@ -1975,7 +1989,8 @@ export default function App(props) {
             const crewWindows = shiftWindows.filter(function(w) { return w.crew === crew; }).map(function(w) { return { start: w.start, end: w.end }; });
             // Planner: the headcount box caps the named people and adds placeholder seats. Current app: real people only.
             const n = IS_CURRENT ? 0 : Math.max(0, Math.round(getCrewHeadcount(crew)));
-            const workers = IS_CURRENT ? cp.workers : cp.workers.slice(0, n);
+            // (someone put on the shift by hand keeps their lane whatever the headcount box says)
+            const workers = IS_CURRENT ? cp.workers : cp.workers.filter(function(x) { return !x.extra; }).slice(0, n).concat(cp.workers.filter(function(x) { return x.extra; }));
             const workerById = {};
             workers.forEach(function(x) { workerById[x.rec.id] = x; });
             const leadById = {};
@@ -2062,7 +2077,8 @@ export default function App(props) {
         });
     };
     const toggleAbsent = function(empId, shiftKey) {
-        if (IS_CURRENT && shiftKey) {
+        if (IS_CURRENT && !shiftKey) return;   // the current app marks per shift only
+        if (IS_CURRENT) {
             setAbsentByShift(function(prev) {
                 const next = Object.assign({}, prev);
                 const m = Object.assign({}, next[shiftKey] || {});
@@ -2074,7 +2090,8 @@ export default function App(props) {
         }
         setAbsentEmployees(function(prev) { const next = Object.assign({}, prev); if (next[empId]) delete next[empId]; else next[empId] = true; return next; });
     };
-    // Put someone on a shift by hand (any crew), or take them off again. Adding also clears an absent mark for that shift.
+    // Put someone on a shift by hand (any crew), or take them off again. Adding also clears an absent mark for that shift
+    // (current app); a Planner plan-wide mark stays as it is, the hand pick wins on that one shift (see crewPeople).
     const addPresent = function(shiftKey, empId) {
         if (!shiftKey || !empId) return;
         setExtraPeople(function(prev) {
@@ -2083,7 +2100,6 @@ export default function App(props) {
             return Object.assign({}, prev, { [shiftKey]: list });
         });
         if (IS_CURRENT) setAbsentByShift(function(prev) { if (!prev[shiftKey] || !prev[shiftKey][empId]) return prev; const m = Object.assign({}, prev[shiftKey]); delete m[empId]; const next = Object.assign({}, prev); if (Object.keys(m).length) next[shiftKey] = m; else delete next[shiftKey]; return next; });
-        else setAbsentEmployees(function(prev) { if (!prev[empId]) return prev; const next = Object.assign({}, prev); delete next[empId]; return next; });
     };
     const removePresent = function(shiftKey, empId) {
         setExtraPeople(function(prev) {
@@ -2133,7 +2149,7 @@ export default function App(props) {
     const activeBreaks = useMemo(function() {
         let breaks = [];
         if (includeBreaks && ganttStartDate && typeof ganttStartDate === 'string') {
-            const globalStart = getGlobalStart(ganttStartDate, ganttStartHour);
+            const globalStart = new Date(globalStartMs);
             for (let day = -1; day <= Math.ceil(planHorizonMins / 1440) + 1; day++) {
                 const base = new Date(globalStart.getTime());
                 base.setDate(base.getDate() + day);
@@ -2160,17 +2176,17 @@ export default function App(props) {
             }
         }
         return breaks;
-    }, [includeBreaks, ganttStartDate, ganttStartHour, planHorizonMins]);
+    }, [includeBreaks, ganttStartDate, globalStartMs, planHorizonMins]);
 
     const allInterrupts = useMemo(function() {
-        const startMs = getGlobalStart(ganttStartDate, ganttStartHour).getTime();
+        const startMs = globalStartMs;
         const customInts = downtimes.map(function(dt) {
             const dtMs = new Date(dt.dateTimeStr).getTime();
             const offset = Math.max(0, Math.round((dtMs - startMs) / 60000));
             return { start: offset, end: offset + dt.duration, duration: dt.duration, label: dt.label, isCustom: true, type: dt.type, targetId: dt.targetId };
         });
         return activeBreaks.concat(customInts).sort(function(a,b) { return a.start - b.start; });
-    }, [activeBreaks, downtimes, ganttStartDate, ganttStartHour]);
+    }, [activeBreaks, downtimes, globalStartMs]);
 
     // Mutators
     const handleRoomHandoverChange = function(area, val) { setRoomHandovers(function(prev) { return Object.assign({}, prev, { [area]: val }); }); };
@@ -2208,19 +2224,22 @@ export default function App(props) {
     const handleToggleRoom = function(areaName) { setHiddenRooms(function(prev) { return Object.assign({}, prev, { [areaName]: !prev[areaName] }); }); };
     const toggleDashboardRoom = function(areaName) { setCollapsedDashboardRooms(function(prev) { return Object.assign({}, prev, { [areaName]: !prev[areaName] }); }); };
 
+    // Ganttly (current): a new downtime starts from today at this hour (the window's first day is usually yesterday); Planner: the plan's day.
+    const defaultDtDate = function() { return IS_CURRENT ? getLocalYMD(liveTime) : ganttStartDate; };
+    const defaultDtTime = function() { return IS_CURRENT ? (liveTime.getHours() < 10 ? '0' : '') + liveTime.getHours() + ':00' : ''; };
     const openRoomDowntime = function(areaName) {
         setDtTarget(areaName);
         setNewDtLabel('');
-        setNewDtDate(ganttStartDate);
-        setNewDtTime('');
+        setNewDtDate(defaultDtDate());
+        setNewDtTime(defaultDtTime());
         setIsRoomDtModalOpen(true);
     };
 
     const openEquipDowntime = function(equipId) {
         setDtTarget(equipId);
         setNewDtLabel('');
-        setNewDtDate(ganttStartDate);
-        setNewDtTime('');
+        setNewDtDate(defaultDtDate());
+        setNewDtTime(defaultDtTime());
         setIsEquipDtModalOpen(true);
     };
 
@@ -2267,6 +2286,7 @@ export default function App(props) {
             isComplete: false,
             isPinned: false
         };
+        if (IS_CURRENT) newTask.createdMs = Date.now();   // goes when the shift it was added on has left the window (see the prune below)
         setAssets(function(prev) { return prev.concat([newTask]); });
         setCustomTasks(function(prev) { return prev.concat([newTask]); });
         setIsCustomTaskModalOpen(false);
@@ -2295,7 +2315,7 @@ export default function App(props) {
         const totalLanes = workers.length;
         const virtualRoomsMap = {};
         const CLEAN_TOGETHER_KEY = '__CLEAN_TOGETHER__';
-        const startMs = getGlobalStart(ganttStartDate, ganttStartHour).getTime();
+        const startMs = globalStartMs;
         const allTasks = [];
         const unscheduled = [];
         const parents = [];
@@ -2836,10 +2856,14 @@ export default function App(props) {
             const leadLanes = workers.filter(function(w) { const lr = laneRoster[w.id]; return lr && lr.crew === W.crew && lr.isLead && w.kind !== 'none' && w.kind !== 'leadership'; }).map(function(w) { return w.id; });
             if (crewLanes.length === 0 && leadLanes.length === 0) return null;
             // Leads set to "PIC items first" (Gerald, Oct 7: leads are populated with the "1 - pic" cleans) take PIC inside this
-            // shift's own fill (teamLeadW / crewLeadW levels, whole cleans only): after the Tech 3s / Inspectors, who can do
-            // nothing else, and before the Tech 1 / 2s, who keep to regular cleaning while a lead can take the PIC.
+            // shift's own fill (the leadR / leadT / leadC levels, whole cleans only): after the Tech 3s / Inspectors who have had
+            // their turn by then, who can do nothing else, and before the Tech 1 / 2s, who keep to regular cleaning while a lead
+            // can take the PIC. leadR / leadT = the room's team's leads (after the room levels / the team levels), leadC = every
+            // PIC-first lead on the shift (after the crew levels).
             const picLeadLanes = leadLanes.filter(function(l) { return workers[l].kind === 'pic'; });
             const leadFirst = picLeadLanes.length > 0;
+            const isLeadLevel = function(level) { return level === 'leadR' || level === 'leadT' || level === 'leadC'; };
+            let inFirst = false;   // the clock-in pass (long cleans start at clock-in before anything else is placed)
             // Who this shift's board puts on a clean's room. skip = the room isn't on this board but a later board has it, so
             // it waits for that shift (work carried over from an earlier shift, and custom tasks, go to whoever is on).
             // late = PIC / admin dealt to a Tech 1 / 2 only because the room has no Tech 3 / Inspector / Admin.
@@ -2903,8 +2927,9 @@ export default function App(props) {
                 });
                 proFirst = work > cap;
             })();
+            // (a held room's spare is used up by any shift-wide placement, Tech 3 / Inspector and lead ones too, not only Tech 1 / 2's)
             const tookFromHeld = function(task, level, who) {
-                if (level.indexOf('crew') === 0 && who.skip) spare[who.lid] -= task.rawWorkloadMins;
+                if ((level.indexOf('crew') === 0 || level === 'leadC') && who.skip) spare[who.lid] -= task.rawWorkloadMins;
             };
             // A Tech 3 / Inspector / Admin who could take this clean still has a free stretch on this shift.
             const specSpare = function(task, who) {
@@ -2917,14 +2942,50 @@ export default function App(props) {
                     return freeRuns(w, from, W.end, tailMin).some(function(r) { return netWorkingMins(r.start, r.end, allInterrupts) >= tailMin - 0.01; });
                 });
             };
-            // Who a PIC-first lead could take this clean with: the lead(s) at this level (their own team's rooms at teamLeadW, the
-            // whole shift at crewLeadW), plus, on a 2-person clean, partners from the room, team or shift who can do PIC (a Tech 3 /
+            // A room with Max Workers set whose own people still have more work waiting there than the room has space left for
+            // over this shift: a lead taking PIC into it would only push that work out, so the clean waits for them (or the next shift).
+            const roomFullWithOwn = function(task, who, from, needMins) {
+                const vRoom = virtualRoomsMap[task.vRoomKey];
+                if (!vRoom || !(vRoom.limit < Infinity)) return false;
+                const own = who.room.filter(function(l) { return !workers[l].isLead; });
+                if (!own.length) return false;
+                let waiting = 0;
+                pending.forEach(function(u) {
+                    if (u === task || u.vRoomKey !== task.vRoomKey || fromOf(u) >= W.end) return;
+                    const wu = whoFor(u);
+                    if (wu.must !== null ? own.indexOf(wu.must) === -1 : !wu.room.some(function(l) { return own.indexOf(l) > -1; })) return;
+                    waiting += u.rawWorkloadMins;
+                });
+                if (waiting <= 0) return false;
+                // The room time its own people can still use: minutes when one of them is free and the room has a slot.
+                const occ = roomOcc(vRoom);
+                const cuts = [from, W.end];
+                const cut = function(a, b) { if (a > from && a < W.end) cuts.push(a); if (b > from && b < W.end) cuts.push(b); };
+                occ.forEach(function(o) { cut(o.start, o.end); });
+                own.forEach(function(l) { workers[l].schedule.forEach(function(sl) { cut(sl.start, sl.end); }); });
+                cuts.sort(function(a, b) { return a - b; });
+                let usable = 0;
+                for (let i = 0; i + 1 < cuts.length; i++) {
+                    const a = cuts[i], b = cuts[i + 1];
+                    if (b <= a) continue;
+                    const slots = vRoom.limit - occAt(occ, a, []);
+                    if (slots <= 0) continue;
+                    const freeOwn = own.filter(function(l) { return freeRuns(workers[l], a, b, 0).some(function(r) { return r.start <= a + 0.01 && r.end >= b - 0.01; }); }).length;
+                    if (freeOwn > 0) usable += Math.min(slots, freeOwn) * netWorkingMins(a, b, allInterrupts);
+                }
+                waiting = Math.min(waiting, usable);
+                return waiting > 0 && waiting > usable - needMins;
+            };
+            // Who a PIC-first lead could take this clean with: the lead(s) at this level (their own team's rooms at leadR / leadT,
+            // the whole shift at leadC), plus, on a 2-person clean, partners from the room, team or shift who can do PIC (a Tech 3 /
             // Inspector or another lead first, see pickLanes). Whole cleans only, except a clean too long for one shift, which a
-            // lead starts at clock-in like anyone else. Null when no such lead could take it (then it isn't a lead's).
+            // lead starts at clock-in like anyone else, so only a lead (and partner) free right when it can start counts for one
+            // (a lead with only a later gap neither cuts it onto their tail nor keeps a Tech 1 / 2 from starting it). Null when no
+            // such lead could take it (then it isn't a lead's).
             const leadTake = function(task, who, level) {
                 if (!leadFirst || task.kind !== 'pic') return null;
                 if (who.must !== null && !who.late) return null;   // hand-placed by Shift Start: stays with that person
-                const leads = level === 'teamLeadW' ? who.leads.filter(function(l) { return picLeadLanes.indexOf(l) > -1; }) : who.leads.concat(leadsFor(who)).filter(uniq).filter(function(l) { return picLeadLanes.indexOf(l) > -1; });
+                const leads = level === 'leadC' ? who.leads.concat(leadsFor(who)).filter(uniq).filter(function(l) { return picLeadLanes.indexOf(l) > -1; }) : who.leads.filter(function(l) { return picLeadLanes.indexOf(l) > -1; });
                 if (!leads.length) return null;
                 const from = Math.max(fromOf(task), W.start);
                 if (from >= W.end) return null;
@@ -2932,21 +2993,25 @@ export default function App(props) {
                 const night = isNightAt(from);
                 const long = isLongJob(task, H);
                 const need = long ? tailMin : task.rawWorkloadMins / H;   // the free stretch one head needs
-                const fits = function(l) { return workers[l].canDo(task.kind, night) && freeRuns(workers[l], from, W.end, need).some(function(r) { return netWorkingMins(r.start, r.end, allInterrupts) >= need - 0.01; }); };
+                const fits = function(l) { return workers[l].canDo(task.kind, night) && freeRuns(workers[l], from, W.end, need).some(function(r) { return (!long || r.start <= from + 0.01) && netWorkingMins(r.start, r.end, allInterrupts) >= need - 0.01; }); };
                 const leadsFit = leads.filter(fits);
                 if (!leadsFit.length) return null;
+                if (roomFullWithOwn(task, who, from, (long ? W.end - from : need) * H)) return null;
                 const partners = H > 1 ? who.room.concat(who.team, crewFor(who), leadsFor(who)).filter(uniq).filter(function(l) { return leads.indexOf(l) === -1 && fits(l); }) : [];
                 if (leadsFit.length + partners.length < H) return null;
                 return { leads: leadsFit, lanes: leadsFit.concat(partners), from: from, night: night, need: need, H: H, long: long };
             };
             // A PIC-first lead on the room's team, or on the shift, could still take this clean (a Tech 1 / 2 then leaves it to them).
-            const leadSpare = function(task, who) { return leadTake(task, who, 'crewLeadW') !== null; };
+            const leadSpare = function(task, who) { return leadTake(task, who, 'leadC') !== null; };
             // defer: a Tech 1 / 2 leaves PIC / admin to the specialists (and PIC to a PIC-first lead) while those have free time.
             const lanesAt = function(task, level, defer) {
                 const who = whoFor(task);
                 const proKind = task.kind === 'pic' || task.kind === 'admin';
                 if (level === 'must' || level === 'mustLate') {
                     if (who.must === null || who.late !== (level === 'mustLate')) return null;
+                    // PIC the even split dealt to a Tech 1 / 2: a PIC-first lead who can take it whole goes first; the Tech gets it in
+                    // the release pass (like PIC at the plain levels).
+                    if (level === 'mustLate' && defer && leadSpare(task, who)) return null;
                     const base = [who.must].concat(who.room.filter(function(l) { return l !== who.must; }));
                     const H = capHeads(task, virtualRoomsMap[task.vRoomKey]);
                     if (H <= 1) return base;
@@ -2960,12 +3025,18 @@ export default function App(props) {
                     const lanes = level === 'teamLead' ? who.leads : leadLanes;
                     return lanes.length ? lanes : null;
                 }
-                if (level === 'teamLeadW' || level === 'crewLeadW') {
+                if (isLeadLevel(level)) {
                     // PIC-first leads inside the shift's own fill: their team's rooms first, then the shift. Not while a Tech 3 /
-                    // Inspector on the room, team or shift could still take the clean whole (a part of a long one): PIC is all they do.
+                    // Inspector who has had their turn by this point in the round could still take the clean whole (a part of a
+                    // long one): PIC is all they do. That is the room's at leadR (after the room levels), the room's and team's at
+                    // leadT (after the team levels), anyone on the shift at leadC (after the crew levels); in the clock-in pass only
+                    // those who start long cleans there (the room's on a shift with a board, the shift's on one without), so a long
+                    // PIC clean isn't left for a Tech 3 who never gets to start it and then cut by the Tech 1 / 2s.
                     const lt = leadTake(task, who, level);
                     if (!lt) return null;
-                    const specCould = who.room.concat(who.team, crewFor(who)).filter(uniq).some(function(l) {
+                    const scope = inFirst ? (plan ? who.room : who.room.concat(who.team, crewFor(who)))
+                        : level === 'leadR' ? who.room : level === 'leadT' ? who.room.concat(who.team) : who.room.concat(who.team, crewFor(who));
+                    const specCould = scope.filter(uniq).some(function(l) {
                         const w = workers[l];
                         if (!isSpecialist(w, task) || !w.canDo(task.kind, lt.night)) return false;
                         // a long clean: only a specialist free right now (they start it in the pass before this one), not one busy
@@ -2993,7 +3064,7 @@ export default function App(props) {
             // fit(lanes, mustLane): on a lead level a lead must be on the clean; with partners (a 2-person clean) try each lead as
             // the must-lane and keep the earliest fit (a part fit has no time: the first lead that fits).
             const leadFit = function(level, lanes, H, fit, mustLane) {
-                if (level !== 'teamLeadW' && level !== 'crewLeadW') return fit(lanes, mustLane);
+                if (!isLeadLevel(level)) return fit(lanes, mustLane);
                 const leads = lanes.filter(function(l) { return workers[l].isLead; });
                 if (H <= 1 || leads.length === lanes.length) return fit(lanes, null);
                 let best = null;
@@ -3142,7 +3213,7 @@ export default function App(props) {
                 });
                 return out;
             };
-            return { wholePass: wholePass, partPass: partPass, swapPic: swapPic, hasPlan: !!plan, hasLeads: leadLanes.length > 0 };
+            return { wholePass: wholePass, partPass: partPass, swapPic: swapPic, hasPlan: !!plan, hasLeads: leadLanes.length > 0, leadFirst: leadFirst, setFirst: function(v) { inFirst = !!v; } };
         };
         // The rest of a clean picked up on a later shift (or left over) carries the handover minutes, once, per head; picked up
         // on the shift it was cut on, none.
@@ -3172,10 +3243,13 @@ export default function App(props) {
             const whole = function(levels, mode) { let n = 0; levels.forEach(function(lv) { ctxs.forEach(function(c) { n += c.wholePass(lv, mode); }); }); return n; };
             const part = function(levels, onlyLong, mode, guard) { let n = 0; levels.forEach(function(lv) { ctxs.forEach(function(c) { n += c.partPass(lv, onlyLong, mode, guard); }); }); return n; };
             if (first) {
+                ctxs.forEach(function(c) { c.setFirst(true); });
                 part(ROOM_LEVELS, true, 'defer');
-                part(['teamLeadW'], true, 'leadPic');   // a PIC clean too long for one shift: a PIC-first lead starts it at clock-in
-                ctxs.forEach(function(c) { if (!c.hasPlan) { c.partPass('crewPro', true, 'defer'); c.partPass('crew', true, 'defer'); } });   // no board: the shift is one room
-                part(['crewLeadW'], true, 'leadPic');
+                part(['leadR'], true, 'leadPic');   // a PIC clean too long for one shift: a PIC-first lead starts it at clock-in (the room's Tech 3s first)
+                // no board: the shift is one room (with PIC-first leads, the Tech 3s / Inspectors start the long PIC cleans before the leads)
+                ctxs.forEach(function(c) { if (!c.hasPlan) { if (c.leadFirst) c.partPass('crewPro', true, 'defer'); c.partPass('crew', true, 'defer'); } });
+                part(['leadC'], true, 'leadPic');
+                ctxs.forEach(function(c) { c.setFirst(false); });
             }
             for (let round = 0; round < 50; round++) {
                 let parts = 0;
@@ -3183,19 +3257,19 @@ export default function App(props) {
                 // level's whole pass then runs again, so a Tech 1 / 2 takes whole the PIC the leads had no room for. A PIC clean
                 // too long for the shift goes to a lead after the Tech 3s / Inspectors and before the Tech 1 / 2s cut it.
                 whole(ROOM_LEVELS, 'defer');
-                if (whole(['teamLeadW'], 'leadPic')) whole(ROOM_LEVELS, 'deferPic');
+                if (whole(['leadR'], 'leadPic')) whole(ROOM_LEVELS, 'deferPic');
                 parts += part(['must', 'roomPro'], false, 'defer', true);
-                parts += part(['teamLeadW'], true, 'leadPic');
+                parts += part(['leadR'], true, 'leadPic');
                 parts += part(['room'], false, 'defer', true);
                 whole(TEAM_LEVELS, 'defer');
-                if (whole(['teamLeadW'], 'leadPic')) whole(TEAM_LEVELS, 'deferPic');
+                if (whole(['leadT'], 'leadPic')) whole(TEAM_LEVELS, 'deferPic');
                 parts += part(['teamPro'], false, 'defer', true);
-                parts += part(['teamLeadW'], true, 'leadPic');
+                parts += part(['leadT'], true, 'leadPic');
                 parts += part(['mustLate', 'team'], false, 'defer', true);
                 whole(CREW_LEVELS, 'defer');
-                if (whole(['crewLeadW'], 'leadPic')) whole(CREW_LEVELS, 'deferPic');   // then any PIC on the shift
+                if (whole(['leadC'], 'leadPic')) whole(CREW_LEVELS, 'deferPic');   // then any PIC on the shift
                 parts += part(['crewPro'], false, 'defer', true);
-                parts += part(['crewLeadW'], true, 'leadPic');
+                parts += part(['leadC'], true, 'leadPic');
                 parts += part(['crew'], false, 'defer', true);
                 const REL = ['mustLate', 'room', 'team', 'crew'];
                 whole(REL, 'release');
@@ -3211,7 +3285,7 @@ export default function App(props) {
             if (ctxs.length === 0) return;
             fillGroup(ctxs, true);
         });
-        // What leads didn't take inside the shifts' own fill (PIC-first leads take whole PIC there, see teamLeadW / crewLeadW)
+        // What leads didn't take inside the shifts' own fill (PIC-first leads take whole PIC there, see leadR / leadT / leadC)
         // comes last of all, once every shift's crew is planned:
         //   1. PIC nobody on any shift could get to (their own team's first, then the shift's);
         //   2. PIC-only leads: PIC taken off a Tech 1 / 2 when regular cleaning is still waiting; the Tech then takes that work
@@ -3449,13 +3523,13 @@ export default function App(props) {
         document.body.removeChild(link);
     };
 
-    // Ganttly (current): a check-off, move or downtime counts while its time is inside the window, i.e. through the shift after
-    // the one it was made in; then the equipment is due again. Marks for shifts that have left the window go with it.
+    // Ganttly (current): a check-off, move, downtime or custom task counts while its time is inside the window, i.e. through the
+    // shift after the one it was made in; then the equipment is due again. Marks for shifts that have left the window go with it.
+    // Not before the Dataverse shift table is in: the built-in rotation's window is not the real one.
     const liveHour = Math.floor(liveTime.getTime() / 3600000);
     useEffect(function() {
-        if (!IS_CURRENT) return;
-        const keep = {};
-        shiftWindows.forEach(function(w) { keep[w.key] = true; });
+        if (!IS_CURRENT || isLoading) return;
+        const markKeep = function(k) { const ms = Number(String(k).split('|')[1]); return !isNaN(ms) && ms >= globalStartMs; };   // key = crew|clock-in ms
         const prune = function(prev, test) {
             let changed = false;
             const next = {};
@@ -3467,9 +3541,12 @@ export default function App(props) {
         const dtKeep = function(dt) { const t = new Date(dt.dateTimeStr).getTime(); return isNaN(t) || t + (Number(dt.duration) || 0) * 60000 >= globalStartMs; };
         setDowntimes(function(prev) { return prev.every(dtKeep) ? prev : prev.filter(dtKeep); });
         setTargetDowntimes(function(prev) { return prev.every(dtKeep) ? prev : prev.filter(dtKeep); });
-        setAbsentByShift(function(prev) { return prune(prev, function(k) { return !!keep[k]; }); });
-        setExtraPeople(function(prev) { return prune(prev, function(k) { return !!keep[k]; }); });
-    }, [globalStartMs, liveHour, shiftWindows]);
+        setAbsentByShift(function(prev) { return prune(prev, markKeep); });
+        setExtraPeople(function(prev) { return prune(prev, markKeep); });
+        const taskKeep = function(a) { return !(a && a.createdMs && a.createdMs < globalStartMs); };
+        setCustomTasks(function(prev) { return prev.every(taskKeep) ? prev : prev.filter(taskKeep); });
+        setAssets(function(prev) { return prev.every(taskKeep) ? prev : prev.filter(taskKeep); });
+    }, [globalStartMs, liveHour, isLoading]);
 
     // Default the shift pickers to the shift happening now (or the first one in the plan).
     const currentWindow = shiftWindows.find(function(w) { return nowMin >= w.start && nowMin < w.end; }) || null;
@@ -4347,11 +4424,12 @@ export default function App(props) {
                                         const rosterList = useCp ? cp.everyone.map(function(x) { return x.rec; }) : leadRosters[crew].concat(crewRosters[crew]);
                                         const roster = rosterList.filter(function(p) { return !p.isLead; });
                                         const crewLeadList = rosterList.filter(function(p) { return p.isLead; });
-                                        const presentCount = roster.filter(function(p) { return !absentEmployees[p.id]; }).length;
                                         const crewShifts = shiftWindows.filter(function(w) { return w.crew === crew; });
                                         const isOverridden = crewHeadcountOverrides[crew] !== undefined;
                                         // The shift the absent marks and "present" picks apply to: the crew's next shift still to finish (current app).
                                         const markWin = IS_CURRENT ? (crewShifts.find(function(w) { return w.end > nowMin; }) || crewShifts[crewShifts.length - 1] || null) : (crewShifts[0] || null);
+                                        const absentHere = IS_CURRENT ? (markWin ? absentByShift[markWin.key] || {} : {}) : absentEmployees;
+                                        const presentCount = roster.filter(function(p) { return !absentHere[p.id]; }).length;
                                         const markLabel = markWin ? markWin.dayLabel + ' ' + formatHourLabel(markWin.startHour) : '';
                                         const onCrew = {};
                                         rosterList.forEach(function(p) { onCrew[p.id] = true; });
@@ -4402,7 +4480,7 @@ export default function App(props) {
                                                         {useCp && cp.boardWindows > 0 ? `Shift Start: ${cp.boardWindows} of ${crewShifts.length} shift${crewShifts.length === 1 ? '' : 's'} ${cp.boardWindows === 1 ? 'has' : 'have'} a board · ${presentCount} of ${roster.length} available` : roster.length > 0 ? `${presentCount} of ${roster.length} on roster available` : (IS_CURRENT ? 'No employees matched this crew' : 'No employees matched this crew — using placeholder seats')}{crewLeadList.length > 0 ? ` · ${crewLeadList.length} lead${crewLeadList.length === 1 ? '' : 's'}` : ''}
                                                         {crewShifts.length > 0 && <span className="text-slate-400"> · {crewShifts.map(function(w) { return w.dayLabel; }).join(', ')}</span>}
                                                     </div>
-                                                    {rosterList.length > 0 && (
+                                                    {rosterList.length > 0 && (!IS_CURRENT || markWin) && (
                                                         <div>
                                                             <button onClick={function() { setExpandedRosters(function(prev) { return Object.assign({}, prev, { [crew]: !prev[crew] }); }); }} className="text-[11px] font-black text-[#0072CE] hover:text-[#00468B] flex items-center gap-1">
                                                                 {expandedRosters[crew] ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />} Roster / mark absent
@@ -4410,7 +4488,7 @@ export default function App(props) {
                                                             {expandedRosters[crew] && (
                                                                 <div className="mt-2 flex flex-wrap gap-1.5">
                                                                     {rosterList.map(function(p) {
-                                                                        const absent = IS_CURRENT && markWin ? !!(absentByShift[markWin.key] && absentByShift[markWin.key][p.id]) : !!absentEmployees[p.id];
+                                                                        const absent = !!absentHere[p.id];
                                                                         const added = extraIds.indexOf(p.id) > -1;
                                                                         return (
                                                                             <button key={p.id} data-absent-toggle={p.id} onClick={function() { toggleAbsent(p.id, markWin ? markWin.key : ''); }} title={(absent ? 'Absent — click to mark present' : 'Present — click to mark absent') + (IS_CURRENT && markLabel ? ' (' + markLabel + ' shift)' : '')} className={`px-2 py-1 rounded-full text-[10px] font-bold border transition-colors ${absent ? 'bg-slate-100 text-slate-400 border-slate-200 line-through' : added ? 'bg-[#E6F1FB] text-[#00468B] border-[#8FC0EC] hover:bg-[#d6e8f8]' : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'}`}>
