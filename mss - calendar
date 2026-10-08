@@ -24,6 +24,9 @@ import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react'
  10. Completion percentages: two rows under the day headers (done % per day; on every Sunday, done % for that
      Monday-to-Sunday week) and, above the grid, the figure for the slicer timeframe and for the year to date. Every
      frequency letter on an equipment is one job per period (see COMPLETION PERCENTAGES below).
+ 11. Line Downtime tab, after Payload Diagnostics: for each production line (area plus line number) the weekdays it is
+     down every week (Scheduled) and the date ranges it is down besides (Off schedule, one day is fine), with a preview of
+     the next five weeks. Kept by hand and saved in this browser until the production schedule feeds it (see LINE DOWNTIME).
   =============================================================================
 */
 
@@ -475,6 +478,152 @@ const completionCells = (comp, timelineDays) => {
 };
 // END COMPLETION PERCENTAGES
 
+// ============================================================================
+// BEGIN LINE DOWNTIME
+// A line is one production line, named the way the production schedule names it: an area plus a line number
+// (craa5_area and craa5_line). Until the production schedule feeds this tab, two kinds of down day are kept by hand:
+//   Scheduled     weekdays on which the line is down every week.
+//   Off schedule  date ranges (one day is a range of one) on which it is down besides.
+// A line is down on a day when either says so (dtStatus). Saved in this browser only; nothing is written to Dataverse.
+// Days are plain YYYY-MM-DD text and are turned into dates one at a time with new Date(y, m, d), so a clock change
+// cannot move one.
+// ============================================================================
+const DOWNTIME_KEY = 'mss_line_downtime_v1';
+const DT_MAX_RANGE_DAYS = 366;                 // one off-schedule range covers at most a year
+const DT_STRIP_WEEKS = 5;                      // weeks shown in each line's preview
+const DT_WEEKDAYS = [                          // Monday first, as the week runs everywhere else on this page; dow is Date.getDay()
+  { dow: 1, short: 'Mon', name: 'Monday' }, { dow: 2, short: 'Tue', name: 'Tuesday' }, { dow: 3, short: 'Wed', name: 'Wednesday' },
+  { dow: 4, short: 'Thu', name: 'Thursday' }, { dow: 5, short: 'Fri', name: 'Friday' }, { dow: 6, short: 'Sat', name: 'Saturday' },
+  { dow: 0, short: 'Sun', name: 'Sunday' }
+];
+const dtPad = (n) => (n < 10 ? '0' : '') + n;
+const dtYmd = (d) => d.getFullYear() + '-' + dtPad(d.getMonth() + 1) + '-' + dtPad(d.getDate());
+// A real day written YYYY-MM-DD (years 2000 to 2100) as a local Date, or null (blank, half typed, 31 February...).
+const dtParse = (s) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(typeof s === 'string' ? s : '');
+  if (!m) return null;
+  const y = Number(m[1]), mo = Number(m[2]) - 1, d = Number(m[3]);
+  if (y < 2000 || y > 2100) return null;
+  const date = new Date(y, mo, d);
+  return date.getFullYear() === y && date.getMonth() === mo && date.getDate() === d ? date : null;
+};
+const dtAddDays = (ymd, n) => { const d = dtParse(ymd); return d ? dtYmd(new Date(d.getFullYear(), d.getMonth(), d.getDate() + n)) : ''; };
+const dtDow = (ymd) => { const d = dtParse(ymd); return d ? d.getDay() : -1; };
+const dtMonday = (ymd) => { const d = dtParse(ymd); return d ? dtYmd(new Date(d.getFullYear(), d.getMonth(), d.getDate() - ((d.getDay() + 6) % 7))) : ''; };
+// Calendar days from a to b, both included (a to a is 1); 0 when either is not a day.
+const dtSpan = (a, b) => {
+  const x = dtParse(a), y = dtParse(b);
+  return x && y ? Math.round((Date.UTC(y.getFullYear(), y.getMonth(), y.getDate()) - Date.UTC(x.getFullYear(), x.getMonth(), x.getDate())) / 86400000) + 1 : 0;
+};
+const dtCollapse = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+const dtSame = (l, area, n) => l.line === n && l.area.toLowerCase() === dtCollapse(area).toLowerCase();
+const dtLineSort = (a, b) => a.area.toLowerCase().localeCompare(b.area.toLowerCase()) || a.line - b.line;
+const dtByFrom = (a, b) => (a.from < b.from ? -1 : a.from > b.from ? 1 : a.to < b.to ? -1 : a.to > b.to ? 1 : 0);
+let dtSeq = 0;
+const dtId = () => 'l' + (++dtSeq).toString(36) + Math.random().toString(36).slice(2, 8);
+
+// Why a line is down on a day: 'sched' (a scheduled weekday), 'off' (inside an off-schedule range), 'both', or ''
+// (running). The production schedule will become one more source here later; a day is down when any source says so.
+const dtStatus = (line, ymd, dow) => {
+  const wd = dow === undefined ? dtDow(ymd) : dow;
+  const sched = wd >= 0 && line.days.indexOf(wd) > -1;
+  let off = false;
+  for (let i = 0; i < line.off.length && !off; i++) off = line.off[i].from <= ymd && ymd <= line.off[i].to;
+  return sched ? (off ? 'both' : 'sched') : (off ? 'off' : '');
+};
+
+// What was stored, made safe to use: anything malformed is dropped, never guessed at.
+const dtClean = (raw) => {
+  const src = raw && Array.isArray(raw.lines) ? raw.lines : [];
+  const out = [];
+  src.forEach((l) => {
+    if (!l || typeof l !== 'object') return;
+    const area = dtCollapse(typeof l.area === 'string' ? l.area : '').slice(0, 80);
+    const n = typeof l.line === 'number' || typeof l.line === 'string' ? Math.floor(Number(l.line)) : 0;
+    if (!area || !(n >= 1 && n <= 99) || out.some(o => dtSame(o, area, n))) return;
+    const days = [];
+    (Array.isArray(l.days) ? l.days : []).forEach((d) => { if (typeof d === 'number' && d % 1 === 0 && d >= 0 && d <= 6 && days.indexOf(d) < 0) days.push(d); });
+    const off = [];
+    (Array.isArray(l.off) ? l.off : []).forEach((r) => {
+      const a = r && dtParse(r.from) ? dtYmd(dtParse(r.from)) : '';
+      const b = r && dtParse(r.to) ? dtYmd(dtParse(r.to)) : '';
+      if (a && b && a <= b && dtSpan(a, b) <= DT_MAX_RANGE_DAYS && !off.some(o => o.from === a && o.to === b)) off.push({ from: a, to: b });
+    });
+    off.sort(dtByFrom);
+    out.push({ id: typeof l.id === 'string' && l.id ? l.id.slice(0, 40) : dtId(), area: area, line: n, days: days, off: off });
+  });
+  return out;
+};
+
+// Text for the screen.
+const dtDayName = (ymd, withWeekday) => {
+  const d = dtParse(ymd);
+  if (!d) return '';
+  const wd = DT_WEEKDAYS.filter(w => w.dow === d.getDay())[0];
+  return (withWeekday ? wd.short + ' ' : '') + d.getDate() + ' ' + MONTHS[d.getMonth()].slice(0, 3);
+};
+// "Mon 12 Oct 2026", or "Mon 12 Oct – Wed 14 Oct 2026" (each end carries its year when the range crosses a year).
+const dtRangeText = (from, to) => {
+  const a = dtParse(from), b = dtParse(to);
+  if (!a || !b) return '';
+  if (from === to) return dtDayName(from, true) + ' ' + a.getFullYear();
+  return a.getFullYear() === b.getFullYear()
+    ? dtDayName(from, true) + ' – ' + dtDayName(to, true) + ' ' + b.getFullYear()
+    : dtDayName(from, true) + ' ' + a.getFullYear() + ' – ' + dtDayName(to, true) + ' ' + b.getFullYear();
+};
+// "Saturday and Sunday", "Monday, Tuesday and Friday", "" for none.
+const dtDaysText = (days) => {
+  const names = DT_WEEKDAYS.filter(w => days.indexOf(w.dow) > -1).map(w => w.name);
+  return names.length < 2 ? names.join('') : names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1];
+};
+// The days of a preview: `weeks` weeks of seven, from the Monday `start`.
+const dtStripDays = (start, weeks) => {
+  const s = dtParse(start), out = [];
+  if (!s) return out;
+  for (let i = 0; i < weeks * 7; i++) {
+    const d = new Date(s.getFullYear(), s.getMonth(), s.getDate() + i);
+    out.push({ ymd: dtYmd(d), dow: d.getDay(), day: d.getDate(), month: d.getMonth() });
+  }
+  return out;
+};
+// Area names on the equipment loaded by Sync, for the Area box to suggest (any name can still be typed).
+const dtAreaNames = (assets) => {
+  const seen = new Set(), out = [];
+  (assets || []).forEach((a) => {
+    const n = dtCollapse(safeString(getProp(a, 'craa5_areaname'))), k = n.toLowerCase();
+    if (n && !seen.has(k)) { seen.add(k); out.push(n); }
+  });
+  return out.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+};
+// The line number the Line box offers for the area typed: one more than the highest already listed for that area, 1 for a new area.
+const dtNextNo = (lines, area) => {
+  const k = dtCollapse(area).slice(0, 80).toLowerCase();
+  let top = 0;
+  lines.forEach((l) => { if (l.area.toLowerCase() === k && l.line > top) top = l.line; });
+  return Math.min(99, top + 1);
+};
+// A date box holding a date that is unfinished (10/14/yyyy) or does not exist (31 September) reports value '' with
+// validity.badInput, so the state alone cannot tell it from an empty box.
+const dtUnreadable = (el) => !!(el && el.validity && el.validity.badInput);
+// Chrome keeps 10/15/26 as year 0026: say so when a refused date has a year outside 2000 to 2100.
+const dtYearNote = (v) => {
+  const y = typeof v === 'string' ? v.split('-')[0] : '';
+  return /^\d+$/.test(y) && (Number(y) < 2000 || Number(y) > 2100) ? ' The year must be 2000 to 2100 (the box shows ' + y + ').' : '';
+};
+
+// Browser storage may be missing or refuse writes (private window, a locked-down host): then the days last only
+// until the page closes, and the tab says so.
+const dtLoad = () => {
+  try { const raw = window.localStorage.getItem(DOWNTIME_KEY); return raw ? dtClean(JSON.parse(raw)) : []; } catch (e) { return []; }
+};
+const dtStore = (lines) => {
+  try { window.localStorage.setItem(DOWNTIME_KEY, JSON.stringify({ v: 1, lines: lines })); return true; } catch (e) { return false; }
+};
+const dtCanStore = () => {
+  try { window.localStorage.setItem(DOWNTIME_KEY + '_probe', '1'); window.localStorage.removeItem(DOWNTIME_KEY + '_probe'); return true; } catch (e) { return false; }
+};
+// END LINE DOWNTIME
+
 // Text fallback for logs whose equipment id is blank or matches no equipment row.
 // Exact normalized name first, then a name contained in exactly one equipment name; when several
 // equipment share a name ("Floors"), the log's own room and area text decides.
@@ -544,7 +693,7 @@ const LOG_FILE_NAME_COLUMN = LOG_FILE_COLUMN + '_name';
 const LOG_OPTIONAL = ["craa5_sap", "craa5_hoursworked", "craa5_room", "craa5_area"].concat(LOG_TYPE_COLUMNS, [LOG_FILE_COLUMN, LOG_FILE_NAME_COLUMN]); // each is dropped on its own if the table lacks it
 const missingLogColumns = new Set();
 const logSelect = (withId) => [LOG_CORE, ...LOG_OPTIONAL.filter(c => !missingLogColumns.has(c)), withId ? LOG_ASSET_ID_SELECT : ''].filter(Boolean).join(',');
-const BUILD = 'id loader r10';    // shown beside the counters and on Payload Diagnostics so a pasted version can be told apart
+const BUILD = 'id loader r11';    // shown under the title and on Payload Diagnostics so a pasted version can be told apart
 const ASSET_CORE = "craa5_aa_assetsid,craa5_equipmentidentifier,craa5_roomname,craa5_areaname";
 const missingAssetColumns = new Set();   // frequency columns this equipment table turned out not to have
 const assetSelect = () => [ASSET_CORE].concat(ASSET_FREQ_COLUMNS.filter(c => !missingAssetColumns.has(c))).join(',');
@@ -893,8 +1042,199 @@ const GroupDays = React.memo(({ g, groupKey, timelineDays, dayColWidth, onEnter,
   );
 }, (p, q) => p.groupKey === q.groupKey && p.timelineDays === q.timelineDays && p.dayColWidth === q.dayColWidth && p.onEnter === q.onEnter && p.onLeave === q.onLeave && sameDays(p.g, q.g));
 
+// ----------------------------------------------------------------------------
+// LINE DOWNTIME TAB: kept in App so the days survive a switch of tab, and so the matrix can use them later.
+// ----------------------------------------------------------------------------
+function useLineDowntime() {
+  const [lines, setLines] = useState(dtLoad);
+  const [saved, setSaved] = useState(dtCanStore);
+  const mounted = useRef(false);
+  useEffect(() => {
+    if (!mounted.current) { mounted.current = true; return; }
+    setSaved(dtStore(lines));
+  }, [lines]);
+  return { lines, setLines, saved };
+}
+
+// The second click of a double-click lands on whatever the first one changed (a form sent twice, the next range slid under
+// the X, the Keep button that replaced Remove line, the next card's Remove line): the buttons that add or remove ignore it.
+const ignoreRepeat = (e) => { if (e.detail > 1) e.preventDefault(); };
+const single = (fn) => (e) => { if (!(e.detail > 1)) fn(); };
+
+const LineCard = React.memo(({ line, strip, todayStr, onPatch, onRemove }) => {
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
+  const [err, setErr] = useState('');
+  const [confirm, setConfirm] = useState(false);
+  const fromRef = useRef(null);
+  const toRef = useRef(null);
+  const title = line.area + ' · Line ' + line.line;
+  const now = dtStatus(line, todayStr);
+  const toggleDay = (dow) => onPatch(line.id, l => ({ ...l, days: l.days.indexOf(dow) > -1 ? l.days.filter(d => d !== dow) : l.days.concat([dow]) }));
+  const addRange = () => {
+    if (dtUnreadable(fromRef.current)) return setErr('Check the first day. The date is unfinished or does not exist.');
+    if (dtUnreadable(toRef.current)) return setErr('Check the last day. The date is unfinished or does not exist. Fix it, or clear it for a single day.');
+    const a = dtParse(from), b = to ? dtParse(to) : a;
+    if (!a) return setErr(from ? 'Check the first day.' + dtYearNote(from) : 'Pick the first day.');
+    if (!b) return setErr('Check the last day, or leave it empty for a single day.' + dtYearNote(to));
+    const f = dtYmd(a), t = dtYmd(b);
+    if (t < f) return setErr('The last day is before the first day.');
+    if (dtSpan(f, t) > DT_MAX_RANGE_DAYS) return setErr('One range can cover at most a year. Add a second range for more.');
+    if (line.off.some(r => r.from === f && r.to === t)) return setErr('That range is already in the list.');
+    onPatch(line.id, l => ({ ...l, off: l.off.concat([{ from: f, to: t }]).sort(dtByFrom) }));
+    setFrom(''); setTo(''); setErr('');
+  };
+  const removeRange = (r) => onPatch(line.id, l => ({ ...l, off: l.off.filter(x => !(x.from === r.from && x.to === r.to)) }));
+  return (
+    <section className="dt-card" data-testid="dt-card" data-line={line.area + '|' + line.line} aria-label={title}>
+      <div className="dt-card-head">
+        <h3 data-testid="dt-title">{title}</h3>
+        {confirm
+          ? (
+            <span className="dt-confirm">
+              Remove this line?
+              <button type="button" className="page-btn danger" data-testid="dt-remove-yes" onClick={single(() => onRemove(line.id))}>Yes, remove</button>
+              <button type="button" className="page-btn" data-testid="dt-keep" onClick={single(() => setConfirm(false))}>Keep</button>
+            </span>
+          )
+          : <button type="button" className="dt-link" data-testid="dt-remove" onClick={single(() => setConfirm(true))}>Remove line</button>}
+      </div>
+      <div>
+        <span className={'dt-chip ' + (now ? 'down' : 'run')} data-testid="dt-today" data-status={now || 'run'}>
+          {now === 'sched' ? 'Down today · scheduled' : now === 'off' ? 'Down today · off schedule' : now === 'both' ? 'Down today' : 'Running today'}
+        </span>
+      </div>
+
+      <div className="dt-label">Scheduled <span>down every week on</span></div>
+      <div className="dt-days" role="group" aria-label={'Scheduled down days for ' + title}>
+        {DT_WEEKDAYS.map(w => {
+          const on = line.days.indexOf(w.dow) > -1;
+          return <button key={w.dow} type="button" className={'dt-day' + (on ? ' on' : '')} aria-pressed={on} title={w.name} data-testid={'dt-day-' + w.short} onClick={() => toggleDay(w.dow)}>{w.short}</button>;
+        })}
+      </div>
+      <p className="dt-note" data-testid="dt-days-text">{line.days.length ? 'Down every ' + dtDaysText(line.days) + '.' : 'No scheduled down days.'}</p>
+
+      <div className="dt-label">Off schedule <span>extra days down</span></div>
+      <form className="dt-range-form" noValidate onSubmit={(e) => { e.preventDefault(); addRange(); }}>
+        <label className="dt-field"><span>First day</span><input type="date" ref={fromRef} value={from} data-testid="dt-from" onChange={(e) => { setFrom(e.target.value); setErr(''); }} /></label>
+        <label className="dt-field"><span>Last day</span><input type="date" ref={toRef} value={to} data-testid="dt-to" onChange={(e) => { setTo(e.target.value); setErr(''); }} /></label>
+        <button type="submit" className="sync-btn" data-testid="dt-add-range" onClick={ignoreRepeat}>Add</button>
+      </form>
+      <p className="dt-hint">Leave the last day empty for a single day.</p>
+      {err && <p className="dt-error" role="alert" data-testid="dt-range-error">{err}</p>}
+      {line.off.length === 0
+        ? <p className="dt-note" data-testid="dt-off-empty">No off-schedule days.</p>
+        : (
+          <ul className="dt-ranges" data-testid="dt-ranges">
+            {line.off.map(r => {
+              const n = dtSpan(r.from, r.to);
+              const text = dtRangeText(r.from, r.to);
+              return (
+                <li key={r.from + '_' + r.to} className={r.to < todayStr ? 'past' : ''} data-testid="dt-range">
+                  <span className="dt-range-label">{text}</span>
+                  <span className="dt-range-n">{n} day{n === 1 ? '' : 's'}{r.to < todayStr ? ' · past' : ''}</span>
+                  <button type="button" className="dt-x" aria-label={'Remove ' + text} title="Remove" onClick={single(() => removeRange(r))}><XIcon /></button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+
+      <div className="dt-strip" aria-label={'Next weeks for ' + title} data-testid="dt-strip">
+        {DT_WEEKDAYS.map(w => <div key={'h' + w.dow} className="dt-strip-h">{w.short}</div>)}
+        {strip.map(d => {
+          const st = dtStatus(line, d.ymd, d.dow);
+          const what = st === 'sched' ? 'down, scheduled' : st === 'off' ? 'down, off schedule' : st === 'both' ? 'down, scheduled and off schedule' : 'running';
+          return (
+            <div key={d.ymd} className={'dt-cell' + (st ? ' ' + st : '') + (d.ymd === todayStr ? ' today' : '') + (d.day === 1 ? ' first' : '')} data-ymd={d.ymd} data-status={st || 'run'} title={dtRangeText(d.ymd, d.ymd) + ' · ' + what}>
+              {d.day === 1 ? d.day + ' ' + MONTHS[d.month].slice(0, 3) : d.day}
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+});
+
+function LineDowntimeTab({ assets, lines, setLines, saved }) {
+  const todayStr = dtYmd(new Date());
+  const [area, setArea] = useState('');
+  const [num, setNum] = useState(null);                   // what was typed in the Line box; until then (null) it offers the next free number of the area
+  const [msg, setMsg] = useState(null);                     // { kind: 'error' | 'ok', text } after pressing Add line
+  const [start, setStart] = useState(() => dtMonday(dtYmd(new Date())));
+  const areaNames = useMemo(() => dtAreaNames(assets), [assets]);
+  const strip = useMemo(() => dtStripDays(start, DT_STRIP_WEEKS), [start]);
+  const sorted = useMemo(() => lines.slice().sort(dtLineSort), [lines]);
+  const patch = useCallback((id, fn) => setLines(prev => prev.map(l => (l.id === id ? fn(l) : l))), [setLines]);
+  const remove = useCallback((id) => setLines(prev => prev.filter(l => l.id !== id)), [setLines]);
+  const thisMonday = dtMonday(todayStr);
+  const canPrev = !!dtParse(dtAddDays(start, -7 * DT_STRIP_WEEKS));                    // the preview stays inside the years dtParse accepts
+  const canNext = !!dtParse(dtAddDays(start, 14 * DT_STRIP_WEEKS - 1));
+  const shownNum = num === null ? String(dtNextNo(lines, area)) : num;
+  const addLine = () => {
+    const name = dtCollapse(area).slice(0, 80);
+    const text = shownNum.trim();
+    const n = /^\d{1,2}$/.test(text) ? Number(text) : 0;
+    if (!name) return setMsg({ kind: 'error', text: 'Type the area name first.' });
+    if (!(n >= 1 && n <= 99)) return setMsg({ kind: 'error', text: 'The line number is a whole number from 1 to 99.' });
+    if (lines.some(l => dtSame(l, name, n))) return setMsg({ kind: 'error', text: name + ', line ' + n + ' is already in the list.' });
+    setLines(prev => prev.concat([{ id: dtId(), area: name, line: n, days: [], off: [] }]));
+    setNum(null);                                         // the box goes back to offering the next free number of the area
+    setMsg({ kind: 'ok', text: 'Added ' + name + ', line ' + n + '.' });
+  };
+  return (
+    <main className="flex-1" style={{ minHeight: 0, overflow: 'auto', padding: '24px clamp(16px, 3vw, 32px)', background: '#F7F9FC' }} data-testid="downtime">
+      <div className="dt-wrap">
+        <h2 style={{ fontSize: '18px', fontWeight: '900', margin: 0, color: BRAND.blueDark }}>Line Downtime</h2>
+        <p className="dt-intro">
+          Mark the days a production line is down. Scheduled days repeat every week. Off schedule adds a date or a range of dates, even a single day.
+          A line is named like the production schedule names it: the area and the line number. Later this tab will read the production schedule instead of being filled in by hand.
+        </p>
+        <p className={'dt-foot' + (saved ? '' : ' warn')} data-testid="dt-saved">
+          {saved
+            ? 'Saved in this browser. Other people and other browsers do not see these days yet.'
+            : 'This browser would not save these days, so they last only until the page is closed.'}
+        </p>
+
+        <form className="diag-card dt-add" noValidate onSubmit={(e) => { e.preventDefault(); addLine(); }}>
+          <label className="dt-field grow">
+            <span>Area</span>
+            <input list="dt-areas" value={area} autoComplete="off" placeholder={areaNames.length ? 'Pick or type the area' : 'Type the area, as the production schedule has it'} data-testid="dt-area" onChange={(e) => { setArea(e.target.value); setMsg(null); }} />
+          </label>
+          <datalist id="dt-areas">{areaNames.map(n => <option key={n} value={n} />)}</datalist>
+          <label className="dt-field">
+            <span>Line</span>
+            <input type="number" min="1" max="99" step="1" value={shownNum} style={{ width: '76px' }} data-testid="dt-line-no" onChange={(e) => { setNum(e.target.value); setMsg(null); }} />
+          </label>
+          <button type="submit" className="sync-btn" data-testid="dt-add-line" onClick={ignoreRepeat}>Add line</button>
+          {!areaNames.length && <span className="dt-hint" style={{ flexBasis: '100%', margin: 0 }}>Press Sync Dataverse for the area names to be suggested here.</span>}
+          <span className={'dt-msg ' + (msg ? msg.kind : '')} role="status" data-testid="dt-msg">{msg ? msg.text : ''}</span>
+        </form>
+
+        <div className="dt-toolbar">
+          <span className="dt-label inline">Preview</span>
+          <button type="button" className="page-btn" aria-label="Earlier weeks" title="Earlier weeks" data-testid="dt-prev" disabled={!canPrev} onClick={() => setStart(s => dtAddDays(s, -7 * DT_STRIP_WEEKS))}><ChevronLeftIcon /></button>
+          <span className="dt-range-text" data-testid="dt-range-text">{strip.length ? dtRangeText(strip[0].ymd, strip[strip.length - 1].ymd) : ''}</span>
+          <button type="button" className="page-btn" aria-label="Later weeks" title="Later weeks" data-testid="dt-next" disabled={!canNext} onClick={() => setStart(s => dtAddDays(s, 7 * DT_STRIP_WEEKS))}><ChevronRightLargeIcon /></button>
+          <button type="button" className="page-btn" data-testid="dt-this-week" disabled={start === thisMonday} onClick={() => setStart(thisMonday)}>This week</button>
+          <span className="dt-legend">
+            <span><i className="dt-sw sched" />Scheduled</span>
+            <span><i className="dt-sw off" />Off schedule</span>
+            <span><i className="dt-sw both" />Both</span>
+          </span>
+        </div>
+
+        {sorted.length === 0
+          ? <div className="diag-card dt-empty" data-testid="dt-empty">No lines yet. Add a line above, then pick its scheduled days and any off-schedule dates.</div>
+          : <div className="dt-grid">{sorted.map(l => <LineCard key={l.id} line={l} strip={strip} todayStr={todayStr} onPatch={patch} onRemove={remove} />)}</div>}
+      </div>
+    </main>
+  );
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState('master'); 
+  const downtime = useLineDowntime();   // Line Downtime tab: kept here so the days survive a switch of tab
   const [assets, setAssets] = useState([]);
   const [logs, setLogs] = useState([]);
   const [anchorYear, setAnchorYear] = useState(new Date().getFullYear());
@@ -1682,13 +2022,14 @@ export default function App() {
         .brand-title { font-size: 18px; font-weight: 900; color: ${BRAND.blueDark}; letter-spacing: -0.3px; display: flex; align-items: center; margin: 0; line-height: 1.2; white-space: nowrap; }
         .brand-subtitle { font-size: 11px; font-weight: 700; color: #64748b; margin: 2px 0 0; white-space: nowrap; }
         .brand-nav { display: flex; align-items: center; gap: 6px; padding: 4px 24px 10px; flex-wrap: wrap; }
-        .brand-tab { padding: 8px 16px; border: none; border-radius: 12px; background: transparent; color: #64748b; font-family: inherit; font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; cursor: pointer; transition: background 0.15s, color 0.15s; white-space: nowrap; }
+        .brand-tab { padding: 8px 12px; border: none; border-radius: 12px; background: transparent; color: #64748b; font-family: inherit; font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; cursor: pointer; transition: background 0.15s, color 0.15s; white-space: nowrap; }
+        .zoom-range { width: 80px; }
         .brand-tab:hover { background: ${BRAND.blueSoft}; color: ${BRAND.blue}; }
         .brand-tab.active { background: ${BRAND.blue}; color: #fff; box-shadow: 0 6px 14px rgba(0,114,206,0.25); }
         .year-btn { border: 1px solid ${BRAND.blueLine}; background: #fff; color: ${BRAND.blue}; border-radius: 6px; padding: 4px; cursor: pointer; display: flex; }
         .year-btn:hover { background: ${BRAND.blueSoft}; }
-        .search-box { background: #F7F9FC; border: 1px solid #e2e8f0; border-radius: 8px; padding: 6px 12px; display: flex; align-items: center; gap: 8px; width: 220px; }
-        .search-box input { background: transparent; border: none; outline: none; font-size: 12px; width: 100%; font-family: inherit; }
+        .search-box { background: #F7F9FC; border: 1px solid #e2e8f0; border-radius: 8px; padding: 6px 12px; display: flex; align-items: center; gap: 8px; flex: 1 1 140px; min-width: 0; max-width: 220px; }
+        .search-box input { background: transparent; border: none; outline: none; font-size: 12px; width: 100%; min-width: 0; font-family: inherit; }
         .search-box:focus-within { border-color: ${BRAND.blue}; box-shadow: 0 0 0 3px rgba(0,114,206,0.15); }
 
         .matrix-outer-container {
@@ -1889,6 +2230,69 @@ export default function App() {
         .diag-card h3 { font-size: 12px; font-weight: 900; color: ${BRAND.blueDark}; text-transform: uppercase; letter-spacing: 0.08em; margin: 0 0 8px; }
         .diag-card input { font-family: inherit; }
 
+        /* LINE DOWNTIME */
+        .dt-wrap { display: flex; flex-direction: column; gap: 14px; max-width: 1500px; }
+        .dt-intro { margin: 0; max-width: 800px; font-size: 13px; line-height: 1.5; color: #475569; }
+        .dt-add { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; width: 100%; max-width: 760px; }
+        .dt-field { display: flex; flex-direction: column; gap: 4px; font-size: 10px; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b; min-width: 0; }
+        .dt-field.grow { flex: 1 1 260px; }
+        .dt-field input { font-family: inherit; font-size: 13px; font-weight: 600; letter-spacing: 0; text-transform: none; padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 8px; background: #fff; color: #1F2937; min-width: 0; }
+        .dt-field input:focus { outline: none; border-color: ${BRAND.blue}; box-shadow: 0 0 0 3px rgba(0,114,206,0.15); }
+        .dt-msg { flex: 1 0 100%; min-height: 17px; font-size: 12px; line-height: 17px; font-weight: 700; }
+        .dt-msg.error { color: #b91c1c; }
+        .dt-msg.ok { color: #15803d; }
+        .dt-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
+        .dt-label { margin-top: 4px; font-size: 10px; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; color: ${BRAND.blueDark}; }
+        .dt-label span { margin-left: 6px; font-weight: 700; letter-spacing: 0; text-transform: none; color: #64748b; font-size: 11px; }
+        .dt-label.inline { margin: 0; }
+        .dt-range-text { min-width: 200px; text-align: center; font-size: 12px; font-weight: 800; color: ${BRAND.blueDark}; }
+        .dt-legend { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px 14px; margin-left: auto; font-size: 11px; font-weight: 700; color: #475569; }
+        .dt-sw { display: inline-block; width: 14px; height: 14px; margin-right: 5px; border-radius: 4px; vertical-align: -2px; }
+        .dt-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; align-items: start; }
+        .dt-card { display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 16px; background: #fff; border: 1px solid #dbe3ee; border-radius: 12px; box-shadow: 0 4px 12px -2px rgba(0,70,139,0.08); }
+        .dt-card-head { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px 10px; }
+        .dt-card-head h3 { flex: 1 1 160px; min-width: 0; margin: 0; font-size: 14px; font-weight: 900; color: ${BRAND.blueDark}; overflow-wrap: anywhere; }
+        .dt-chip { padding: 2px 10px; border-radius: 12px; font-size: 10px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; white-space: nowrap; }
+        .dt-chip.run { background: #F1F5F9; color: #475569; }
+        .dt-chip.down { background: ${BRAND.blueSoft}; color: ${BRAND.blueDark}; border: 1px solid ${BRAND.blueLine}; }
+        .dt-link { flex: none; padding: 2px 4px; border: none; background: none; font-family: inherit; font-size: 11px; font-weight: 700; color: #64748b; cursor: pointer; text-decoration: underline; }
+        .dt-link:hover { color: ${BRAND.red}; }
+        .dt-confirm { flex: none; display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px; font-size: 11px; font-weight: 700; color: #475569; }
+        .page-btn.danger { color: #fff; background: ${BRAND.red}; border-color: ${BRAND.red}; }
+        .page-btn.danger:hover:not(:disabled) { background: #b8001f; border-color: #b8001f; color: #fff; }
+        .dt-days { display: flex; gap: 4px; }
+        .dt-day { flex: 1 1 0; min-width: 0; padding: 8px 0; border: 1px solid #cbd5e1; border-radius: 8px; background: #fff; color: #475569; font-family: inherit; font-size: 11px; font-weight: 800; cursor: pointer; transition: 0.1s; }
+        .dt-day:hover { border-color: ${BRAND.blue}; color: ${BRAND.blue}; }
+        .dt-day.on { background: ${BRAND.blue}; border-color: ${BRAND.blue}; color: #fff; box-shadow: 0 4px 10px rgba(0,114,206,0.25); }
+        .dt-day:focus-visible, .dt-x:focus-visible, .dt-link:focus-visible { outline: 2px solid ${BRAND.blueDark}; outline-offset: 2px; }
+        .dt-note { margin: 0; font-size: 12px; color: #475569; }
+        .dt-hint { margin: 0; font-size: 11px; color: #64748b; }
+        .dt-error { margin: 0; font-size: 12px; font-weight: 700; color: #b91c1c; }
+        .dt-range-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
+        .dt-range-form .dt-field { flex: 1 1 130px; }
+        .dt-range-form .sync-btn { padding: 8px 18px; }
+        .dt-ranges { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+        .dt-ranges li { display: flex; align-items: center; gap: 8px; padding: 4px 6px 4px 10px; border: 1px solid ${BRAND.yellow}; border-left-width: 4px; border-radius: 8px; background: ${BRAND.yellowSoft}; font-size: 12px; font-weight: 700; color: #1F2937; }
+        .dt-ranges li.past { border-color: #e2e8f0; background: #F8FAFC; color: #64748b; }
+        .dt-range-label { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+        .dt-range-n { flex: none; font-size: 11px; font-weight: 600; color: #64748b; }
+        .dt-x { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0; border: none; border-radius: 6px; background: transparent; color: #64748b; cursor: pointer; }
+        .dt-x:hover { background: #fff; color: ${BRAND.red}; }
+        .dt-strip { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 3px; margin-top: 4px; }
+        .dt-strip-h { text-align: center; font-size: 10px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; color: #64748b; }
+        .dt-cell { display: flex; align-items: center; justify-content: center; height: 28px; border-radius: 6px; background: #F1F5F9; color: #475569; font-size: 11px; font-weight: 700; white-space: nowrap; }
+        .dt-cell.first { font-size: 9px; }
+        .dt-cell.sched { background: ${BRAND.blue}; color: #fff; }
+        .dt-cell.off { background: ${BRAND.yellow}; color: ${BRAND.blueDark}; }
+        .dt-cell.both { background: ${BRAND.blue}; color: #fff; box-shadow: inset 0 -5px 0 ${BRAND.yellow}; }
+        .dt-cell.today { outline: 2px solid ${BRAND.blueDark}; outline-offset: 1px; font-weight: 900; }
+        .dt-sw.sched { background: ${BRAND.blue}; }
+        .dt-sw.off { background: ${BRAND.yellow}; }
+        .dt-sw.both { background: ${BRAND.blue}; box-shadow: inset 0 -5px 0 ${BRAND.yellow}; }
+        .dt-empty { font-size: 13px; color: #475569; }
+        .dt-foot { margin: 0; font-size: 12px; font-weight: 700; color: #475569; }
+        .dt-foot.warn { color: #b45309; }
+
         /* MODAL DIALOG */
         .modal-overlay {
           position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
@@ -2050,7 +2454,7 @@ export default function App() {
         <div className="brand-header-row">
           <div style={{ minWidth: 0, flex: 1 }}>
             <h1 className="brand-title"><ClockIcon style={{ marginRight: '10px', color: BRAND.blue }} /> MSS Matrix</h1>
-            <p className="brand-subtitle">Master Sanitation Schedule · {visibleMonths.length ? `${visibleMonths.map(m => MONTHS[m].slice(0, 3)).join(', ')} ${anchorYear}` : `${anchorYear} · no months selected`}</p>
+            <p className="brand-subtitle">Master Sanitation Schedule · {visibleMonths.length ? `${visibleMonths.map(m => MONTHS[m].slice(0, 3)).join(', ')} ${anchorYear}` : `${anchorYear} · no months selected`}<span data-testid="build-tag" style={{ fontWeight: 'normal', color: '#94a3b8' }}> · {BUILD}</span></p>
           </div>
           <div className="flex items-center" style={{ gap: '16px', flexShrink: 0 }}>
             <div className="flex items-center" style={{ gap: '8px' }}>
@@ -2064,12 +2468,13 @@ export default function App() {
         <div className="brand-nav">
           <button className={`brand-tab ${activeTab === 'master' ? 'active' : ''}`} onClick={() => setActiveTab('master')}>Compliance Matrix</button>
           <button className={`brand-tab ${activeTab === 'payloads' ? 'active' : ''}`} onClick={() => setActiveTab('payloads')}>Payload Diagnostics</button>
+          <button className={`brand-tab ${activeTab === 'downtime' ? 'active' : ''}`} onClick={() => setActiveTab('downtime')} data-testid="tab-downtime">Line Downtime</button>
           <span style={{ width: '1px', height: '22px', background: '#e2e8f0', margin: '0 6px' }} />
           <div className="search-box">
             <SearchIcon /><input placeholder="Filter items..." value={searchQuery} onChange={e => { setSearchQuery(e.target.value); setCurrentPage(0); setAreaPages({}); setModalPages({}); }} />
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px', background: '#F7F9FC', border: '1px solid #e2e8f0', padding: '4px 12px', borderRadius: '20px', fontSize: '11px', fontWeight: 'bold', color: '#64748b' }}>
-            <ZoomInIcon /><input type="range" min="0.8" max="2.0" step="0.1" value={zoom} onChange={e => setZoom(parseFloat(e.target.value))} />
+            <ZoomInIcon /><input className="zoom-range" type="range" min="0.8" max="2.0" step="0.1" value={zoom} onChange={e => setZoom(parseFloat(e.target.value))} />
             <span>{Math.round(zoom * 100)}%</span>
           </div>
           <button className="sync-btn" onClick={triggerSync} disabled={isLoading || isSaving}><RefreshIcon style={isLoading ? { animation: 'spin 1s linear infinite' } : {}} /> Sync Dataverse</button>
@@ -2083,7 +2488,7 @@ export default function App() {
           {canWriteBack && textLinks.size > 0 && (
             <button className="sync-btn yellow" onClick={saveTextMatches} disabled={isSaving || isLoading} title="Writes craa5_equipmentguid on the text-matched logs in Dataverse">{isSaving ? 'Saving...' : `Save ${textLinks.size} text match${textLinks.size === 1 ? '' : 'es'} to Dataverse`}</button>
           )}
-          <span data-testid="match-stats" title="Green = matched by Dataverse id. Yellow = matched by equipment name (the stored id was blank or matched no equipment row). Counts cover the logs loaded so far for the equipment and months you have viewed since the last Sync." style={{ fontSize: '11px', fontWeight: 'bold', color: '#475569', whiteSpace: 'nowrap' }}><span style={{ color: BRAND.green }}>■</span> id {completionIndex.stats.id} · <span style={{ color: BRAND.yellow }}>■</span> text {completionIndex.stats.text} · unmapped {completionIndex.stats.unmapped}{completionIndex.stats.duplicate ? ` · duplicate ${completionIndex.stats.duplicate}` : ''}{logsLoading ? ' · loading…' : ''}<span style={{ fontWeight: 'normal', color: '#94a3b8' }}> · {BUILD}</span></span>
+          <span data-testid="match-stats" title="Green = matched by Dataverse id. Yellow = matched by equipment name (the stored id was blank or matched no equipment row). Counts cover the logs loaded so far for the equipment and months you have viewed since the last Sync." style={{ fontSize: '11px', fontWeight: 'bold', color: '#475569', whiteSpace: 'nowrap' }}><span style={{ color: BRAND.green }}>■</span> id {completionIndex.stats.id} · <span style={{ color: BRAND.yellow }}>■</span> text {completionIndex.stats.text} · unmapped {completionIndex.stats.unmapped}{completionIndex.stats.duplicate ? ` · duplicate ${completionIndex.stats.duplicate}` : ''}{logsLoading ? ' · loading…' : ''}</span>
           {loadErrors.length > 0 && <button className="page-btn" style={{ color: BRAND.red, whiteSpace: 'normal', textAlign: 'left', maxWidth: '420px' }} onClick={retryLoads} title={loadErrors[loadErrors.length - 1]}>Some logs failed to load: {loadErrors[loadErrors.length - 1].slice(0, 140)} · Retry</button>}
         </div>
         {isLoading && <div className="progress-bar" style={{ width: `${loadProgress}%` }} />}
@@ -2238,6 +2643,8 @@ export default function App() {
                 )}
              </div>
           </main>
+        ) : activeTab === 'downtime' ? (
+          <LineDowntimeTab assets={assets} lines={downtime.lines} setLines={downtime.setLines} saved={downtime.saved} />
         ) : (
           <main className="matrix-outer-container">
             <div className="viewport">
