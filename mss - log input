@@ -80,6 +80,12 @@ import {
   in a different room/area than the entry names. Identical entries are grouped,
   the closest equipment is ranked (SAP order first, then name in the same room
   and area) and the chosen ID is written back.
+  Break up: an old entry that covers several pieces of equipment (its text lists
+  them, or the equipment has since been split into records named after it) can
+  be broken up. The entry keeps the first piece and a new entry is saved for each
+  other piece with the same date, SAP order and initials; the hours are shared
+  out evenly and a piece already logged for that order and date is not saved
+  again. The pieces are suggested, never ticked, and can be searched by hand.
   Unify duplicates: for one room (and optionally one area), finds equipment
   records that are the same equipment (same name; with the option ticked, also
   similar names) in the same room and area, lists them newest first (by when
@@ -149,7 +155,7 @@ const FIX_SELECT = ['craa5__log_id', 'craa5_equipment', 'craa5_equipmentguid', '
 const LIMITS = {
   orderSuggest: 100, orderRows: 300, assetSearch: 25, assetNames: 80, idChunk: 20, nameChunk: 5, prevEntries: 300, fuzzyLines: 30,
   logPage: 50, logMax: 500, calendar: 600, dashboard: 1000, fixGroupsShown: 200, retroPage: 200, retroRounds: 25, unifyAssets: 500, countCap: 500,
-  familyPage: 500, familyPages: 4, familyLinkedPages: 2, familyWriteMax: 2000, evidence: 100,
+  familyPage: 500, familyPages: 4, familyLinkedPages: 2, familyWriteMax: 2000, evidence: 100, splitLoggedPages: 6, splitPieces: 12,
 };
 
 // --- HELPERS ---
@@ -209,9 +215,10 @@ const LINE_PROBLEM = /highlighted line|equipment line|Two lines|needs hours grea
 
 const splitHours = (total, n) => {
   if (!n || !(total > 0)) return [];
-  const each = Math.floor((total / n) * 100) / 100;
-  const out = Array(n).fill(each);
-  out[n - 1] = Math.round((total - each * (n - 1)) * 100) / 100;
+  const cents = Math.round(total * 100);
+  const each = Math.floor(cents / n);
+  const out = Array(n).fill(each / 100);
+  out[n - 1] = (cents - each * (n - 1)) / 100;
   return out;
 };
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
@@ -1006,8 +1013,10 @@ const makeStore = (api) => {
     },
     // Every entry of a group's equipment (same name, room and area) that needs this equipment: no ID, an ID that no longer
     // exists, or one of the wrong IDs given. Entries already on other existing equipment are only counted. Read page by page.
+    // assetId may be a list (an entry broken up into pieces): entries already on any of them are left alone.
     async familyToFix(g, assetId, wrongIds, places) {
       if (!canonName(g.equipment)) return { rows: [], kept: 0, keptMore: false, capped: false };
+      const keep = [].concat(assetId).map(cleanGuid).filter(Boolean);
       const readAll = async (filter, maxPages) => {
         const out = [];
         let pg = await api.page(LOG_TABLE, { select: FIX_SELECT, filter, top: LIMITS.familyPage });
@@ -1021,11 +1030,11 @@ const makeStore = (api) => {
       const base = familyFilter(g, places);
       const [blank, linked] = await Promise.all([
         readAll(`${base} and ${BLANK_GUID}`, LIMITS.familyPages),
-        readAll(`${base} and ${LINKED} and ${guidNe('craa5_equipmentguid', assetId)}`, LIMITS.familyLinkedPages),
+        readAll(`${base} and ${LINKED}${keep.map(id => ` and ${guidNe('craa5_equipmentguid', id)}`).join('')}`, LIMITS.familyLinkedPages),
       ]);
       await resolve(linked.rows.map(r => r.craa5_equipmentguid));
       const wrong = (wrongIds || []).map(cleanGuid);
-      const fix = linked.rows.filter(r => { const id = cleanGuid(r.craa5_equipmentguid); return id !== cleanGuid(assetId) && (wrong.includes(id) || store.isGone(id)); });
+      const fix = linked.rows.filter(r => { const id = cleanGuid(r.craa5_equipmentguid); return keep.indexOf(id) < 0 && (wrong.includes(id) || store.isGone(id)); });
       const fixIds = new Set(fix.map(r => r.craa5__log_id));
       const keptIds = linked.rows.filter(r => !fixIds.has(r.craa5__log_id)).map(r => cleanGuid(r.craa5_equipmentguid));
       return { rows: blank.rows.concat(fix), kept: keptIds.length, keptIds, keptMore: linked.capped, capped: blank.capped || linked.capped };
@@ -1401,6 +1410,222 @@ const repointRows = async (api, rows, from, target) => {
   return { fixed: movedIds.length, failed: rows.length - movedIds.length, error, movedIds };
 };
 
+// --- BREAKING AN ENTRY UP INTO PIECES ---
+// An old entry can cover several things ("Floor Cleaning, shadow board + tools") that are separate equipment records now.
+// Breaking it up keeps the existing entry for the first piece and saves one new entry for every other piece, with the same
+// date, SAP order and initials. The hours are shared out evenly, so their total stays the same. A piece that already has an
+// entry for that order and date is not saved again.
+const LISTING = /\s*(?:[,;+&\/]|\band\b|\bplus\b)\s*/i;
+// The things a text lists ("Mixers 1, 2 & 3" -> Mixers 1, mixers 2, mixers 3); [] unless it lists two or more
+const textParts = (text) => {
+  const out = [];
+  safeString(text).split(LISTING).map(x => x.trim()).filter(x => /[a-z0-9]/i.test(x)).forEach(x => {
+    if (/^\d+$/.test(x)) {
+      // A bare number takes the words of the part before it
+      const words = out.length ? tokenize(out[out.length - 1]).filter(w => !/^\d+$/.test(w)) : [];
+      if (words.length) out.push(`${words.join(' ')} ${x}`);
+      return;
+    }
+    if (/[a-z0-9]{2}/i.test(x)) out.push(x);
+  });
+  const seen = new Set();
+  const list = out.filter(x => { const k = canonName(x); if (!k || seen.has(k)) return false; seen.add(k); return true; });
+  return list.length >= 2 ? list : [];
+};
+// Equipment records with the same name, room and area (twins, which the Unify tab merges) are one piece: the one more log
+// entries already use, else the first. uses remembers the counts (id -> lookup) for the scan that passes it in.
+const oneOfTwins = async (store, list, uses = new Map()) => {
+  const useOf = (id) => { if (!uses.has(id)) uses.set(id, store.logUse(id)); return uses.get(id); };
+  const key = (a) => [canonName(a.name), placeKey(a.room), placeKey(a.area)].join('|');
+  const sets = new Map(); // key -> its records, in the order first seen
+  list.forEach(a => { const k = key(a); if (!sets.has(k)) sets.set(k, []); sets.get(k).push(a); });
+  const keys = Array.from(sets.keys());
+  const picked = await pool(keys, 3, async (k) => {
+    const twins = sets.get(k).slice().sort((x, y) => (x.id < y.id ? -1 : 1));
+    if (twins.length === 1) return twins[0];
+    const counts = await pool(twins, 3, (a) => useOf(a.id));
+    let best = 0;
+    twins.forEach((a, i) => { if (counts[i].ok && (!counts[best].ok || counts[i].value.n > counts[best].value.n)) best = i; });
+    return twins[best];
+  });
+  return picked.map((r, i) => (r.ok ? r.value : sets.get(keys[i])[0]));
+};
+// Equipment an old entry may now be spread over: the things its text lists, or else the equipment whose names start from the
+// entry's own name ("Smock Racking" -> "Smock Racking left" and "Smock Racking right"). Only equipment in the entry's own room
+// and area, only for entries that name both, and never when equipment with the entry's own name is there (that is the match).
+// A hint only: nothing is ticked for the admin.
+const suggestPieces = async (store, g, uses) => {
+  if (!(placeKey(g.room) && placeKey(g.area)) || !canonName(g.equipment)) return null;
+  const here = (a) => samePlace(g.room, a.room) && samePlace(g.area, a.area);
+  if ((g.ranked || []).some(c => canonName(c.asset.name) === canonName(g.equipment) && here(c.asset))) return null;
+  const parts = textParts(g.equipment);
+  if (parts.length) {
+    const rs = await pool(parts, 3, async (part) => {
+      const q = nameProfile(part);
+      const want = { equipment: part, room: g.room, area: g.area };
+      const scored = (await store.assetsLikeName(q, g.room)).filter(here)
+        .map(a => ({ a, s: scoreAsset(want, a, q) })).filter(c => c.s >= 0.8)
+        .sort((x, y) => y.s - x.s || (x.a.id < y.a.id ? -1 : 1));
+      if (!scored.length) return null;
+      // Equally good records with one name (twins) are one piece: the one the log uses. Several differently named ones
+      // ("Racking left" / "Racking right" for "Racking") are not guessed between: the part counts as not found
+      const tied = scored.filter(c => c.s >= scored[0].s - 1e-9).map(c => c.a);
+      if (tied.some(a => canonName(a.name) !== canonName(tied[0].name))) return null;
+      return (await oneOfTwins(store, tied, uses))[0];
+    });
+    const assets = uniqueById(rs.filter(r => r.ok && r.value).map(r => r.value));
+    return assets.length >= 2 ? { how: 'text', assets, missing: parts.filter((x, i) => !(rs[i].ok && rs[i].value)) } : null;
+  }
+  const p = nameProfile(g.equipment);
+  const stems = (words) => words.map(w => (w.length > 3 ? w.replace(/s$/, '') : w));
+  const mine = stems(p.words);
+  if (!mine.length) return null;
+  const found = await store.assetsLikeName(p, g.room);
+  // The entry's own room has more equipment with this word than one search returns: a partial list would look complete
+  // (rows of other rooms, which the last search of assetsLikeName adds, do not count)
+  if (found.filter(a => samePlace(g.room, a.room)).length >= LIMITS.assetNames) return null;
+  // Names that start with the entry's words and numbers and have at least one more word or number ("Racking" -> "Racking left", "Racking 2")
+  const kids = found.filter(here).filter(a => {
+    const q = nameProfile(a.name);
+    const theirs = stems(q.words);
+    return mine.every((w, i) => theirs[i] === w) && p.numList.every(n => q.numList.indexOf(n) >= 0)
+      && theirs.length + q.numList.length > mine.length + p.numList.length;
+  }).sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
+  // Many more than a handful is a guess, not a suggestion: the admin picks the pieces
+  const names = new Set(kids.map(a => canonName(a.name)));
+  if (names.size < 2 || names.size > LIMITS.splitPieces) return null;
+  return { how: 'name', assets: await oneOfTwins(store, kids, uses), missing: [] };
+};
+// A blank room or area on the piece is filled in from the entry, unless the piece is somewhere else than the entry says
+const pieceFields = (a, row) => {
+  const same = !!row && placeOk({ room: row.craa5_room, area: row.craa5_area }, a);
+  return { craa5_equipmentguid: a.id, craa5_equipment: a.name, craa5_room: a.room || (same ? safeString(row.craa5_room) : ''), craa5_area: a.area || (same ? safeString(row.craa5_area) : '') };
+};
+// Hours of the old entry for one piece: its share when they can be shared out, else the entry's own value (null: none)
+const hoursFor = (row, count, index) => {
+  const raw = row.craa5_hoursworked;
+  if (raw === null || raw === undefined || raw === '') return null;
+  const total = Number(raw);
+  if (!(total > 0) || count < 2) return raw;
+  return splitHours(total, count)[index];
+};
+// A new entry for another piece: what the old entry says (date, SAP order, initials), with the piece in place of the equipment
+const entryForPiece = (row, a, hours) => {
+  const e = pieceFields(a, row);
+  if (safeString(row.craa5_sap)) e.craa5_sap = row.craa5_sap;
+  if (safeString(row.craa5_lastcleaned)) e.craa5_lastcleaned = row.craa5_lastcleaned;
+  if (safeString(row.craa5_lastcleanedby)) e.craa5_lastcleanedby = row.craa5_lastcleanedby;
+  if (hours !== null && hours !== undefined) e.craa5_hoursworked = hours;
+  return e;
+};
+// The entries to break up, read just before anything is written (by id, a few at a time)
+const readEntries = async (api, ids) => {
+  const rs = await pool(chunked(ids, LIMITS.idChunk), 3, (c) => api.query(LOG_TABLE, { select: LOG_SELECT, filter: c.map(id => `craa5__log_id eq ${id}`).join(' or '), top: c.length }));
+  const bad = rs.find(r => !r.ok);
+  if (bad) throw bad.error;
+  const out = new Map();
+  rs.forEach(r => r.value.forEach(row => out.set(cleanGuid(row.craa5__log_id), row)));
+  return out;
+};
+// A piece's entries between two dates (page by page, capped), to see which dates it is already logged on
+const loggedFor = async (api, pieceId, from, to) => {
+  const list = [];
+  let pg = await api.page(LOG_TABLE, { select: ['craa5__log_id', 'craa5_sap', 'craa5_lastcleaned'], filter: `${guidEq('craa5_equipmentguid', pieceId)} and craa5_lastcleaned ge ${from}T00:00:00Z and craa5_lastcleaned lt ${nextDay(to)}T00:00:00Z`, top: LIMITS.familyPage });
+  for (let pages = 1; ; pages++) {
+    pg.rows.forEach(r => list.push({ id: r.craa5__log_id, sap: normCode(r.craa5_sap), day: dayKey(r.craa5_lastcleaned) }));
+    if (!pg.next) return { list, capped: false };
+    if (pages >= LIMITS.splitLoggedPages) return { list, capped: true };
+    pg = await pg.next();
+  }
+};
+// For each entry to break up, the pieces that still need an entry: not those another entry already covers for the same
+// SAP order and date. jobs: [{ id, pieces }]. Reads only; throws if it cannot check.
+const planSplits = async (api, jobs) => {
+  const rows = await readEntries(api, Array.from(new Set(jobs.map(j => j.id))));
+  const days = [];
+  jobs.forEach(j => { const r = rows.get(cleanGuid(j.id)); const d = r ? dayKey(r.craa5_lastcleaned) : ''; if (d) days.push(d); });
+  days.sort();
+  const pieceIds = Array.from(new Set(jobs.reduce((all, j) => all.concat(j.pieces.map(x => x.id)), [])));
+  const logged = new Map(); // piece id -> its entries { id, sap, day }
+  const capped = [];
+  if (days.length) {
+    const rs = await pool(pieceIds, 3, (id) => loggedFor(api, id, days[0], days[days.length - 1]));
+    const bad = rs.find(r => !r.ok);
+    if (bad) throw bad.error;
+    rs.forEach((r, i) => { logged.set(pieceIds[i], r.value.list); if (r.value.capped) capped.push(pieceIds[i]); });
+  }
+  // What earlier entries of this same plan will already cover, so two entries for the same order and date do not both save a piece
+  const claimed = new Set();
+  const items = jobs.map(j => {
+    const row = rows.get(cleanGuid(j.id));
+    if (!row) return { id: j.id, gone: true, pieces: j.pieces, todo: [] };
+    const sap = normCode(row.craa5_sap);
+    const day = dayKey(row.craa5_lastcleaned);
+    if (!day) return { id: j.id, row, pieces: j.pieces, todo: [], undated: true };
+    const claim = (x) => `${cleanGuid(x.id)}|${sap}|${day}`;
+    const have = (x) => claimed.has(claim(x)) || (logged.get(x.id) || []).some(e => e.day === day && e.sap === sap && cleanGuid(e.id) !== cleanGuid(row.craa5__log_id));
+    const todo = j.pieces.filter(x => !have(x));
+    todo.forEach(x => claimed.add(claim(x)));
+    return { id: j.id, row, pieces: j.pieces, todo };
+  });
+  return { items, capped };
+};
+// Saves the new entries first, then points the old entry at the first piece: an entry that could not get all its new
+// entries stays as it was and can be applied again (pieces already saved are found and skipped the next time).
+const runSplits = async (api, items, onStep) => {
+  const out = { rows: 0, created: 0, failedRows: 0, error: '', fixedIds: [], pieceSkips: 0, leftAlone: 0, gone: 0, undated: 0 };
+  let done = 0;
+  await pool(items, 4, async (it) => {
+    try {
+      if (it.gone) { out.gone += 1; return; }
+      if (it.undated) { out.undated += 1; return; }
+      if (!it.todo.length) { out.leftAlone += 1; return; }
+      out.pieceSkips += it.pieces.length - it.todo.length;
+      const at = (x) => it.pieces.indexOf(x);
+      let failed = 0;
+      for (let i = 1; i < it.todo.length; i++) {
+        try { await api.create(LOG_TABLE, entryForPiece(it.row, it.todo[i], hoursFor(it.row, it.pieces.length, at(it.todo[i])))); out.created += 1; }
+        catch (e) { failed += 1; if (!out.error) out.error = errText(e); }
+      }
+      if (failed) { out.failedRows += 1; return; }
+      const first = it.todo[0];
+      const payload = pieceFields(first, it.row);
+      // Nothing else is left to save and the entry already is the first piece: an earlier apply went through (it may have reported
+      // an error), so its hours are shared out already. Writing them again would share them out a second time.
+      const cur = it.row;
+      if (it.todo.length === 1 && cleanGuid(cur.craa5_equipmentguid) === cleanGuid(first.id) && safeString(cur.craa5_equipment) === payload.craa5_equipment
+        && safeString(cur.craa5_room) === payload.craa5_room && safeString(cur.craa5_area) === payload.craa5_area) { out.rows += 1; out.fixedIds.push(it.id); return; }
+      const h = hoursFor(it.row, it.pieces.length, at(first));
+      if (h !== null && h !== undefined && h !== it.row.craa5_hoursworked) payload.craa5_hoursworked = h;
+      try { await api.update(LOG_TABLE, it.id, payload); }
+      catch (e) {
+        // A save can be applied although it reported an error (a timeout after it went through): look before calling it a failure,
+        // or applying again would share the hours out a second time
+        let now = null;
+        try { now = (await readEntries(api, [it.id])).get(cleanGuid(it.id)); } catch (_) { now = null; }
+        const applied = !!now && cleanGuid(now.craa5_equipmentguid) === cleanGuid(first.id) && safeString(now.craa5_equipment) === safeString(payload.craa5_equipment)
+          && (payload.craa5_hoursworked === undefined || Number(now.craa5_hoursworked) === Number(payload.craa5_hoursworked));
+        if (!applied) throw e;
+      }
+      out.rows += 1; out.fixedIds.push(it.id);
+    } catch (e) { out.failedRows += 1; if (!out.error) out.error = errText(e); }
+    finally { done += 1; if (onStep) onStep(done); }
+  });
+  return out;
+};
+// What a plan will do, for the question before anything is saved
+const splitStats = (items) => {
+  const live = items.filter(it => !it.gone && it.todo.length);
+  return {
+    rows: live.length,
+    creates: live.reduce((n, it) => n + it.todo.length - 1, 0),
+    pieceSkips: live.reduce((n, it) => n + it.pieces.length - it.todo.length, 0),
+    leftAlone: items.filter(it => !it.gone && !it.undated && !it.todo.length).length,
+    gone: items.filter(it => it.gone).length,
+    undated: items.filter(it => it.undated).length,
+  };
+};
+
 // Equipment already logged for an order on a date
 const fetchDupes = async (api, code, dateStr) => {
   const rows = await api.query(LOG_TABLE, {
@@ -1546,7 +1771,7 @@ const BrandLogo = () => {
 };
 
 // --- EQUIPMENT PICKER: server search as you type, small result list ---
-const AssetPicker = ({ store, onPick, exclude, initialQuery = '', ariaLabel = 'Search equipment', actionLabel = 'Add', placeholder = 'Start typing a name, room or area…', disabled = false }) => {
+const AssetPicker = ({ store, onPick, exclude, initialQuery = '', ariaLabel = 'Search equipment', actionLabel = 'Add', placeholder = 'Start typing a name, room or area…', disabled = false, autoFocus = false, idTails = false }) => {
   const styles = useStyles();
   const [q, setQ] = useState(initialQuery);
   const [res, setRes] = useState([]);
@@ -1566,10 +1791,14 @@ const AssetPicker = ({ store, onPick, exclude, initialQuery = '', ariaLabel = 'S
   }, [q, store]);
 
   const shown = res.filter(a => !exclude || !exclude.has(a.id));
+  // Records that look the same (same name, room and area) show the end of their ID, so the right one can be picked
+  const looks = (a) => normName(`${a.name}|${placeText(a)}`);
+  const twins = new Map();
+  if (idTails) res.forEach(a => twins.set(looks(a), (twins.get(looks(a)) || 0) + 1));
   return (
     <div>
       <div className={styles.field} style={{ maxWidth: 420 }}>
-        <Input aria-label={ariaLabel} autoComplete="off" placeholder={placeholder} value={q} onChange={(e, d) => setQ(d.value)} />
+        <Input aria-label={ariaLabel} autoComplete="off" autoFocus={autoFocus} placeholder={placeholder} value={q} onChange={(e, d) => setQ(d.value)} />
       </div>
       <div aria-live="polite">
         {busy && <Text className={styles.hint} block style={{ marginTop: 6 }}>Searching…</Text>}
@@ -1583,9 +1812,9 @@ const AssetPicker = ({ store, onPick, exclude, initialQuery = '', ariaLabel = 'S
               <tbody>
                 {shown.map(a => (
                   <tr key={a.id}>
-                    <td className={styles.td}><strong>{a.name}</strong></td><td className={styles.td}>{a.room}</td><td className={styles.td}>{a.area}</td>
+                    <td className={styles.td}><strong>{a.name}</strong>{twins.get(looks(a)) > 1 && <span className={styles.hint}> · ID …{shortId(a.id)}</span>}</td><td className={styles.td}>{a.room}</td><td className={styles.td}>{a.area}</td>
                     <td className={styles.td} style={{ textAlign: 'right' }}>
-                      <Button size="small" appearance="primary" className={styles.btnPrimary} disabled={disabled} aria-label={`${actionLabel} ${a.name} (${placeText(a)})`} onClick={() => onPick(a)}>{actionLabel}</Button>
+                      <Button size="small" appearance="primary" className={styles.btnPrimary} disabled={disabled} aria-label={`${actionLabel} ${a.name} (${placeText(a)})${twins.get(looks(a)) > 1 ? ` ID …${shortId(a.id)}` : ''}`} onClick={() => onPick(a)}>{actionLabel}</Button>
                     </td>
                   </tr>
                 ))}
@@ -2432,9 +2661,12 @@ const SCAN_MODES = {
   missing: { label: 'Entries with no equipment ID', kind: 'missing id', pageSize: 100, pages: 1 },
   unknown: { label: 'Entries whose ID no longer exists (slower)', kind: 'unknown id', pageSize: 200, pages: 5 },
   place: { label: 'Entries whose ID is equipment in another room or area (slower)', kind: 'other room/area', pageSize: 200, pages: 5 },
+  several: { label: 'Entries that list several pieces of equipment, whatever their ID (slower)', kind: 'several pieces', pageSize: 100, pages: 5 },
 };
+// Text that lists several things: a comma, semicolon, plus, ampersand or slash, or the word and / plus (the list is checked again on screen)
+const LISTS_SEVERAL = `(${[',', ';', '+', '&', '/', ' and ', ' And ', ' AND ', ' plus ', ' Plus ', ' PLUS '].map(x => `contains(craa5_equipment,'${x}')`).join(' or ')})`;
 const scanFilter = (mode, scope) => {
-  const parts = [mode === 'missing' ? BLANK_GUID : `craa5_equipmentguid ne null and craa5_equipmentguid ne ''`];
+  const parts = [mode === 'missing' ? BLANK_GUID : mode === 'several' ? LISTS_SEVERAL : `craa5_equipmentguid ne null and craa5_equipmentguid ne ''`];
   if (scope === 'year') parts.push(`craa5_lastcleaned ge ${daysAgo(366)}T00:00:00Z`);
   return parts.join(' and ');
 };
@@ -2502,6 +2734,50 @@ const EquipmentChoice = ({ store, label, options, value, disabled, onChoose, use
 const NO_MATCH = '__none';
 const INFO = '__info-';
 
+// What a break-up did, for the message under the buttons
+const splitSummary = (s) => [
+  s.rows > 0 && `Broke up ${plural(s.rows, 'entry', 'entries')} and saved ${plural(s.created, 'new entry', 'new entries')} for the other pieces${s.extra ? `, including ${plural(s.extra, 'more entry', 'more entries')} found in the log with the same name, room and area` : ''}.`,
+  s.rows === 0 && s.failedRows === 0 && 'Nothing was broken up.',
+  s.failedRows > 0 && `${plural(s.failedRows, 'entry', 'entries')} could not be broken up${s.error ? ` (${s.error})` : ''}. Anything saved for ${s.failedRows === 1 ? 'it' : 'them'} stays. Apply again to finish ${s.failedRows === 1 ? 'it' : 'them'} (scan again if ${s.failedRows === 1 ? 'it is' : 'they are'} not in the list).`,
+].filter(Boolean).join(' ');
+const splitNotes = (s) => [
+  s.pieceSkips > 0 && `${plural(s.pieceSkips, 'piece was', 'pieces were')} not saved again because ${s.pieceSkips === 1 ? 'it was' : 'they were'} already logged for that order and date.`,
+  s.leftAlone > 0 && `${plural(s.leftAlone, 'entry was', 'entries were')} left as ${s.leftAlone === 1 ? 'it is' : 'they are'} because every piece was already logged for that order and date.`,
+  s.gone > 0 && `${plural(s.gone, 'entry was', 'entries were')} not found (removed since the scan).`,
+  s.undated > 0 && `${plural(s.undated, 'entry has', 'entries have')} no date, so ${s.undated === 1 ? 'it was' : 'they were'} not broken up: there is no date to check the pieces against.`,
+].filter(Boolean).join(' ');
+
+// Break-up of one entry: the pieces so far, each with a remove button, and a search to add more
+const PiecesEditor = ({ store, g, list, disabled, onChange, missing = [] }) => {
+  const styles = useStyles();
+  const label = g.equipment || 'blank entry';
+  // Names in the entry's text that had no equipment: kept in view until the pieces are as many as the text lists
+  const lacking = missing.length > 0 && list.length < textParts(g.equipment).length ? missing : [];
+  const acted = useRef(false); // set once the admin adds or removes a piece here, so the search box takes the focus again (not when rows first appear)
+  const change = (next) => { acted.current = true; onChange(next); };
+  useEffect(() => { acted.current = false; }); // the flag is used by the render the action caused, then cleared
+  const sig = (a) => normName(`${a.name}|${placeText(a)}`);
+  const count = new Map();
+  list.forEach(a => count.set(sig(a), (count.get(sig(a)) || 0) + 1));
+  return (
+    <div>
+      <Text className={styles.hint} block>Break up into:</Text>
+      {lacking.length > 0 && <Text className={styles.hint} block>No equipment found for {lacking.map(x => `“${x}”`).join(', ')}: search below to add {lacking.length === 1 ? 'it' : 'them'}.</Text>}
+      {list.length === 0 && <Text className={styles.hint} block>Search below and add at least two pieces.</Text>}
+      {list.map(a => (
+        <div key={a.id} style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '2px' }}>
+          <span><strong>{a.name}</strong> · {placeText(a) || 'no room/area'}{count.get(sig(a)) > 1 ? ` · ID …${shortId(a.id)}` : ''}{!placeOk(g, a) && <span className={mergeClasses(styles.tag, styles.tagWarn)} style={{ marginLeft: 6 }}>other room/area</span>}</span>
+          <Button size="small" appearance="subtle" disabled={disabled} aria-label={`Remove ${a.name} from the pieces of ${label}`} onClick={() => change(list.filter(x => x.id !== a.id))}>✕</Button>
+        </div>
+      ))}
+      <div style={{ marginTop: '4px' }}>
+        <AssetPicker key={list.length} autoFocus={acted.current} idTails store={store} exclude={new Set(list.map(a => a.id))} ariaLabel={`Search equipment to add as a piece of ${label}`} placeholder="Search to add a piece…" disabled={disabled} onPick={(a) => change(list.concat([a]))} />
+      </div>
+      <Button size="small" appearance="transparent" disabled={disabled} aria-label={`One piece only: ${label}`} onClick={() => onChange(null)}>One piece only</Button>
+    </div>
+  );
+};
+
 const RepairIds = ({ ctx, onCount }) => {
   const styles = useStyles();
   const { api, store } = ctx;
@@ -2515,6 +2791,7 @@ const RepairIds = ({ ctx, onCount }) => {
   const [choice, setChoice] = useState({});      // groupKey -> assetId | ''
   const [apply, setApply] = useState({});        // groupKey -> bool
   const [extraOpts, setExtraOpts] = useState({});// groupKey -> assets picked through search
+  const [pieces, setPieces] = useState({});      // groupKey -> the equipment the entry is broken up into (a key here means break up is on)
   const [showAll, setShowAll] = useState(false);
   const [sameName, setSameName] = useState(true); // applying also fixes every other entry with the same name, room and area
   const [pending, setPending] = useState(null);   // same-name entries found by Apply, waiting for the admin's answer
@@ -2527,7 +2804,7 @@ const RepairIds = ({ ctx, onCount }) => {
   const resetScan = useCallback(() => {
     scanId.current += 1; nextRef.current = null; pendingRef.current = null; scannedRef.current = 0;
     setScan({ started: false, done: false, scanned: 0 });
-    setGroups([]); setChoice({}); setApply({}); setExtraOpts({}); setResult(null); setScanError(''); setPending(null);
+    setGroups([]); setChoice({}); setApply({}); setExtraOpts({}); setPieces({}); setResult(null); setScanError(''); setPending(null);
   }, []);
   useEffect(() => { resetScan(); }, [mode, scope, resetScan]);
 
@@ -2566,6 +2843,8 @@ const RepairIds = ({ ctx, onCount }) => {
         if (!pg.next) done = true;
         if (mode === 'missing') bad.push(...pg.rows);
         else if (mode === 'unknown') bad.push(...pg.rows.filter(r => !store.hasAsset(r.craa5_equipmentguid)));
+        // Entries whose text lists several things, unless their ID already points at equipment with that very name
+        else if (mode === 'several') bad.push(...pg.rows.filter(r => { const a = store.getAsset(r.craa5_equipmentguid); return textParts(r.craa5_equipment).length > 0 && !(a && sameText(a.name, r.craa5_equipment)); }));
         else bad.push(...pg.rows.filter(r => { const a = store.getAsset(r.craa5_equipmentguid); return a && placeDiffers(r, a); }));
       }
 
@@ -2577,8 +2856,8 @@ const RepairIds = ({ ctx, onCount }) => {
         const key = [canonName(l.equipment), placeKey(l.room), placeKey(l.area), l.sap, l.guid].join('|');
         const into = prior.get(key) || fresh.get(key);
         if (into) { if (!into.ids.includes(l.id)) into.ids = [...into.ids, l.id]; return; }
-        const current = mode === 'place' ? store.getAsset(l.guid) : null;
-        fresh.set(key, { key, equipment: l.equipment, room: l.room, area: l.area, sap: l.sap, kind: m.kind, mode, current, exclude: current ? current.id : null, ids: [l.id] });
+        const current = mode === 'place' || mode === 'several' ? store.getAsset(l.guid) : null;
+        fresh.set(key, { key, equipment: l.equipment, room: l.room, area: l.area, sap: l.sap, kind: m.kind, mode, current, exclude: mode === 'place' && current ? current.id : null, ids: [l.id] });
       });
       const todo = Array.from(fresh.values());
       let n = 0;
@@ -2589,21 +2868,40 @@ const RepairIds = ({ ctx, onCount }) => {
       });
       if (!live()) return;
       const added = todo.map((g, i) => ({ ...g, ...(ranks[i].ok ? ranks[i].value : { ranked: [], tier: 'none', ambiguous: false, conflict: false, check: null, lookupError: errText(ranks[i].error) }) }));
-      // A name (same room and area) already in the list keeps the equipment chosen there, if its rows agree
-      const famPick = new Map();
+      // Equipment an entry may now be spread over (the things its text lists, or equipment named after it): only a hint
+      const uses = new Map(); // equipment id -> its log count, looked up once per scan (not kept: the Unify tab reads fresh counts)
+      const hints = await pool(added, 3, (g) => suggestPieces(store, g, uses));
+      if (!live()) return;
+      added.forEach((g, i) => { g.suggest = hints[i].ok ? hints[i].value : null; });
+      // A name (same room and area) already in the list keeps the equipment chosen there (or the pieces it is broken up into), if its rows agree
+      const famPick = new Map(); // family -> 'P:' + the equipment chosen, 'S:' + the pieces, or null when its rows disagree
+      const famPieces = new Map();
       Array.from(prior.values()).forEach(g => {
-        if (!canonName(g.equipment) || !choice[g.key]) return;
+        if (!canonName(g.equipment)) return;
+        const list = pieces[g.key];
+        if (!list && !choice[g.key]) return;
         const k = familyKey(g);
-        famPick.set(k, famPick.has(k) && famPick.get(k) !== choice[g.key] ? null : choice[g.key]);
+        const sig = list ? `S:${list.map(a => a.id).sort().join(',')}` : `P:${choice[g.key]}`;
+        famPick.set(k, famPick.has(k) && famPick.get(k) !== sig ? null : sig);
+        if (list) famPieces.set(k, list);
       });
       const known = (id) => { let a = store.getAsset(id); prior.forEach(g => { if (!a) a = g.ranked.concat((extraOpts[g.key] || []).map(o => ({ asset: o }))).map(r => r.asset).find(o => o.id === id) || null; }); return a; };
       const inherited = new Map();
-      added.forEach(g => { const id = canonName(g.equipment) ? famPick.get(familyKey(g)) : null; const a = id ? known(id) : null; if (a) inherited.set(g.key, a); });
+      const inheritedPieces = new Map();
+      added.forEach(g => {
+        const sig = canonName(g.equipment) ? famPick.get(familyKey(g)) : null;
+        if (!sig) return;
+        if (sig.indexOf('S:') === 0) { inheritedPieces.set(g.key, famPieces.get(familyKey(g))); return; }
+        const a = known(sig.slice(2));
+        if (a) inherited.set(g.key, a);
+      });
       const own = (g) => (g.ranked.length && g.tier !== 'none' ? g.ranked[0].asset.id : '');
       setChoice(prev => { const x = { ...prev }; added.forEach(g => { const a = inherited.get(g.key); x[g.key] = a ? a.id : own(g); }); return x; });
       // High confidence is ticked (not when it differs from the choice made for the name); entries whose ID points elsewhere are always left for the admin to tick
-      setApply(prev => { const x = { ...prev }; added.forEach(g => { const a = inherited.get(g.key); x[g.key] = g.tier === 'high' && mode !== 'place' && (!a || a.id === own(g)); }); return x; });
+      setApply(prev => { const x = { ...prev }; added.forEach(g => { const a = inherited.get(g.key); x[g.key] = g.tier === 'high' && mode !== 'place' && !(mode === 'several' && g.current) && !g.suggest && !inheritedPieces.has(g.key) && (!a || a.id === own(g)); }); return x; });
       setExtraOpts(prev => { const x = { ...prev }; added.forEach(g => { const a = inherited.get(g.key); if (a && !g.ranked.some(r => r.asset.id === a.id)) x[g.key] = [a]; }); return x; });
+      // A fresh group never starts with pieces left over from an earlier row that had the same key
+      setPieces(prev => { const x = { ...prev }; added.forEach(g => { delete x[g.key]; }); inheritedPieces.forEach((list, key) => { x[key] = list; }); return x; });
       setGroups(() => {
         const merged = Array.from(prior.values()).concat(added);
         const order = { high: 0, medium: 1, low: 2, none: 3 };
@@ -2616,44 +2914,54 @@ const RepairIds = ({ ctx, onCount }) => {
   };
 
   // Only groups on screen can be applied
-  const visible = groups.filter(g => showAll || g.tier !== 'none' || choice[g.key] || g.lookupError);
+  const visible = groups.filter(g => showAll || g.tier !== 'none' || choice[g.key] || g.lookupError || g.suggest || pieces[g.key]);
   const hidden = groups.length - visible.length;
   const shown = visible.slice(0, LIMITS.fixGroupsShown);
-  const selected = shown.filter(g => apply[g.key] && choice[g.key]);
+  // A row can be applied once it has equipment chosen, or (broken up) at least two pieces
+  const isReady = (g) => (pieces[g.key] ? pieces[g.key].length >= 2 : !!choice[g.key]);
+  const selected = shown.filter(g => apply[g.key] && isReady(g));
   const selectedRows = selected.reduce((s, g) => s + g.ids.length, 0);
-  const highGroups = shown.filter(g => g.tier === 'high' && choice[g.key] && g.ranked.length && g.ranked[0].asset.id === choice[g.key]);
+  const highGroups = shown.filter(g => !pieces[g.key] && !g.suggest && g.tier === 'high' && choice[g.key] && g.ranked.length && g.ranked[0].asset.id === choice[g.key]);
   // Medium matches on screen whose suggestion is still the one chosen, not flagged ambiguous or disagreeing,
   // and (as for every bulk pick) with room and area filled in and the same on the entry and the equipment
-  const mediumGroups = shown.filter(g => g.tier === 'medium' && !g.ambiguous && !g.conflict && choice[g.key] && g.ranked.length && g.ranked[0].asset.id === choice[g.key] && sameRoomAndArea(g, g.ranked[0].asset));
+  const mediumGroups = shown.filter(g => !pieces[g.key] && !g.suggest && g.tier === 'medium' && !g.ambiguous && !g.conflict && choice[g.key] && g.ranked.length && g.ranked[0].asset.id === choice[g.key] && sameRoomAndArea(g, g.ranked[0].asset));
   const tickAll = (list) => setApply(p => { const x = { ...p }; list.forEach(g => { x[g.key] = true; }); return x; });
 
   const applySelected = async () => {
-    const todo = selected.filter(g => store.getAsset(choice[g.key]));
+    const todo = selected.filter(g => pieces[g.key] || store.getAsset(choice[g.key]));
     if (!todo.length) return;
     setBusy('apply'); setResult(null);
     // Entries pointing at other equipment keep their own text; blank entries get the equipment's details filled in
     const fill = (g, a) => (g.mode === 'place' ? {} : { ...(g.room ? {} : { craa5_room: a.room }), ...(g.area ? {} : { craa5_area: a.area }), ...(g.equipment ? {} : { craa5_equipment: a.name }) });
-    const jobs = new Map(); // log id -> { id, payload }
-    todo.forEach(g => { const a = store.getAsset(choice[g.key]); g.ids.forEach(id => jobs.set(id, { id, payload: { craa5_equipmentguid: a.id, ...fill(g, a) } })); });
+    // A job is { id, payload } (given one piece of equipment) or { id, pieces } (broken up into several)
+    const jobFor = (g, id) => {
+      if (pieces[g.key]) return { id, pieces: pieces[g.key] };
+      const a = store.getAsset(choice[g.key]);
+      return { id, payload: { craa5_equipmentguid: a.id, ...fill(g, a) } };
+    };
+    const jobs = new Map(); // log id -> job
+    todo.forEach(g => g.ids.forEach(id => jobs.set(id, jobFor(g, id))));
     const listed = jobs.size;
     const out = { extra: 0, moreIds: [], kept: 0, keptMore: false, mixed: 0, unplaced: 0, held: 0, capped: false, failedNames: [], declined: false };
+    let more = [];
     if (sameName) {
-      // The same name in the same room and area is the same equipment: every such entry gets the equipment chosen,
-      // unless the ticked rows for that name chose different equipment (then only those rows are written)
+      // The same name in the same room and area is the same equipment: every such entry gets the equipment chosen (or is broken
+      // up the same way), unless the ticked rows for that name chose differently (then only those rows are written)
+      const sigOf = (g) => (pieces[g.key] ? `S:${pieces[g.key].map(a => a.id).sort().join(',')}` : `P:${choice[g.key]}`);
       const fams = new Map();
       todo.forEach(g => {
         if (!canonName(g.equipment)) return;
         const k = familyKey(g);
-        const wrong = g.mode === 'place' && g.current ? [g.current.id] : [];
+        const wrong = (g.mode === 'place' || g.mode === 'several') && g.current ? [g.current.id] : [];
         const f = fams.get(k);
-        if (!f) { fams.set(k, { key: k, g, assetId: choice[g.key], wrong, mixed: false }); return; }
-        if (f.assetId !== choice[g.key]) f.mixed = true;
+        if (!f) { fams.set(k, { key: k, g, sig: sigOf(g), split: !!pieces[g.key], assets: pieces[g.key] || [store.getAsset(choice[g.key])], wrong, mixed: false }); return; }
+        if (f.sig !== sigOf(g)) f.mixed = true;
         f.wrong = f.wrong.concat(wrong);
       });
       const agreed = Array.from(fams.values()).filter(f => !f.mixed);
       out.mixed = fams.size - agreed.length;
       // Only a name with room and area filled in, and equipment in that same room and area, is spread to the rest of the log
-      const list = agreed.filter(f => sameRoomAndArea(f.g, store.getAsset(f.assetId)));
+      const list = agreed.filter(f => f.assets.every(a => sameRoomAndArea(f.g, a)));
       out.unplaced = agreed.length - list.length;
       list.forEach(f => {
         const rows = groups.filter(x => canonName(x.equipment) && familyKey(x) === f.key);
@@ -2661,20 +2969,20 @@ const RepairIds = ({ ctx, onCount }) => {
         f.places = { rooms: rows.map(r => r.room), areas: rows.map(r => r.area) };
         // Rows of this name in the list that were given other equipment (or No match) keep the admin's decision
         f.held = new Set();
-        rows.forEach(r => { if (choice[r.key] !== f.assetId) r.ids.forEach(id => f.held.add(id)); });
+        rows.forEach(r => { if (sigOf(r) !== f.sig) r.ids.forEach(id => f.held.add(id)); });
       });
       let n = 0;
       setProgress(`Looking through the log for other entries with the same names… 0 of ${list.length}`);
       const found = await pool(list, 3, async (f) => {
-        const r = await store.familyToFix(f.g, f.assetId, f.wrong, f.places);
+        // Entries already on the equipment chosen are left alone (broken up: on any of its pieces, unless that one is the wrong ID being repaired)
+        const keep = f.assets.map(a => a.id).filter(id => !f.split || f.wrong.indexOf(id) < 0);
+        const r = await store.familyToFix(f.g, keep, f.wrong, f.places);
         n += 1; setProgress(`Looking through the log for other entries with the same names… ${n} of ${list.length}`);
         return r;
       });
-      let more = [];
       found.forEach((r, i) => {
         const f = list[i];
         if (!r.ok) { out.failedNames.push(f.g.equipment); return; }
-        const a = store.getAsset(f.assetId);
         out.kept += r.value.kept;
         out.keptMore = out.keptMore || r.value.keptMore;
         out.capped = out.capped || r.value.capped;
@@ -2682,19 +2990,39 @@ const RepairIds = ({ ctx, onCount }) => {
           const id = row.craa5__log_id;
           if (jobs.has(id)) return;
           if (f.held.has(id)) { out.held += 1; return; }
-          more.push({ id, payload: { craa5_equipmentguid: a.id, ...fill(f.g, a) } });
+          more.push(jobFor(f.g, id));
         });
       });
+      // At most familyWriteMax writes (an entry broken up into pieces is one write for each piece)
       more = uniqueById(more);
-      if (more.length > LIMITS.familyWriteMax) { more = more.slice(0, LIMITS.familyWriteMax); out.capped = true; }
-      // More entries than were ticked: ask first (on the page, so it works where pop-up dialogs are blocked)
-      if (more.length) {
-        const inList = new Set();
-        groups.forEach(g => g.ids.forEach(id => inList.add(id)));
-        setPending({ jobs, more, listed, inList: more.filter(j => inList.has(j.id)).length, out });
-        setProgress(''); setBusy('confirm');
+      let budget = LIMITS.familyWriteMax;
+      const within = [];
+      for (let i = 0; i < more.length; i++) {
+        const cost = more[i].pieces ? more[i].pieces.length : 1;
+        if (cost > budget) { out.capped = true; break; }
+        budget -= cost; within.push(more[i]);
+      }
+      more = within;
+    }
+    // Entries to break up: find out which pieces still need an entry before asking
+    let plan = null;
+    const splitJobs = Array.from(jobs.values()).concat(more).filter(j => j.pieces);
+    if (splitJobs.length) {
+      setProgress('Checking which pieces are already logged…');
+      try { plan = await planSplits(api, splitJobs); }
+      catch (e) {
+        setResult({ ok: 0, failed: 0, error: '', ...out, extra: 0, split: null, planError: errText(e) });
+        setProgress(''); setBusy('');
         return;
       }
+    }
+    // More entries than were ticked, or entries to break up: ask first (on the page, so it works where pop-up dialogs are blocked)
+    if (more.length || plan) {
+      const inList = new Set();
+      groups.forEach(g => g.ids.forEach(id => inList.add(id)));
+      setPending({ jobs, more, listed, inList: more.filter(j => inList.has(j.id)).length, out, plan });
+      setProgress(''); setBusy('confirm');
+      return;
     }
     await writeJobs(Array.from(jobs.values()), out);
   };
@@ -2707,23 +3035,43 @@ const RepairIds = ({ ctx, onCount }) => {
     pd.jobs.forEach((j, id) => jobs.set(id, j));
     const out = { ...pd.out };
     if (withMore) pd.more.forEach(j => { if (!jobs.has(j.id)) { jobs.set(j.id, j); out.moreIds.push(j.id); } });
-    else out.declined = true;
-    await writeJobs(Array.from(jobs.values()), out);
+    else if (pd.more.length) out.declined = true;
+    // Entries to break up are read again now: pieces saved or entries removed while the question was open are not missed
+    let items = [];
+    const splitJobs = Array.from(jobs.values()).filter(j => j.pieces);
+    if (pd.plan && splitJobs.length) {
+      setBusy('apply'); setProgress('Checking which pieces are already logged…');
+      try { items = (await planSplits(api, splitJobs)).items; }
+      catch (e) {
+        setResult({ ok: 0, failed: 0, error: '', ...out, extra: 0, split: null, planError: errText(e) });
+        setProgress(''); setBusy('');
+        return;
+      }
+    }
+    await writeJobs(Array.from(jobs.values()).filter(j => !j.pieces), out, items);
   };
 
-  const writeJobs = async (all, out) => {
+  // all: entries given one piece of equipment { id, payload }; splitItems: entries broken up into pieces (from the plan)
+  const writeJobs = async (all, out, splitItems = []) => {
     setBusy('apply');
     let done = 0;
-    setProgress(`Updating entries… 0 of ${all.length}`);
+    if (all.length) setProgress(`Updating entries… 0 of ${all.length}`);
     const res = await pool(all, 8, async (j) => {
       await api.update(LOG_TABLE, j.id, j.payload);
       done += 1; if (done % 25 === 0 || done === all.length) setProgress(`Updating entries… ${done} of ${all.length}`);
     });
     const fixed = new Set(all.filter((j, i) => res[i].ok).map(j => j.id));
     const firstError = res.find(r => !r.ok);
+    let split = null;
+    if (splitItems.length) {
+      setProgress(`Breaking up entries… 0 of ${splitItems.length}`);
+      split = await runSplits(api, splitItems, (k) => setProgress(`Breaking up entries… ${k} of ${splitItems.length}`));
+      split.extra = out.moreIds.filter(id => split.fixedIds.indexOf(id) >= 0).length;
+    }
+    const finished = new Set(Array.from(fixed).concat(split ? split.fixedIds : []));
     // Remove fixed entries from every row of the list (same-name rows included); nothing is rescanned
-    setGroups(prev => prev.map(g => ({ ...g, ids: g.ids.filter(id => !fixed.has(id)) })).filter(g => g.ids.length));
-    setResult({ ok: fixed.size, failed: all.length - fixed.size, error: firstError ? errText(firstError.error) : '', ...out, extra: out.moreIds.filter(id => fixed.has(id)).length });
+    setGroups(prev => prev.map(g => ({ ...g, ids: g.ids.filter(id => !finished.has(id)) })).filter(g => g.ids.length));
+    setResult({ ok: fixed.size, failed: all.length - fixed.size, error: firstError ? errText(firstError.error) : '', ...out, extra: out.moreIds.filter(id => fixed.has(id)).length, split });
     setProgress('');
     ctx.dataChanged();
     setBusy('');
@@ -2750,12 +3098,33 @@ const RepairIds = ({ ctx, onCount }) => {
     });
   };
 
+  // Breaking up is a choice for the whole name, like one piece of equipment: every row of the same name, room and area follows.
+  // list: the pieces so far (a list of fewer than two is still being chosen), or null for one piece of equipment again.
+  const breakUp = (g, list) => {
+    const fam = canonName(g.equipment) ? familyKey(g) : null;
+    const rows = fam ? groups.filter(x => x.key === g.key || (canonName(x.equipment) && familyKey(x) === fam)) : [g];
+    setPieces(p => { const x = { ...p }; rows.forEach(r => { if (list) x[r.key] = list; else delete x[r.key]; }); return x; });
+    // The row acted on is ticked once it has two pieces. The other rows of the name keep their tick, except entries whose ID points elsewhere
+    setApply(p => {
+      const x = { ...p };
+      rows.forEach(r => {
+        if (r.key === g.key) x[r.key] = !!list && list.length >= 2;
+        else if (r.mode === 'place' || (list && !list.every(a => sameRoomAndArea(r, a)))) x[r.key] = false;
+      });
+      return x;
+    });
+  };
+
   const failedLookups = groups.filter(g => g.lookupError).length;
+  // What breaking up would do: for the ticked entries, and for all of them with the other entries of the same names
+  const planned = pending && pending.plan ? { ticked: splitStats(pending.plan.items.filter(it => pending.jobs.has(it.id))), all: splitStats(pending.plan.items), others: pending.listed - Array.from(pending.jobs.values()).filter(j => j.pieces).length } : null;
+  // Nothing would be written (every piece is already logged, the entries are gone or have no date, and no other entry is ticked)
+  const idle = !!planned && planned.all.rows === 0 && planned.others === 0 && pending.more.every(j => j.pieces);
 
   return (
     <div>
       <Text className={styles.hint} block style={{ marginBottom: 10 }}>
-        Log entries need the equipment’s ID (craa5_equipmentguid) so the calendar can match them. This scans the log page by page, groups identical entries, and suggests the closest equipment using the SAP order first, then the equipment name in the same room and area (equipment numbers must agree). Each suggestion is double-checked against the log: other entries with the same name in the same room and area that already have an ID. Type in Map to to search all equipment for a match of your own. Only the equipment it needs is looked up. Nothing is saved until you apply.
+        Log entries need the equipment’s ID (craa5_equipmentguid) so the calendar can match them. This scans the log page by page, groups identical entries, and suggests the closest equipment using the SAP order first, then the equipment name in the same room and area (equipment numbers must agree). Each suggestion is double-checked against the log: other entries with the same name in the same room and area that already have an ID. Type in Map to to search all equipment for a match of your own. Only the equipment it needs is looked up. An entry that covers several pieces of equipment, because the equipment has since been broken up, can be broken up as well: choose Break up under Map to and pick the pieces. The entry keeps the first piece and every other piece gets a new entry with the same date, SAP order and initials (the hours are shared out evenly). Nothing is saved until you apply.
       </Text>
       <div className={styles.filterBar}>
         <Select aria-label="Entries to look for" value={mode} disabled={!!busy} onChange={(e, d) => setMode(d.value)}>
@@ -2780,14 +3149,40 @@ const RepairIds = ({ ctx, onCount }) => {
         <Checkbox label="Also fix every entry with the same name, room and area" checked={sameName} disabled={!!busy} onChange={(e, d) => setSameName(!!d.checked)} />
       </div>
       {pending && (
-        <div role="alertdialog" aria-label="Update the other entries with the same names?" style={{ border: `2px solid ${BRAND.yellow}`, backgroundColor: '#FFF6E5', borderRadius: '6px', padding: '10px 12px', marginBottom: '10px' }}>
-          <Text block weight="semibold">The log has {plural(pending.more.length, 'more entry', 'more entries')} with the same name, room and area as the ticked rows{pending.inList ? ` (${pending.inList} of them further down this list)` : ''}. Update {pending.more.length === 1 ? 'it' : 'them'} to the same equipment too?</Text>
+        <div role="alertdialog" aria-label={pending.plan ? 'Break up these entries?' : 'Update the other entries with the same names?'} style={{ border: `2px solid ${BRAND.yellow}`, backgroundColor: '#FFF6E5', borderRadius: '6px', padding: '10px 12px', marginBottom: '10px' }}>
+          {planned && (
+            <div style={{ marginBottom: pending.more.length > 0 && !idle ? 8 : 0 }}>
+              <Text block weight="semibold">{planned.ticked.rows > 0 ? `Break up ${plural(planned.ticked.rows, 'entry', 'entries')} into pieces?` : idle ? 'Nothing can be broken up here.' : 'Nothing to break up in the ticked rows.'}</Text>
+              {planned.ticked.rows > 0 && <Text className={styles.hint} block>The first piece stays on the existing entry and {plural(planned.ticked.creates, 'new entry', 'new entries')} {planned.ticked.creates === 1 ? 'is' : 'are'} saved for the other pieces, each with the entry’s date, SAP order and initials. The hours are shared out evenly.</Text>}
+              {planned.others > 0 && <Text className={styles.hint} block>The other {plural(planned.others, 'ticked entry', 'ticked entries')} {planned.others === 1 ? 'is' : 'are'} updated with the equipment chosen for {planned.others === 1 ? 'it' : 'them'}.</Text>}
+              {planned.ticked.pieceSkips > 0 && <Text className={styles.hint} block>{plural(planned.ticked.pieceSkips, 'piece already has', 'pieces already have')} an entry for that order and date and {planned.ticked.pieceSkips === 1 ? 'is' : 'are'} not saved again.</Text>}
+              {planned.ticked.leftAlone > 0 && <Text className={styles.hint} block>{plural(planned.ticked.leftAlone, 'entry stays', 'entries stay')} as {planned.ticked.leftAlone === 1 ? 'it is' : 'they are'}, because every piece is already logged for that order and date.</Text>}
+              {planned.ticked.gone > 0 && <Text className={styles.hint} block>{plural(planned.ticked.gone, 'entry was', 'entries were')} not found (removed since the scan).</Text>}
+              {planned.ticked.undated > 0 && <Text className={styles.hint} block>{plural(planned.ticked.undated, 'entry has', 'entries have')} no date and will not be broken up: there is no date to check the pieces against.</Text>}
+              {pending.plan.capped.length > 0 && <Text className={styles.hint} block>{plural(pending.plan.capped.length, 'piece has', 'pieces have')} more entries than could be checked for earlier dates, so a piece could be saved twice.</Text>}
+            </div>
+          )}
+          {pending.more.length > 0 && !idle && (
+            <Text block weight="semibold">The log has {plural(pending.more.length, 'more entry', 'more entries')} with the same name, room and area as the ticked rows{pending.inList ? ` (${pending.inList} of them further down this list)` : ''}. {pending.plan ? 'Include' : 'Update'} {pending.more.length === 1 ? 'it' : 'them'} {pending.plan ? 'too' : 'to the same equipment too'}?{planned ? ` Together that is ${plural(planned.all.rows, 'entry', 'entries')} broken up and ${plural(planned.all.creates, 'new entry', 'new entries')} saved.` : ''}</Text>
+          )}
           {pending.out.held > 0 && <Text className={styles.hint} block>{plural(pending.out.held, 'entry', 'entries')} with those names {pending.out.held === 1 ? 'has' : 'have'} a row in this list with other equipment (or No match) chosen and will be left out.</Text>}
           {pending.out.kept > 0 && <Text className={styles.hint} block>{pending.out.keptMore ? 'At least ' : ''}{plural(pending.out.kept, 'entry', 'entries')} with those names already {pending.out.kept === 1 ? 'points' : 'point'} at other existing equipment and will be left as {pending.out.kept === 1 ? 'it is' : 'they are'}.</Text>}
           <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px' }}>
-            <Button appearance="primary" className={styles.btnCta} onClick={() => answerPending(true)}>{`Update all ${pending.listed + pending.more.length}`}</Button>
-            <Button onClick={() => answerPending(false)}>{`Only the ${pending.listed} ticked`}</Button>
-            <Button appearance="subtle" onClick={() => answerPending(null)}>Cancel</Button>
+            {idle ? (
+              <Button appearance="primary" className={styles.btnCta} onClick={() => answerPending(null)}>Close</Button>
+            ) : (
+              <>
+                {pending.more.length > 0 ? (
+                  <>
+                    <Button appearance="primary" className={styles.btnCta} onClick={() => answerPending(true)}>{`Update all ${pending.listed + pending.more.length}`}</Button>
+                    <Button onClick={() => answerPending(false)}>{`Only the ${pending.listed} ticked`}</Button>
+                  </>
+                ) : (
+                  <Button appearance="primary" className={styles.btnCta} onClick={() => answerPending(true)}>{`Apply ${pending.listed}`}</Button>
+                )}
+                <Button appearance="subtle" onClick={() => answerPending(null)}>Cancel</Button>
+              </>
+            )}
           </div>
         </div>
       )}
@@ -2795,11 +3190,14 @@ const RepairIds = ({ ctx, onCount }) => {
         {progress && <Text className={styles.hint} block style={{ marginBottom: 8 }}>{progress}</Text>}
         {scanError && <Text className={styles.errorText} block role="alert">Scan failed: {scanError}</Text>}
         {failedLookups > 0 && <Text className={styles.errorText} block role="alert">Equipment lookup failed for {plural(failedLookups, 'group', 'groups')} (marked “Lookup failed”). Scan again to retry.</Text>}
-        {result && <Text className={result.failed ? styles.errorText : styles.okText} block>{plural(result.ok, 'entry', 'entries')} updated{result.extra ? `, including ${plural(result.extra, 'more entry', 'more entries')} found in the log with the same name, room and area` : ''}{result.failed ? `; ${result.failed} failed (${result.error})` : ''}.</Text>}
-        {result && (result.kept > 0 || result.mixed > 0 || result.unplaced > 0 || result.held > 0 || (result.capped && !result.declined) || result.failedNames.length > 0 || result.declined) && (
+        {result && result.planError && <Text className={styles.errorText} block role="alert">Nothing was saved: could not check which pieces are already logged ({result.planError}).</Text>}
+        {result && !result.planError && (result.ok > 0 || result.failed > 0 || !result.split) && <Text className={result.failed ? styles.errorText : styles.okText} block>{plural(result.ok, 'entry', 'entries')} updated{result.extra ? `, including ${plural(result.extra, 'more entry', 'more entries')} found in the log with the same name, room and area` : ''}{result.failed ? `; ${result.failed} failed (${result.error})` : ''}.</Text>}
+        {result && result.split && <Text className={result.split.failedRows ? styles.errorText : styles.okText} block>{splitSummary(result.split)}</Text>}
+        {result && result.split && splitNotes(result.split) && <Text className={styles.warnText} block>{splitNotes(result.split)}</Text>}
+        {result && !result.planError && (result.kept > 0 || result.mixed > 0 || result.unplaced > 0 || result.held > 0 || (result.capped && !result.declined) || result.failedNames.length > 0 || result.declined) && (
           <Text className={styles.warnText} block>
             {[
-              result.declined && 'Only the ticked entries were updated.',
+              result.declined && 'Only the ticked entries were included.',
               result.mixed > 0 && `For ${plural(result.mixed, 'name', 'names')} the ticked rows chose different equipment, so only those rows were updated.`,
               result.unplaced > 0 && `For ${plural(result.unplaced, 'name', 'names')} the room or area is blank, or the equipment chosen is in another room or area, so only the ticked rows were updated.`,
               result.held > 0 && `${plural(result.held, 'entry', 'entries')} with those names ${result.held === 1 ? 'was' : 'were'} left because ${result.held === 1 ? 'its' : 'their'} row in the list has other equipment (or No match) chosen.`,
@@ -2810,8 +3208,8 @@ const RepairIds = ({ ctx, onCount }) => {
           </Text>
         )}
       </div>
-      {scan.started && <Text className={styles.hint} block style={{ marginBottom: 8 }}>{scan.scanned} entries checked. {totalRows} need an ID, in {plural(groups.length, 'distinct equipment group', 'distinct equipment groups')}.{scan.done ? ' The whole log has been checked.' : ' More entries remain: scan the next batch.'}</Text>}
-      {scan.started && scan.done && groups.length === 0 && <Text className={styles.okText} block>Every checked entry has a valid equipment ID.</Text>}
+      {scan.started && <Text className={styles.hint} block style={{ marginBottom: 8 }}>{scan.scanned} entries checked. {mode === 'several' ? `${totalRows} list several pieces` : `${totalRows} need an ID`}, in {plural(groups.length, 'distinct equipment group', 'distinct equipment groups')}.{scan.done ? ' The whole log has been checked.' : ' More entries remain: scan the next batch.'}</Text>}
+      {scan.started && scan.done && groups.length === 0 && <Text className={styles.okText} block>{mode === 'several' ? 'No entry lists several pieces of equipment.' : 'Every checked entry has a valid equipment ID.'}</Text>}
       {hidden > 0 && (
         <Text className={styles.hint} block style={{ marginBottom: 8 }}>
           {plural(hidden, 'group has', 'groups have')} no suggested match. <Button size="small" appearance="transparent" onClick={() => setShowAll(true)}>Show them to map by hand</Button>
@@ -2832,24 +3230,45 @@ const RepairIds = ({ ctx, onCount }) => {
                 const ORDER = { high: 0, medium: 1, low: 2, none: 3 };
                 const own = top && top !== g.ranked[0] ? tierOf(top.score) : g.tier;
                 const tier = ORDER[own] < ORDER[g.tier] ? g.tier : own;
-                const check = logCheck(g, choice[g.key], options.find(a => a.id === choice[g.key]) || store.getAsset(choice[g.key]));
+                const check = pieces[g.key] ? null : logCheck(g, choice[g.key], options.find(a => a.id === choice[g.key]) || store.getAsset(choice[g.key]));
                 return (
                   <tr key={g.key}>
-                    <td className={styles.td}><input type="checkbox" aria-label={`Apply ${g.equipment || 'blank entry'}`} checked={!!apply[g.key] && !!choice[g.key]} disabled={!choice[g.key] || !!busy} onChange={(e) => setApply(p => ({ ...p, [g.key]: e.target.checked }))} /></td>
+                    <td className={styles.td}><input type="checkbox" aria-label={`Apply ${g.equipment || 'blank entry'}`} checked={!!apply[g.key] && isReady(g)} disabled={!isReady(g) || !!busy} onChange={(e) => setApply(p => ({ ...p, [g.key]: e.target.checked }))} /></td>
                     <td className={styles.td}><strong>{g.equipment || '(blank)'}</strong></td>
                     <td className={styles.td}>{placeText(g)}</td>
                     <td className={styles.td}>{g.sap}</td>
                     <td className={styles.td}>{g.ids.length}</td>
                     <td className={styles.td}>
-                      <span className={mergeClasses(styles.tag, g.kind === 'missing id' ? styles.tagWarn : styles.tagBad)}>{g.kind}</span>
+                      <span className={mergeClasses(styles.tag, g.kind === 'missing id' ? styles.tagWarn : g.kind === 'several pieces' ? styles.tagInfo : styles.tagBad)}>{g.kind}</span>
                       {g.current && <div className={styles.hint}>ID is {g.current.name} · {placeText(g.current)}</div>}
                     </td>
                     <td className={styles.td} style={{ minWidth: 280 }}>
-                      <EquipmentChoice store={store} label={`Equipment for ${g.equipment || 'blank entry'}`} options={options} value={choice[g.key] || ''} disabled={!!busy} onChoose={(a) => chooseFor(g, a)}
-                        uses={g.check && g.check.uses ? new Map(g.check.uses.map(x => [x.asset.id, x.count])) : null} />
+                      {pieces[g.key] ? (
+                        <PiecesEditor store={store} g={g} list={pieces[g.key]} missing={g.suggest ? g.suggest.missing : []} disabled={!!busy} onChange={(list) => breakUp(g, list)} />
+                      ) : (
+                        <>
+                          <EquipmentChoice store={store} label={`Equipment for ${g.equipment || 'blank entry'}`} options={options} value={choice[g.key] || ''} disabled={!!busy} onChoose={(a) => chooseFor(g, a)}
+                            uses={g.check && g.check.uses ? new Map(g.check.uses.map(x => [x.asset.id, x.count])) : null} />
+                          {g.suggest && (
+                            <div className={styles.hint} style={{ marginTop: 4 }}>
+                              {g.suggest.how === 'text' ? 'This entry lists several things. Found: ' : 'Equipment here that starts with this name: '}<strong>{g.suggest.assets.map(a => a.name).join(', ')}</strong>.
+                              {g.suggest.missing.length > 0 && ` No equipment found for ${g.suggest.missing.map(x => `“${x}”`).join(', ')}: choose Break up like this, then search to add ${g.suggest.missing.length === 1 ? 'it' : 'them'}.`}{' '}
+                              <Button size="small" appearance="primary" className={styles.btnPrimary} disabled={!!busy} aria-label={`Break up like this: ${g.equipment || 'blank entry'}`} onClick={() => breakUp(g, g.suggest.assets)}>Break up like this</Button>
+                            </div>
+                          )}
+                          <div style={{ marginTop: 2 }}>
+                            <Button size="small" appearance="transparent" disabled={!!busy} aria-label={`Break up into several pieces: ${g.equipment || 'blank entry'}`} onClick={() => breakUp(g, [])}>Break up into several pieces…</Button>
+                          </div>
+                        </>
+                      )}
                     </td>
                     <td className={styles.td}>
-                      {top ? (
+                      {pieces[g.key] ? (
+                        <>
+                          <span className={mergeClasses(styles.tag, pieces[g.key].length >= 2 ? styles.tagInfo : styles.tagWarn)}>{pieces[g.key].length >= 2 ? `Break up · ${plural(pieces[g.key].length, 'piece', 'pieces')}` : 'Add at least two pieces'}</span>
+                          {pieces[g.key].length >= 2 && <div className={styles.hint} style={{ marginTop: 4 }}>Each entry becomes {pieces[g.key].length} entries, one for each piece.</div>}
+                        </>
+                      ) : top ? (
                         <span className={mergeClasses(styles.tag, tier === 'high' ? styles.tagOk : tier === 'none' ? styles.tagBad : styles.tagWarn)}>
                           {TIER_LABEL[tier]} · {top.reason}{g.ambiguous ? ' · ambiguous' : ''}{g.conflict ? ` · ${g.conflictText || 'sources disagree'}` : ''}
                         </span>
