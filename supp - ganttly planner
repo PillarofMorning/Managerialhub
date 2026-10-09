@@ -13,6 +13,11 @@ const IS_CURRENT = APP_MODE === 'current';
 // and the Shift Start / production schedule re-reads also happen on a tab click, not on a timer, in PBED.
 const LAZY_ENGINE = !IS_CURRENT;
 const ENGINE_TABS = ['gantt', 'focus', 'metrics'];
+// 🚨 ARCHITECTURE NOTE: Production first, support below. An MSS area is production when craa5_production or craa5_runsproduct is ticked;
+// production rooms are listed first everywhere and support rooms sit in a folded "Support" section at the bottom (PBED folded, Ganttly
+// open). It is display only (the engine just breaks ties with it): preset room priorities always decide what is cleaned first. Room order,
+// room / function / piece colors and the production-support pick are PBED settings that Ganttly reads. PBED also has time blocks
+// (inspection / maintenance / project) and Ganttly has down lines; both become interruptions (see TIME BLOCKS and DOWN LINES).
 
 // ============================================================================
 // SECTION 1: INLINE SVG ICONS 
@@ -365,9 +370,23 @@ function isPicSubcategory(v) { return /^1\s*[-–]?\s*pic\b/.test(normS(v)); }
 // Lines in table order: Shift Start matches equipment to lines in this order (before it sorts them for display).
 function buildLineIndex(lineRows) {
     return lineRows.map(function(r) {
-        return { id: String(getRowField(r, 'craa5_aa_mss_areaid') || ''), name: String(getRowField(r, 'craa5_area') || '').trim() };
+        return { id: String(getRowField(r, 'craa5_aa_mss_areaid') || ''), name: String(getRowField(r, 'craa5_area') || '').trim(), prod: lineIsProduction(r) };
     }).filter(function(l) { return l.id && l.name && STATUS_LINE_NAMES.indexOf(normS(l.name)) === -1; });
 }
+// PRODUCTION / SUPPORT. An MSS area is production when it is marked production or runs product (craa5_production, craa5_runsproduct);
+// every other MSS area is support (so is a chemical / admin / janitorial room); a room that no MSS area is named after is shown as
+// production, so nothing is hidden by mistake (the Group box on a room changes it). Production is shown first in every list and chart
+// and support goes in a folded section below it; that is only about what is shown first, the room priorities still decide what is
+// cleaned first.
+function lineIsProduction(r) { return odTrue(getRowField(r, 'craa5_production')) || odTrue(getRowField(r, 'craa5_runsproduct')); }
+// Colors picked by hand are #rrggbb; white or dark text is chosen to read on them.
+function hexOr(v) { return typeof v === 'string' && /^#[0-9a-f]{6}$/i.test(v) ? v.toLowerCase() : ''; }
+function textOnHex(h) {
+    const r = parseInt(h.slice(1, 3), 16), g = parseInt(h.slice(3, 5), 16), b = parseInt(h.slice(5, 7), 16);
+    return (r * 299 + g * 587 + b * 114) / 1000 > 160 ? '#1e293b' : '#ffffff';
+}
+// The room colors the app has always used (Tailwind classes), as hex, so a color picker can start from what is on screen.
+const ROOM_CLASS_HEX = { 'bg-amber-800': '#92400e', 'bg-orange-500': '#f97316', 'bg-red-500': '#ef4444', 'bg-purple-500': '#a855f7', 'bg-blue-500': '#3b82f6', 'bg-emerald-500': '#10b981', 'bg-teal-500': '#14b8a6', 'bg-cyan-500': '#06b6d4', 'bg-indigo-500': '#6366f1', 'bg-pink-500': '#ec4899', 'bg-slate-500': '#64748b' };
 const manualLineId = function(name) { return 'manual:' + normS(name); };
 // Which line an equipment area belongs to: exact name, else the longest line name it contains as whole words (Shift Start's
 // rule). Chemical / admin / janitorial areas also match a line like "Chemical Clerk" (first by name, the line Shift Start puts
@@ -386,6 +405,114 @@ function lineForArea(lines, area, manualNames) {
     }
     if (!line && manualNames && manualNames[normS(label)]) line = { id: manualLineId(label), name: manualNames[normS(label)] };
     return line || null;
+}
+// ============================================================================
+// TIME BLOCKS (PBED) and DOWN LINES (Ganttly)
+// A time block is a stretch of time put aside for an inspection, maintenance or a project: for one room (nothing in that room is
+// cleaned then) or for the whole plant (nobody cleans). It can repeat every day of the plan. A down line is a production line that
+// stopped (and may restart): its rooms are free to clean from the time it went down, and are closed again when it restarts.
+// Both are turned into interruptions the engine already knows (same as Room Downtime / Global Downtime) and a handoff for the room.
+// ============================================================================
+const BLOCK_KINDS = [
+    { id: 'inspection', label: 'Inspection', color: '#0072ce' },
+    { id: 'maintenance', label: 'Maintenance', color: '#f5b800' },
+    { id: 'project', label: 'Project', color: '#7c3aed' }
+];
+const DOWN_LINE_COLOR = '#d92d20';
+function blockKindOf(id) { return BLOCK_KINDS.filter(function(k) { return k.id === id; })[0] || BLOCK_KINDS[0]; }
+function localInputMs(str) { return str ? new Date(str).getTime() : NaN; }
+// The turns of each time block that fall inside the plan window, as interruptions in minutes from the window start. A block that began
+// before the window keeps its real end.
+function expandTimeBlocks(blocks, startMs, horizonMins) {
+    const out = [], endMs = startMs + horizonMins * 60000;
+    (blocks || []).forEach(function(b) {
+        const base = localInputMs(b.dateTimeStr), dur = Math.round(Number(b.duration) || 0);
+        if (isNaN(base) || dur <= 0) return;
+        const kind = blockKindOf(b.kind), color = hexOr(b.color) || kind.color;
+        const first = b.repeat === 'daily' ? Math.max(0, Math.floor((startMs - base) / 86400000) - 1) : 0;
+        const last = b.repeat === 'daily' ? first + Math.ceil(horizonMins / 1440) + 3 : 0;
+        for (let i = first; i <= last; i++) {
+            const d = new Date(base); d.setDate(d.getDate() + i);
+            const s0 = d.getTime(), e0 = s0 + dur * 60000;
+            if (e0 <= startMs || s0 >= endMs) continue;
+            const raw = Math.round((s0 - startMs) / 60000), start = Math.max(0, raw), end = raw + dur;
+            out.push({ start: start, end: end, duration: end - start, label: b.label || kind.label, kind: b.kind, room: b.room || '', color: color, blockId: b.id, isCustom: true, wall: !!b.room });
+        }
+    });
+    return out;
+}
+// Down lines: { id, line, lineId, rooms: [room], startStr, endStr ('' = down until further notice), note }. Per room: the handoff is the
+// earliest time one of its lines went down; the room is closed again from each restart until the next time a line is down; `bands` are
+// what the Gantt draws (one per down line).
+function expandDownLines(list, startMs, horizonMins) {
+    const endMs = startMs + horizonMins * 60000;
+    const byRoom = {}, bands = [];
+    (list || []).forEach(function(d) {
+        const s0 = localInputMs(d.startStr), e0 = d.endStr ? localInputMs(d.endStr) : Infinity;
+        if (isNaN(s0) || isNaN(e0) || e0 <= s0) return;
+        if (e0 <= startMs || s0 >= endMs) return;   // over before the plan, or not down until after it
+        const toMin = function(ms) { return Math.round((ms - startMs) / 60000); };
+        bands.push({ start: Math.max(0, toMin(s0)), end: Math.min(toMin(endMs), e0 === Infinity ? toMin(endMs) : toMin(e0)), label: (d.line || 'Line') + ' down', kind: 'down', room: '', color: DOWN_LINE_COLOR, blockId: d.id, lineName: d.line || '' });
+        (d.rooms || []).forEach(function(r) { (byRoom[r] = byRoom[r] || []).push({ s: s0, e: e0, line: d.line || '' }); });
+    });
+    const handoff = {}, blocks = {};
+    Object.keys(byRoom).forEach(function(room) {
+        const w = byRoom[room].sort(function(a, b) { return a.s - b.s; });
+        handoff[room] = { ms: w[0].s, lines: w.map(function(x) { return x.line; }).filter(function(x, i, a) { return x && a.indexOf(x) === i; }) };
+        const ints = [];
+        let cur = w[0].e;
+        const closeTo = function(toMs) {
+            const a = Math.max(cur, startMs), b = Math.min(toMs, endMs);
+            if (cur !== Infinity && b > a) ints.push({ start: Math.round((a - startMs) / 60000), end: Math.round((b - startMs) / 60000), duration: Math.round((b - a) / 60000), label: 'Line running', kind: 'running', isCustom: true, wall: true });
+        };
+        for (let i = 1; i < w.length; i++) {
+            if (cur === Infinity) break;
+            if (w[i].s > cur) closeTo(w[i].s);
+            cur = Math.max(cur, w[i].e);
+        }
+        closeTo(endMs);
+        if (ints.length) blocks[room] = ints;
+    });
+    return { handoff: handoff, blocks: blocks, bands: bands };
+}
+// A room that could start at `startMin` while a block is under way starts when the block ends (blocks that follow each other are all
+// waited out). A block in the middle of the work is a wall (see wallAt).
+function pushPastBlocks(startMin, ints) {
+    let t = startMin, moved = true, guard = 0;
+    while (moved && guard++ < 200) {
+        moved = false;
+        ints.forEach(function(i) { if (i.start <= t && i.end > t) { t = i.end; moved = true; } });
+    }
+    return t;
+}
+// A room's reserved stretches (its time blocks, a stopped line's "Line running" closing) are walls: work in that room never runs across
+// one, it stops before it and carries on after it (a break only pauses work, which is wrong for a stretch of hours).
+function wallAt(walls, t) {
+    if (walls) for (let i = 0; i < walls.length; i++) if (walls[i].start <= t + 0.01 && t < walls[i].end - 0.01) return true;
+    return false;
+}
+function nextWallStart(walls, t) {
+    let s = Infinity;
+    if (walls) for (let i = 0; i < walls.length; i++) if (walls[i].start > t + 0.01 && walls[i].start < s) s = walls[i].start;
+    return s;
+}
+// Minutes of [s, e) covered by any of the stretches in `list` (overlaps counted once).
+function unionMins(list, s, e) {
+    const iv = list.map(function(i) { return [Math.max(s, i.start), Math.min(e, i.end)]; }).filter(function(x) { return x[1] > x[0]; }).sort(function(a, b) { return a[0] - b[0]; });
+    let total = 0, cs = 0, ce = -Infinity;
+    iv.forEach(function(x) { if (x[0] > ce) { if (ce > -Infinity) total += ce - cs; cs = x[0]; ce = x[1]; } else if (x[1] > ce) ce = x[1]; });
+    if (ce > -Infinity) total += ce - cs;
+    return total;
+}
+// The rooms (equipment areas) that belong to a production line: those the line index puts on it, plus rooms named like it.
+function roomsForLine(rooms, lineIndex, lineId, name) {
+    const nw = wordsOf(name);
+    return rooms.filter(function(room) {
+        const l = lineId ? lineForArea(lineIndex, room) : null;
+        if (l && l.id === lineId) return true;
+        const rw = wordsOf(room);
+        return nw.length > 0 && rw.length > 0 && (hasWords(rw, nw) || hasWords(nw, rw));
+    });
 }
 // People working a line on a board (leads first, then team members), minus anyone marked out or not kept by `keep`.
 function boardWorkersOn(board, lineId, keep) {
@@ -848,7 +975,7 @@ function boardRowsSignature(rows) {
     return (rows || []).map(function(r) { return String(getRowField(r, 'craa5_name') || '') + '|' + String(getRowField(r, 'modifiedon') || '') + '|' + String(getRowField(r, 'craa5_equipmentjson') || '').length; }).join(';');
 }
 function lineRowsSignature(rows) {
-    return (rows || []).map(function(r) { return String(getRowField(r, 'craa5_aa_mss_areaid') || '') + '|' + String(getRowField(r, 'craa5_area') || ''); }).join(';');
+    return (rows || []).map(function(r) { return String(getRowField(r, 'craa5_aa_mss_areaid') || '') + '|' + String(getRowField(r, 'craa5_area') || '') + '|' + String(getRowField(r, 'craa5_production')) + '|' + String(getRowField(r, 'craa5_runsproduct')); }).join(';');
 }
 
 // ---- Shift Start's saved task assignments (craa5_taskassignment) ----
@@ -1338,12 +1465,12 @@ function autoCrewBoard(inp) {
         if (!room) { view.unplaced.push({ id: p.id, name: p.name, why: 'no ' + p.kind + ' work in the plan' }); return; }
         board.members[p.id] = '';
         board.workerLine[p.id] = useRoom(room);
-        view.fixed.push({ roomId: room.id, room: room.name, id: p.id, name: p.name, kind: p.kind });
+        view.fixed.push({ roomId: room.id, room: room.name, id: p.id, name: p.name, kind: p.kind, support: !!room.support });
     });
     const pool = people.filter(function(p) { return !specialist[p.id] && (p.kind === 'general' || p.kind === 'pic' || p.kind === 'inspector'); });
     const P = pool.length;
     const rooms = (inp.rooms || []).filter(function(r) { return !r.fixed && remOf(r) > 1; })
-        .sort(function(a, b) { return a.priority - b.priority || remOf(b) - remOf(a) || String(a.name).localeCompare(String(b.name)); });
+        .sort(function(a, b) { return a.priority - b.priority || (a.support ? 1 : 0) - (b.support ? 1 : 0) || remOf(b) - remOf(a) || String(a.name).localeCompare(String(b.name)); });
     if (P === 0 || rooms.length === 0) {
         const placedAny = Object.keys(board.workerLine).length > 0;
         leads.forEach(function(l) { board.leads.push(l.id); view.floaters.push({ id: l.id, name: l.name }); });
@@ -1495,7 +1622,7 @@ function autoCrewBoard(inp) {
     const byRoom = {};
     teams.forEach(function(t, ti) {
         t.rooms.forEach(function(r, k) {
-            const rv = byRoom[r.id] = byRoom[r.id] || { id: r.id, name: r.name, priority: r.priority, work: r.work, rem: before[r.id], left: remOf(r), teams: [] };
+            const rv = byRoom[r.id] = byRoom[r.id] || { id: r.id, name: r.name, priority: r.priority, work: r.work, rem: before[r.id], left: remOf(r), teams: [], support: !!r.support, labels: r.labels || [] };
             rv.teams.push({
                 lead: t.owner.pseudo ? '' : t.owner.name, leadId: t.owner.id, leadExp: t.owner.pseudo ? 0 : expOf(t.owner.id, r.id), queued: k > 0, split: t.split && t.parts && t.members.some(function(m) { return t.parts[m.id].id === r.id; }),
                 members: t.members.filter(function(m) { return t.parts[m.id].id === r.id; }).map(function(m) { return { id: m.id, name: m.name, kind: m.kind, exp: expOf(m.id, r.id) }; }),
@@ -1503,7 +1630,7 @@ function autoCrewBoard(inp) {
             });
         });
     });
-    view.rooms = Object.keys(byRoom).map(function(id) { return byRoom[id]; }).sort(function(a, b) { return a.priority - b.priority || b.work - a.work || String(a.name).localeCompare(String(b.name)); });
+    view.rooms = Object.keys(byRoom).map(function(id) { return byRoom[id]; }).sort(function(a, b) { return (a.support ? 1 : 0) - (b.support ? 1 : 0) || a.priority - b.priority || b.work - a.work || String(a.name).localeCompare(String(b.name)); });
     view.teams = teams.map(function(t) {
         return { lead: t.owner.pseudo ? '' : t.owner.name, leadId: t.owner.id, rooms: t.rooms.map(function(r) { return r.name; }), split: t.split, heads: t.members.length };
     });
@@ -1900,6 +2027,19 @@ export default function App(props) {
     const [handoffSource, setHandoffSource] = useState(!IS_CURRENT && initialSettings.handoffSource !== 'hand' ? 'schedule' : 'hand');
     const [handoffGapMins, setHandoffGapMins] = useState(function() { const n = Number(initialSettings.handoffGapMins); return initialSettings.handoffGapMins === undefined || isNaN(n) ? HANDOFF_GAP_DEFAULT : Math.max(0, Math.min(600, Math.round(n))); });
     const [roomProdLines, setRoomProdLines] = useState(initialSettings.roomProdLines && typeof initialSettings.roomProdLines === 'object' ? initialSettings.roomProdLines : {});
+    // Production first, support below (see lineIsProduction). roomGroups = a room's own pick ('production' | 'support') over what the MSS
+    // area table says; roomOrder = the order the rooms are shown in (the rooms the planner moved, in order); roomColors / functionColors
+    // ('room|function') / equipColors (equipment id) = colors picked by hand (#rrggbb). Ganttly reads all of these and never writes them.
+    const objOf = function(v) { return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; };
+    const [roomGroups, setRoomGroups] = useState(objOf(initialSettings.roomGroups));
+    const [roomOrder, setRoomOrder] = useState(Array.isArray(initialSettings.roomOrder) ? initialSettings.roomOrder.map(String) : []);
+    const [roomColors, setRoomColors] = useState(objOf(initialSettings.roomColors));
+    const [functionColors, setFunctionColors] = useState(objOf(initialSettings.functionColors));
+    const [equipColors, setEquipColors] = useState(objOf(initialSettings.equipColors));
+    // Which Support sections are open (PBED opens them folded; Ganttly, the floor app, shows everything).
+    const [supportOpen, setSupportOpen] = useState({});
+    const isSupportOpen = function(view) { return supportOpen[view] === undefined ? IS_CURRENT : supportOpen[view]; };
+    const toggleSupport = function(view) { setSupportOpen(function(prev) { const n = Object.assign({}, prev); n[view] = !(prev[view] === undefined ? IS_CURRENT : prev[view]); return n; }); };
 
     // 🚨 ARCHITECTURE NOTE: Global Omission Filter
     // hiddenRooms tracks if a room is toggled to "Skipped".
@@ -1910,6 +2050,11 @@ export default function App(props) {
 
     const [targetDowntimes, setTargetDowntimes] = useState(initialPlan.targetDowntimes || []);
     const [downtimes, setDowntimes] = useState(initialPlan.downtimes || []);
+    // PBED time blocks (inspection / maintenance / project) and Ganttly down lines, kept with the plan (see TIME BLOCKS).
+    const [timeBlocks, setTimeBlocks] = useState(initialPlan.timeBlocks || []);
+    const [downLineList, setDownLineList] = useState(initialPlan.downLineList || []);
+    const [blockModal, setBlockModal] = useState(null);
+    const [downModal, setDownModal] = useState(null);
 
     const [isRoomDtModalOpen, setIsRoomDtModalOpen] = useState(false);
     const [isEquipDtModalOpen, setIsEquipDtModalOpen] = useState(false);
@@ -2142,6 +2287,11 @@ export default function App(props) {
             handoffSource: handoffSource,
             handoffGapMins: handoffGapMins,
             roomProdLines: roomProdLines,
+            roomGroups: roomGroups,
+            roomOrder: roomOrder,
+            roomColors: roomColors,
+            functionColors: functionColors,
+            equipColors: equipColors,
             roomConfigured: roomConfigured,
             hiddenRooms: hiddenRooms,
             hideConfiguredRooms: hideConfiguredRooms,
@@ -2168,7 +2318,7 @@ export default function App(props) {
             liveReforecast: savedLiveReforecast
         };
         try { localStorage.setItem('itp_settings_v10', JSON.stringify(s)); } catch(e) {}
-    }, [roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, cleanTypes, roomCleanType, planMode, handoffSource, handoffGapMins, roomProdLines, roomConfigured, hiddenRooms, hideConfiguredRooms, hourlyRate, savedStartDate, savedStartHour, savedPlanHours, shiftRotation, rotationSource, crewHeadcountOverrides, absentEmployees, extraPeople, jobRoleChoices, handoverMins, tailFillMins, includeBreaks, includeTransit, includeInspection, pbMode, savedLiveReforecast, savedRosterSource, savedRoomSource, crewMode, ganttView]);
+    }, [roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, cleanTypes, roomCleanType, planMode, handoffSource, handoffGapMins, roomProdLines, roomGroups, roomOrder, roomColors, functionColors, equipColors, roomConfigured, hiddenRooms, hideConfiguredRooms, hourlyRate, savedStartDate, savedStartHour, savedPlanHours, shiftRotation, rotationSource, crewHeadcountOverrides, absentEmployees, extraPeople, jobRoleChoices, handoverMins, tailFillMins, includeBreaks, includeTransit, includeInspection, pbMode, savedLiveReforecast, savedRosterSource, savedRoomSource, crewMode, ganttView]);
     // The current-shift app's own crew marks and Live Reforecast switch.
     useEffect(function() {
         if (!IS_CURRENT) return;
@@ -2176,9 +2326,9 @@ export default function App(props) {
     }, [absentByShift, extraPeople, curLiveReforecast]);
 
     useEffect(function() {
-        const p = { overrides: overrides, taskStatus: taskStatus, customTasks: customTasks, assetEdits: assetEdits, downtimes: downtimes, targetDowntimes: targetDowntimes };
+        const p = { overrides: overrides, taskStatus: taskStatus, customTasks: customTasks, assetEdits: assetEdits, downtimes: downtimes, targetDowntimes: targetDowntimes, timeBlocks: timeBlocks, downLineList: downLineList };
         try { localStorage.setItem(PLAN_KEY, JSON.stringify(p)); } catch(e) {}
-    }, [overrides, taskStatus, customTasks, assetEdits, downtimes, targetDowntimes]);
+    }, [overrides, taskStatus, customTasks, assetEdits, downtimes, targetDowntimes, timeBlocks, downLineList]);
 
     useEffect(() => {
         const applyEdits = function(list) {
@@ -2445,6 +2595,58 @@ export default function App(props) {
     useEffect(function() { loadTaskRowsRef.current(); }, [props.dataApi, globalStartMs, planHorizonMins, taskSinceMs]);
 
     const lineIndex = useMemo(function() { return buildLineIndex(lineRows); }, [lineRows]);
+    // Production or support: a room's own pick, else its MSS area's production / runs-product flags. When the area table has no
+    // production flag anywhere (or could not be read) nothing is called support, so nothing is hidden by mistake.
+    const prodKnown = useMemo(function() { return lineIndex.some(function(l) { return l.prod; }); }, [lineIndex]);
+    // What the MSS area table gave us for this: how many areas, and whether the two flag columns exist at all (shown in the app, never
+    // dropped silently).
+    const areaColumns = useMemo(function() {
+        const has = function(n) { return lineRows.some(function(r) { return getRowField(r, n) !== undefined; }); };
+        return { rows: lineRows.length, production: has('craa5_production'), runs: has('craa5_runsproduct'), prodLines: lineIndex.filter(function(l) { return l.prod; }).length };
+    }, [lineRows, lineIndex]);
+    // What the MSS area table says about a room (a room no MSS area is named after stays production, so nothing is hidden by mistake;
+    // chemical / admin / janitorial are support), before any pick of the planner's own.
+    const autoSupportOf = function(k) { const l = lineForArea(lineIndex, k); return l ? !l.prod : FIXED_AREA_KINDS.indexOf(normS(k)) > -1; };
+    const supportRooms = useMemo(function() {
+        const m = {};
+        assets.forEach(function(a) {
+            const k = String(a.area);
+            if (k in m) return;
+            const forced = roomGroups[k];
+            if (forced === 'production') { m[k] = false; return; }
+            if (forced === 'support') { m[k] = true; return; }
+            if (!prodKnown) { m[k] = false; return; }
+            m[k] = autoSupportOf(k);
+        });
+        return m;
+    }, [assets, lineIndex, prodKnown, roomGroups]);
+    const isSupportRoom = function(area) { return !!supportRooms[String(area)]; };
+    const autoSupportRoom = function(area) { return !prodKnown ? false : autoSupportOf(String(area)); };
+    // Production rooms first, then support; inside each the rooms the planner moved come first in the order they were put in, then
+    // `fallback` (default: by name).
+    const roomCmp = function(a, b, fallback) {
+        const sa = supportRooms[a] ? 1 : 0, sb = supportRooms[b] ? 1 : 0;
+        if (sa !== sb) return sa - sb;
+        const ia = roomOrder.indexOf(a), ib = roomOrder.indexOf(b);
+        if (ia > -1 || ib > -1) { if (ia === -1) return 1; if (ib === -1) return -1; if (ia !== ib) return ia - ib; }
+        return fallback ? fallback(a, b) : (a < b ? -1 : a > b ? 1 : 0);
+    };
+    const orderRooms = function(list, fallback) { return list.slice().sort(function(a, b) { return roomCmp(a, b, fallback); }); };
+    // The one-line check of the MSS area columns that decide production / support. Setup always shows it, Dashboard only when something is off.
+    const areaColumnsNote = function(always) {
+        const a = areaColumns, ok = a.rows > 0 && (a.production || a.runs) && a.prodLines > 0;
+        if (ok && !always) return null;
+        return (
+            <div data-area-columns={ok ? 'ok' : 'check'} className={`text-[11px] font-bold rounded-lg border px-3 py-2 ${ok ? 'bg-white border-slate-200 text-slate-600' : 'bg-amber-50 border-amber-200 text-amber-800'}`}>
+                {a.rows === 0
+                    ? 'The MSS area table (craa5_aa_mss_area) returned no rows, so rooms cannot be marked production or support yet; every room is shown as production.'
+                    : <span>MSS area table: {a.rows} area{a.rows === 1 ? '' : 's'} read · craa5_production column {a.production ? 'found' : 'NOT FOUND'} · craa5_runsproduct column {a.runs ? 'found' : 'NOT FOUND'} · {a.prodLines} production line{a.prodLines === 1 ? '' : 's'}</span>}
+                {a.rows > 0 && !a.production && !a.runs && <div className="mt-1 font-semibold">Add the missing Yes/No column to the MSS area table (craa5_production "Production", craa5_runsproduct "Runs Product") and tick it for each production line. A room is production if either is ticked.</div>}
+                {a.rows > 0 && (a.production !== a.runs) && <div className="mt-1 font-semibold">{a.production ? 'craa5_runsproduct' : 'craa5_production'} has no value on any area (Dataverse leaves an empty column out), so only {a.production ? 'craa5_production' : 'craa5_runsproduct'} decides. A room is production if either is ticked.</div>}
+                {a.rows > 0 && (a.production || a.runs) && a.prodLines === 0 && <div className="mt-1 font-semibold">No area is ticked as production yet, so every room is shown as production.</div>}
+            </div>
+        );
+    };
     // Shift Start's saved task assignments as boards, one per supervisor per shift.
     const taskBoards = useMemo(function() {
         return boardsFromTaskRows(taskRows, shiftWindows, globalStartMs, rosterInfo.who, lineIndex);
@@ -2475,6 +2677,8 @@ export default function App(props) {
     loadProdRunsRef.current = loadProdRuns;
     useEffect(function() { if (!isLoading) loadProdRuns(); }, [props.dataApi, isLoading, globalStartMs, planHorizonMins, handoffSource]);
     const prodLines = useMemo(function() { return buildProdLines(prodRows); }, [prodRows]);
+    // Ganttly down lines turned into per-room handoffs, closings after a restart and the bands the Gantt draws (see TIME BLOCKS).
+    const downLinePlan = useMemo(function() { return IS_CURRENT ? expandDownLines(downLineList, globalStartMs, planHorizonMins) : { handoff: {}, blocks: {}, bands: [] }; }, [downLineList, globalStartMs, planHorizonMins]);
     // The rooms (equipment areas), as one string so a change of equipment minutes doesn't redo the handoffs.
     const areaSig = useMemo(function() { const seen = {}; assets.forEach(function(a) { seen[String(a.area)] = 1; }); return Object.keys(seen).sort().join('\u0001'); }, [assets]);
     // Per room: when it may first be cleaned. { ms, src } with src 'hand' (a Handover typed in), 'schedule' (production hands it over then),
@@ -2495,13 +2699,15 @@ export default function App(props) {
             if (!h) { out[area] = { ms: null, src: roomProdLines[area] === 'none' ? 'nolines' : 'nomatch', lines: lines, how: m.how, stale: stale }; return; }
             out[area] = { ms: h.ms, src: h.state === 'handed' ? 'schedule' : h.state, lines: lines, how: m.how, next: h.next, stale: stale };
         });
+        // A line that is down frees its rooms from the time it went down; that wins over a Handover typed on the room.
+        Object.keys(downLinePlan.handoff).forEach(function(area) { if (area in out) out[area] = { ms: downLinePlan.handoff[area].ms, src: 'down', lines: downLinePlan.handoff[area].lines, typed: out[area].src === 'hand' }; });
         return out;
-    }, [areaSig, prodLines, handoffSource, handoffGapMins, roomProdLines, roomHandovers, globalStartMs, planHorizonMins, lineIndex]);
+    }, [areaSig, prodLines, handoffSource, handoffGapMins, roomProdLines, roomHandovers, globalStartMs, planHorizonMins, lineIndex, downLinePlan]);
     // What the engine needs: only the rooms that really wait ({ area: ms }), kept as the same object until a number changes, so a read that
     // finds nothing new, or a note that changes, never re-plans.
     const handoffNow = (function() {
         const map = {}, parts = [];
-        Object.keys(handoffInfo).forEach(function(k) { const h = handoffInfo[k]; if (h.ms !== null && (h.src === 'hand' || h.src === 'schedule')) { map[k] = h.ms; parts.push(k + '=' + h.ms); } });
+        Object.keys(handoffInfo).forEach(function(k) { const h = handoffInfo[k]; if (h.ms !== null && (h.src === 'hand' || h.src === 'schedule' || h.src === 'down')) { map[k] = h.ms; parts.push(k + '=' + h.ms); } });
         return { map: map, sig: parts.sort().join('|') };
     })();
     const handoffRef = useRef({ sig: null, map: {} });
@@ -2589,6 +2795,7 @@ export default function App(props) {
             let r = byId[id];
             if (!r) { r = byId[id] = { id: id, name: l ? l.name : label, priority: 99, work: 0, picWork: 0, fixed: '', labels: [] }; roomList.push(r); }
             if (r.labels.indexOf(label) === -1) r.labels.push(label);
+            r.support = r.labels.every(function(lb) { return !!supportRooms[lb]; });
             r.priority = Math.min(r.priority, roomPriority[label] || 2);
             const mins = roomAllergen[label] && a.allergenMins > 0 ? a.allergenMins : (Number(a.minutesRequired) || 0);
             r.work += mins;
@@ -2628,7 +2835,7 @@ export default function App(props) {
             }
         });
         return { boards: boards, views: views, rooms: roomList };
-    }, [autoCrews, shiftWindows, assets, hiddenRooms, roomPriority, roomAllergen, cleanTypes, roomCleanType, cleanTypeCols, planMode, odStatus, lineIndex, expMap, crewRosters, leadRosters, empById, absentEmployees, absentByShift, extraPeople, crewHeadcountOverrides, globalStartMs]);
+    }, [autoCrews, shiftWindows, assets, supportRooms, hiddenRooms, roomPriority, roomAllergen, cleanTypes, roomCleanType, cleanTypeCols, planMode, odStatus, lineIndex, expMap, crewRosters, leadRosters, empById, absentEmployees, absentByShift, extraPeople, crewHeadcountOverrides, globalStartMs]);
     // Shift Start boards that line up with each shift in the plan (same crew, started within 90 min of the shift). A supervisor
     // with no board row gets the board built from their saved task assignments instead.
     const windowBoards = useMemo(function() {
@@ -3144,11 +3351,13 @@ export default function App(props) {
     };
     const coverage = weeklyCoverage(shiftRotation);
     const startNewPlan = function() {
-        if (!window.confirm('Clear all check-offs, manual moves and downtimes for a fresh plan? Room setup, crews and custom tasks are kept.')) return;
+        if (!window.confirm('Clear all check-offs, manual moves, downtimes' + (IS_CURRENT ? ' and down lines' : ' and time blocks') + ' for a fresh plan? Room setup, crews and custom tasks are kept.')) return;
         setOverrides({});
         setTaskStatus({});
         setDowntimes([]);
         setTargetDowntimes([]);
+        setTimeBlocks([]);
+        setDownLineList([]);
     };
 
     // Plan presets. "Weekend" = Friday 6PM through Monday 6AM (D → C → D → A → B).
@@ -3165,7 +3374,83 @@ export default function App(props) {
         }
     };
 
-    const allUniqueRooms = Array.from(new Set(assets.map(function(a) { return String(a.area); }))).sort();
+    const allUniqueRooms = orderRooms(Array.from(new Set(assets.map(function(a) { return String(a.area); }))));
+    // Move a room up or down inside its own group (production or support) of the list the planner is looking at (`shown`, default the
+    // Setup list). The rooms of that list take, in their new order, the places they held in the whole order; every other room (one with
+    // no work in the window, one hidden on this screen) keeps its own place.
+    const moveRoom = function(room, dir, shown) {
+        const cur = allUniqueRooms;
+        const view = (shown || cur).filter(function(r) { return cur.indexOf(r) > -1; });
+        const sup = !!supportRooms[room];
+        const same = view.filter(function(r) { return !!supportRooms[r] === sup; });
+        const i = same.indexOf(room), j = i + dir;
+        if (i < 0 || j < 0 || j >= same.length) return;
+        const next = view.slice();
+        next[view.indexOf(room)] = same[j]; next[view.indexOf(same[j])] = room;
+        const inView = {}; view.forEach(function(r) { inView[r] = true; });
+        let k = 0;
+        setRoomOrder(cur.map(function(r) { return inView[r] ? next[k++] : r; }));
+    };
+    // The rooms the Setup list actually draws (a configured room is left out while "hide configured" is on).
+    const setupShown = function() { return allUniqueRooms.filter(function(r) { return !(hideConfiguredRooms && roomConfigured[r] && !roomHidden(r)); }); };
+    const handleRoomGroupChange = function(room, val) {
+        setRoomGroups(function(prev) { const n = Object.assign({}, prev); if (val === 'production' || val === 'support') n[room] = val; else delete n[room]; return n; });
+    };
+    // The folded Support section under a list of production rooms.
+    const supportHeader = function(view, n, note) {
+        const open = isSupportOpen(view);
+        return (
+            <button key={'support-' + view} data-support-toggle={view} data-support-open={open ? '1' : '0'} onClick={function() { toggleSupport(view); }} className="w-full flex items-center gap-2 px-4 py-2 rounded-lg border border-slate-300 bg-slate-100 hover:bg-slate-200 text-left no-pan">
+                {open ? <ChevronDown className="w-4 h-4 text-slate-600" /> : <ChevronRight className="w-4 h-4 text-slate-600" />}
+                <span className="text-[11px] font-black uppercase tracking-widest text-slate-700">Support</span>
+                <span className="text-[11px] font-bold text-slate-500">{n} room{n === 1 ? '' : 's'}{note ? ' · ' + note : ''}</span>
+                <span className="ml-auto text-[10px] font-extrabold text-[#0072CE]">{open ? 'Fold' : 'Show'}</span>
+            </button>
+        );
+    };
+    // Production rooms first, then the Support section (folded in PBED). `card(room)` draws one room.
+    const sectioned = function(list, view, card, note) {
+        const prodList = list.filter(function(r) { return !supportRooms[r]; });
+        const supList = list.filter(function(r) { return !!supportRooms[r]; });
+        return (
+            <React.Fragment>
+                {prodList.map(function(r) { return card(r); })}
+                {supList.length > 0 && prodList.length > 0 && supportHeader(view, supList.length, note ? note(supList) : '')}
+                {supList.length > 0 && (prodList.length === 0 || isSupportOpen(view)) && supList.map(function(r) { return card(r); })}
+            </React.Fragment>
+        );
+    };
+    // Colors. A color picked by hand wins: a piece's own, then its function's in that room (the Subcategory, or "Regular" with none),
+    // then the room's; with none the room keeps the color the app has always given it.
+    const fnLabelOf = function(a) { return String((a && a.subcategory) || '').trim() || 'Regular'; };
+    const assetFn = useMemo(function() { const m = {}; assets.forEach(function(a) { m[a.id] = fnLabelOf(a); }); return m; }, [assets]);
+    const functionsByRoom = useMemo(function() {
+        const m = {};
+        assets.forEach(function(a) { const k = String(a.area); const f = fnLabelOf(a); (m[k] = m[k] || {})[f] = true; });
+        Object.keys(m).forEach(function(k) { m[k] = Object.keys(m[k]).sort(); });
+        return m;
+    }, [assets]);
+    const roomHex = function(area) { return hexOr(roomColors[String(area)]); };
+    const roomHexShown = function(area) { return roomHex(area) || ROOM_CLASS_HEX[getRoomColor(area)] || '#64748b'; };
+    const taskHex = function(t) {
+        if (!t) return '';
+        const pid = t.parentId || t.id, area = String(t.originalArea || t.area || '');
+        return hexOr(equipColors[pid]) || hexOr(functionColors[area + '|' + (assetFn[pid] || 'Regular')]) || roomHex(area);
+    };
+    const pieceHexShown = function(a) { return hexOr(equipColors[a.id]) || hexOr(functionColors[String(a.area) + '|' + fnLabelOf(a)]) || roomHexShown(a.area); };
+    const bgOf = function(hex, extra) { return hex ? Object.assign({ backgroundColor: hex }, extra || {}) : extra; };
+    const inkOf = function(hex, extra) { return hex ? Object.assign({ color: textOnHex(hex) }, extra || {}) : extra; };
+    // A block label can start over the dark Transit / Inspection strip: dark ink (a light color picked by hand) then gets a white halo.
+    const labelInkOf = function(hex, overDark) { return hex && overDark && textOnHex(hex) !== '#ffffff' ? Object.assign({ color: textOnHex(hex) }, { textShadow: '0 0 2px #fff, 0 0 4px #fff, 0 0 6px #fff' }) : inkOf(hex); };
+    const setColorIn = function(setter, key, hex) { setter(function(prev) { const n = Object.assign({}, prev); if (hex) n[key] = hex; else delete n[key]; return n; }); };
+    const colorPick = function(id, value, isCustom, onPick, onClear, label) {
+        return (
+            <span className="inline-flex items-center gap-1">
+                <input type="color" data-color-pick={id} value={value} title={label} onChange={function(e) { onPick(e.target.value); }} className="w-6 h-6 p-0 border border-slate-300 rounded cursor-pointer no-pan bg-white" />
+                {isCustom && <button data-color-clear={id} onClick={function() { onClear(); }} title="Back to the standard color" className="text-[11px] font-black text-slate-400 hover:text-rose-600 leading-none">×</button>}
+            </span>
+        );
+    };
 
     // Filtered list strictly omitting skipped rooms to clean up UI rendering loops downstream
     const activeRooms = allUniqueRooms.filter(function(r) { return !roomHidden(r); });
@@ -3206,6 +3491,14 @@ export default function App(props) {
         return breaks;
     }, [includeBreaks, ganttStartDate, globalStartMs, planHorizonMins]);
 
+    // Time blocks (PBED) and what the down lines close (Ganttly): per room, whole-plant ones, and everything the Gantt draws as a band.
+    const planBlocks = useMemo(function() {
+        const tb = IS_CURRENT ? [] : expandTimeBlocks(timeBlocks, globalStartMs, planHorizonMins);
+        const byRoom = {}, plant = [];
+        tb.forEach(function(i) { if (i.room) (byRoom[i.room] = byRoom[i.room] || []).push(i); else plant.push(i); });
+        Object.keys(downLinePlan.blocks).forEach(function(a) { byRoom[a] = (byRoom[a] || []).concat(downLinePlan.blocks[a]); });
+        return { byRoom: byRoom, plant: plant, bands: tb.concat(downLinePlan.bands) };
+    }, [timeBlocks, downLinePlan, globalStartMs, planHorizonMins]);
     const allInterrupts = useMemo(function() {
         const startMs = globalStartMs;
         // A downtime that began before the window keeps its real end (only the part inside the window counts); one that ended
@@ -3216,8 +3509,8 @@ export default function App(props) {
             const offset = Math.max(0, raw), end = raw + (Number(dt.duration) || 0);
             return { start: offset, end: end, duration: end - offset, label: dt.label, isCustom: true, type: dt.type, targetId: dt.targetId };
         }).filter(function(i) { return i.end > i.start; });
-        return activeBreaks.concat(customInts).sort(function(a,b) { return a.start - b.start; });
-    }, [activeBreaks, downtimes, globalStartMs]);
+        return activeBreaks.concat(customInts).concat(planBlocks.plant).sort(function(a,b) { return a.start - b.start; });
+    }, [activeBreaks, downtimes, globalStartMs, planBlocks]);
 
     // Mutators
     const handleRoomHandoverChange = function(area, val) { setRoomHandovers(function(prev) { return Object.assign({}, prev, { [area]: val }); }); };
@@ -3280,6 +3573,62 @@ export default function App(props) {
         setNewDtTime(defaultDtTime());
         setIsEquipDtModalOpen(true);
     };
+
+    // ---- Time blocks (PBED) and down lines (Ganttly): the dialogs ----
+    const pad2 = function(n) { return (n < 10 ? '0' : '') + n; };
+    const openBlockModal = function(b) {
+        setBlockModal(b ? { id: b.id, kind: b.kind, label: b.label || '', room: b.room || '', date: String(b.dateTimeStr).slice(0, 10), time: String(b.dateTimeStr).slice(11, 16), duration: b.duration, repeat: b.repeat || 'none', color: hexOr(b.color), err: '' }
+            : { id: '', kind: 'inspection', label: '', room: '', date: ganttStartDate, time: pad2(ganttStartHour) + ':00', duration: 60, repeat: 'none', color: '', err: '' });
+    };
+    const patchBlock = function(patch) { setBlockModal(function(m) { return m ? Object.assign({}, m, patch, { err: '' }) : m; }); };
+    const saveBlock = function() {
+        const m = blockModal;
+        if (!m) return;
+        if (!m.date || !m.time) { setBlockModal(Object.assign({}, m, { err: 'Pick the date and the start time.' })); return; }
+        const dur = Math.round(Number(m.duration));
+        if (!(dur > 0)) { setBlockModal(Object.assign({}, m, { err: 'Give the block a length in minutes.' })); return; }
+        const at = localInputMs(m.date + 'T' + m.time), yr = new Date(at).getFullYear();
+        if (isNaN(at) || yr < 2000 || yr > 2100) { setBlockModal(Object.assign({}, m, { err: 'Pick a date this decade (the year looks wrong).' })); return; }
+        const rec = { id: m.id || 'tb_' + Date.now(), kind: m.kind, label: String(m.label || '').trim(), room: m.room, dateTimeStr: m.date + 'T' + m.time, duration: dur, repeat: m.repeat === 'daily' ? 'daily' : 'none', color: hexOr(m.color) };
+        setTimeBlocks(function(prev) { return m.id ? prev.map(function(x) { return x.id === m.id ? rec : x; }) : prev.concat([rec]); });
+        setBlockModal(null);
+    };
+    const deleteBlock = function(id) { setTimeBlocks(function(prev) { return prev.filter(function(x) { return x.id !== id; }); }); setBlockModal(null); };
+    const openDownModal = function(d) {
+        setDownModal(d ? { id: d.id, line: d.line, lineId: d.lineId || '', typed: !d.lineId, rooms: (d.rooms || []).slice(), edited: true, startStr: d.startStr, hasEnd: !!d.endStr, endStr: d.endStr || '', note: d.note || '', err: '' }
+            : { id: '', line: '', lineId: '', typed: false, rooms: [], edited: false, startStr: msToLocalInput(liveTime.getTime()), hasEnd: false, endStr: '', note: '', err: '' });
+    };
+    const patchDown = function(patch) { setDownModal(function(m) { return m ? Object.assign({}, m, patch, { err: '' }) : m; }); };
+    const pickDownLine = function(val) {
+        if (val === '__typed') { patchDown({ typed: true, lineId: '', line: '', rooms: [], edited: false }); return; }
+        const l = lineIndex.filter(function(x) { return x.id === val; })[0];
+        if (!l) { patchDown({ typed: false, lineId: '', line: '', rooms: [], edited: false }); return; }
+        patchDown({ typed: false, lineId: l.id, line: l.name, rooms: roomsForLine(allUniqueRooms, lineIndex, l.id, l.name), edited: false });
+    };
+    const typeDownLine = function(name) {
+        setDownModal(function(m) { return m ? Object.assign({}, m, { line: name, err: '', rooms: m.edited ? m.rooms : roomsForLine(allUniqueRooms, lineIndex, '', name) }) : m; });
+    };
+    const toggleDownRoom = function(room, on) {
+        setDownModal(function(m) {
+            if (!m) return m;
+            const has = m.rooms.indexOf(room) > -1;
+            return Object.assign({}, m, { err: '', edited: true, rooms: on && !has ? m.rooms.concat([room]) : !on ? m.rooms.filter(function(r) { return r !== room; }) : m.rooms });
+        });
+    };
+    const saveDown = function() {
+        const m = downModal;
+        if (!m) return;
+        const fail = function(msg) { setDownModal(Object.assign({}, m, { err: msg })); };
+        if (!String(m.line).trim()) return fail('Pick the line, or type its name.');
+        const st = localInputMs(m.startStr), en = m.hasEnd ? localInputMs(m.endStr) : Infinity;
+        if (isNaN(st)) return fail('Pick when the line went down.');
+        if (isNaN(en)) return fail('Pick when it restarts, or tick "Not known yet".');
+        if (en <= st) return fail('The restart has to be after the stop.');
+        const rec = { id: m.id || 'dl_' + Date.now(), line: String(m.line).trim(), lineId: m.typed ? '' : m.lineId, rooms: m.rooms.slice(), startStr: m.startStr, endStr: m.hasEnd ? m.endStr : '', note: String(m.note || '').trim() };
+        setDownLineList(function(prev) { return m.id ? prev.map(function(x) { return x.id === m.id ? rec : x; }) : prev.concat([rec]); });
+        setDownModal(null);
+    };
+    const deleteDown = function(id) { setDownLineList(function(prev) { return prev.filter(function(x) { return x.id !== id; }); }); setDownModal(null); };
 
     const addDowntime = function(type) {
         if (!newDtDate || !newDtTime) return alert("Date and Time required.");
@@ -3349,7 +3698,7 @@ export default function App(props) {
     // PBED keeps the plan's inputs still on every tab that doesn't show the plan: React is handed the array it had last time, so the memo
     // below returns its last result, and the first click on Gantt, Focus or Metrics (or Print) plans once with whatever changed.
     const engineOn = !LAZY_ENGINE || printing || ENGINE_TABS.indexOf(activeTab) > -1;
-    const engineDepsNow = [assets, cleanTypes, roomCleanType, cleanTypeCols, planMode, odStatus, roomLimits, handoffMs, roomPriority, roomCleanTogether, roomAllergen, overrides, taskStatus, targetDowntimes, allInterrupts, includeTransit, includeInspection, pbMode, hiddenRooms, roomSource, shiftStartLines, areaLine, customOnlyAreas, windowPlans, laneByEmpCrew, shiftWindows, laneRoster, maxCrewSize, planHorizonMins, handoverMins, tailFillMins, reforecastFrom, ganttStartDate, ganttStartHour, shiftRotation];
+    const engineDepsNow = [assets, supportRooms, cleanTypes, roomCleanType, cleanTypeCols, planMode, odStatus, roomLimits, handoffMs, roomPriority, roomCleanTogether, roomAllergen, overrides, taskStatus, targetDowntimes, planBlocks, allInterrupts, includeTransit, includeInspection, pbMode, hiddenRooms, roomSource, shiftStartLines, areaLine, customOnlyAreas, windowPlans, laneByEmpCrew, shiftWindows, laneRoster, maxCrewSize, planHorizonMins, handoverMins, tailFillMins, reforecastFrom, ganttStartDate, ganttStartHour, shiftRotation];
     const engineDepsRef = useRef(null);
     if (engineOn || engineDepsRef.current === null) engineDepsRef.current = engineDepsNow;
     const scheduleData = useMemo(function() {
@@ -3434,6 +3783,7 @@ export default function App(props) {
                     tasks: [],
                     limit: Infinity,
                     startOffset: Infinity,
+                    supportOnly: true,   // every room in it is support (production goes first among rooms of the same priority)
                     areaFloor: {},   // each room's own earliest start: a combined clean orders by the earliest, but a room's tasks never start before its own handoff
                     priority: Infinity,
                     areas: {}
@@ -3442,6 +3792,7 @@ export default function App(props) {
 
             const vRoom = virtualRoomsMap[vRoomKey];
             vRoom.areas[area] = true;
+            if (!supportRooms[String(area)]) vRoom.supportOnly = false;
 
             // Max Workers = how many people may work in the room at the same time (blank = no cap).
             const rLimit = roomLimits[area] !== undefined ? roomLimits[area] : Infinity;
@@ -3450,6 +3801,7 @@ export default function App(props) {
             let rStartMins = 0;
             const handMs = handoffMs[area];   // a typed Handover or the production schedule's handoff (see PRODUCTION SCHEDULE HANDOFFS)
             if (handMs !== undefined && handMs !== null) rStartMins = Math.max(0, Math.round((handMs - startMs) / 60000));
+            rStartMins = pushPastBlocks(rStartMins, (planBlocks.byRoom[area] || []).concat(planBlocks.plant));   // a time block under way at the start is waited out
             if (rStartMins < vRoom.startOffset) vRoom.startOffset = rStartMins;
             vRoom.areaFloor[area] = rStartMins;
 
@@ -3474,6 +3826,7 @@ export default function App(props) {
             }).filter(function(i) { return i.end > i.start; });
 
             t.customInterrupts = mappedInts.concat(allInterrupts).sort(function(a,b){return a.start - b.start;});
+            t.walls = (planBlocks.byRoom[area] || []).slice().sort(function(a, b) { return a.start - b.start; });   // the room's time blocks and closings: never worked across
 
             const baseMins = t.isPbActive && t.pbMins > 0 ? t.pbMins : (t.isAllergenActive && t.allergenMins > 0 ? t.allergenMins : t.baseMins);
             const parent = {
@@ -3752,7 +4105,8 @@ export default function App(props) {
         // Whatever no shift can take overflows the plan.
         const sortedVRooms = Object.values(virtualRoomsMap).sort(function(a, b) {
             if (a.startOffset !== b.startOffset) return a.startOffset - b.startOffset;
-            return a.priority - b.priority;
+            if (a.priority !== b.priority) return a.priority - b.priority;
+            return (a.supportOnly ? 1 : 0) - (b.supportOnly ? 1 : 0);
         });
         let pending = [];
         sortedVRooms.forEach(function(vRoom) {
@@ -3837,10 +4191,13 @@ export default function App(props) {
             const capped = vRoom.limit < Infinity;
             const occ = capped ? roomOcc(vRoom) : [];
             occ.forEach(function(o) { if (o.end > from && o.end < until) timeSet[o.end] = true; });
+            (task.walls || []).forEach(function(w) { if (w.end > from && w.end < until) timeSet[w.end] = true; });
             const times = Object.keys(timeSet).map(Number).sort(function(a, b) { return a - b; });
             for (let i = 0; i < times.length; i++) {
                 const t = times[i];
+                if (wallAt(task.walls, t)) continue;
                 const dur = task.calculateDuration(t, task.customInterrupts, H);
+                if (nextWallStart(task.walls, t) < t + dur - 0.01) continue;
                 const night = isNightAt(t);
                 const fits = [];
                 lanes.forEach(function(l) {
@@ -3871,15 +4228,19 @@ export default function App(props) {
             const capped = vRoom.limit < Infinity;
             const occ = capped ? roomOcc(vRoom) : [];
             occ.forEach(function(o) { if (o.end > from && o.end < until) timeSet[o.end] = true; });
+            (task.walls || []).forEach(function(w) { if (w.end > from && w.end < until) timeSet[w.end] = true; });
             const times = Object.keys(timeSet).map(Number).sort(function(a, b) { return a - b; });
             for (let i = 0; i < times.length; i++) {
                 const t = times[i];
+                if (wallAt(task.walls, t)) continue;
+                const wallStart = nextWallStart(task.walls, t);   // the part stops where the room's next block / closing starts
                 const night = isNightAt(t);
                 const opts = [];
                 lanes.forEach(function(l) {
                     if (l !== mustLane && !workers[l].canDo(task.kind, night)) return;
                     const r = runsBy[l].find(function(x) { return x.start <= t && t < x.end; });
-                    if (r && netWorkingMins(t, r.end, ints) >= tailMin - 0.01) opts.push({ w: workers[l], r: { run: r.end - t, end: r.end } });
+                    const rEnd = r ? Math.min(r.end, wallStart) : 0;
+                    if (r && netWorkingMins(t, rEnd, ints) >= tailMin - 0.01) opts.push({ w: workers[l], r: { run: rEnd - t, end: rEnd } });
                 });
                 if (opts.length < H) continue;
                 if (mustLane !== null && !opts.some(function(o) { return o.w.id === mustLane; })) continue;
@@ -4649,6 +5010,8 @@ export default function App(props) {
         const dtKeep = function(dt) { const t = new Date(dt.dateTimeStr).getTime(); return isNaN(t) || t + (Number(dt.duration) || 0) * 60000 >= globalStartMs; };
         setDowntimes(function(prev) { return prev.every(dtKeep) ? prev : prev.filter(dtKeep); });
         setTargetDowntimes(function(prev) { return prev.every(dtKeep) ? prev : prev.filter(dtKeep); });
+        const dlKeep = function(d) { const e = d.endStr ? new Date(d.endStr).getTime() : Infinity; return isNaN(e) || e >= globalStartMs; };   // a down line that restarted before the window no longer matters
+        setDownLineList(function(prev) { return prev.every(dlKeep) ? prev : prev.filter(dlKeep); });
         setAbsentByShift(function(prev) { return prune(prev, markKeep); });
         setExtraPeople(function(prev) { return prune(prev, markKeep); });
         setCustomTasks(function(prev) { return prev.every(taskKeep) ? prev : prev.filter(taskKeep); });
@@ -4910,14 +5273,10 @@ export default function App(props) {
     // Breaks / downtime that land inside a worker's booked time (absorbed into their blocks).
     metricsWorkers.forEach(function(w) {
         w.schedule.forEach(function(slot) {
-            allInterrupts.forEach(function(b) {
-                const oStart = Math.max(slot.start, b.start);
-                const oEnd = Math.min(slot.end, b.end);
-                if (oEnd > oStart) {
-                    if (b.isCustom) deepDown += (oEnd - oStart);
-                    else deepBreak += (oEnd - oStart);
-                }
-            });
+            // Overlapping stretches (a plant block over a break) are counted once, as downtime.
+            const down = unionMins(allInterrupts.filter(function(b) { return b.isCustom; }), slot.start, slot.end);
+            deepDown += down;
+            deepBreak += unionMins(allInterrupts, slot.start, slot.end) - down;
         });
     });
 
@@ -4982,6 +5341,13 @@ export default function App(props) {
             equipDone: parentsHere.filter(function(p) { return (p.blocks.length > 0 || (IS_CURRENT && p.lastDoneMs > 0)) && p.unscheduledWork === 0 && p.blocks.every(function(b) { return b.isComplete; }); }).length
         };
     });
+    // The Metrics table: production rooms, then a Support band that folds the support rooms away (open when there is nothing above it).
+    const roomStatRows = (function() {
+        const prod = roomStats.filter(function(r) { return !isSupportRoom(r.room); }), sup = roomStats.filter(function(r) { return isSupportRoom(r.room); });
+        if (!sup.length || !prod.length) return prod.concat(sup);
+        const open = isSupportOpen('metrics');
+        return prod.concat([{ band: true, n: sup.length, open: open }]).concat(open ? sup : []);
+    })();
 
     const dynamicTotalHours = Math.max(Math.ceil(planHorizonMins / 60), Math.ceil(globalMaxEnd / 60)) + 2;
     const GANTT_TOTAL_WIDTH_PX = dynamicTotalHours * zoomLevel + (stack ? stack.gapCount * INTERRUPT_PX : 0);
@@ -5010,11 +5376,20 @@ export default function App(props) {
         const gaps = w && w.idleGaps ? w.idleGaps.filter(function(g) { return g.end - g.start >= IDLE_SHOW_MINS; }) : [];
         return { gaps: gaps, mins: gaps.reduce(function(a, g) { return a + (g.end - g.start); }, 0) };
     });
+    // A saved local date-time ("2026-10-09T14:30") as clock text, e.g. "Fri 10/9 2:30 PM".
+    // A block that matters for this plan: one that repeats every day, or whose time overlaps the plan window (one whose date cannot be read stays listed so it can be removed).
+    const blockInWindow = function(b) {
+        if (b.repeat === 'daily') return true;
+        const ms = localInputMs(b.dateTimeStr);
+        if (isNaN(ms)) return true;
+        return ms + Math.round(Number(b.duration) || 0) * 60000 > globalStartMs && ms < globalStartMs + planHorizonMins * 60000;
+    };
+    const whenOf = function(str) { const ms = localInputMs(str); return isNaN(ms) ? String(str) : formatDayClock(ms); };
     const fmtMins = function(m) { m = Math.round(m); return m >= 60 ? Math.floor(m / 60) + 'h' + (m % 60 ? ' ' + (m % 60) + 'm' : '') : m + 'm'; };
     // PBED's room-first Gantt: the left column lists the rooms and, under each room, a second list of the people cleaning it in
     // the order they get going (with when they start); the chart gives each room a straight bar from when it starts to when it
     // is done, and each person's own cleans on their line, so the team reads as a staircase. Click a block to open it.
-    const ROOM_HEAD_PX = 40, ROOM_ROW_PX = 24, ROOM_GAP_PX = 8;
+    const ROOM_HEAD_PX = 40, ROOM_ROW_PX = 24, ROOM_GAP_PX = 8, SUPPORT_BAND_PX = 28;
     const roomLayout = function() {
         const rows = [];
         displayData.forEach(function(g) {
@@ -5042,27 +5417,51 @@ export default function App(props) {
                 const ids = lid && windowPlans[k].lineWorkers[lid] ? windowPlans[k].lineWorkers[lid] : [];
                 ids.forEach(function(id) { const r = empById[id]; if (r && r.isLead && leadNames.indexOf(rosterInfo.namesById[id]) === -1 && laneRoster.some(function(l) { return l.empId === id; })) leadNames.push(rosterInfo.namesById[id]); });
             });
-            rows.push({ g: g, per: per, people: people, blocks: blocks, start: start, end: end, work: work, pct: work > 0 ? Math.round((done / work) * 100) : 0, late: late, priority: roomPriority[g.name] || 2, leads: leadNames, height: ROOM_HEAD_PX + people.length * ROOM_ROW_PX + 6 });
+            rows.push({ g: g, per: per, people: people, blocks: blocks, start: start, end: end, work: work, pct: work > 0 ? Math.round((done / work) * 100) : 0, late: late, priority: roomPriority[g.name] || 2, leads: leadNames, support: isSupportRoom(g.name), height: ROOM_HEAD_PX + people.length * ROOM_ROW_PX + 6 });
         });
-        rows.sort(function(a, b) { return a.priority - b.priority || a.start - b.start || a.g.name.localeCompare(b.g.name); });
+        // Production rooms first, then the Support section. Inside each: the order the planner set (Setup, or the arrows here), and the
+        // rooms nobody has moved by the preset priority, then by when they start.
+        rows.sort(function(a, b) { return roomCmp(a.g.name, b.g.name, function() { return a.priority - b.priority || a.start - b.start || a.g.name.localeCompare(b.g.name); }); });
+        const prodRows = rows.filter(function(r) { return !r.support; }), supRows = rows.filter(function(r) { return r.support; });
+        const shown = rows.map(function(r) { return r.g.name; });
+        const supOpen = isSupportOpen('gantt') || prodRows.length === 0;
+        const placed = [];
         let top = 0;
-        rows.forEach(function(r) { r.top = top; top += r.height + ROOM_GAP_PX; });
-        return { rows: rows, height: Math.max(top, 60) };
+        const place = function(r, i, arr) { r.top = top; top += r.height + ROOM_GAP_PX; r.canUp = i > 0; r.canDown = i < arr.length - 1; placed.push(r); };
+        prodRows.forEach(place);
+        let band = null;
+        if (supRows.length) {
+            if (prodRows.length > 0) { band = { top: top, n: supRows.length, open: supOpen }; top += SUPPORT_BAND_PX + ROOM_GAP_PX; }
+            if (supOpen) supRows.forEach(place);
+        }
+        return { rows: placed, band: band, shown: shown, height: Math.max(top, 60) };
     };
     const renderRoomChart = function() {
         const lay = roomLayout();
         return (
             <React.Fragment>
                 <div data-room-left className="sticky left-0 w-[190px] flex-shrink-0 bg-slate-50 border-r border-gray-300 z-30 shadow-[4px_0_10px_rgba(0,0,0,0.03)] relative no-pan" style={{ height: `${lay.height}px` }}>
-                    {lay.rows.length === 0 && <div className="p-3 text-[11px] font-bold text-slate-400">No room has work in this view.</div>}
+                    {lay.rows.length === 0 && !lay.band && <div className="p-3 text-[11px] font-bold text-slate-400">No room has work in this view.</div>}
+                    {lay.band && (
+                        <button data-support-toggle="gantt" data-support-open={lay.band.open ? '1' : '0'} onClick={function() { toggleSupport('gantt'); }} className="absolute left-0 right-0 flex items-center gap-1.5 px-2 border-y border-slate-300 bg-slate-100 hover:bg-slate-200 text-left no-pan" style={{ top: `${lay.band.top}px`, height: `${SUPPORT_BAND_PX}px` }}>
+                            {lay.band.open ? <ChevronDown className="w-3.5 h-3.5 text-slate-600" /> : <ChevronRight className="w-3.5 h-3.5 text-slate-600" />}
+                            <span className="text-[10px] font-black uppercase tracking-widest text-slate-700">Support</span>
+                            <span className="text-[10px] font-bold text-slate-500">{lay.band.n} room{lay.band.n === 1 ? '' : 's'}</span>
+                            <span className="ml-auto text-[9px] font-extrabold text-[#0072CE]">{lay.band.open ? 'Fold' : 'Show'}</span>
+                        </button>
+                    )}
                     {lay.rows.map(function(r) {
                         return (
                             <div key={r.g.name} data-room-row={r.g.name} className="absolute left-0 right-0 border-b border-gray-200 bg-white overflow-hidden" style={{ top: `${r.top}px`, height: `${r.height}px` }} title={`${r.g.name}${r.leads.length ? '\nLead: ' + r.leads.join(', ') : ''}`}>
                                 <div className="px-2 pt-1.5 bg-slate-50 border-b border-slate-100" style={{ height: `${ROOM_HEAD_PX}px` }}>
                                     <div className="flex items-center gap-1.5 min-w-0">
-                                        <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${getRoomColor(r.g.name)}`} />
+                                        <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${getRoomColor(r.g.name)}`} style={bgOf(roomHex(r.g.name))} />
                                         <span className="text-[12px] font-black text-slate-800 truncate min-w-0">{r.g.name}</span>
                                         <span className="text-[9px] font-black rounded px-1 py-0.5 bg-[#E6F1FB] text-[#00468B] border border-[#B3D4F2] flex-shrink-0" title="Room priority (1 = first)">P{r.priority}</span>
+                                        <span className="ml-auto flex items-center gap-0.5 flex-shrink-0">
+                                            <button data-room-up={r.g.name} disabled={!r.canUp} onClick={function(e) { e.stopPropagation(); moveRoom(r.g.name, -1, lay.shown); }} title="Show this room higher" aria-label="Show this room higher" className="w-5 h-5 rounded text-[9px] leading-none font-black text-[#0072CE] hover:bg-[#E6F1FB] disabled:opacity-25 disabled:hover:bg-transparent no-pan">▲</button>
+                                            <button data-room-down={r.g.name} disabled={!r.canDown} onClick={function(e) { e.stopPropagation(); moveRoom(r.g.name, 1, lay.shown); }} title="Show this room lower" aria-label="Show this room lower" className="w-5 h-5 rounded text-[9px] leading-none font-black text-[#0072CE] hover:bg-[#E6F1FB] disabled:opacity-25 disabled:hover:bg-transparent no-pan">▼</button>
+                                        </span>
                                     </div>
                                     <div className="text-[10px] font-bold text-slate-500 mt-0.5 truncate">{fmtMins(r.work)} · {r.people.length} {r.people.length === 1 ? 'person' : 'people'} · {r.pct}% done</div>
                                 </div>
@@ -5081,14 +5480,23 @@ export default function App(props) {
                     })}
                 </div>
                 <div className="relative no-pan touch-none" style={{ width: `${GANTT_TOTAL_WIDTH_PX}px`, height: `${lay.height}px` }}>
+                    {lay.band && <div data-support-band className="absolute left-0 right-0 border-y border-slate-300 bg-slate-100/80 pointer-events-none" style={{ top: `${lay.band.top}px`, height: `${SUPPORT_BAND_PX}px` }} />}
                     {lay.rows.map(function(r) {
                         const left = xOf(r.start), width = Math.max(xOf(r.end) - xOf(r.start), 10);
                         return (
                             <div key={r.g.name} data-room-chart={r.g.name} className="absolute left-0 right-0 border-b border-gray-200/70" style={{ top: `${r.top}px`, height: `${r.height}px` }}>
-                                <div data-room-bar className={`absolute rounded-md border border-black/20 shadow-sm flex items-center overflow-hidden ${getRoomColor(r.g.name)}`} style={{ left: `${left}px`, width: `${width}px`, top: '7px', height: `${ROOM_HEAD_PX - 14}px` }} title={`${r.g.name}: ${formatClockTime(ganttStartDate, ganttStartHour, r.start)} – ${formatClockTime(ganttStartDate, ganttStartHour, r.end).replace(/^\S+ /, '')}`}>
+                                <div data-room-bar className={`absolute rounded-md border border-black/20 shadow-sm flex items-center overflow-hidden ${getRoomColor(r.g.name)}`} style={bgOf(roomHex(r.g.name), { left: `${left}px`, width: `${width}px`, top: '7px', height: `${ROOM_HEAD_PX - 14}px` })} title={`${r.g.name}: ${formatClockTime(ganttStartDate, ganttStartHour, r.start)} – ${formatClockTime(ganttStartDate, ganttStartHour, r.end).replace(/^\S+ /, '')}`}>
                                     <div className="h-full bg-white/25" style={{ width: `${r.pct}%` }} />
-                                    {width > 70 && <span className="absolute inset-0 px-2 flex items-center text-white font-black text-[11px] truncate drop-shadow">{formatClockTime(ganttStartDate, ganttStartHour, r.start)} → {formatClockTime(ganttStartDate, ganttStartHour, r.end).replace(/^\S+ /, '')} · {fmtMins(r.end - r.start)}{r.late > 0 ? ' · ' + r.late + ' late' : ''}</span>}
+                                    {width > 70 && <span className="absolute inset-0 px-2 flex items-center text-white font-black text-[11px] truncate drop-shadow" style={inkOf(roomHex(r.g.name))}>{formatClockTime(ganttStartDate, ganttStartHour, r.start)} → {formatClockTime(ganttStartDate, ganttStartHour, r.end).replace(/^\S+ /, '')} · {fmtMins(r.end - r.start)}{r.late > 0 ? ' · ' + r.late + ' late' : ''}</span>}
                                 </div>
+                                {planBlocks.bands.filter(function(b) { return b.room === r.g.name; }).map(function(b, bi) {
+                                    const lPx = xOf(b.start), wPx = Math.max(xEnd(b.end) - lPx, 4);
+                                    return (
+                                        <div key={`rb-${bi}`} data-band={b.kind} data-band-room={b.room} className="absolute z-10 overflow-hidden pointer-events-none border-x border-dashed" style={{ left: `${lPx}px`, width: `${wPx}px`, top: 0, bottom: 0, backgroundColor: b.color + '33', borderColor: b.color }}>
+                                            {wPx > 15 && <span className="absolute top-1 left-1 text-[9px] font-black whitespace-nowrap rounded px-1" style={{ backgroundColor: b.color, color: textOnHex(b.color) }}>{b.label}</span>}
+                                        </div>
+                                    );
+                                })}
                                 {r.people.map(function(q) {
                                     return <div key={q.lane} className="absolute border-t border-dashed border-gray-200/80 pointer-events-none" style={{ left: 0, right: 0, top: `${ROOM_HEAD_PX + q.row * ROOM_ROW_PX}px` }} />;
                                 })}
@@ -5105,9 +5513,9 @@ export default function App(props) {
                                                 onClick={function() { setSelectedTaskEditor(t.id); }}
                                                 title={`${t.name} · ${t.originalArea}\n${laneRoster[lane].name}\n${timeRange(t)}`}
                                                 className={`no-pan absolute z-20 cursor-pointer rounded flex items-center overflow-hidden border border-black/20 ${getRoomColor(t.originalArea)} ${t.isComplete ? 'opacity-60 grayscale complete-stripes' : ''} ${ringCls} hover:brightness-110 hover:shadow-lg hover:z-30`}
-                                                style={{ left: `${bl}px`, width: `${bw}px`, top: `${ROOM_HEAD_PX + q.row * ROOM_ROW_PX + 3}px`, height: `${ROOM_ROW_PX - 6}px` }}
+                                                style={bgOf(taskHex(t), { left: `${bl}px`, width: `${bw}px`, top: `${ROOM_HEAD_PX + q.row * ROOM_ROW_PX + 3}px`, height: `${ROOM_ROW_PX - 6}px` })}
                                             >
-                                                {bw > 30 && <span className="px-1.5 text-white font-bold text-[10px] truncate leading-none drop-shadow-sm flex items-center gap-1">{t.isComplete && <Check className="w-2.5 h-2.5 flex-shrink-0" />}{t.name}</span>}
+                                                {bw > 30 && <span className="px-1.5 text-white font-bold text-[10px] truncate leading-none drop-shadow-sm flex items-center gap-1" style={inkOf(taskHex(t))}>{t.isComplete && <Check className="w-2.5 h-2.5 flex-shrink-0" />}{t.name}</span>}
                                             </div>
                                         );
                                     });
@@ -5122,12 +5530,33 @@ export default function App(props) {
     // The Crew tab's card for a shift whose crews were built automatically: one block per room, its leader and team inside.
     const renderAutoRooms = function(w, view) {
         const dayTag = function(n) { return n > 0 ? n + (n === 1 ? ' day' : ' days') + ' here' : 'new to it'; };
-        return (
-            <div className="p-3 space-y-2" data-auto-rooms={w.key}>
-                {view.rooms.map(function(r) {
+        // Production rooms first, then the Support section at the bottom (folded in PBED). Inside each: the order the planner set in
+        // Setup / the Gantt arrows, the rooms nobody moved as the crews were built (priority, then work).
+        const manualIdx = function(r) { let best = -1; (r.labels || []).forEach(function(lb) { const i = roomOrder.indexOf(lb); if (i > -1 && (best === -1 || i < best)) best = i; }); return best; };
+        const ordered = view.rooms.map(function(r, i) { return { r: r, i: i }; }).sort(function(a, b) {
+            const sa = a.r.support ? 1 : 0, sb = b.r.support ? 1 : 0;
+            if (sa !== sb) return sa - sb;
+            const ia = manualIdx(a.r), ib = manualIdx(b.r);
+            if (ia > -1 || ib > -1) { if (ia === -1) return 1; if (ib === -1) return -1; if (ia !== ib) return ia - ib; }
+            return a.i - b.i;
+        }).map(function(x) { return x.r; });
+        const prodRooms = ordered.filter(function(r) { return !r.support; }), supRooms = ordered.filter(function(r) { return r.support; });
+        const fixedProd = view.fixed.filter(function(f) { return !f.support; }), fixedSup = view.fixed.filter(function(f) { return f.support; });
+        const ownArea = function(list, key) {
+            return list.length > 0 && (
+                <div key={key} className="text-[11px] font-bold text-slate-600 border border-slate-200 rounded-lg px-3 py-1.5 bg-white">
+                    Own area: {list.map(function(f) { return f.name + ' → ' + f.room; }).join(' · ')}
+                </div>
+            );
+        };
+        const supCount = supRooms.length + fixedSup.length;
+        const foldKey = 'crew:' + w.key;   // one fold per shift card
+        const supShown = prodRooms.length === 0 && fixedProd.length === 0 || isSupportOpen(foldKey);
+        const roomCard = function(r) {
                     return (
-                        <div key={r.id} data-auto-room={r.name} className="border border-slate-200 rounded-lg overflow-hidden">
+                        <div key={r.id} data-auto-room={r.name} data-auto-support={r.support ? '1' : '0'} className="border border-slate-200 rounded-lg overflow-hidden">
                             <div className="flex flex-wrap items-center gap-2 px-3 py-1.5 bg-slate-50 border-b border-slate-100">
+                                <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: roomHexShown((r.labels || [])[0] || r.name) }} />
                                 <span className="text-[9px] font-black rounded px-1.5 py-0.5 bg-[#E6F1FB] text-[#00468B] border border-[#B3D4F2]" title="Room priority (1 = first)">P{r.priority}</span>
                                 <span className="font-black text-sm text-slate-800">{r.name}</span>
                                 <span className="text-[11px] font-bold text-slate-500">{fmtMins(r.rem)} of work{r.left > 1 ? ' · ' + fmtMins(r.left) + ' left for a later shift' : ' · done this shift'}</span>
@@ -5154,15 +5583,17 @@ export default function App(props) {
                             </div>
                         </div>
                     );
-                })}
-                {view.fixed.length > 0 && (
-                    <div className="text-[11px] font-bold text-slate-600 border border-slate-200 rounded-lg px-3 py-1.5 bg-white">
-                        Own area: {view.fixed.map(function(f) { return f.name + ' → ' + f.room; }).join(' · ')}
-                    </div>
-                )}
+        };
+        return (
+            <div className="p-3 space-y-2" data-auto-rooms={w.key}>
+                {prodRooms.map(roomCard)}
+                {ownArea(fixedProd, 'own-prod')}
                 {view.waiting.length > 0 && <div className="text-[11px] font-bold text-slate-500">Waiting for a later shift: {view.waiting.map(function(r) { return r.name + ' (P' + r.priority + ')'; }).join(', ')}</div>}
                 {view.floaters.length > 0 && <div className="text-[11px] font-bold text-slate-500">Leaders with no team this shift: {view.floaters.map(function(f) { return f.name; }).join(', ')}</div>}
                 {view.unplaced.length > 0 && <div className="text-[11px] font-bold text-amber-700">Not placed: {view.unplaced.map(function(u) { return u.name + ' (' + u.why + ')'; }).join(', ')}</div>}
+                {supCount > 0 && (prodRooms.length > 0 || fixedProd.length > 0) && supportHeader(foldKey, supRooms.length, fixedSup.length > 0 ? fixedSup.length + ' on their own area' : '')}
+                {supCount > 0 && supShown && supRooms.map(roomCard)}
+                {supCount > 0 && supShown && ownArea(fixedSup, 'own-sup')}
             </div>
         );
     };
@@ -5441,28 +5872,46 @@ export default function App(props) {
                         <div className="bg-white rounded-xl shadow-lg border border-gray-200 flex flex-col h-fit overflow-hidden flex-shrink-0">
                             <div className="bg-slate-50 border-b border-gray-200 px-4 md:px-6 py-4 md:py-5 shadow-sm z-10 flex-shrink-0 flex justify-between items-center">
                                 <h2 className="font-black text-slate-800 flex items-center uppercase tracking-widest text-xs md:text-sm"><MapPin className="w-4 h-4 md:w-5 md:h-5 mr-2 text-[#0072CE]"/> Room Configuration Canvas</h2>
-                                <Button variant="success" size="sm" onClick={function() { setIsCustomTaskModalOpen(true); }}>+ Add Custom Task</Button>
+                                <div className="flex items-center gap-2">
+                                    {roomOrder.length > 0 && (
+                                        <span data-reset-order className="inline-flex">
+                                            <Button variant="outline" size="sm" onClick={function() { setRoomOrder([]); }} title="Put the rooms back in their usual order (priority, then work; by name on Setup)">Reset room order</Button>
+                                        </span>
+                                    )}
+                                    <Button variant="success" size="sm" onClick={function() { setIsCustomTaskModalOpen(true); }}>+ Add Custom Task</Button>
+                                </div>
                             </div>
                             
                             <div className="p-4 md:p-6 bg-slate-50/50 grid gap-4">
+                                {areaColumnsNote(true)}
                                 {allUniqueRooms.length === 0 ? (
                                     <p className="text-center text-slate-400 mt-10 text-sm font-medium">No areas active.</p>
-                                ) : allUniqueRooms.map(function(room) {
+                                ) : sectioned(setupShown(), 'setup', function(room) {
                                     
                                     const isSkipped = roomHidden(room);
                                     const skippedByShiftStart = isSkipped && !hiddenRooms[room];
                                     if (hideConfiguredRooms && roomConfigured[room] && !isSkipped) return null;
 
                                     return (
-                                    <div key={room} className={`bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm transition-all flex-shrink-0 ${isSkipped ? 'opacity-50 bg-slate-50' : 'hover:border-[#B3D4F2]'}`}>
+                                    <div key={room} data-setup-room={room} className={`bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm transition-all flex-shrink-0 ${isSkipped ? 'opacity-50 bg-slate-50' : 'hover:border-[#B3D4F2]'}`}>
                                         
                                         <div className={`px-4 md:px-5 py-4 flex flex-col justify-between gap-3 ${isSkipped ? 'bg-slate-100/50' : 'bg-[#E6F1FB]'}`}>
-                                            <div className="flex items-center justify-between">
+                                            <div className="flex flex-wrap items-center justify-between gap-2">
                                                 <div className="flex items-center gap-2">
                                                     <MapPin className={`w-4 h-4 md:w-5 md:h-5 ${isSkipped ? 'text-slate-400' : 'text-[#0072CE]'}`}/>
                                                     <h3 className={`font-bold text-base md:text-[17px] tracking-wide ${isSkipped ? 'text-slate-500 line-through' : 'text-[#00468B]'}`}>{room}</h3>
+                                                    <span className={`w-3 h-3 rounded-full flex-shrink-0 border border-black/10 ${getRoomColor(room)}`} style={bgOf(roomHex(room))} title="Room color" />
+                                                    <span className="inline-flex items-center gap-0.5 ml-1" title="Move the room up or down in every list and chart">
+                                                        <button data-room-up={room} onClick={function() { moveRoom(room, -1, setupShown()); }} className="w-6 h-6 rounded border border-[#B3D4F2] bg-white text-[#0072CE] text-[11px] font-black hover:bg-[#E6F1FB] no-pan">▲</button>
+                                                        <button data-room-down={room} onClick={function() { moveRoom(room, 1, setupShown()); }} className="w-6 h-6 rounded border border-[#B3D4F2] bg-white text-[#0072CE] text-[11px] font-black hover:bg-[#E6F1FB] no-pan">▼</button>
+                                                    </span>
                                                 </div>
-                                                <div className="flex items-center gap-3">
+                                                <div className="flex flex-wrap items-center gap-2 md:gap-3">
+                                                    <select data-room-group={room} value={roomGroups[room] || ''} onChange={function(e) { handleRoomGroupChange(room, e.target.value); }} title="Production rooms are shown first; support rooms go in a folded section below them" className="text-[11px] font-bold outline-none bg-white cursor-pointer no-pan border border-[#B3D4F2] rounded-full px-2 py-1">
+                                                        <option value="">Group: auto ({autoSupportRoom(room) ? 'support' : 'production'})</option>
+                                                        <option value="production">Group: production</option>
+                                                        <option value="support">Group: support</option>
+                                                    </select>
                                                     {!isSkipped && (
                                                         <label className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-bold transition-colors cursor-pointer border shadow-sm touch-none ${roomConfigured[room] ? 'bg-emerald-500 text-white border-emerald-600 hover:bg-emerald-600' : 'bg-white text-slate-500 border-slate-300 hover:bg-slate-50'}`}>
                                                             <input type="checkbox" className="hidden" checked={roomConfigured[room] || false} onChange={function(e) { handleRoomConfiguredChange(room, e.target.checked); }} />
@@ -5482,9 +5931,10 @@ export default function App(props) {
                                                 <div className="flex flex-wrap items-center gap-3 mt-2">
                                                     {(function() {
                                                         const hi = handoffInfo[room] || { ms: null, src: 'hand-none' };
-                                                        const shown = roomHandovers[room] ? roomHandovers[room] : hi.ms !== null && hi.ms !== undefined ? msToLocalInput(hi.ms) : getDatetimeLocalString(0, ganttStartDate, ganttStartHour);
+                                                        const shown = hi.src === 'down' ? msToLocalInput(hi.ms) : roomHandovers[room] ? roomHandovers[room] : hi.ms !== null && hi.ms !== undefined ? msToLocalInput(hi.ms) : getDatetimeLocalString(0, ganttStartDate, ganttStartHour);
                                                         const fromSchedule = handoffSource === 'schedule';
-                                                        const chip = !fromSchedule ? null
+                                                        const chip = hi.src === 'down' ? 'line down · ' + (hi.lines || []).join(', ') + (hi.typed || roomHandovers[room] ? ' · a Handover typed here is overridden' : '')
+                                                            : !fromSchedule ? null
                                                             : hi.src === 'hand' ? 'typed in'
                                                             : hi.src === 'schedule' ? 'production hands it over · ' + (hi.lines || []).slice(0, 2).join(', ') + ((hi.lines || []).length > 2 ? ' +' + ((hi.lines || []).length - 2) : '')
                                                             : hi.src === 'free' ? 'production stopped · ' + (hi.lines || []).slice(0, 2).join(', ')
@@ -5522,6 +5972,20 @@ export default function App(props) {
                                                     <div className="flex items-center gap-2 h-[32px] md:h-[38px] px-2">
                                                         <input type="checkbox" checked={roomCleanTogether[room] || false} onChange={function(e) { handleRoomCleanTogetherChange(room, e.target.checked); }} className="w-4 h-4 md:w-5 md:h-5 accent-[#0072CE] cursor-pointer" />
                                                         <span className="text-[11px] font-bold text-slate-700 leading-tight cursor-pointer" onClick={function() { handleRoomCleanTogetherChange(room, !(roomCleanTogether[room] || false)); }}>Clean Together</span>
+                                                    </div>
+                                                    <div data-room-colors={room} className="flex flex-wrap items-center gap-2 bg-white px-2 py-1.5 rounded border border-[#B3D4F2] shadow-sm">
+                                                        <span className="text-[10px] font-black text-slate-500 uppercase">Color:</span>
+                                                        {colorPick('room:' + room, roomHexShown(room), !!roomHex(room), function(h) { setColorIn(setRoomColors, room, h); }, function() { setColorIn(setRoomColors, room, ''); }, 'Room color')}
+                                                        {(functionsByRoom[room] || []).length > 0 && <span className="text-[10px] font-black text-slate-500 uppercase ml-1">Functions:</span>}
+                                                        {(functionsByRoom[room] || []).map(function(fn) {
+                                                            const fk = room + '|' + fn;
+                                                            return (
+                                                                <span key={fn} className="inline-flex items-center gap-1 text-[11px] font-bold text-slate-600">
+                                                                    {colorPick('fn:' + fk, hexOr(functionColors[fk]) || roomHexShown(room), !!hexOr(functionColors[fk]), function(h) { setColorIn(setFunctionColors, fk, h); }, function() { setColorIn(setFunctionColors, fk, ''); }, 'Color for ' + fn + ' in ' + room)}
+                                                                    {fn}
+                                                                </span>
+                                                            );
+                                                        })}
                                                     </div>
                                                     {cleanTypeCols.length > 0 && (
                                                         <div className="flex items-center gap-2 bg-white px-2 py-1.5 rounded border border-[#B3D4F2] shadow-sm">
@@ -5567,11 +6031,12 @@ export default function App(props) {
                             )}
                         </div>
                         <div className="p-6 grid gap-6 bg-slate-50/50">
+                            {areaColumnsNote(false)}
                             {activeRooms.length === 0 ? (
                                 <p className="text-center text-slate-400 w-full py-10 font-bold">No active equipment to display.</p>
                             ) : dashboardRooms.length === 0 ? (
                                 <p className="text-center text-slate-400 w-full py-10 font-bold">Nothing in the active rooms is marked yes for the type of clean picked {IS_CURRENT ? 'in PBED' : 'on the Setup tab'}.</p>
-                            ) : dashboardRooms.map(function(room) {
+                            ) : sectioned(dashboardRooms, 'dash', function(room) {
                                 // Ganttly (current): a finished clean and when it is due again (its cadence after the check-off), or that
                                 // the next clean is already planned in the window. Nothing while a clean is still under way.
                                 const doneInfo = function(a) {
@@ -5601,10 +6066,10 @@ export default function App(props) {
                                 const manpowerHours = roomAllergen[room] ? (totalAllergen / 60) : (totalBase / 60);
 
                                 return (
-                                    <div key={room} className="bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden">
+                                    <div key={room} data-dash-room={room} className="bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden">
                                         <div className="bg-[#E6F1FB] px-4 py-3 border-b border-[#CFE3F7] flex items-center justify-between cursor-pointer" onClick={function() { toggleDashboardRoom(room); }}>
                                             <div className="flex items-center gap-4">
-                                                <h3 className="font-bold text-[#00468B]">{room}</h3>
+                                                <h3 className="font-bold text-[#00468B] flex items-center gap-2"><span className={`w-3 h-3 rounded-full border border-black/10 ${getRoomColor(room)}`} style={bgOf(roomHex(room))} />{room}</h3>
                                                 <span className="text-xs font-bold text-[#00468B] bg-[#E6F1FB] px-2 py-0.5 rounded border border-[#B3D4F2]">
                                                     Manpower Required: {manpowerHours.toFixed(1)} hrs
                                                 </span>
@@ -5637,7 +6102,7 @@ export default function App(props) {
                                                             const di = doneInfo(task);
                                                             return (
                                                                 <tr key={task.id} className="hover:bg-slate-50">
-                                                                    <td className="p-3 font-bold text-slate-800">{task.name}{odChip(task)}{di && (
+                                                                    <td className="p-3 font-bold text-slate-800">{!IS_CURRENT && <span className="mr-2 align-middle" onClick={function(e) { e.stopPropagation(); }}>{colorPick('eq:' + task.id, pieceHexShown(task), !!hexOr(equipColors[task.id]), function(h) { setColorIn(setEquipColors, task.id, h); }, function() { setColorIn(setEquipColors, task.id, ''); }, 'Color for ' + task.name + ' (blank = its function or room color)')}</span>}{task.name}{odChip(task)}{di && (
                                                                         <span data-done-chip={task.id} className={`block text-[10px] font-bold ${di.planned ? 'text-amber-700' : 'text-emerald-700'}`}>✓ Cleaned {formatDayClock(di.doneMs)}{di.dueMs ? (di.planned ? ' · next clean planned (due ' + formatDayClock(di.dueMs) + ')' : ' · due again ' + formatDayClock(di.dueMs)) : ''}</span>
                                                                     )}</td>
                                                                     <td className="p-3">
@@ -5787,7 +6252,7 @@ export default function App(props) {
                                                                 const partners = t.assignedLanes.filter(function(x) { return x !== l.lane; }).map(function(x) { return laneRoster[x] ? laneRoster[x].name : ''; }).filter(Boolean);
                                                                 return (
                                                                     <div key={t.id} className={`px-4 py-2.5 flex items-start gap-3 ${t.isComplete ? 'bg-emerald-50/40' : ''}`}>
-                                                                        <div className={`w-1.5 self-stretch rounded-full ${getRoomColor(t.originalArea)}`} />
+                                                                        <div className={`w-1.5 self-stretch rounded-full ${getRoomColor(t.originalArea)}`} style={bgOf(taskHex(t))} />
                                                                         <div className="flex-1 min-w-0">
                                                                             <div className="flex items-center gap-2 flex-wrap">
                                                                                 <span className="text-[11px] font-black text-slate-500">{timeRange(t)}</span>
@@ -6295,10 +6760,19 @@ export default function App(props) {
                                     <tbody className="divide-y divide-slate-100">
                                         {roomStats.length === 0 ? (
                                             <tr><td colSpan="8" className="p-6 text-center text-slate-400 font-bold">No active rooms.</td></tr>
-                                        ) : roomStats.map(function(r) {
+                                        ) : roomStatRows.map(function(r) {
+                                            if (r.band) {
+                                                return (
+                                                    <tr key="support-band" data-support-toggle="metrics" data-support-open={r.open ? '1' : '0'} onClick={function() { toggleSupport('metrics'); }} className="bg-slate-100 hover:bg-slate-200 cursor-pointer">
+                                                        <td colSpan="8" className="px-3 py-2 text-[11px] font-black uppercase tracking-widest text-slate-700">
+                                                            {r.open ? <ChevronDown className="inline w-4 h-4 mr-1 text-slate-600" /> : <ChevronRight className="inline w-4 h-4 mr-1 text-slate-600" />}Support <span className="ml-1 normal-case tracking-normal font-bold text-slate-500">{r.n} room{r.n === 1 ? '' : 's'}</span><span className="float-right text-[10px] font-extrabold text-[#0072CE] normal-case tracking-normal">{r.open ? 'Fold' : 'Show'}</span>
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            }
                                             return (
                                                 <tr key={r.room} className="hover:bg-slate-50">
-                                                    <td className="p-3 font-bold text-slate-800"><span className={`inline-block w-2.5 h-2.5 rounded-full mr-2 ${getRoomColor(r.room)}`} />{r.room}</td>
+                                                    <td className="p-3 font-bold text-slate-800"><span className={`inline-block w-2.5 h-2.5 rounded-full mr-2 ${getRoomColor(r.room)}`} style={bgOf(roomHex(r.room))} />{r.room}</td>
                                                     <td className="p-3 w-40">
                                                         <div className="flex items-center gap-2"><div className="flex-1 h-2 bg-slate-100 rounded-full overflow-hidden"><div className="h-full bg-emerald-500" style={{ width: `${r.pct}%` }} /></div><span className="text-xs font-black text-slate-600 w-9 text-right">{r.pct}%</span></div>
                                                     </td>
@@ -6381,7 +6855,7 @@ export default function App(props) {
                         {shownRooms.map(function(room) {
                             return (
                                 <div key={room} className="flex items-center gap-1.5">
-                                    <div className={`w-3 h-3 rounded-full ${getRoomColor(room)}`}></div>
+                                    <div className={`w-3 h-3 rounded-full ${getRoomColor(room)}`} style={bgOf(roomHex(room))}></div>
                                     <span className="text-[10px] font-bold text-slate-700 uppercase tracking-wider">{room}</span>
                                 </div>
                             );
@@ -6398,6 +6872,35 @@ export default function App(props) {
                             <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm border-2 border-dashed border-[#FFB81C] bg-[#FFF6E0] inline-block" /> Blank space</span>
                         </span>
                     </div>
+                    {(IS_CURRENT ? downLineList.length > 0 : timeBlocks.length > 0) && (
+                        <div data-block-chips className="bg-white px-5 py-1.5 border-b border-slate-200 flex flex-wrap gap-2 items-center flex-shrink-0">
+                            <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest mr-1">{IS_CURRENT ? 'Down lines:' : 'Time blocks:'}</span>
+                            {IS_CURRENT ? downLineList.map(function(d) {
+                                return (
+                                    <button key={d.id} data-down-chip={d.id} onClick={function() { openDownModal(d); }} title="Change or remove" className="no-pan flex items-center gap-1.5 text-[11px] font-bold rounded-full border px-2.5 py-0.5 bg-white hover:bg-slate-50" style={{ borderColor: DOWN_LINE_COLOR }}>
+                                        <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: DOWN_LINE_COLOR }} />
+                                        <span className="text-slate-800">{d.line} down</span>
+                                        <span className="text-slate-500">{whenOf(d.startStr)} → {d.endStr ? whenOf(d.endStr) : 'not known yet'}</span>
+                                        <span className="text-slate-400">{(d.rooms || []).length} room{(d.rooms || []).length === 1 ? '' : 's'}</span>
+                                    </button>
+                                );
+                            }) : timeBlocks.filter(blockInWindow).map(function(b) {
+                                const k = blockKindOf(b.kind), c = hexOr(b.color) || k.color;
+                                return (
+                                    <button key={b.id} data-block-chip={b.id} onClick={function() { openBlockModal(b); }} title="Change or remove" className="no-pan flex items-center gap-1.5 text-[11px] font-bold rounded-full border px-2.5 py-0.5 bg-white hover:bg-slate-50" style={{ borderColor: c }}>
+                                        <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: c }} />
+                                        <span className="text-slate-800">{b.label || k.label}</span>
+                                        <span className="text-slate-500">{b.room || 'Whole plant'} · {whenOf(b.dateTimeStr)} · {fmtMins(Number(b.duration) || 0)}{b.repeat === 'daily' ? ' · every day' : ''}</span>
+                                    </button>
+                                );
+                            })}
+                            {!IS_CURRENT && timeBlocks.some(function(b) { return !blockInWindow(b); }) && (
+                                <button data-block-outside onClick={function() { setTimeBlocks(function(prev) { return prev.filter(blockInWindow); }); }} title="Blocks saved for other dates are not part of this plan. Click to remove them." className="no-pan text-[11px] font-bold rounded-full border border-dashed border-slate-300 px-2.5 py-0.5 text-slate-500 hover:bg-slate-50">
+                                    {timeBlocks.filter(function(b) { return !blockInWindow(b); }).length} saved for other dates · Remove
+                                </button>
+                            )}
+                        </div>
+                    )}
                     {(scheduleData.unscheduled.length > 0 || countLate > 0 || countConflict > 0) && (
                         <div className="bg-rose-50 border-b border-rose-200 px-5 py-1.5 text-[11px] font-bold text-rose-700 flex items-center gap-4 flex-shrink-0">
                             <AlertCircle className="w-3.5 h-3.5" />
@@ -6462,6 +6965,27 @@ export default function App(props) {
                                         <Button variant="outline" size="sm" onClick={function() { openRoomDowntime('GLOBAL'); }} className="text-rose-600 border-rose-200 hover:bg-rose-50 shadow-sm px-2 py-1 text-[10px]">
                                             + Global Downtime
                                         </Button>
+                                        {!IS_CURRENT && (
+                                            <span data-add-block className="inline-flex">
+                                                <Button variant="outline" size="sm" onClick={function() { openBlockModal(null); }} className="text-[#00468B] border-[#B3D4F2] hover:bg-[#E6F1FB] shadow-sm px-2 py-1 text-[10px]" title="Put aside a stretch of time for an inspection, maintenance or a project">
+                                                    + Time block
+                                                </Button>
+                                            </span>
+                                        )}
+                                        {!IS_CURRENT && roomOrder.length > 0 && (
+                                            <span data-reset-order className="inline-flex">
+                                                <Button variant="outline" size="sm" onClick={function() { setRoomOrder([]); }} className="text-slate-600 border-slate-300 hover:bg-slate-50 shadow-sm px-2 py-1 text-[10px]" title="Put the rooms back in their usual order (priority, then work; by name on Setup)">
+                                                    Reset room order
+                                                </Button>
+                                            </span>
+                                        )}
+                                        {IS_CURRENT && (
+                                            <span data-add-downline className="inline-flex">
+                                                <Button variant="outline" size="sm" onClick={function() { openDownModal(null); }} className="text-rose-700 border-rose-300 hover:bg-rose-50 shadow-sm px-2 py-1 text-[10px]" title="A production line stopped: its rooms are free to clean until it restarts">
+                                                    + Down line
+                                                </Button>
+                                            </span>
+                                        )}
                                         <Button variant="success" size="sm" onClick={handleExportExcel} className="shadow-sm px-2 py-1 text-[10px]">
                                             <Download className="w-3.5 h-3.5 mr-1" /> Export CSV
                                         </Button>
@@ -6545,8 +7069,17 @@ export default function App(props) {
                                             const wPx = Math.max(0, xEnd(brk.start + brk.duration) - lPx);
                                             if (lPx >= GANTT_TOTAL_WIDTH_PX) return null;
                                             return (
-                                                <div key={`brk-${idx}`} className={`absolute top-0 bottom-0 border-x border-slate-400/20 z-10 flex items-start justify-center overflow-hidden pointer-events-none ${brk.isCustom ? 'bg-slate-900/80' : 'bg-slate-400/60'}`} style={{ left: `${lPx}px`, width: `${wPx}px` }}>
-                                                    {wPx > 15 && <span className={`text-[9px] font-black uppercase mt-4 transform -rotate-90 origin-center whitespace-nowrap text-white/90`}>{brk.label}</span>}
+                                                <div key={`brk-${idx}`} data-interrupt-kind={brk.kind || ''} className={`absolute top-0 bottom-0 border-x border-slate-400/20 z-10 flex items-start justify-center overflow-hidden pointer-events-none ${brk.color ? '' : brk.isCustom ? 'bg-slate-900/80' : 'bg-slate-400/60'}`} style={brk.color ? { left: `${lPx}px`, width: `${wPx}px`, backgroundColor: brk.color, opacity: 0.8 } : { left: `${lPx}px`, width: `${wPx}px` }}>
+                                                    {wPx > 15 && <span className={`text-[9px] font-black uppercase mt-4 transform -rotate-90 origin-center whitespace-nowrap`} style={{ color: brk.color ? textOnHex(brk.color) : 'rgba(255,255,255,0.9)' }}>{brk.label}</span>}
+                                                </div>
+                                            );
+                                        })}
+                                        {!roomView && planBlocks.bands.filter(function(b) { return (b.room || b.kind === 'down') && b.start < dynamicTotalHours * 60; }).map(function(b, idx) {
+                                            const lPx = xOf(b.start), wPx = Math.max(xEnd(b.end) - lPx, 4);
+                                            if (lPx >= GANTT_TOTAL_WIDTH_PX) return null;
+                                            return (
+                                                <div key={`band-${idx}`} data-band={b.kind} data-band-room={b.room || ''} className="absolute top-0 bottom-0 z-10 overflow-hidden pointer-events-none border-x border-dashed" style={{ left: `${lPx}px`, width: `${wPx}px`, backgroundColor: b.color + '33', borderColor: b.color }}>
+                                                    {wPx > 15 && <span className="absolute bottom-1 left-1 text-[9px] font-black whitespace-nowrap rounded px-1" style={{ backgroundColor: b.color, color: textOnHex(b.color) }}>{b.kind === 'down' ? b.label : (b.label + ' · ' + b.room)}</span>}
                                                 </div>
                                             );
                                         })}
@@ -6686,25 +7219,25 @@ export default function App(props) {
                                                                 style={{ left: `${leftPx}px`, width: `${Math.max(widthPx, 8)}px`, top: `${topPx + 2}px`, height: `${LANE_HEIGHT_PX - 4}px` }}
                                                             >
                                                                 <div className={`absolute inset-0 rounded-md overflow-hidden flex shadow-sm border ${(task.isPinned || task.isFrozen) && !isDraggingMe ? 'border-[2px] border-slate-900/70' : 'border-black/20'}`}>
-                                                                    {isSimpleBlock && <div className={`absolute inset-0 ${getRoomColor(task.originalArea)} ${task.isComplete ? 'complete-stripes' : ''}`} />}
+                                                                    {isSimpleBlock && <div className={`absolute inset-0 ${getRoomColor(task.originalArea)} ${task.isComplete ? 'complete-stripes' : ''}`} style={bgOf(taskHex(task))} />}
                                                                     {isSimpleBlock && task.isSplitPart1 && <div className="absolute top-0 bottom-0 right-0 w-1.5 bg-white/70" title={task.handedOver ? 'Handed over to a later shift' : 'Continues later this shift'} />}
                                                                     {isSimpleBlock && task.isSplitPart2 && !task.isFrozen && <div className="absolute top-0 bottom-0 left-0 w-1.5 bg-white/70" title={task.handoverAdded ? 'Continued from an earlier shift' : 'Continues an earlier part'} />}
                                                                     {!isSimpleBlock && transitOverlap && <div className="absolute top-0 bottom-0 bg-slate-900" style={{ left: `${transitOverlap.leftPct}%`, width: `${transitOverlap.widthPct}%` }} title="Transit/Prep (10m)" />}
-                                                                    {!isSimpleBlock && baseOverlap && <div className={`absolute top-0 bottom-0 ${getRoomColor(task.originalArea)} ${task.isComplete ? 'complete-stripes' : ''}`} style={{ left: `${baseOverlap.leftPct}%`, width: `${baseOverlap.widthPct}%` }} />}
-                                                                    {!isSimpleBlock && allergenOverlap && <div className={`absolute top-0 bottom-0 ${getRoomColor(task.originalArea)} opacity-40 ${task.isComplete ? 'complete-stripes' : ''}`} style={{ left: `${allergenOverlap.leftPct}%`, width: `${allergenOverlap.widthPct}%` }} title="Allergen Extra Time" />}
+                                                                    {!isSimpleBlock && baseOverlap && <div className={`absolute top-0 bottom-0 ${getRoomColor(task.originalArea)} ${task.isComplete ? 'complete-stripes' : ''}`} style={bgOf(taskHex(task), { left: `${baseOverlap.leftPct}%`, width: `${baseOverlap.widthPct}%` })} />}
+                                                                    {!isSimpleBlock && allergenOverlap && <div className={`absolute top-0 bottom-0 ${getRoomColor(task.originalArea)} opacity-40 ${task.isComplete ? 'complete-stripes' : ''}`} style={bgOf(taskHex(task), { left: `${allergenOverlap.leftPct}%`, width: `${allergenOverlap.widthPct}%` })} title="Allergen Extra Time" />}
                                                                     {!isSimpleBlock && inspectOverlap && <div className="absolute top-0 bottom-0 bg-slate-900" style={{ left: `${inspectOverlap.leftPct}%`, width: `${inspectOverlap.widthPct}%` }} title="Inspection" />}
                                                                 </div>
 
                                                                 <div className="relative z-30 pl-2 pr-1 pointer-events-none flex items-center gap-1 w-full h-full">
                                                                     {widthPx > 20 && (isPrimaryLane ? (
-                                                                        <span className="text-white font-bold text-[11px] truncate leading-tight drop-shadow-md flex-1 flex items-center gap-1">
+                                                                        <span className="text-white font-bold text-[11px] truncate leading-tight drop-shadow-md flex-1 flex items-center gap-1" style={labelInkOf(taskHex(task), !isSimpleBlock && !!(transitOverlap || inspectOverlap))}>
                                                                             {task.isComplete && <Check className="w-3 h-3 flex-shrink-0" />}
                                                                             {task.isInProgress && <Play className="w-3 h-3 flex-shrink-0" />}
                                                                             {(task.isAllergenActive || task.isPbActive) && <Biohazard className="w-3 h-3 text-rose-200 flex-shrink-0" />}
                                                                             <span className="truncate">{task.name}</span>
                                                                         </span>
                                                                     ) : (
-                                                                        <span className="text-white/80 font-black text-[10px] flex-1 truncate drop-shadow-sm">+ {task.name}</span>
+                                                                        <span className="text-white/80 font-black text-[10px] flex-1 truncate drop-shadow-sm" style={inkOf(taskHex(task))}>+ {task.name}</span>
                                                                     ))}
                                                                     {isPrimaryLane && widthPx > 60 && !isDraggingMe && (
                                                                         <button
@@ -6778,6 +7311,130 @@ export default function App(props) {
                                 </div>
                             </div>
                             <Button className="w-full mt-4" onClick={handleAddCustomTask}>Create Task</Button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* TIME BLOCK MODAL (PBED) */}
+            {blockModal && (
+                <div data-block-modal className="fixed inset-0 bg-slate-900/40 z-[100] flex items-center justify-center backdrop-blur-sm p-4 touch-none" onPointerDown={function() { setBlockModal(null); }}>
+                    <div className="bg-white p-5 rounded-2xl shadow-2xl w-full max-w-md border border-slate-200 max-h-full overflow-y-auto" onPointerDown={function(e) { if (e && typeof e.stopPropagation === 'function') e.stopPropagation(); }}>
+                        <div className="flex justify-between items-center mb-3 border-b border-slate-100 pb-3">
+                            <h3 className="text-lg font-black text-slate-800">{blockModal.id ? 'Change time block' : 'Add a time block'}</h3>
+                            <Button variant="outline" size="sm" onClick={function() { setBlockModal(null); }} className="px-2 py-1 shadow-none text-slate-400 hover:text-slate-800">✕</Button>
+                        </div>
+                        <div className="text-[11px] font-bold text-slate-500 mb-3">Time put aside for the room (or the whole plant): nothing is cleaned there while the block runs, and the Gantt shows it.</div>
+                        <div className="space-y-3">
+                            <div className="flex flex-wrap gap-2">
+                                {BLOCK_KINDS.map(function(k) {
+                                    const on = blockModal.kind === k.id;
+                                    return <button key={k.id} data-block-kind={k.id} onClick={function() { patchBlock({ kind: k.id }); }} className="flex-1 rounded-lg border-2 px-2 py-1.5 text-xs font-black no-pan" style={on ? { backgroundColor: k.color, borderColor: k.color, color: textOnHex(k.color) } : { borderColor: k.color, color: '#334155' }}>{k.label}</button>;
+                                })}
+                            </div>
+                            <div>
+                                <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1">Name (optional)</label>
+                                <input type="text" data-block-label value={blockModal.label} onChange={function(e) { patchBlock({ label: e.target.value }); }} className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none" placeholder={'e.g. ' + (blockModal.kind === 'inspection' ? 'Pre-op inspection' : blockModal.kind === 'maintenance' ? 'Belt change' : 'New guard install')} />
+                            </div>
+                            <div>
+                                <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1">Where</label>
+                                <select data-block-room value={blockModal.room} onChange={function(e) { patchBlock({ room: e.target.value }); }} className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none bg-white">
+                                    <option value="">Whole plant (nobody cleans)</option>
+                                    {allUniqueRooms.filter(function(r) { return !isSupportRoom(r); }).map(function(r) { return <option key={r} value={r}>{r}</option>; })}
+                                    {allUniqueRooms.some(isSupportRoom) && <optgroup label="Support">{allUniqueRooms.filter(isSupportRoom).map(function(r) { return <option key={r} value={r}>{r}</option>; })}</optgroup>}
+                                </select>
+                            </div>
+                            <div className="grid grid-cols-2 gap-3">
+                                <div className="min-w-0">
+                                    <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1">Date</label>
+                                    <input type="date" data-block-date value={blockModal.date} onChange={function(e) { patchBlock({ date: e.target.value }); }} className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none" />
+                                </div>
+                                <div className="min-w-0">
+                                    <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1">Starts</label>
+                                    <input type="time" data-block-time value={blockModal.time} onChange={function(e) { patchBlock({ time: e.target.value }); }} className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none" />
+                                </div>
+                            </div>
+                            <div>
+                                <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1">Length (minutes)</label>
+                                <div className="flex flex-wrap gap-2 items-center">
+                                    <input type="number" data-block-duration min="5" step="5" value={blockModal.duration} onChange={function(e) { patchBlock({ duration: e.target.value }); }} className="w-24 border border-slate-300 rounded p-2 text-sm font-bold outline-none" />
+                                    {[30, 60, 120, 240].map(function(m) { return <button key={m} onClick={function() { patchBlock({ duration: m }); }} className="text-[11px] font-black rounded border border-slate-300 px-2 py-1 text-slate-600 hover:bg-slate-50 no-pan">{fmtMins(m)}</button>; })}
+                                </div>
+                            </div>
+                            <div className="flex gap-3 items-center flex-wrap">
+                                <label className="flex items-center gap-2 text-xs font-bold text-slate-700 cursor-pointer"><input type="checkbox" data-block-repeat checked={blockModal.repeat === 'daily'} onChange={function(e) { patchBlock({ repeat: e.target.checked ? 'daily' : 'none' }); }} className="w-4 h-4 accent-[#0072CE]" /> Same time every day of the plan</label>
+                                <span className="ml-auto flex items-center gap-1.5 text-[11px] font-bold text-slate-500">Color
+                                    <input type="color" data-block-color value={hexOr(blockModal.color) || blockKindOf(blockModal.kind).color} onChange={function(e) { patchBlock({ color: e.target.value }); }} className="w-7 h-7 p-0 border border-slate-300 rounded cursor-pointer no-pan bg-white" />
+                                    {hexOr(blockModal.color) && <button onClick={function() { patchBlock({ color: '' }); }} title="Back to the standard color" className="text-[11px] font-black text-slate-400 hover:text-rose-600">×</button>}
+                                </span>
+                            </div>
+                            {blockModal.err && <div data-block-error className="text-xs font-bold text-rose-700 bg-rose-50 border border-rose-200 rounded p-2">{blockModal.err}</div>}
+                            <div className="flex gap-2 pt-1">
+                                <Button className="flex-1" onClick={saveBlock}>{blockModal.id ? 'Save changes' : 'Add time block'}</Button>
+                                {blockModal.id && <Button variant="danger" onClick={function() { deleteBlock(blockModal.id); }}>Remove</Button>}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* DOWN LINE MODAL (Ganttly) */}
+            {downModal && (
+                <div data-down-modal className="fixed inset-0 bg-slate-900/40 z-[100] flex items-center justify-center backdrop-blur-sm p-4 touch-none" onPointerDown={function() { setDownModal(null); }}>
+                    <div className="bg-white p-5 rounded-2xl shadow-2xl w-full max-w-md border border-slate-200 max-h-full overflow-y-auto" onPointerDown={function(e) { if (e && typeof e.stopPropagation === 'function') e.stopPropagation(); }}>
+                        <div className="flex justify-between items-center mb-3 border-b border-slate-100 pb-3">
+                            <h3 className="text-lg font-black text-slate-800">{downModal.id ? 'Change down line' : 'Add a down line'}</h3>
+                            <Button variant="outline" size="sm" onClick={function() { setDownModal(null); }} className="px-2 py-1 shadow-none text-slate-400 hover:text-slate-800">✕</Button>
+                        </div>
+                        <div className="text-[11px] font-bold text-slate-500 mb-3">A production line that stopped. Its rooms are free to clean from then on, and are closed again when the line restarts. It counts from 24 hours before it stops until 12 hours after it restarts, then it is forgotten (the rooms go back to normal).</div>
+                        <div className="space-y-3">
+                            <div>
+                                <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1">Line</label>
+                                <select data-down-line value={downModal.typed ? '__typed' : downModal.lineId} onChange={function(e) { pickDownLine(e.target.value); }} className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none bg-white">
+                                    <option value="">Pick a line…</option>
+                                    {lineIndex.some(function(l) { return l.prod; }) ? (
+                                        <React.Fragment>
+                                            <optgroup label="Production lines">{lineIndex.filter(function(l) { return l.prod; }).sort(byNameNum).map(function(l) { return <option key={l.id} value={l.id}>{l.name}</option>; })}</optgroup>
+                                            <optgroup label="Other areas">{lineIndex.filter(function(l) { return !l.prod; }).sort(byNameNum).map(function(l) { return <option key={l.id} value={l.id}>{l.name}</option>; })}</optgroup>
+                                        </React.Fragment>
+                                    ) : lineIndex.slice().sort(byNameNum).map(function(l) { return <option key={l.id} value={l.id}>{l.name}</option>; })}
+                                    <option value="__typed">A line that isn't in the list (type its name)…</option>
+                                </select>
+                                {downModal.typed && <input type="text" data-down-typed value={downModal.line} onChange={function(e) { typeDownLine(e.target.value); }} className="w-full mt-2 border border-slate-300 rounded p-2 text-sm font-bold outline-none" placeholder="Name of the line, e.g. Packaging 2" />}
+                            </div>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                <div className="min-w-0">
+                                    <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1">Went down</label>
+                                    <input type="datetime-local" data-down-start value={downModal.startStr} onChange={function(e) { patchDown({ startStr: e.target.value }); }} className="w-full min-w-0 border border-slate-300 rounded p-2 text-xs font-bold outline-none" />
+                                </div>
+                                <div className="min-w-0">
+                                    <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1">Restarts</label>
+                                    <input type="datetime-local" data-down-end disabled={!downModal.hasEnd} value={downModal.endStr} onChange={function(e) { patchDown({ endStr: e.target.value }); }} className="w-full min-w-0 border border-slate-300 rounded p-2 text-xs font-bold outline-none disabled:bg-slate-100 disabled:text-slate-400" />
+                                </div>
+                            </div>
+                            <label className="flex items-center gap-2 text-xs font-bold text-slate-700 cursor-pointer"><input type="checkbox" data-down-open checked={!downModal.hasEnd} onChange={function(e) { patchDown({ hasEnd: !e.target.checked, endStr: e.target.checked ? '' : (downModal.endStr || msToLocalInput(localInputMs(downModal.startStr) + 4 * 3600000)) }); }} className="w-4 h-4 accent-[#0072CE]" /> Not known yet (down until it is changed here)</label>
+                            <div>
+                                <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1">Rooms that are free to clean</label>
+                                <div data-down-rooms className="flex flex-wrap gap-1.5 mb-1.5">
+                                    {downModal.rooms.length === 0 && <span className="text-[11px] font-bold text-amber-700">{downModal.line ? 'No room is named like this line. Add the rooms below.' : 'Pick the line first.'}</span>}
+                                    {downModal.rooms.map(function(r) {
+                                        return <span key={r} data-down-room={r} className="flex items-center gap-1 text-[11px] font-bold rounded-full bg-[#E6F1FB] text-[#00468B] border border-[#B3D4F2] px-2 py-0.5">{r}<button onClick={function() { toggleDownRoom(r, false); }} title="Take this room off" className="text-[12px] leading-none font-black text-slate-400 hover:text-rose-600 no-pan">×</button></span>;
+                                    })}
+                                </div>
+                                <select data-down-add-room value="" onChange={function(e) { if (e.target.value) toggleDownRoom(e.target.value, true); }} className="w-full border border-slate-300 rounded p-1.5 text-xs font-bold outline-none bg-white">
+                                    <option value="">+ Add another room…</option>
+                                    {allUniqueRooms.filter(function(r) { return downModal.rooms.indexOf(r) === -1; }).map(function(r) { return <option key={r} value={r}>{r}{isSupportRoom(r) ? ' (support)' : ''}</option>; })}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1">Note (optional)</label>
+                                <input type="text" data-down-note value={downModal.note} onChange={function(e) { patchDown({ note: e.target.value }); }} className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none" placeholder="e.g. Motor swap, back up at shift change" />
+                            </div>
+                            {downModal.err && <div data-down-error className="text-xs font-bold text-rose-700 bg-rose-50 border border-rose-200 rounded p-2">{downModal.err}</div>}
+                            <div className="flex gap-2 pt-1">
+                                <Button className="flex-1" onClick={saveDown}>{downModal.id ? 'Save changes' : 'Add down line'}</Button>
+                                {downModal.id && <Button variant="danger" onClick={function() { deleteDown(downModal.id); }}>Remove</Button>}
+                            </div>
                         </div>
                     </div>
                 </div>
