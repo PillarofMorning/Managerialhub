@@ -13,6 +13,14 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
  *   2. SCHEDULE      - Gantt over 1 day to 8 weeks. Drag a run to move it (or to another line), drag its edges to
  *                      change start / stop, drag it past a neighbour to swap the order, double-click to edit,
  *                      double-click an empty spot to add a run. Undo keeps the last 30 changes.
+ *                      Every MSS production line (areas flagged "runs product") has its row, even before it has a run.
+ *                      The chart has day lines (Sundays stronger), hour lines (every hour on a day, every 6 h over a week,
+ *                      noon over 2 weeks), weekend and night shading and a NOW tag, like the Ganttly; its header stays
+ *                      at the top while the lines scroll. Each line is drawn on its own, so a click or drag only redraws
+ *                      the line it touches.
+ *   LINE PICKER      - The Run dialog and every Import line card pick the line from the MSS list (search, arrow keys,
+ *                      Enter). "IBL 4", "ibl4" and "IBL4" are the same line; "IBL 4" with only IBL in the list is IBL line 4.
+ *                      A name not in the list is still allowed and is saved as typed.
  *   3. MONTH         - month calendar, drag a run to another day, double-click to edit.
  *   4. SHIFTS+ROSTER - production and sanitation shifts (headcount, start / stop) per line, shown as an overlay
  *                      on the Gantt, with the roster read from the employee table.
@@ -24,7 +32,8 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
  *
  * DATAVERSE MAPPING
  * | craa5__aa_prd_schd   | Runs (source of truth). Same columns the Manager hub uses.                    |
- * | craa5__aa_areas      | Areas; only craa5_runsproduct = yes areas are offered.                         |
+ * | craa5_aa_mss_area    | MSS areas = the lines. Areas flagged craa5_runsproduct = yes are offered (and get   |
+ * |                      | a row on the Gantt); older copies of the table (craa5__aa_areas) work as a fallback. |
  * | craa5_aa_assets      | Equipment + cleaning minutes (craa5_hoursrequired = base minutes,              |
  * |                      | craa5_MINALRG = allergen minutes, craa5_heads, craa5_areaname).                |
  * | craa5__aa_employee   | Roster (name, craa5_shift = crew A-D, role, job-role lookup).                  |
@@ -81,7 +90,8 @@ function BrandLogo() {
 const TABLE_PROD = "craa5__aa_prd_schd";
 const TABLE_ASSETS = "craa5_aa_assets";
 const TABLE_EMPLOYEE_NAMES = ["craa5__aa_employee", "craa5_aa_employee"];
-const TABLE_AREA_NAMES = ["craa5__aa_areas", "craa5_aa_areas", "craa5_aa_mss_area"];
+const TABLE_AREA_NAMES = ["craa5_aa_mss_area", "craa5__aa_areas", "craa5_aa_areas"];   // the MSS area table first; the first one that has rows is used
+const STATUS_AREAS = ["pto", "sick", "late", "left early", "ncns", "unassigned"];   // staffing statuses the MSS keeps as "areas"
 const F_ORDER = "craa5_ordernumber", F_CASES = "craa5_cases";
 const API_TIMEOUT_MS = 20000;
 const QUERY_LIMIT = 1000;
@@ -175,12 +185,18 @@ const parseYMD = (s) => {   // local midnight, or null when blank / half-typed /
 const withTime = (day, hhmm) => { const m = /^(\d{1,2}):(\d{2})/.exec(hhmm || ''); return m ? new Date(day.getFullYear(), day.getMonth(), day.getDate(), Number(m[1]), Number(m[2])) : null; };
 const hhmmOf = (ms) => { const d = new Date(ms); return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
 const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-const fmtDay = (ms) => new Date(ms).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
-const fmtTime = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+// toLocaleDateString / toLocaleTimeString build a new formatter on every call, which made each Gantt redraw (a tooltip per run)
+// cost over a second at 8 weeks. One formatter per pattern, made once; a bad date gives a blank instead of throwing.
+const fmtMaker = (make) => { let f = null; return (v) => { const t = +v; return t === t && isFinite(t) ? (f || (f = make())).format(t) : ''; }; };
+const fmtDay = fmtMaker(() => new Intl.DateTimeFormat([], { weekday: 'short', month: 'short', day: 'numeric' }));
+const fmtTime = fmtMaker(() => new Intl.DateTimeFormat([], { hour: '2-digit', minute: '2-digit' }));
 const fmtDT = (ms) => `${fmtDay(ms)} ${fmtTime(ms)}`;
+const fmtDayHead = fmtMaker(() => new Intl.DateTimeFormat([], { weekday: 'short', day: 'numeric' }));   // Wed 8
+const fmtMonthName = fmtMaker(() => new Intl.DateTimeFormat([], { month: 'short' }));
 const fmtHrs = (ms) => { let h = (ms / HOUR).toFixed(1); if (h.endsWith('.0')) h = h.slice(0, -2); return `${h}h`; };
 const fmtMins = (m) => m >= 60 ? fmtHrs(m * 60000) : `${Math.round(m)}m`;
-const fmtNum = (n) => (n === null || n === undefined || n === '' || isNaN(Number(n))) ? '' : Number(n).toLocaleString();
+const fmtNumber = fmtMaker(() => new Intl.NumberFormat());
+const fmtNum = (n) => (n === null || n === undefined || n === '' || isNaN(Number(n))) ? '' : fmtNumber(Number(n));
 // A run keeps its real length in hours, except whole days (24 h, 48 h...), which end at the same clock time N days
 // later so "24 h every day" runs back to back across daylight-saving changes.
 function endFromHours(startMs, hours) {
@@ -192,6 +208,26 @@ const lineLabelOf = (area, line) => `${area} - Line ${line}`;
 const splitKey = (k) => { const i = String(k).lastIndexOf('|'); return { area: String(k).slice(0, i), line: Number(String(k).slice(i + 1)) || 1 }; };
 const byStart = (a, b) => a.start - b.start;
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const memo = (React && React.memo) ? React.memo : (c) => c;   // skip redrawing a part whose inputs did not change
+// "IBL 4", "IBL-4" and "ibl4" name the same line: compare on letters and digits only.
+const canon = (s) => String(s === undefined || s === null ? '' : s).toLowerCase().replace(/[^a-z0-9]+/g, '');
+// the same line whether it is written as area "IBL4" line 1 or as area "IBL" line 4
+const canonLine = (area, line) => canon(area) + (Number(line) > 1 ? String(Math.floor(Number(line))) : '');
+const byNatural = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });   // IBL4 before IBL10
+// What a typed or pasted line name means: an area from the list (case, spaces and dashes ignored), "IBL 4" as area IBL line 4,
+// or - when nothing matches - the text itself. exact tells the two apart.
+function resolveArea(text, areas) {
+    const t = String(text === undefined || text === null ? '' : text).trim();
+    if (!t) return { area: '', line: 0, exact: false };
+    const c = canon(t);
+    for (let i = 0; i < areas.length; i++) if (canon(areas[i]) === c) return { area: areas[i], line: 0, exact: true };
+    const m = /^(.*?)[\s\-_#]*(\d+)$/.exec(t);
+    if (m && canon(m[1])) {
+        const base = canon(m[1]);
+        for (let i = 0; i < areas.length; i++) if (canon(areas[i]) === base) return { area: areas[i], line: Math.max(1, parseInt(m[2], 10) || 1), exact: true };
+    }
+    return { area: t, line: 0, exact: false };
+}
 
 // "Doe, John" -> "John Doe"
 function formatFullName(name) {
@@ -414,7 +450,8 @@ function patternFields(kind) {
     const pt = LINE_PATTERNS[kind];
     return pt && pt.start ? { pattern: kind, dayStart: pt.start, dayStop: pt.stop, chain: true } : { pattern: kind };
 }
-const fmtClock = (hhmm) => { const d = withTime(new Date(2000, 0, 1), hhmm); return d ? d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : ''; };
+const fmtClockOf = fmtMaker(() => new Intl.DateTimeFormat([], { hour: 'numeric', minute: '2-digit' }));
+const fmtClock = (hhmm) => { const d = withTime(new Date(2000, 0, 1), hhmm); return d ? fmtClockOf(d.getTime()) : ''; };
 // The run window of one day on a line: { start, end, cut }. start = when the day's first run begins; end = where blank hours
 // are filled to (null when the line has no window); cut = the stop time a run is checked against (null for non-stop lines).
 function dayWindow(day, cfg) {
@@ -543,7 +580,9 @@ function shiftOccurrences(defs, fromMs, toMs, rosterCount) {
 // `own` = { 'lineKey|group': true } for lines that define their own shifts; those replace the "every line" ones.
 function occForLine(occ, lineKey, group, own) {
     const want = lineKey !== '*' && own && own[`${lineKey}|${group}`] ? lineKey : '*';
-    return occ.filter(o => o.group === group && o.lineKey === want);
+    // the list is grouped by line + group once and remembered on the array, so each call is a lookup instead of a scan of every shift
+    if (!occ.byLG) { const m = {}; occ.forEach(o => { const k = `${o.lineKey}|${o.group}`; (m[k] = m[k] || []).push(o); }); occ.byLG = m; }
+    return occ.byLG[`${want}|${group}`] || [];
 }
 function coverageFor(occ, lineKey, group, s, e, own) {
     const mine = occForLine(occ, lineKey, group, own).filter(o => o.end > s && o.start < e);
@@ -739,19 +778,119 @@ const Btn = ({ children, onClick, kind = 'primary', disabled, title, className =
 const Chip = ({ on, onClick, children, title }) => (
     <button type="button" onClick={onClick} title={title} className={`px-2.5 py-1 rounded-lg text-xs font-extrabold border transition-colors whitespace-nowrap ${on ? 'bg-[#0072CE] text-white border-[#0072CE] shadow-sm' : 'bg-white text-slate-600 border-slate-300 hover:bg-[#E6F1FB] hover:text-[#0072CE] hover:border-[#B3D4F2]'}`}>{children}</button>
 );
-const Field = ({ label, children, className = '', hint }) => (
-    <label className={`block ${className}`}>
-        <span className="block text-[10px] font-black uppercase tracking-wider text-slate-500 mb-1">{label}</span>
-        {children}
-        {hint && <span className="block text-[10px] text-slate-400 mt-0.5">{hint}</span>}
-    </label>
-);
+// plain = a div instead of a label (a pick list inside a label would hand every click on a row back to the text box)
+const Field = ({ label, children, className = '', hint, plain }) => {
+    const Tag = plain ? 'div' : 'label';
+    return (
+        <Tag className={`block ${className}`}>
+            <span className="block text-[10px] font-black uppercase tracking-wider text-slate-500 mb-1">{label}</span>
+            {children}
+            {hint && <span className="block text-[10px] text-slate-400 mt-0.5">{hint}</span>}
+        </Tag>
+    );
+};
+
+// A search box with a pick list under it, used instead of <input list=...> (which only offers what matches the text already in the box).
+// It opens with the whole list, narrows as you type, Up / Down + Enter or a click picks, Esc closes just the list. What is typed but
+// not in the list stays as typed (allowNew) and is offered as the last row. options: [{ value, label, group?, note? }].
+let comboSeq = 0;
+function ComboBox({ value, onText, onPick, onCommit, onStart, options, placeholder, className, allowNew, newWord, ariaLabel }) {
+    const [open, setOpen] = useState(false);
+    const [typed, setTyped] = useState(false);   // the list only narrows after typing, so opening on a filled box still shows everything
+    const [hi, setHi] = useState(0);
+    const [up, setUp] = useState(false);     // opens upward when there is no room under the box (low on the screen, or behind the Apply bar)
+    const idRef = useRef(null); if (!idRef.current) idRef.current = `ps-cb-${++comboSeq}`;
+    const listRef = useRef(null), inputRef = useRef(null), dirtyRef = useRef(false);   // dirty = typed since the last pick, so a blur only re-reads text that was typed
+    const text = value === undefined || value === null ? '' : String(value);
+    const q = canon(text);
+    const shown = useMemo(() => {
+        if (!typed || !q) return options;
+        const a = [], b = [], c = [];
+        options.forEach(o => { const k = canon(o.label); if (k === q) a.push(o); else if (k.indexOf(q) === 0) b.push(o); else if (k.indexOf(q) >= 0) c.push(o); });
+        return a.concat(b, c);
+    }, [options, typed, q]);
+    const exact = options.some(o => canon(o.value) === q);
+    const showNew = !!allowNew && typed && !!q && !exact;
+    const total = shown.length + (showNew ? 1 : 0);
+    const openList = () => {
+        const el = inputRef.current;
+        if (el) {
+            const r = el.getBoundingClientRect(), host = el.closest ? el.closest('main') : null;
+            const floor = (host ? host.getBoundingClientRect().bottom : window.innerHeight) - (host ? 76 : 0);   // main has the pinned Apply bar at its foot
+            setUp(floor - r.bottom < 250 && r.top - (host ? host.getBoundingClientRect().top : 0) > floor - r.bottom);
+        }
+        setOpen(true); setTyped(false);
+        let at = 0; for (let i = 0; i < options.length; i++) if (q && canon(options[i].value) === q) { at = i; break; }
+        setHi(at);
+    };
+    const closeList = () => { setOpen(false); setTyped(false); };
+    const pick = (i) => {
+        dirtyRef.current = false;
+        if (i < shown.length) onPick(shown[i]);
+        else if (showNew) onPick({ value: text.trim(), label: text.trim(), isNew: true });
+        closeList();
+    };
+    useEffect(() => {   // keep the highlighted row in view inside the list (without moving the page)
+        const list = listRef.current;
+        if (!open || !list) return;
+        const el = list.querySelector(`[data-i="${hi}"]`);
+        if (!el) return;
+        if (el.offsetTop < list.scrollTop) list.scrollTop = el.offsetTop - 22;
+        else if (el.offsetTop + el.offsetHeight > list.scrollTop + list.clientHeight) list.scrollTop = el.offsetTop + el.offsetHeight - list.clientHeight;
+    }, [hi, open, shown]);
+    const onKeyDown = (e) => {
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            if (!open) { openList(); return; }
+            const step = e.key === 'ArrowDown' ? 1 : total - 1;
+            if (total) setHi(h => (h + step) % total);
+        } else if (e.key === 'Enter') {
+            if (open && total) { e.preventDefault(); pick(Math.min(hi, total - 1)); }
+        } else if (e.key === 'Escape') {
+            if (open) { e.preventDefault(); e.stopPropagation(); closeList(); }   // closes the list, not the dialog around it
+        } else if (e.key === 'Tab') closeList();
+    };
+    return (
+        <div className="relative">
+            <input ref={inputRef} role="combobox" aria-expanded={open} aria-controls={idRef.current} aria-autocomplete="list" aria-label={ariaLabel} autoComplete="off" spellCheck={false}
+                className={className} value={text} placeholder={placeholder}
+                onChange={(e) => { dirtyRef.current = true; setTyped(true); setOpen(true); setHi(0); onText(e.target.value); }}
+                onFocus={() => { if (onStart) onStart(); openList(); }} onClick={() => { if (!open) openList(); }} onKeyDown={onKeyDown}
+                onBlur={() => { closeList(); if (dirtyRef.current) { dirtyRef.current = false; if (onCommit) onCommit(text); } }} />
+            {open && (
+                <div id={idRef.current} ref={listRef} role="listbox" onMouseDown={(e) => e.preventDefault()}
+                    className={`absolute left-0 right-0 z-[60] max-h-60 overflow-y-auto rounded-lg border border-slate-300 bg-white shadow-xl py-1 text-sm ${up ? 'bottom-full mb-1' : 'mt-1'}`} style={{ minWidth: 190 }}>
+                    {total === 0 && <div className="px-3 py-2 text-xs text-slate-400">Nothing in the list yet. Type a name.</div>}
+                    {shown.map((o, i) => (
+                        <React.Fragment key={o.value}>
+                            {o.group && (i === 0 || shown[i - 1].group !== o.group) && <div className="px-3 pt-1.5 pb-0.5 text-[10px] font-black uppercase tracking-wider text-slate-400">{o.group}</div>}
+                            <div role="option" aria-selected={i === hi} data-i={i} onClick={() => pick(i)} onMouseMove={() => { if (hi !== i) setHi(i); }}
+                                className={`px-3 py-1.5 cursor-pointer flex items-center gap-2 ${i === hi ? 'bg-[#E6F1FB] text-[#00468B]' : 'text-slate-700'}`}>
+                                <span className="font-bold truncate">{o.label}</span>
+                                {o.note && <span className="ml-auto text-[10px] text-slate-400 whitespace-nowrap">{o.note}</span>}
+                            </div>
+                        </React.Fragment>
+                    ))}
+                    {showNew && (
+                        <div role="option" aria-selected={hi === shown.length} data-i={shown.length} onClick={() => pick(shown.length)} onMouseMove={() => { if (hi !== shown.length) setHi(shown.length); }}
+                            className={`px-3 py-1.5 cursor-pointer border-t border-slate-100 text-xs font-bold ${hi === shown.length ? 'bg-[#FFF6E0] text-slate-800' : 'text-slate-600'}`}>
+                            Use "{text.trim()}" {newWord || 'as typed'}
+                        </div>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+}
 function Modal({ title, onClose, children, wide, footer }) {
+    // one listener for the life of the dialog (it used to be taken off and put back on every keystroke); Esc that a pick list
+    // already used to close itself is left alone
+    const closeRef = useRef(onClose); closeRef.current = onClose;
     useEffect(() => {
-        const k = (e) => { if (e.key === 'Escape') onClose(); };
+        const k = (e) => { if (e.key === 'Escape' && !e.defaultPrevented) closeRef.current(); };
         window.addEventListener('keydown', k);
         return () => window.removeEventListener('keydown', k);
-    }, [onClose]);
+    }, []);
     return (
         <div className="fixed inset-0 z-[100] bg-slate-900/40 backdrop-blur-sm flex items-start justify-center p-4 overflow-y-auto" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
             <div className={`bg-white rounded-2xl shadow-2xl border border-slate-200 w-full ${wide ? 'max-w-3xl' : 'max-w-xl'} my-6`} style={{ fontFamily: BRAND_FONT }}>
@@ -796,11 +935,20 @@ function makeDraft(run, areaDefault) {
 const draftStart = (d) => { const day = parseYMD(d.startDate), t = day && withTime(day, d.startTime); return t ? t.getTime() : null; };
 const draftEnd = (d) => { const day = parseYMD(d.endDate), t = day && withTime(day, d.endTime); return t ? t.getTime() : null; };
 
-function RunDialog({ draft: initial, areaOptions, lineOptions, recall, gapCtx, allRuns, onSave, onDelete, onSwap, onDuplicate, onClose, busy, canSwap }) {
+function RunDialog({ draft: initial, areaOptions, lineChoices, mssNames, recall, gapCtx, allRuns, onSave, onDelete, onSwap, onDuplicate, onClose, busy, canSwap }) {
     const [d, setD] = useState(initial);
     const [confirmDel, setConfirmDel] = useState(false);
     const isNew = !d.id;
     const set = (patch) => setD(p => ({ ...p, ...patch }));
+    // A picked or typed line. A name from the list is written the list's way ("ibl 4" becomes IBL4, or IBL on line 4), anything else stays
+    // as typed. Another area starts on line 1; the same area as when the box was entered keeps the line number it had.
+    const startRef = useRef(null);
+    const pickLine = (text) => {
+        const r = resolveArea(text, areaOptions), base = startRef.current || { area: d.area, line: d.line };
+        const area = r.exact ? r.area : String(text).trim();
+        const line = r.exact && r.line > 1 ? String(r.line) : area === base.area ? String(base.line) : '1';
+        if (area !== d.area || line !== String(d.line)) set({ area, line });
+    };
     const s = draftStart(d), e = draftEnd(d);
     // Start keeps the length (the whole run moves); Stop changes the length; Length moves the stop.
     const setStart = (patch) => setD(p => {
@@ -819,7 +967,7 @@ function RunDialog({ draft: initial, areaOptions, lineOptions, recall, gapCtx, a
         return n;
     });
     const lineNum = Math.max(1, parseInt(d.line, 10) || 1);
-    const problem = !d.area ? 'Choose an area.' : s === null || e === null ? 'Enter a start and a stop.' : !(e > s) ? 'Stop must be after start.'
+    const problem = !d.area.trim() ? 'Pick a line.' : s === null || e === null ? 'Enter a start and a stop.' : !(e > s) ? 'Stop must be after start.'
         : d.code !== '' && !/^\d{1,9}$/.test(String(d.code)) ? 'Product code must be a whole number.' : !d.product.trim() ? 'Enter the product.' : null;
     const gaps = useMemo(() => (s === null || e === null || !(e > s) || !d.area) ? null
         : gapsAround({ id: d.id, area: d.area, line: lineNum, code: d.code === '' ? null : Number(d.code), start: s, end: e, allergen: d.allergen, allergenType: d.allergenType, crumb: d.crumb }, allRuns, gapCtx),
@@ -839,10 +987,13 @@ function RunDialog({ draft: initial, areaOptions, lineOptions, recall, gapCtx, a
                 {!isNew && confirmDel && <span className="ml-auto flex items-center gap-2"><span className="text-xs font-bold text-[#E4002B]">Delete this run?</span><Btn kind="dangerSolid" onClick={() => onDelete(d)} disabled={busy}>Yes, delete</Btn><Btn kind="ghost" onClick={() => setConfirmDel(false)}>No</Btn></span>}
             </>}>
             <div className="grid grid-cols-6 gap-3">
-                <Field label="Area" className="col-span-3">
-                    <input list="ps-areas" className={inputCls} value={d.area} onChange={e2 => set({ area: e2.target.value })} />
+                <Field label="Line" className="col-span-4" plain hint={d.area.trim() && mssNames.length && mssNames.indexOf(d.area.trim()) < 0 ? 'Not an MSS area: it is saved with exactly this name.' : 'The lines come from the MSS areas. Type to search.'}>
+                    <ComboBox value={d.area} options={lineChoices} allowNew newWord="as a new line" ariaLabel="Line" placeholder="Pick or type a line"
+                        className={inputCls + (!d.area.trim() ? ' border-[#E4002B]' : '')}
+                        onText={(t) => set({ area: t })} onStart={() => { startRef.current = { area: d.area, line: d.line }; }}
+                        onPick={(o) => pickLine(o.value)} onCommit={pickLine} />
                 </Field>
-                <Field label="Line" className="col-span-1">
+                <Field label="Line #" className="col-span-2" hint="only when an area has several lines">
                     <input className={inputCls} type="number" min="1" value={d.line} onChange={e2 => set({ line: e2.target.value })} />
                 </Field>
                 <Field label="Product code" className="col-span-2">
@@ -888,7 +1039,6 @@ function RunDialog({ draft: initial, areaOptions, lineOptions, recall, gapCtx, a
                 )}
                 {problem && <div className="col-span-6 text-xs font-bold text-[#E4002B]">{problem}</div>}
             </div>
-            <datalist id="ps-areas">{areaOptions.map(a => <option key={a} value={a} />)}</datalist>
         </Modal>
     );
 }
@@ -896,7 +1046,91 @@ function RunDialog({ draft: initial, areaOptions, lineOptions, recall, gapCtx, a
 // ============================================================================
 // GANTT: 1 day to 8 weeks. Drag to move (or to another line), drag the edges to change start / stop, drop past a
 // neighbour's middle to swap the order, double-click to edit, double-click empty space to add.
+// The grid (weekends, nights, hour lines, day lines) is drawn once behind all the lines, and each line is its own memoized
+// part, so selecting or dragging a run redraws only the line(s) it touches.
 // ============================================================================
+const GANTT_LABEL_W = 170;
+const GRID_STEPS = [1, 2, 3, 4, 6, 12];           // hours between hour lines; the smallest one that leaves room for a label
+const NO_ITEMS = [];
+const hourLabel = (h) => `${h % 12 || 12}${h >= 12 ? 'p' : 'a'}`;   // 6a, 12p, 6p
+
+const GanttRow = memo(function GanttRow({ row, vis, rowGaps, occProd, occSan, rangeFrom, rangeTo, rangeMs, trackW, showClean, stripH, selId, dragId, gh, issueMap, uncoveredMap, api }) {
+    const pct = (ms) => ((ms - rangeFrom) / rangeMs) * 100;
+    const rowH = 46 + stripH * 2 + (stripH ? 3 : 0);
+    return (
+        <div ref={(el) => api.row(row.key, el)} data-line={row.key} className="flex border-b border-slate-200 hover:bg-slate-50/40" style={{ minHeight: rowH }}>
+            <div className="flex-shrink-0 border-r-2 border-slate-300 px-2 py-1 flex flex-col justify-center bg-slate-50 z-20" style={{ width: GANTT_LABEL_W }}>
+                <span className="font-bold text-[13px] text-slate-800 leading-tight">{row.label}</span>
+                <span className="text-[10px] text-slate-400">{vis.length} run{vis.length === 1 ? '' : 's'} in view</span>
+            </div>
+            <div className="flex-1 relative"
+                onDoubleClick={(e) => {
+                    if (e.target.closest && e.target.closest('[data-run],[data-gap]')) return;
+                    api.addAt(row, e.clientX);
+                }}>
+                {/* shift overlay: production and sanitation headcount */}
+                {stripH > 0 && [['production', occProd], ['sanitation', occSan]].map((pair, gi) => {
+                    const g = pair[0], list = pair[1];
+                    return (
+                        <div key={g} className="absolute left-0 right-0" style={{ bottom: gi === 0 ? stripH + 2 : 1, height: stripH - 1 }}>
+                            {list.map((o, i) => {
+                                const l = Math.max(rangeFrom, o.start), r2 = Math.min(rangeTo, o.end), w = ((r2 - l) / rangeMs) * trackW;
+                                const sg = SHIFT_GROUPS[g];
+                                return <div key={i} className="absolute top-0 bottom-0 rounded-sm overflow-hidden whitespace-nowrap text-[8px] font-black leading-none flex items-center px-0.5 border"
+                                    style={{ left: `${pct(l)}%`, width: `${((r2 - l) / rangeMs) * 100}%`, background: sg.soft, borderColor: sg.color, color: sg.color }}
+                                    title={`${sg.label}${o.label ? ' ' + o.label : ''}${o.crew ? ' crew ' + o.crew : ''}: ${o.heads} people, ${fmtTime(o.start)} to ${fmtTime(o.end)}`}>
+                                    {w > 26 ? `${sg.short} ${o.heads}` : ''}{w > 90 && o.label ? ` ${o.label}` : ''}
+                                </div>;
+                            })}
+                        </div>
+                    );
+                })}
+                {/* cleaning windows between runs */}
+                {showClean && rowGaps.map(g => {
+                    const l = Math.max(rangeFrom, g.start), r2 = Math.min(rangeTo, g.end);
+                    if (r2 <= l) return null;
+                    const st = GAP_STYLE[g.status], w = ((r2 - l) / rangeMs) * trackW;
+                    return <div key={g.prevId + g.nextId} data-gap="1" className="absolute rounded-sm border text-[9px] font-black overflow-hidden whitespace-nowrap flex items-center justify-center z-[5]"
+                        style={{ left: `${pct(l)}%`, width: `${((r2 - l) / rangeMs) * 100}%`, top: 6, height: 34, background: st.bg, borderColor: st.border, color: st.text, backgroundImage: 'repeating-linear-gradient(45deg, transparent, transparent 5px, rgba(0,0,0,0.04) 5px, rgba(0,0,0,0.04) 10px)' }}
+                        title={`${st.label}\n${gapText(g)}`}>
+                        {w > 34 && (g.status === 'overlap' ? 'OVERLAP' : g.req.mins <= 0 ? fmtHrs(g.gapMs) : w > 120 ? `Clean ${fmtMins(g.req.mins)} / ${fmtHrs(g.gapMs)}` : w > 60 ? `${fmtMins(g.req.mins)}/${fmtHrs(g.gapMs)}` : fmtHrs(g.gapMs))}
+                    </div>;
+                })}
+                {/* runs */}
+                {vis.map(r => {
+                    const l = Math.max(rangeFrom, r.start), r2 = Math.min(rangeTo, r.end);
+                    const w = ((r2 - l) / rangeMs) * trackW;
+                    const maint = isMaint(r), sel = selId === r.id, dragging = dragId === r.id;
+                    const bg = maint ? 'bg-black border-slate-800 text-white' : r.allergen ? 'bg-[#FFB81C] border-[#B27B00] text-slate-900' : 'bg-[#0072CE] border-[#00468B] text-white';
+                    const bad = issueMap[r.id] === 'overlap', unc = uncoveredMap[r.id];
+                    const tip = `${runTitle(r)}\n${fmtDT(r.start)} to ${fmtDT(r.end)} (${fmtHrs(r.end - r.start)})${r.cases ? `\n${fmtNum(r.cases)} cases` : ''}${r.order ? `\nOrder ${r.order}` : ''}${r.allergen ? `\nAllergen${r.allergenType ? ': ' + r.allergenType : ''}` : ''}${unc ? `\nNo production shift for ${fmtHrs(unc)} of this run` : ''}\nDrag to move, drag an edge to resize, double-click to edit`;
+                    return (
+                        <div key={r.id} data-run="1" title={tip}
+                            onPointerDown={(e) => api.down(e, r, 'move')}
+                            onDoubleClick={(e) => { e.stopPropagation(); api.open(r); }}
+                            className={`absolute rounded-sm shadow-sm border text-[10px] px-1.5 py-0.5 flex flex-col justify-center overflow-hidden z-10 cursor-grab active:cursor-grabbing ${bg} ${sel ? 'ring-2 ring-offset-1 ring-[#E4002B]' : ''} ${bad ? 'outline outline-2 outline-[#E4002B]' : ''} ${dragging ? 'opacity-40' : ''}`}
+                            style={{ left: `${pct(l)}%`, width: `${Math.max(((r2 - l) / rangeMs) * 100, 0.15)}%`, top: 6, height: 34, touchAction: 'none', borderTop: unc ? '4px solid #F97316' : undefined }}>
+                            {r.start >= rangeFrom && <div onPointerDown={(e) => api.down(e, r, 'start')} className="absolute left-0 top-0 bottom-0 w-[6px] cursor-ew-resize hover:bg-white/40" />}
+                            {r.end <= rangeTo && <div onPointerDown={(e) => api.down(e, r, 'end')} className="absolute right-0 top-0 bottom-0 w-[6px] cursor-ew-resize hover:bg-white/40" />}
+                            {w > 22 && <span className="truncate leading-tight font-bold pointer-events-none">{maint ? 'MAINTENANCE' : r.product}</span>}
+                            {w > 110 && <span className="truncate leading-none text-[9px] opacity-90 pointer-events-none">{fmtHrs(r.end - r.start)}{r.cases ? ` · ${fmtNum(r.cases)} cs` : ''}{r.order ? ` · #${r.order}` : ''}{r.allergen ? ' · ALLERGEN' : ''}</span>}
+                        </div>
+                    );
+                })}
+                {gh && (
+                    <div className="absolute rounded-sm border-2 border-dashed z-[25] pointer-events-none flex items-center justify-center text-[10px] font-black"
+                        style={{ left: `${pct(Math.max(rangeFrom, gh.start))}%`, width: `${Math.max(((Math.min(rangeTo, gh.end) - Math.max(rangeFrom, gh.start)) / rangeMs) * 100, 0.2)}%`, top: 4, height: 38,
+                            background: gh.mode === 'blocked' ? 'rgba(228,0,43,0.18)' : gh.mode === 'free' ? 'rgba(0,114,206,0.18)' : 'rgba(255,184,28,0.30)', borderColor: gh.mode === 'blocked' ? '#E4002B' : gh.mode === 'free' ? '#0072CE' : '#B27B00', color: '#111' }}>
+                        <span className="absolute left-0 top-0.5 bg-slate-900 text-white text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap shadow z-30">
+                            {fmtDay(gh.start)} {fmtTime(gh.start)} to {fmtTime(gh.end)} ({fmtHrs(gh.end - gh.start)}){gh.mode === 'swap' ? ' · swaps order' : gh.mode === 'push' ? ` · pushes ${gh.pushed} later run${gh.pushed === 1 ? '' : 's'}` : gh.mode === 'blocked' ? ' · blocked' : ''}
+                        </span>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+});
+
 function GanttView({ rows, runs, gaps, occ, own, rangeFrom, rangeDays, settings, selectedId, onSelect, onCommit, onOpen, onNewRun, issueMap, uncoveredMap, nowMs }) {
     const rangeTo = addDaysLocal(new Date(rangeFrom), rangeDays).getTime();   // local calendar days (a day can be 23 or 25 h)
     const rangeMs = rangeTo - rangeFrom;
@@ -960,7 +1194,7 @@ function GanttView({ rows, runs, gaps, occ, own, rangeFrom, rangeDays, settings,
             const tgt = { start: s, end: en, area: kr.area, line: kr.line };
             d.tgt = tgt;
             const plan = planPlacement(run, tgt, byLineRef.current[key] || [], settingsRef.current.push);
-            setGhost({ id: run.id, rowKey: key, start: s, end: en, mode: plan.mode, error: plan.error, pushed: plan.pushed });
+            setGhost({ id: run.id, rowKey: key, originKey: d.rowKey, start: s, end: en, mode: plan.mode, error: plan.error, pushed: plan.pushed });
         };
         const finish = (ev) => {
             window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', finish); window.removeEventListener('pointercancel', finish); window.removeEventListener('keydown', onKey);
@@ -973,120 +1207,112 @@ function GanttView({ rows, runs, gaps, occ, own, rangeFrom, rangeDays, settings,
         const onKey = (ev) => { if (ev.key === 'Escape') { cancelRef.current = true; finish(ev); } };
         window.addEventListener('pointermove', onMove); window.addEventListener('pointerup', finish); window.addEventListener('pointercancel', finish); window.addEventListener('keydown', onKey);
     };
+    // What the memoized lines call. The functions above are new on every render, so the lines get this fixed object that
+    // always reaches the latest of them (a line only redraws when its own data changes).
+    const live = useRef({});
+    live.current = {
+        startDrag, onOpen,
+        addAt: (row, clientX) => { const rect = trackRef.current.getBoundingClientRect(); onNewRun(row, snapMs(rangeFrom + ((clientX - rect.left) / rect.width) * rangeMs, false)); },
+    };
+    const rowApi = useMemo(() => ({
+        row: (key, el) => { if (el) rowRefs.current[key] = el; else delete rowRefs.current[key]; },
+        down: (e, r, mode) => live.current.startDrag(e, r, mode),
+        open: (r) => live.current.onOpen(r),
+        addAt: (row, x) => live.current.addAt(row, x),
+    }), []);
 
-    // day columns
+    // columns: one per local day
     const dayCells = useMemo(() => {
         const out = [];
-        for (let i = 0; i < rangeDays; i++) { const d = addDaysLocal(new Date(rangeFrom), i); out.push({ ms: d.getTime(), next: addDaysLocal(d, 1).getTime(), dow: d.getDay(), date: d.getDate(), month: d.getMonth(), label: d.toLocaleDateString([], { weekday: 'short', day: 'numeric' }) }); }
+        for (let i = 0; i < rangeDays; i++) { const d = addDaysLocal(new Date(rangeFrom), i); out.push({ ms: d.getTime(), next: addDaysLocal(d, 1).getTime(), dow: d.getDay(), date: d.getDate(), month: d.getMonth(), label: fmtDayHead(d.getTime()) }); }
         return out;
     }, [rangeFrom, rangeDays]);
-    const hourStep = rangeDays === 1 ? 2 : rangeDays === 2 ? 3 : rangeDays <= 4 ? 6 : 0;
+    // hour lines: as many as leave room for a label (every hour on a day, every 6 h over a week, noon and midnight over 2 weeks, none after)
+    const hoursInRange = Math.max(1, rangeMs / HOUR);
+    let hourStep = 0;
+    if (rangeDays <= 14) for (let i = 0; i < GRID_STEPS.length; i++) if (GRID_STEPS[i] * (trackW / hoursInRange) >= 34) { hourStep = GRID_STEPS[i]; break; }
+    const hourTicks = useMemo(() => {
+        const out = [];
+        if (!hourStep) return out;
+        // (on the day the clocks change an hour does not exist, or comes twice: label what the clock really shows and never draw two lines on one spot)
+        dayCells.forEach(c => { for (let h = hourStep; h < 24; h += hourStep) { const t = new Date(c.ms); t.setHours(h, 0, 0, 0); if (t.getTime() > c.ms && t.getTime() < c.next && (!out.length || out[out.length - 1].ms < t.getTime())) out.push({ ms: t.getTime(), h: t.getHours() }); } });
+        return out;
+    }, [dayCells, hourStep]);
+    const nightBands = useMemo(() => {   // 6 pm to 6 am, shaded over ranges up to a week
+        const out = [];
+        if (rangeDays > 7) return out;
+        dayCells.forEach(c => { const a = new Date(c.ms); a.setHours(6, 0, 0, 0); const b = new Date(c.ms); b.setHours(18, 0, 0, 0); out.push([c.ms, a.getTime()], [b.getTime(), c.next]); });
+        return out;
+    }, [dayCells, rangeDays]);
     const dayCellStyle = (c) => ({ left: `${pct(c.ms)}%`, width: `${((c.next - c.ms) / rangeMs) * 100}%` });
     const showNow = nowMs >= rangeFrom && nowMs <= rangeTo;
     const overlayOn = settings.showShifts && rangeDays <= 14;   // too dense to read over longer ranges
     const stripH = overlayOn ? 11 : 0;
+    const showClean = !!settings.showClean;
+
+    // per line: what is in view (rebuilt only when the runs, shifts or range change, not on a click or a drag)
+    const rowData = useMemo(() => {
+        const out = {}, inView = (o) => o.end > rangeFrom && o.start < rangeTo;
+        rows.forEach(row => {
+            out[row.key] = {
+                vis: (byLine[row.key] || []).filter(r => r.start < rangeTo && r.end > rangeFrom),
+                rowGaps: (gapsByLine[row.key] || []).filter(g => g.end > rangeFrom && g.start < rangeTo),
+                occProd: overlayOn ? occForLine(occ, row.key, 'production', own).filter(inView) : NO_ITEMS,
+                occSan: overlayOn ? occForLine(occ, row.key, 'sanitation', own).filter(inView) : NO_ITEMS,
+            };
+        });
+        return out;
+    }, [rows, byLine, gapsByLine, occ, own, overlayOn, rangeFrom, rangeTo]);
+    const selKey = useMemo(() => {
+        if (!selectedId) return null;
+        const ks = Object.keys(byLine);
+        for (let i = 0; i < ks.length; i++) if (byLine[ks[i]].some(r => r.id === selectedId)) return ks[i];
+        return null;
+    }, [selectedId, byLine]);
 
     return (
-        <div className="bg-white border border-slate-300 rounded-xl overflow-hidden select-none" style={{ touchAction: 'pan-y' }}>
-            {/* header */}
-            <div className="flex border-b-2 border-slate-300 bg-slate-50 sticky top-0 z-30">
-                <div className="w-[170px] flex-shrink-0 border-r-2 border-slate-300 px-2 py-1.5 text-[10px] font-black uppercase tracking-widest text-slate-500 flex items-end">Line</div>
+        <div className="bg-white border border-slate-300 rounded-xl select-none" style={{ touchAction: 'pan-y', overflow: 'clip' }}>
+            {/* header: days on top, hours under them; it stays at the top of the page while the lines scroll */}
+            <div className="flex border-b-2 border-slate-300 bg-slate-50 sticky top-0 z-30 shadow-sm">
+                <div className="flex-shrink-0 border-r-2 border-slate-300 px-2 py-1.5 text-[10px] font-black uppercase tracking-widest text-slate-500 flex items-end" style={{ width: GANTT_LABEL_W }}>Line</div>
                 <div className="flex-1 relative" ref={trackRef} style={{ height: hourStep ? 46 : 34 }}>
                     {dayCells.map((c, i) => (
-                        <div key={i} className={`absolute top-0 border-l border-slate-300 text-[10px] font-bold text-slate-600 px-1 overflow-hidden whitespace-nowrap ${c.dow === 0 || c.dow === 6 ? 'bg-slate-100' : ''}`} style={{ ...dayCellStyle(c), height: hourStep ? 23 : 34 }}>
-                            {rangeDays <= 21 ? c.label : (c.date === 1 || i === 0 || c.dow === 0 ? <><span className={c.date === 1 ? 'text-[#00468B]' : ''}>{c.date === 1 ? new Date(c.ms).toLocaleDateString([], { month: 'short' }) + ' ' : ''}{c.date}</span></> : null)}
+                        <div key={i} className={`absolute top-0 border-l ${c.dow === 0 ? 'border-slate-500/70' : 'border-slate-300'} ${hourStep ? 'border-b border-b-slate-200' : ''} text-[10px] font-bold text-slate-600 px-1 overflow-hidden whitespace-nowrap ${c.dow === 0 || c.dow === 6 ? 'bg-slate-100' : ''}`} style={{ ...dayCellStyle(c), height: hourStep ? 23 : 34 }}>
+                            {rangeDays <= 21 ? c.label : (c.date === 1 || i === 0 || c.dow === 0 ? <><span className={c.date === 1 ? 'text-[#00468B]' : ''}>{c.date === 1 ? fmtMonthName(c.ms) + ' ' : ''}{c.date}</span></> : null)}
                             {rangeDays > 21 && <div className="text-[8px] text-slate-400 font-medium">{DOW[c.dow][0]}</div>}
                         </div>
                     ))}
-                    {hourStep > 0 && dayCells.map((c, i) => {
-                        const out = [];
-                        for (let h = 0; h < 24; h += hourStep) out.push(<div key={`${i}-${h}`} className="absolute border-l border-slate-200 text-[9px] text-slate-400 pl-0.5" style={{ left: `${pct(c.ms + h * HOUR)}%`, top: 23, height: 23 }}>{pad2(h)}</div>);
-                        return out;
-                    })}
+                    {hourStep > 0 && hourTicks.map(t => (
+                        <div key={t.ms} className="absolute border-l border-slate-300 leading-none" style={{ left: `${pct(t.ms)}%`, top: 23, height: 23 }}>
+                            <span className="inline-block text-[9px] font-black text-[#00468B] bg-[#E6F1FB] border-b border-r border-[#CFE3F7] rounded-br px-1 py-0.5">{hourLabel(t.h)}</span>
+                        </div>
+                    ))}
+                    {showNow && <div className="absolute bottom-0 px-1 rounded-t bg-[#E4002B] text-white text-[9px] font-black leading-4 z-[2]" style={{ left: `${pct(nowMs)}%`, transform: 'translateX(-50%)' }}>NOW</div>}
                 </div>
             </div>
             {rows.length === 0 && <div className="p-10 text-center text-sm text-slate-500">No lines to show yet. Import a week, or use "+ Run" to schedule the first run.</div>}
-            {rows.map(row => {
-                const lineRuns = byLine[row.key] || [];
-                const vis = lineRuns.filter(r => r.start < rangeTo && r.end > rangeFrom);
-                const rowGaps = (gapsByLine[row.key] || []).filter(g => g.end > rangeFrom && g.start < rangeTo);
-                const rowOcc = overlayOn ? ['production', 'sanitation'].flatMap(g => occForLine(occ, row.key, g, own)).filter(o => o.end > rangeFrom && o.start < rangeTo) : [];
-                const rowH = 46 + stripH * 2 + (stripH ? 3 : 0);
-                const gh = ghost && ghost.rowKey === row.key ? ghost : null;
-                return (
-                    <div key={row.key} ref={el => { rowRefs.current[row.key] = el; }} className="flex border-b border-slate-200 hover:bg-slate-50/40" style={{ minHeight: rowH }}>
-                        <div className="w-[170px] flex-shrink-0 border-r-2 border-slate-300 px-2 py-1 flex flex-col justify-center bg-white z-20">
-                            <span className="font-bold text-[13px] text-slate-800 leading-tight">{row.label}</span>
-                            <span className="text-[10px] text-slate-400">{vis.length} run{vis.length === 1 ? '' : 's'} in view</span>
-                        </div>
-                        <div className="flex-1 relative"
-                            onDoubleClick={(e) => {
-                                if (e.target.closest && e.target.closest('[data-run],[data-gap]')) return;
-                                const rect = trackRef.current.getBoundingClientRect();
-                                onNewRun(row, snapMs(rangeFrom + ((e.clientX - rect.left) / rect.width) * rangeMs, false));
-                            }}>
-                            {dayCells.map((c, i) => <div key={i} className={`absolute top-0 bottom-0 border-l ${c.dow === 0 ? 'border-slate-300' : 'border-slate-200'} ${c.dow === 0 || c.dow === 6 ? 'bg-slate-50' : ''}`} style={dayCellStyle(c)} />)}
-                            {rangeDays <= 4 && dayCells.map((c, i) => <div key={`n${i}`} className="absolute top-0 bottom-0 bg-slate-200/30" style={{ left: `${pct(c.ms + 18 * HOUR)}%`, width: `${(12 * HOUR / rangeMs) * 100}%` }} />)}
-                            {showNow && <div className="absolute top-0 bottom-0 w-px bg-[#E4002B] z-[15]" style={{ left: `${pct(nowMs)}%` }} title="Now" />}
-                            {/* shift overlay: production and sanitation headcount */}
-                            {stripH > 0 && ['production', 'sanitation'].map((g, gi) => (
-                                <div key={g} className="absolute left-0 right-0" style={{ bottom: gi === 0 ? stripH + 2 : 1, height: stripH - 1 }}>
-                                    {rowOcc.filter(o => o.group === g).map((o, i) => {
-                                        const l = Math.max(rangeFrom, o.start), r2 = Math.min(rangeTo, o.end), w = ((r2 - l) / rangeMs) * trackW;
-                                        const sg = SHIFT_GROUPS[g];
-                                        return <div key={i} className="absolute top-0 bottom-0 rounded-sm overflow-hidden whitespace-nowrap text-[8px] font-black leading-none flex items-center px-0.5 border"
-                                            style={{ left: `${pct(l)}%`, width: `${((r2 - l) / rangeMs) * 100}%`, background: sg.soft, borderColor: sg.color, color: sg.color }}
-                                            title={`${sg.label}${o.label ? ' ' + o.label : ''}${o.crew ? ' crew ' + o.crew : ''}: ${o.heads} people, ${fmtTime(o.start)} to ${fmtTime(o.end)}`}>
-                                            {w > 26 ? `${sg.short} ${o.heads}` : ''}{w > 90 && o.label ? ` ${o.label}` : ''}
-                                        </div>;
-                                    })}
-                                </div>
-                            ))}
-                            {/* cleaning windows between runs */}
-                            {settings.showClean && rowGaps.map(g => {
-                                const l = Math.max(rangeFrom, g.start), r2 = Math.min(rangeTo, g.end);
-                                if (r2 <= l) return null;
-                                const st = GAP_STYLE[g.status], w = ((r2 - l) / rangeMs) * trackW;
-                                return <div key={g.prevId + g.nextId} data-gap="1" className="absolute rounded-sm border text-[9px] font-black overflow-hidden whitespace-nowrap flex items-center justify-center z-[5]"
-                                    style={{ left: `${pct(l)}%`, width: `${((r2 - l) / rangeMs) * 100}%`, top: 6, height: 34, background: st.bg, borderColor: st.border, color: st.text, backgroundImage: 'repeating-linear-gradient(45deg, transparent, transparent 5px, rgba(0,0,0,0.04) 5px, rgba(0,0,0,0.04) 10px)' }}
-                                    title={`${st.label}\n${gapText(g)}`}>
-                                    {w > 34 && (g.status === 'overlap' ? 'OVERLAP' : g.req.mins <= 0 ? fmtHrs(g.gapMs) : w > 120 ? `Clean ${fmtMins(g.req.mins)} / ${fmtHrs(g.gapMs)}` : w > 60 ? `${fmtMins(g.req.mins)}/${fmtHrs(g.gapMs)}` : fmtHrs(g.gapMs))}
-                                </div>;
-                            })}
-                            {/* runs */}
-                            {vis.map(r => {
-                                const l = Math.max(rangeFrom, r.start), r2 = Math.min(rangeTo, r.end);
-                                const w = ((r2 - l) / rangeMs) * trackW;
-                                const maint = isMaint(r), sel = selectedId === r.id, dragging = ghost && ghost.id === r.id;
-                                const bg = maint ? 'bg-black border-slate-800 text-white' : r.allergen ? 'bg-[#FFB81C] border-[#B27B00] text-slate-900' : 'bg-[#0072CE] border-[#00468B] text-white';
-                                const bad = issueMap[r.id] === 'overlap', unc = uncoveredMap[r.id];
-                                const tip = `${runTitle(r)}\n${fmtDT(r.start)} to ${fmtDT(r.end)} (${fmtHrs(r.end - r.start)})${r.cases ? `\n${fmtNum(r.cases)} cases` : ''}${r.order ? `\nOrder ${r.order}` : ''}${r.allergen ? `\nAllergen${r.allergenType ? ': ' + r.allergenType : ''}` : ''}${unc ? `\nNo production shift for ${fmtHrs(unc)} of this run` : ''}\nDrag to move, drag an edge to resize, double-click to edit`;
-                                return (
-                                    <div key={r.id} data-run="1" title={tip}
-                                        onPointerDown={(e) => startDrag(e, r, 'move')}
-                                        onDoubleClick={(e) => { e.stopPropagation(); onOpen(r); }}
-                                        className={`absolute rounded-sm shadow-sm border text-[10px] px-1.5 py-0.5 flex flex-col justify-center overflow-hidden z-10 cursor-grab active:cursor-grabbing ${bg} ${sel ? 'ring-2 ring-offset-1 ring-[#E4002B]' : ''} ${bad ? 'outline outline-2 outline-[#E4002B]' : ''} ${dragging ? 'opacity-40' : ''}`}
-                                        style={{ left: `${pct(l)}%`, width: `${Math.max(((r2 - l) / rangeMs) * 100, 0.15)}%`, top: 6, height: 34, touchAction: 'none', borderTop: unc ? '4px solid #F97316' : undefined }}>
-                                        {r.start >= rangeFrom && <div onPointerDown={(e) => startDrag(e, r, 'start')} className="absolute left-0 top-0 bottom-0 w-[6px] cursor-ew-resize hover:bg-white/40" />}
-                                        {r.end <= rangeTo && <div onPointerDown={(e) => startDrag(e, r, 'end')} className="absolute right-0 top-0 bottom-0 w-[6px] cursor-ew-resize hover:bg-white/40" />}
-                                        {w > 22 && <span className="truncate leading-tight font-bold pointer-events-none">{maint ? 'MAINTENANCE' : r.product}</span>}
-                                        {w > 110 && <span className="truncate leading-none text-[9px] opacity-90 pointer-events-none">{fmtHrs(r.end - r.start)}{r.cases ? ` · ${fmtNum(r.cases)} cs` : ''}{r.order ? ` · #${r.order}` : ''}{r.allergen ? ' · ALLERGEN' : ''}</span>}
-                                    </div>
-                                );
-                            })}
-                            {gh && (
-                                <div className="absolute rounded-sm border-2 border-dashed z-[25] pointer-events-none flex items-center justify-center text-[10px] font-black"
-                                    style={{ left: `${pct(Math.max(rangeFrom, gh.start))}%`, width: `${Math.max(((Math.min(rangeTo, gh.end) - Math.max(rangeFrom, gh.start)) / rangeMs) * 100, 0.2)}%`, top: 4, height: 38,
-                                        background: gh.mode === 'blocked' ? 'rgba(228,0,43,0.18)' : gh.mode === 'free' ? 'rgba(0,114,206,0.18)' : 'rgba(255,184,28,0.30)', borderColor: gh.mode === 'blocked' ? '#E4002B' : gh.mode === 'free' ? '#0072CE' : '#B27B00', color: '#111' }}>
-                                    <span className="absolute left-0 top-0.5 bg-slate-900 text-white text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap shadow z-30">
-                                        {fmtDay(gh.start)} {fmtTime(gh.start)} to {fmtTime(gh.end)} ({fmtHrs(gh.end - gh.start)}){gh.mode === 'swap' ? ' · swaps order' : gh.mode === 'push' ? ` · pushes ${gh.pushed} later run${gh.pushed === 1 ? '' : 's'}` : gh.mode === 'blocked' ? ' · blocked' : ''}
-                                    </span>
-                                </div>
-                            )}
-                        </div>
+            <div className="relative">
+                {rows.length > 0 && (
+                    <div className="absolute top-0 bottom-0 right-0 pointer-events-none overflow-hidden" style={{ left: GANTT_LABEL_W }} data-grid="1">
+                        {dayCells.map((c, i) => (c.dow === 0 || c.dow === 6) && <div key={`w${i}`} className="absolute top-0 bottom-0 bg-slate-100/80" style={dayCellStyle(c)} />)}
+                        {nightBands.map((b, i) => <div key={`n${i}`} className="absolute top-0 bottom-0 bg-slate-300/20" style={{ left: `${pct(b[0])}%`, width: `${((b[1] - b[0]) / rangeMs) * 100}%` }} />)}
+                        {hourTicks.map(t => <div key={t.ms} data-hourline="1" className="absolute top-0 bottom-0 border-l border-dashed border-slate-300/90" style={{ left: `${pct(t.ms)}%` }} />)}
+                        {dayCells.map((c, i) => i > 0 && <div key={`d${i}`} data-dayline="1" className={`absolute top-0 bottom-0 border-l ${c.dow === 0 ? 'border-slate-500/70' : 'border-slate-300'}`} style={{ left: `${pct(c.ms)}%` }} />)}
                     </div>
-                );
-            })}
+                )}
+                {rows.map(row => {
+                    const rd = rowData[row.key];
+                    return <GanttRow key={row.key} row={row} vis={rd.vis} rowGaps={rd.rowGaps} occProd={rd.occProd} occSan={rd.occSan}
+                        rangeFrom={rangeFrom} rangeTo={rangeTo} rangeMs={rangeMs} trackW={trackW} showClean={showClean} stripH={stripH}
+                        selId={selKey === row.key ? selectedId : null} dragId={ghost && ghost.originKey === row.key ? ghost.id : null} gh={ghost && ghost.rowKey === row.key ? ghost : null}
+                        issueMap={issueMap} uncoveredMap={uncoveredMap} api={rowApi} />;
+                })}
+                {rows.length > 0 && showNow && (
+                    <div className="absolute top-0 bottom-0 right-0 pointer-events-none z-[15]" style={{ left: GANTT_LABEL_W }}>
+                        <div className="absolute top-0 bottom-0 border-l-2 border-[#E4002B]" style={{ left: `${pct(nowMs)}%`, boxShadow: '0 0 8px rgba(228,0,43,0.35)' }} />
+                    </div>
+                )}
+            </div>
         </div>
     );
 }
@@ -1147,23 +1373,30 @@ const STATUS_LOOK = {
     same: { label: 'ALREADY THERE', cls: 'bg-slate-100 text-slate-500 border-slate-300' },
     clash: { label: 'CLASH', cls: 'bg-[#FDE8EC] text-[#B00020] border-[#E4002B]' },
 };
+// Which MSS line a sheet line belongs on: the same name ignoring spaces and dashes ("IBL 4" is IBL4), else "IBL 4" as area IBL line 4,
+// else the longest area name found inside the sheet name ("Breading Night"), else the only area whose name holds the sheet name.
+function guessArea(label, areaOptions) {
+    const r = resolveArea(label, areaOptions);
+    if (r.exact) return { area: r.area, line: r.line > 1 ? r.line : 1 };
+    const cl = canon(label);
+    if (!cl) return { area: '', line: 1 };
+    const inside = areaOptions.filter(a => canon(a) && cl.indexOf(canon(a)) >= 0).sort((x, y) => canon(y).length - canon(x).length);
+    if (inside.length) return { area: inside[0], line: 1 };
+    const holds = areaOptions.filter(a => canon(a).indexOf(cl) >= 0);
+    return holds.length === 1 ? { area: holds[0], line: 1 } : { area: '', line: 1 };
+}
 function guessLineCfg(label, areaOptions, prevCfg) {
     const preset = presetForLabel(label);
+    const guess = guessArea(label, areaOptions);
     if (prevCfg) {
-        if (prevCfg.pattern) return prevCfg;
+        // a line that never found its area (an older guess missed "IBL 4" against IBL4) tries again; one the person cleared or picked (areaSet) is left alone
+        const pc = !prevCfg.area && !prevCfg.areaSet && guess.area ? { ...prevCfg, area: guess.area, line: Number(prevCfg.line) > 1 ? prevCfg.line : guess.line } : prevCfg;
+        if (pc.pattern) return pc;
         // saved before line patterns existed: settings still at the old defaults take this line's pattern, anything typed by hand stays
-        const untouched = prevCfg.dayStart === '06:00' && !prevCfg.dayStop && prevCfg.chain !== false && !(Number(prevCfg.gapMins) > 0) && !prevCfg.rate && Number(prevCfg.defaultHours) === 8 && !prevCfg.skip;
-        return untouched && preset !== 'custom' ? { ...prevCfg, ...patternFields(preset) } : { ...prevCfg, pattern: 'custom' };
+        const untouched = pc.dayStart === '06:00' && !pc.dayStop && pc.chain !== false && !(Number(pc.gapMins) > 0) && !pc.rate && Number(pc.defaultHours) === 8 && !pc.skip;
+        return untouched && preset !== 'custom' ? { ...pc, ...patternFields(preset) } : { ...pc, pattern: 'custom' };
     }
-    const lc = label.toLowerCase().trim();
-    const find = (name) => areaOptions.find(a => a.toLowerCase() === name.toLowerCase());
-    let area = find(lc) || '', line = 1;
-    if (!area) {
-        const m = /^(.*?)[\s-]*(\d+)$/.exec(lc);
-        if (m && find(m[1].trim())) { area = find(m[1].trim()); line = Number(m[2]); }
-    }
-    if (!area) area = areaOptions.find(a => a.toLowerCase().indexOf(lc) >= 0 || lc.indexOf(a.toLowerCase()) >= 0) || '';
-    return { area, line, dayStart: '06:00', dayStop: '', chain: true, gapMins: 0, rate: '', defaultHours: 8, skip: false, ...patternFields(preset) };
+    return { area: guess.area, line: guess.line, dayStart: '06:00', dayStop: '', chain: true, gapMins: 0, rate: '', defaultHours: 8, skip: false, ...patternFields(preset) };
 }
 
 const smallIn = "border border-slate-300 rounded px-1.5 py-1 text-xs bg-white focus:outline-none focus:ring-1 focus:ring-[#0072CE] ";
@@ -1190,10 +1423,19 @@ function chipLook(hours, winH) {
 }
 
 // One sheet line: where it goes, how it runs, and what its hours add up to each day. Wraps on any screen width.
-function LineCard({ L, c, chips, setCfg }) {
+function LineCard({ L, c, chips, setCfg, areaOptions, lineChoices }) {
     const [more, setMore] = useState(false);
     const kind = LINE_PATTERNS[c.pattern] ? c.pattern : 'custom';
     const missing = !c.area && !c.skip;
+    // a line picked or typed: a name from the MSS list is written the list's way ("ibl 4" becomes IBL4, or IBL on line 4); anything else stays as typed.
+    // Another line starts at line 1; the same one as when the box was entered keeps the line number it had.
+    const startRef = useRef(null);
+    const pickArea = (text) => {
+        const r = resolveArea(text, areaOptions), base = startRef.current || { area: c.area, line: c.line };
+        const area = r.exact ? r.area : String(text).trim();
+        const line = r.exact && r.line > 1 ? r.line : area === base.area ? base.line : 1;
+        if (area !== c.area || String(line) !== String(c.line)) setCfg(L.label, { area, line, areaSet: true });
+    };
     return (
         <div className={`border border-slate-200 rounded-xl p-3 ${c.skip ? 'opacity-50' : ''} ${missing ? 'bg-[#FDE8EC]/40' : 'bg-white'}`}>
             <div className="flex flex-wrap items-end gap-x-3 gap-y-2">
@@ -1201,7 +1443,12 @@ function LineCard({ L, c, chips, setCfg }) {
                     <div className="font-black text-slate-800 text-sm">{L.label}</div>
                     <div className="text-[10px] text-slate-400">{[L.leads, L.supervisor].filter(Boolean).join(' · ')}</div>
                 </div>
-                <Field label="Area"><input list="ps-areas-i" className={smallIn + 'w-36 ' + (missing ? 'border-[#E4002B] bg-[#FDE8EC]' : '')} value={c.area} onChange={(e) => setCfg(L.label, { area: e.target.value })} placeholder="choose area" /></Field>
+                <Field label="Goes on line" plain>
+                    <ComboBox value={c.area} options={lineChoices} allowNew newWord="as a new line" ariaLabel={`Line for ${L.label}`} placeholder="pick a line"
+                        className={smallIn + 'w-40 ' + (missing ? 'border-[#E4002B] bg-[#FDE8EC]' : '')}
+                        onText={(t) => setCfg(L.label, { area: t, areaSet: true })} onStart={() => { startRef.current = { area: c.area, line: c.line }; }}
+                        onPick={(o) => pickArea(o.value)} onCommit={pickArea} />
+                </Field>
                 <Field label="Line #"><input type="number" min="1" className={smallIn + 'w-16'} value={c.line} onChange={(e) => setCfg(L.label, { line: e.target.value })} /></Field>
                 <Field label="How it runs"><select className={smallIn + 'w-52'} value={kind} onChange={(e) => setCfg(L.label, patternFields(e.target.value))}>{PATTERN_ORDER.map(k => <option key={k} value={k}>{LINE_PATTERNS[k].label}</option>)}</select></Field>
                 <Field label="First run starts"><input type="time" className={smallIn} value={c.dayStart} onChange={(e) => setCfg(L.label, { dayStart: e.target.value })} /></Field>
@@ -1295,7 +1542,7 @@ function Section({ title, open, onToggle, summary, right, children }) {
     );
 }
 
-function ImportView({ areaOptions, settings, updateSettings, api, gapCtx, onDone, onView, apiReady }) {
+function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, gapCtx, onDone, onView, apiReady }) {
     const [text, setText] = useState('');
     const [fileName, setFileName] = useState('');
     const [weekStart, setWeekStart] = useState('');
@@ -1557,7 +1804,7 @@ function ImportView({ areaOptions, settings, updateSettings, api, gapCtx, onDone
 
     // why the Apply button is off, so it never just sits there grey
     const applyHint = canApply || applying ? '' :
-        unmapped.length > 0 ? `Choose an area for ${unmapped.map(l => l.label).join(', ')} in step 2 (or tick Skip).` :
+        unmapped.length > 0 ? `Pick a line for ${unmapped.map(l => l.label).join(', ')} in step 2 (or tick Skip).` :
         existing.failed ? 'Could not read what is already scheduled: press Reload (top right) and try again.' :
         view.pending ? 'Checking what is already on the schedule...' :
         toApply.some(r => r.p.bad) ? 'A run stops before it starts: fix its start or stop in step 3.' :
@@ -1600,13 +1847,12 @@ function ImportView({ areaOptions, settings, updateSettings, api, gapCtx, onDone
 
             {ok && (
                 <Section title="2. How each line runs" open={open.s2} onToggle={() => toggleStep('s2')}
-                    summary={<>{lineCount} line{lineCount === 1 ? '' : 's'}{skippedCount > 0 && ` · ${skippedCount} skipped`}{unmapped.length > 0 ? <span className="text-[#E4002B]"> · choose an area for {unmapped.map(l => l.label).join(', ')}</span> : ' · all set'}</>}>
+                    summary={<>{lineCount} line{lineCount === 1 ? '' : 's'}{skippedCount > 0 && ` · ${skippedCount} skipped`}{unmapped.length > 0 ? <span className="text-[#E4002B]"> · pick a line for {unmapped.map(l => l.label).join(', ')}</span> : ' · all set'}</>}>
                     <p className="text-sm text-slate-500 mb-3">Pick how each line runs. <b>First run starts</b> is where every day begins and the rest of that day's runs stack after it in sheet order. Which days a line runs on comes from the sheet. The chips compare each day's hours with the line's window. Settings are remembered for next week.</p>
                     <div className="space-y-3">
-                        {stepLines.map(L => <LineCard key={L.label} L={L} c={cfgs[lineCfgKey(L.label)]} chips={chipsFor(L)} setCfg={setCfg} />)}
+                        {stepLines.map(L => <LineCard key={L.label} L={L} c={cfgs[lineCfgKey(L.label)]} chips={chipsFor(L)} setCfg={setCfg} areaOptions={areaOptions} lineChoices={lineChoices} />)}
                     </div>
-                    <datalist id="ps-areas-i">{areaOptions.map(a => <option key={a} value={a} />)}</datalist>
-                    {unmapped.length > 0 && <p className="mt-2 text-xs font-bold text-[#E4002B]">Choose an area for: {unmapped.map(l => l.label).join(', ')} (or tick Skip).</p>}
+                    {unmapped.length > 0 && <p className="mt-2 text-xs font-bold text-[#E4002B]">Pick a line for: {unmapped.map(l => l.label).join(', ')} (or tick Skip).</p>}
                 </Section>
             )}
 
@@ -1908,6 +2154,8 @@ function previewData() {
     };
 }
 
+const ImportViewMemo = memo(ImportView);   // redraws only when one of its own inputs changes
+
 // ============================================================================
 // MAIN COMPONENT
 // ============================================================================
@@ -1917,7 +2165,7 @@ export default function ProductionScheduleApp({ dataApi }) {
     const [tab, setTab] = useState('schedule');
     const [settings, setSettings] = useState(() => ({ ...DEFAULT_SETTINGS, ...lsRead(LS_SETTINGS, {}) }));
     const settingsRef = useRef(settings); settingsRef.current = settings;
-    const updateSettings = (fn) => setSettings(prev => { const next = fn(prev); lsWrite(LS_SETTINGS, next); return next; });
+    const updateSettings = useMemo(() => (fn) => setSettings(prev => { const next = fn(prev); lsWrite(LS_SETTINGS, next); return next; }), []);   // one function for the life of the page, so the Import view can skip redrawing
     const sideRef = useRef(lsRead(LS_SIDE, {}));   // run id -> { order, cases } kept in this browser when the Dataverse columns are missing
 
     const [areas, setAreas] = useState([]);
@@ -1956,43 +2204,67 @@ export default function ProductionScheduleApp({ dataApi }) {
     // READS
     // ------------------------------------------------------------------------
     const preview = useMemo(() => previewData(), []);
+    const openedRef = useRef(false);   // the full-page "Loading" screen is for the first open only; Reload refreshes behind the page you are on
     useEffect(() => {
         let alive = true;
         (async () => {
-            setLoading(true);
-            const api = dataApiRef.current, problems = {};
+            if (!openedRef.current) setLoading(true);
+            const api = dataApiRef.current;
             if (!apiReady) {
                 if (!alive) return;
                 setAreas(preview.areas); setRuns(preview.runs.map(r => normRun(r, sideRef.current)));
                 setAssets(preview.assets); setAssetsLoaded(true); setEmployees(preview.employees.map(readEmployee)); setEmpLoaded(true);
-                setIssues({ preview: 'Preview mode: no Dataverse connection. Sample data is shown and changes live only on this screen.' }); setLoading(false);
+                setIssues({ preview: 'Preview mode: no Dataverse connection. Sample data is shown and changes live only on this screen.' }); setLoading(false); openedRef.current = true;
                 return;
             }
-            const [areaRows, assetRows, empRows] = await Promise.all([
-                queryRecords(TABLE_AREA_NAMES, api, { top: QUERY_LIMIT }),
-                queryRecords(TABLE_ASSETS, api, { top: 2000 }),
-                queryRecords(TABLE_EMPLOYEE_NAMES, api, { top: 2000 }),
-            ]);
+            // The three reads start together, but the schedule opens as soon as the (small) area list is in. Equipment and the roster
+            // fill in behind it: cleaning checks and shift headcounts update when they arrive.
+            const areaP = queryRecords(TABLE_AREA_NAMES, api, { top: QUERY_LIMIT });
+            const assetP = queryRecords(TABLE_ASSETS, api, { top: 2000 });
+            const empP = queryRecords(TABLE_EMPLOYEE_NAMES, api, { top: 2000 });
+            const flag = (key, msg) => setIssues(p => { const n = { ...p }; if (msg) n[key] = msg; else delete n[key]; return n; });
+            const areaRows = await areaP;
             if (!alive) return;
-            if (areaRows === null) problems.areas = 'Areas could not be loaded: type the area name by hand.';
-            if (assetRows === null) problems.assets = 'Equipment could not be loaded: cleaning checks use the manual minutes.';
-            if (empRows === null) problems.emp = 'The roster could not be loaded: shift headcounts must be typed in.';
-            setAreas(areaRows || []); setAssets(assetRows || []); setAssetsLoaded(true);
-            setEmployees((empRows || []).map(readEmployee)); setEmpLoaded(true);
-            setIssues(p => ({ ...p, ...problems }));
-            setLoading(false);
+            flag('areas', areaRows === null ? 'Areas could not be loaded: type the line name by hand.' : '');
+            setAreas(areaRows || []);
+            setLoading(false); openedRef.current = true;
+            assetP.then(rows => {
+                if (!alive) return;
+                flag('assets', rows === null ? 'Equipment could not be loaded: cleaning checks use the manual minutes.' : '');
+                setAssets(rows || []); setAssetsLoaded(true);
+            });
+            empP.then(rows => {
+                if (!alive) return;
+                flag('emp', rows === null ? 'The roster could not be loaded: shift headcounts must be typed in.' : '');
+                setEmployees((rows || []).map(readEmployee)); setEmpLoaded(true);
+            });
         })();
         return () => { alive = false; };
     }, [apiReady, reloadTick]);
 
-    const areaOptions = useMemo(() => {
-        const flagged = areas.filter(a => truthy(a.craa5_runsproduct) || truthy(a.craa5_RunsProduct));
-        const src = flagged.length ? flagged : areas;
+    // The lines a run can go on = the MSS areas that run product: those flagged "runs product" first; if none is flagged, the
+    // production flags the Manager hub also reads; if none of those either, every area (without the staffing statuses).
+    const mss = useMemo(() => {
+        const nameOf = (a) => renderSafe(a.craa5_area || a.craa5_name).trim();
+        const flagged = (a, keys) => keys.some(k => truthy(a[k]) || truthy(a[k + FMT]));
+        let tier = 'runs', list = areas.filter(a => flagged(a, ['craa5_runsproduct', 'craa5_RunsProduct']));
+        if (!list.length) { tier = 'production'; list = areas.filter(a => flagged(a, ['craa5_production', 'craa5_Production', 'craa5_isproduction', 'craa5_IsProduction']) || a.craa5_type === 256000000); }
+        if (!list.length) { tier = 'all'; list = areas.filter(a => STATUS_AREAS.indexOf(nameOf(a).toLowerCase()) < 0); }
         const names = {};
-        src.forEach(a => { const n = renderSafe(a.craa5_area || a.craa5_name); if (n) names[n] = true; });
-        runs.forEach(r => { if (r.area) names[r.area] = true; });
-        return Object.keys(names).sort();
-    }, [areas, runs]);
+        list.forEach(a => { const n = nameOf(a); if (n) names[n] = true; });
+        return { tier, names: Object.keys(names).sort(byNatural) };
+    }, [areas]);
+    const areaOptions = useMemo(() => {
+        const names = {};
+        mss.names.forEach(n => { names[n] = true; });
+        runs.forEach(r => { if (r.area) names[r.area] = true; });   // (not the line cards' own text: what is being typed there must not become an option)
+        return Object.keys(names).sort(byNatural);
+    }, [mss, runs]);
+    const lineChoices = useMemo(() => {
+        const inMss = {}; mss.names.forEach(n => { inMss[n] = true; });
+        const head = mss.tier === 'runs' ? 'Production lines (MSS)' : mss.tier === 'production' ? 'Production areas (MSS)' : 'MSS areas';
+        return areaOptions.map(n => inMss[n] ? { value: n, label: n, group: head } : { value: n, label: n, group: mss.names.length ? 'Other lines already on the schedule' : '' });
+    }, [areaOptions, mss]);
     const assetList = useMemo(() => assets.map((a, i) => ({
         id: a.craa5_aa_assetsid || `a${i}`, name: a.craa5_equipmentidentifier || 'Equipment', area: renderSafe(a.craa5_areaname) || 'General',
         baseMins: parseFloat(a.craa5_hoursrequired) || 0, allergenMins: parseFloat(a.craa5_MINALRG || a.craa5_minalrg) || 0, heads: parseInt(a.craa5_heads || a.craa5_Heads, 10) || 1,
@@ -2139,10 +2411,15 @@ export default function ProductionScheduleApp({ dataApi }) {
         runs.forEach(r => add(r.area, r.line));
         Object.keys(settings.lineMap).forEach(k => { const c = settings.lineMap[k]; if (c && !c.skip && c.area) add(c.area, c.line); });
         settings.extraLines.forEach(k => { const kr = splitKey(k); add(kr.area, kr.line); });
+        // every MSS production line has its row, even before it has a run (IBL4 and "IBL line 4" count as the same line)
+        if (mss.tier !== 'all') {
+            const have = {}; Object.keys(m).forEach(k => { have[canonLine(m[k].area, m[k].line)] = true; });
+            mss.names.forEach(n => { if (!have[canonLine(n, 1)]) add(n, 1); });
+        }
         const list = Object.keys(m).map(k => m[k]);
         const idx = (k) => { const i = settings.lineOrder.indexOf(k); return i < 0 ? 9999 : i; };
-        return list.sort((a, b) => idx(a.key) - idx(b.key) || a.label.localeCompare(b.label));
-    }, [runs, settings.lineMap, settings.extraLines, settings.lineOrder]);
+        return list.sort((a, b) => idx(a.key) - idx(b.key) || byNatural(a.label, b.label));
+    }, [runs, settings.lineMap, settings.extraLines, settings.lineOrder, mss]);
     const rangeTo = addDaysLocal(new Date(view.from), view.days).getTime();
     const rows = useMemo(() => {
         if (!settings.hideEmpty) return allRows;
@@ -2194,7 +2471,7 @@ export default function ProductionScheduleApp({ dataApi }) {
     // ------------------------------------------------------------------------
     // API handed to the import view
     // ------------------------------------------------------------------------
-    const importApi = {
+    const importApiNow = {
         readLine: async (area, line, from, to) => {
             if (!apiReady) return runsRef.current.filter(r => r.area === area && r.line === line && r.start < to && r.end > from).sort(byStart);
             const rows2 = await queryRecords(TABLE_PROD, dataApiRef.current, { filter: `statecode eq 0 and craa5_area eq '${odataStr(area)}' and craa5_line eq ${line} and craa5_datestarttime lt ${isoZ(to)} and craa5_dateendtime gt ${isoZ(from)}`, orderby: 'craa5_datestarttime asc', top: RANGE_LIMIT });
@@ -2214,6 +2491,17 @@ export default function ProductionScheduleApp({ dataApi }) {
         },
         saveRun, deleteRun,
     };
+    // The Import view is kept in the page while another tab shows; it gets one fixed object (always reaching the latest functions)
+    // and fixed callbacks, so a click or drag on the Gantt does not redraw a big loaded plan behind the scenes.
+    const importLatest = useRef(null); importLatest.current = importApiNow;
+    const importApi = useMemo(() => ({
+        readLine: (a, l, f, t) => importLatest.current.readLine(a, l, f, t),
+        recallMany: (c) => importLatest.current.recallMany(c),
+        saveRun: (op, id, run, extras) => importLatest.current.saveRun(op, id, run, extras),
+        deleteRun: (id) => importLatest.current.deleteRun(id),
+    }), []);
+    const importDone = useMemo(() => () => { loadedRef.current = []; setReloadTick(n => n + 1); }, []);
+    const importShow = useMemo(() => (ms) => { setTab('schedule'); setView(v => ({ days: 7, from: addDaysLocal(midnightOf(ms), -new Date(ms).getDay()).getTime() })); }, []);
     const recallOne = async (code) => { if (!/^\d{1,9}$/.test(String(code))) return null; const m = await importApi.recallMany([String(code)]); return m[String(code)] || null; };
 
     // ------------------------------------------------------------------------
@@ -2442,16 +2730,15 @@ export default function ProductionScheduleApp({ dataApi }) {
                         </div>
                     )}
                     <div style={{ display: tab === 'import' ? 'block' : 'none' }}>
-                        <ImportView areaOptions={areaOptions} settings={settings} updateSettings={updateSettings} api={importApi} gapCtx={gapCtx} apiReady={apiReady}
-                            onDone={() => { loadedRef.current = []; setReloadTick(n => n + 1); }}
-                            onView={(ms) => { setTab('schedule'); setView(v => ({ days: 7, from: addDaysLocal(midnightOf(ms), -new Date(ms).getDay()).getTime() })); }} />
+                        <ImportViewMemo areaOptions={areaOptions} lineChoices={lineChoices} settings={settings} updateSettings={updateSettings} api={importApi} gapCtx={gapCtx} apiReady={apiReady}
+                            onDone={importDone} onView={importShow} />
                     </div>
                     {tab === 'shifts' && <ShiftsView rows={allRows} settings={settings} updateSettings={updateSettings} employees={employees} empLoaded={empLoaded} rosterCount={rosterCount} own={own} />}
                     {tab === 'cleaning' && <CleaningView rows={allRows} assets={assetList} assetsByArea={assetsByArea} settings={settings} updateSettings={updateSettings} gaps={analysis.gaps} own={own} rosterCount={rosterCount} assetsLoaded={assetsLoaded}
                         onJump={(ms) => { setTab('schedule'); jumpTo(ms); }} />}
                 </div>
             </main>
-            {dialog && <RunDialog key={dialog.draft.id || 'new'} draft={dialog.draft} areaOptions={areaOptions} recall={recallOne} gapCtx={gapCtx} allRuns={runs} busy={dialogBusy} canSwap={dialogCanSwap}
+            {dialog && <RunDialog key={dialog.draft.id || 'new'} draft={dialog.draft} areaOptions={areaOptions} lineChoices={lineChoices} mssNames={mss.names} recall={recallOne} gapCtx={gapCtx} allRuns={runs} busy={dialogBusy} canSwap={dialogCanSwap}
                 onSave={saveDialog} onDelete={deleteDialog} onDuplicate={duplicateRun} onSwap={(d, dir) => { swapWithNeighbour(d.id, dir); setDialog(null); }} onClose={() => setDialog(null)} />}
         </div>
     );
