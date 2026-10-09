@@ -280,39 +280,81 @@ function parseWorkShiftRows(rows: any[]): Slot[] {
     return slots;
 }
 
-function findCurrentShift(slots: Slot[], now = new Date()): { crew: string; startMs: number } {
+// A slot ends at the same wall-clock hour whatever the clocks did in between (a 12 h night is 11 real hours the night clocks go forward).
+const slotEndMs = (start: Date, lengthHours: number) => { const e = new Date(start); e.setHours(e.getHours() + lengthHours, 0, 0, 0); return e.getTime(); };
+function findCurrentShift(slots: Slot[], now = new Date()): { crew: string; startMs: number; endMs: number } {
     for (const s of slots) {
         for (let back = 0; back <= 1; back++) {
             const d = new Date(now); d.setDate(d.getDate() - back);
             if (d.getDay() !== s.day) continue;
             const start = new Date(d); start.setHours(s.startHour, 0, 0, 0);
-            if (now.getTime() >= start.getTime() && now.getTime() < start.getTime() + s.lengthHours * 3600000) return { crew: s.crew, startMs: start.getTime() };
+            const end = slotEndMs(start, s.lengthHours);
+            if (now.getTime() >= start.getTime() && now.getTime() < end) return { crew: s.crew, startMs: start.getTime(), endMs: end };
         }
     }
-    return { crew: "", startMs: 0 };
+    return { crew: "", startMs: 0, endMs: 0 };
 }
 
-// The crew whose shift starts within the next hour (supervisors set up before clock-in), or "" when none does.
-function findUpcomingShift(slots: Slot[], now = new Date()): string {
-    let crew = "", soonest = SHIFT_PREP_MS + 1;
+// The crew whose shift starts within the next hour (supervisors set up before clock-in), with the time it starts; crew is "" when none does.
+function findUpcomingSlot(slots: Slot[], now = new Date()): { crew: string; startMs: number } {
+    let crew = "", startMs = 0, soonest = SHIFT_PREP_MS + 1;
     slots.forEach(s => {
         for (let ahead = 0; ahead <= 1; ahead++) {
             const d = new Date(now); d.setDate(d.getDate() + ahead);
             if (d.getDay() !== s.day) continue;
             const start = new Date(d); start.setHours(s.startHour, 0, 0, 0);
             const inMs = start.getTime() - now.getTime();
-            if (inMs > 0 && inMs <= SHIFT_PREP_MS && inMs < soonest) { crew = s.crew; soonest = inMs; }
+            if (inMs > 0 && inMs <= SHIFT_PREP_MS && inMs < soonest) { crew = s.crew; soonest = inMs; startMs = start.getTime(); }
         }
     });
-    return crew;
+    return { crew, startMs };
+}
+const findUpcomingShift = (slots: Slot[], now = new Date()): string => findUpcomingSlot(slots, now).crew;
+
+// The next shift a crew (an employee-table letter) works that has not started yet. skipFirst leaves out the one starting within the hour,
+// which is the shift being set up live, so "next" means the one after it.
+function nextSlotOf(slots: Slot[], crew: string, now = new Date(), skipFirst = false): { startMs: number; endMs: number } | null {
+    const found: { startMs: number; endMs: number }[] = [];
+    slots.filter(s => crewLetterOf(s.crew) === crew).forEach(s => {
+        for (let ahead = 0; ahead <= 8; ahead++) {
+            const d = new Date(now); d.setDate(d.getDate() + ahead);
+            if (d.getDay() !== s.day) continue;
+            const start = new Date(d); start.setHours(s.startHour, 0, 0, 0);
+            if (start.getTime() > now.getTime() && !found.some(f => f.startMs === start.getTime())) found.push({ startMs: start.getTime(), endMs: slotEndMs(start, s.lengthHours) });   // a slot listed twice is one shift
+        }
+    });
+    found.sort((a, b) => a.startMs - b.startMs);
+    return found[skipFirst ? 1 : 0] || null;
+}
+const slotLabel = (ms: number) => new Date(ms).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+
+// Which board a person opens: a supervisor whose crew is on the clock (or starts within the hour) opens it live; a supervisor whose crew is
+// off while another crew works opens that crew's next shift to set up. Everyone else, and any time no shift is on the clock, opens live.
+// Assignments the person's team already saved since this shift began (plus the prep hour) keep the live board: saved rows beat a setup.
+// A supervisor is only sent to their next shift when someone else is listed for the crew on the clock; if nobody is, they are the one acting on it.
+function viewDefaultsFor(sup: any, slots: Slot[], rows: any[] = [], sups: any[] = [], readOk = true): { crew: string; next: boolean } {
+    if (!sup || !isSupervisorLike(sup) || !slots.length) return { crew: "", next: false };
+    const now = new Date(), own = crewOfPerson(sup), cur = findCurrentShift(slots, now), up = findUpcomingSlot(slots, now);
+    if (!cur.crew || !readOk) return { crew: own, next: false };   // when the saved rows could not be read there is no telling whether this team has a board, so it stays live
+    if (own === crewLetterOf(cur.crew) || own === crewLetterOf(up.crew)) return { crew: own, next: false };
+    const cover = supervisorOfCrew(sups, crewLetterOf(cur.crew));
+    if (!cover || empIdOf(cover) === empIdOf(sup)) return { crew: own, next: false };
+    if (rows.some(r => taskTime(r) >= cur.startMs && rowBelongsTo(r, sup))) return { crew: own, next: false };   // no prep hour: that is only for the crew starting next, which returned above
+    return { crew: own, next: !!nextSlotOf(slots, own, now, false) };
+}
+// The shift a next-shift board is about (null for a live board): the crew's next one, leaving out the one starting within the hour.
+function nextSlotForView(crew: string, wantNext: boolean, slots: Slot[]): { startMs: number; endMs: number } | null {
+    if (!wantNext || !crew || !slots.length) return null;
+    const now = new Date(), cur = findCurrentShift(slots, now), up = findUpcomingSlot(slots, now);
+    return nextSlotOf(slots, crew, now, crew !== crewLetterOf(cur.crew) && crew === crewLetterOf(up.crew));
 }
 
 // ============================================================================
 // DATAVERSE READS — Xrm.WebApi first, then the generative page's dataApi.
 // A slow or failed call only falls back for that call; it never switches an API off.
 // ============================================================================
-async function queryDataApi(dataApi: any, table: string, filter: string): Promise<any[]> {
-    let page: any = await asyncRace(dataApi.queryTable(table, { filter, pageSize: 500 }), API_TIMEOUT_MS, `queryTable ${table}`);
+async function queryDataApi(dataApi: any, table: string, filter: string, extra: { select?: string[]; orderBy?: string; top?: number } = {}): Promise<any[]> {
+    let page: any = await asyncRace(dataApi.queryTable(table, { filter, pageSize: 500, ...extra }), API_TIMEOUT_MS, `queryTable ${table}`);
     if (!Array.isArray(page?.rows)) throw new Error(`queryTable ${table}: no rows`);
     const rows = [...page.rows];
     while (page?.hasMoreRows && typeof page.loadMoreRows === 'function' && rows.length < 5000) {
@@ -333,6 +375,106 @@ async function fetchFallbackRecords(entityNames: string | string[], props: any, 
         }
     }
     return [];
+}
+
+// ============================================================================
+// NEXT-SHIFT SETUPS ("presets")
+// A supervisor (or a manager) can set up the board of a crew's next shift ahead of time. It is saved in the table craa5_shiftpreset (one row per
+// setup; the board is JSON in craa5_boardjson). Until that table and its columns exist the setup is kept on this computer (browser storage)
+// instead, and the Data check panel says which. When the shift comes and nothing has been saved for it yet, the setup is loaded onto the board.
+// All names are lowercase, as Dataverse writes them. Only craa5_name and craa5_boardjson are needed; the other columns are tried and, if the
+// table refuses one, it is left out and named.
+// ============================================================================
+const PRESET_TABLE = "craa5_shiftpreset";
+const PRESET_LS_KEY = "ss_presets_v1";
+const PRESET_KEEP_MS = 36 * 3600000;   // a setup is dropped this long after the shift it was for began
+const PRESET_READ_DAYS = 10;           // setups are read from the table this far back, newest first (a setup is made a day or two ahead)
+const PRESET_COLUMNS: { name: string; type: string; why: string; optional: boolean }[] = [
+    { name: 'craa5_name', type: 'Single line of text (the table\'s primary name column)', why: 'name of the setup, e.g. "Setup · D · Fri 6:00 PM"', optional: false },
+    { name: 'craa5_boardjson', type: 'Multiple lines of text (max length 100000 or more)', why: 'the setup itself: areas, leads and people', optional: false },
+    { name: 'craa5_crew', type: 'Single line of text', why: 'crew letter A-D, so the table can be filtered', optional: true },
+    { name: 'craa5_slotstart', type: 'Single line of text', why: 'start of the shift the setup is for (ISO time)', optional: true },
+    { name: 'craa5_supervisor', type: 'Single line of text', why: 'supervisor the setup was made for', optional: true },
+    { name: 'craa5_savedby', type: 'Single line of text', why: 'who saved it', optional: true },
+];
+type PresetRow = { area: string; lead: string; emp: string; empId: string; status: string; notes: string };
+type PresetBoard = { v: number; crew: string; slotStart: number; supervisor: string; savedAt: string; savedBy: string; rows: PresetRow[]; recordId?: string; where?: string };
+const presetKey = (crew: string, slotStart: number) => `${crew}|${Math.round(slotStart / 60000)}`;
+
+function lsReadPresets(): Record<string, PresetBoard> {
+    try {
+        const raw = window.localStorage.getItem(PRESET_LS_KEY), o = raw ? JSON.parse(raw) : {}, out: Record<string, PresetBoard> = {};
+        if (!o || typeof o !== 'object') return out;
+        Object.keys(o).forEach(k => { const b = o[k]; if (b && typeof b === 'object' && b.crew && typeof b.slotStart === 'number' && Array.isArray(b.rows)) out[k] = { ...b, rows: b.rows.filter((r: any) => r && typeof r === 'object') }; });   // anything else in the key is ignored
+        return out;
+    } catch (e) { return {}; }
+}
+function lsWritePresets(o: Record<string, PresetBoard>): boolean {
+    try { window.localStorage.setItem(PRESET_LS_KEY, JSON.stringify(o)); return true; } catch (e) { return false; }
+}
+const looksMissing = (msg: string) => /does not exist|not found|could not find|doesn't contain|0x80060888|0x80040217|resource not found|no table|entity .* not/i.test(msg);
+
+// Xrm.WebApi first, then the generative page's own data calls.
+function getWriteApi(props: any): { create: (t: string, d: any) => Promise<any>; update: (t: string, id: string, d: any) => Promise<any> } | null {
+    const xrm = safeGetXrm(), web = xrm?.WebApi?.createRecord ? xrm.WebApi : props?.context?.webAPI?.createRecord ? props.context.webAPI : null, dataApi = props?.dataApi;
+    if (web) return { create: (t, d) => Promise.resolve(web.createRecord(t, d)), update: (t, id, d) => Promise.resolve(web.updateRecord(t, id, d)) };
+    if (dataApi?.createRow && dataApi?.updateRow) return { create: (t, d) => Promise.resolve(dataApi.createRow(t, d)), update: (t, id, d) => Promise.resolve(dataApi.updateRow(t, id, d)) };
+    return null;
+}
+
+type PresetStore = { remote: 'unknown' | 'ok' | 'missing' | 'error'; error: string; localCount: number };
+// Every setup still worth keeping, from the table and from this computer; the newest save of each crew-and-shift wins.
+async function readPresets(props: any): Promise<{ list: PresetBoard[]; store: PresetStore }> {
+    const webApi = getWebApi(props), dataApi = props?.dataApi, keep = Date.now() - PRESET_KEEP_MS;
+    const since = odataDate(Date.now() - PRESET_READ_DAYS * 86400000), pick = ['craa5_shiftpresetid', 'craa5_boardjson', 'createdon'];   // only the recent rows, only the columns the app uses
+    let recs: any[] | null = null, remote: PresetStore['remote'] = 'unknown', error = "";
+    const failed = (e: any) => { const m = String(e?.message || e || "failed"); error = m; remote = looksMissing(m) ? 'missing' : 'error'; };
+    if (webApi?.retrieveMultipleRecords) {
+        try { const res: any = await asyncRace(webApi.retrieveMultipleRecords(PRESET_TABLE, `?$select=${pick.join(',')}&$filter=statecode eq 0 and createdon ge ${since}&$orderby=createdon desc&$top=60`), TASK_TIMEOUT_MS, "presets"); if (Array.isArray(res?.entities)) { recs = res.entities; remote = 'ok'; } } catch (e: any) { failed(e); }
+    }
+    if (!recs && dataApi?.queryTable) {
+        try { recs = await queryDataApi(dataApi, PRESET_TABLE, `statecode eq 0 and createdon ge ${since}`, { select: pick, orderBy: 'createdon desc', top: 60 }); remote = 'ok'; error = ""; } catch (e: any) { if (!error || remote === 'unknown') failed(e); }
+    }
+    const all: PresetBoard[] = [];
+    (recs || []).forEach(r => {
+        try {
+            const b = JSON.parse(String(getField(r, 'craa5_boardjson') || ""));
+            if (b && b.crew && b.slotStart && Array.isArray(b.rows)) all.push({ ...b, recordId: String(getField(r, PRESET_TABLE + 'id') || ""), where: 'dataverse' });
+        } catch (e) { /* a row that isn't a setup */ }
+    });
+    const local = lsReadPresets(), localList = Object.keys(local).map(k => ({ ...local[k], where: 'device' }));
+    all.push.apply(all, localList);
+    const best: Record<string, PresetBoard> = {};
+    all.forEach(b => { if (b.slotStart < keep) return; const k = presetKey(b.crew, b.slotStart), cur = best[k]; if (!cur || String(b.savedAt) > String(cur.savedAt)) best[k] = b; });
+    return { list: Object.keys(best).map(k => best[k]), store: { remote, error, localCount: localList.length } };
+}
+
+// Saves a setup in the table (creating the table's row, or updating the one already there). A column the table refuses is left out and named;
+// when the table itself can't take it, the setup is kept on this computer. Returns where it went and exactly what was sent.
+async function writePreset(props: any, board: PresetBoard): Promise<{ where: 'dataverse' | 'device'; error: string; refused: string[]; sent: any; recordId: string }> {
+    const api = getWriteApi(props), refused: string[] = [];
+    const data: any = { craa5_name: `Setup · ${board.crew} · ${slotLabel(board.slotStart)}`, craa5_boardjson: JSON.stringify(board), craa5_crew: board.crew, craa5_slotstart: new Date(board.slotStart).toISOString(), craa5_supervisor: board.supervisor, craa5_savedby: board.savedBy };
+    const device = (error: string) => {
+        const local = lsReadPresets(), k = presetKey(board.crew, board.slotStart); local[k] = { ...board, recordId: undefined, where: 'device' };
+        const kept = lsWritePresets(local);
+        return { where: 'device' as const, error: kept ? error : `${error} (and this browser would not keep it either)`, refused, sent: data, recordId: "" };
+    };
+    if (!api) return device('no way to write to Dataverse from here');
+    for (let attempt = 0; attempt < 6; attempt++) {
+        try {
+            let id = board.recordId || "";
+            if (id) await asyncRace(api.update(PRESET_TABLE, id, data), TASK_TIMEOUT_MS, "preset update");
+            else { const res: any = await asyncRace(api.create(PRESET_TABLE, data), TASK_TIMEOUT_MS, "preset create"); id = String(typeof res === 'string' ? res : (res?.id || res?.[PRESET_TABLE + 'id'] || res?.rowId || "")).replace(/[{}]/g, ""); }
+            const local = lsReadPresets(), k = presetKey(board.crew, board.slotStart); if (local[k]) { delete local[k]; lsWritePresets(local); }
+            return { where: 'dataverse', error: "", refused, sent: data, recordId: id };
+        } catch (e: any) {
+            const msg = String(e?.message || e || "failed");
+            const bad = (msg.match(/craa5_[a-z0-9_]+/g) || []).find(n => PRESET_COLUMNS.some(c => c.name === n && c.optional) && n in data);
+            if (bad) { refused.push(bad); delete data[bad]; continue; }
+            return device(msg);
+        }
+    }
+    return device('too many columns refused');
 }
 
 // ============================================================================
@@ -387,13 +529,15 @@ const AuthBox = ({ users, onLogin }: any) => (
 
 // What the app read and how it used it, so a wrong crew can be traced without a console: who is signed in, the shift on the clock,
 // each team's lead and crew size, and which columns were found.
-function DataCheckPanel({ onClose, msUser, currentUser, slotCount, currentShift, shiftStartMs, upNextShift, teams, teamsRead, employees, supervisors, taskStatus, areaCount, boardCrew, ownerName }: any) {
+function DataCheckPanel({ onClose, msUser, currentUser, slotCount, currentShift, shiftStartMs, upNextShift, teams, teamsRead, employees, supervisors, taskStatus, areaCount, boardCrew, ownerName, presets, presetStore, presetLog }: any) {
     const nameOf = (id: string) => { const e = employees.find((x: any) => empIdOf(x) === id); return e ? formatFullName(getField(e, 'craa5_name')) : ""; };
     const withLookup = employees.filter((e: any) => !!teamIdOfEmp(e)).length;
     const sample = employees[0] || {}, hasKey = (k: string) => Object.keys(sample).some(x => x.toLowerCase() === k.toLowerCase());
     const sourceOf = (e: any) => teamLedBy(e) ? 'lead of the team' : teamIdOfEmp(e) && TEAMS.some(t => t.id === teamIdOfEmp(e)) ? 'team lookup' : 'shift letter';
     const row = (k: string, v: any, bad?: boolean) => <div key={k} className="flex gap-3 py-1 border-b border-slate-100"><Text size={200} weight="semibold" style={{ width: 150, flexShrink: 0 }}>{k}</Text><Text size={200} style={{ color: bad ? BRAND.red : undefined }}>{v}</Text></div>;
-    const col = (name: string, ok: boolean, why: string) => <div key={name} className="flex gap-2 py-0.5 items-center"><Badge size="small" appearance="filled" color={ok ? 'success' : 'danger'}>{ok ? 'found' : 'missing'}</Badge><Text size={200} weight="semibold">{name}</Text><Text size={200} color="neutralSecondary">{why}</Text></div>;
+    const col = (name: string, ok: boolean | null, why: string) => <div key={name} className="flex gap-2 py-0.5 items-center flex-wrap"><Badge size="small" appearance="filled" color={ok === null ? 'informative' : ok ? 'success' : 'danger'}>{ok === null ? 'not checked' : ok ? 'found' : 'missing'}</Badge><Text size={200} weight="semibold">{name}</Text><Text size={200} color="neutralSecondary">{why}</Text></div>;
+    const sentKeys = presetLog && presetLog.where === 'dataverse' ? Object.keys(presetLog.sent || {}) : [];
+    const colState = (name: string): boolean | null => presetLog && presetLog.refused && presetLog.refused.indexOf(name) >= 0 ? false : sentKeys.indexOf(name) >= 0 ? true : null;
     return (
         <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,30,60,0.45)', zIndex: 10000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }} onClick={onClose}>
             <div className="bg-white rounded-2xl shadow-lg border border-slate-200 w-full max-w-[860px] flex flex-col" style={{ maxHeight: '100%' }} onClick={e => e.stopPropagation()}>
@@ -424,6 +568,14 @@ function DataCheckPanel({ onClose, msUser, currentUser, slotCount, currentShift,
                     {col('craa5__aa_employee._craa5_leadershipteamid_value', hasKey('_craa5_leadershipteamid_value') || hasKey('craa5_leadershipteamid'), 'lookup to the team: which crew the employee is on')}
                     {col('craa5__aa_employee.craa5_shift', hasKey('craa5_shift'), 'choice: the crew letter used when the team lookup is empty')}
                     {col('craa5_workshift (craa5_shiftcode, craa5_dayname, craa5_shiftstarthour, craa5_shiftendhour)', slotCount > 0, 'which crew is on the clock')}
+                    <div className="mt-4 mb-1"><Text size={300} weight="bold" style={{ color: BRAND.blueDark }}>Next-shift setups (table {PRESET_TABLE})</Text></div>
+                    <Text size={200} block style={{ color: presetStore.remote === 'ok' ? undefined : presetStore.remote === 'unknown' ? undefined : BRAND.red }}>
+                        {presetStore.remote === 'ok' ? `The table was read: ${presets.filter((b: any) => b.where === 'dataverse').length} setup${presets.filter((b: any) => b.where === 'dataverse').length === 1 ? '' : 's'} in it.` : presetStore.remote === 'missing' ? `The table ${PRESET_TABLE} was not found, so setups are kept on this computer (${presetStore.localCount} here). Create it with the columns below and save again to share setups through Dataverse.` : presetStore.remote === 'error' ? `The table could not be read (${String(presetStore.error).slice(0, 160)}); setups are kept on this computer (${presetStore.localCount} here).` : 'Not read yet.'}
+                    </Text>
+                    {PRESET_COLUMNS.map(c => col(`${PRESET_TABLE}.${c.name}`, c.name === 'craa5_name' || c.name === 'craa5_boardjson' ? (presetStore.remote === 'ok' && presetLog && presetLog.where === 'dataverse' ? colState(c.name) : null) : colState(c.name), `${c.type} · ${c.optional ? 'optional' : 'needed'} · ${c.why}`))}
+                    {presets.length > 0 && <Text size={200} color="neutralSecondary" block className="mt-1">Setups held: {presets.map((b: any) => `${b.crew} ${slotLabel(b.slotStart)} by ${b.supervisor || '?'} (${b.where === 'device' ? 'this computer' : 'Dataverse'})`).join(' · ')}</Text>}
+                    {presetLog && <div className="mt-2 p-2 rounded-lg border border-slate-200" style={{ background: BRAND.blueSoft }}><Text size={200} weight="semibold" block>Last setup save · {clockTime(new Date(presetLog.at).getTime())} · {presetLog.where === 'dataverse' ? 'sent to Dataverse' : 'kept on this computer'} · {presetLog.rows} board row{presetLog.rows === 1 ? '' : 's'}</Text>
+                        <Text size={200} block style={{ color: presetLog.error ? BRAND.red : undefined, wordBreak: 'break-all' }}>{presetLog.error ? `Why: ${String(presetLog.error).slice(0, 220)}. ` : ''}{presetLog.refused && presetLog.refused.length ? `Refused: ${presetLog.refused.join(', ')}. ` : ''}Sent: {Object.keys(presetLog.sent || {}).map(k => k === 'craa5_boardjson' ? `${k} (${String(presetLog.sent[k]).length} characters)` : `${k} = ${String(presetLog.sent[k]).slice(0, 60)}`).join(' · ')}</Text></div>}
                     {employees.length > 0 && <div className="mt-3"><Text size={200} weight="bold" block className="mb-1">Who is on crew {currentShift || boardCrew || '?'} and how they were placed</Text>
                         <Text size={200} color="neutralSecondary" block>{employees.filter((e: any) => crewOfPerson(e) === (currentShift || boardCrew)).map((e: any) => `${formatFullName(getField(e, 'craa5_name'))} (${roleOf(e)}, ${sourceOf(e)})`).join(' · ') || 'nobody'}</Text></div>}
                 </div>
@@ -543,6 +695,7 @@ function AreaSelectionScreen({ areas, selectedAreaIds, onSelectChange, onAddCust
 // ============================================================================
 export function MainComponent(props: any) {
     const propsRef = useRef(props); useEffect(() => { propsRef.current = props; }, [props]);
+    const reopenSeq = useRef(0);   // each reopenBoard takes a number; an older one that finishes late does nothing
 
     const [msUser, setMsUser] = useState<any>(null);
     const [presetsApplied, setPresetsApplied] = useState(false);
@@ -582,6 +735,13 @@ export function MainComponent(props: any) {
     const [employeeStartTimes, setEmployeeStartTimes] = useState<Record<string, string>>({});
     const [currentTime, setCurrentTime] = useState(Date.now());
     const [showData, setShowData] = useState(false);
+    const [upNextStartMs, setUpNextStartMs] = useState(0);          // when the crew starting within the hour starts
+    const [viewCrew, setViewCrew] = useState("");                    // the crew the board is about ("" = whichever the clock or the supervisor's own crew gives)
+    const [nextSlot, setNextSlot] = useState<{ startMs: number; endMs: number } | null>(null);   // set = setting up that crew's next shift (saved as a setup, not as today's assignments)
+    const [presets, setPresets] = useState<PresetBoard[]>([]);
+    const [presetStore, setPresetStore] = useState<PresetStore>({ remote: 'unknown', error: '', localCount: 0 });
+    const [presetsReady, setPresetsReady] = useState(false);         // the setups have been read for this board
+    const [presetLog, setPresetLog] = useState<any>(null);           // the last setup saved: where it went and exactly what was sent
 
     const [clipboardFormat, setClipboardFormat] = useState<"headcount" | "initials" | "fullname">("headcount");
     const [disableAutoLogin, setDisableAutoLogin] = useState(false);
@@ -622,9 +782,12 @@ export function MainComponent(props: any) {
         TEAMS = c.teams || [];   // before anything reads a crew
         // Shift and user first: React 17 renders each set separately, and the board defaults read these.
         // The shift is worked out again every time the app opens, so a page that has been loaded for hours still knows which shift it is.
-        const sh = findCurrentShift(c.slots || []);
-        setCurrentShift(sh.crew); setShiftStartMs(sh.startMs); setBoardShiftStart(sh.startMs); setUpNextShift(findUpcomingShift(c.slots || [])); setMsUser(c.msUser || null);
+        const sh = findCurrentShift(c.slots || []), up = findUpcomingSlot(c.slots || []);
+        setCurrentShift(sh.crew); setShiftStartMs(sh.startMs); setBoardShiftStart(sh.startMs); setUpNextShift(up.crew); setUpNextStartMs(up.startMs); setMsUser(c.msUser || null);
+        setPresets(c.presets || []); setPresetStore(c.presetStore || { remote: 'unknown', error: '', localCount: 0 }); setPresetsReady(true);
         setAllEmployees(c.allEmployees || []); setSupervisors(withActingManagers(c.supervisors || [], c.resolvedUser, c.allEmployees || [], c.presetRecords || [])); setLeads(c.leads || []); setAreas(c.areas || []); setTaskStatus(c.taskStatus || null); setPresetRecords(c.presetRecords || []);
+        const v = c.resolvedUser && c.resolvedUser.calculatedRole === 'supervisor' ? viewDefaultsFor(c.resolvedUser, c.slots || [], c.presetRecords || [], c.supervisors || [], !(c.taskStatus && c.taskStatus.ok === false)) : { crew: "", next: false };
+        setViewCrew(v.crew); setNextSlot(nextSlotForView(v.crew, v.next, c.slots || []));   // before the board is chosen, so the first render already knows live or next
         if (c.resolvedUser) {
             setCurrentUser(c.resolvedUser);
             if (c.resolvedUser.calculatedRole === 'manager') setAdminMode(true);
@@ -635,22 +798,31 @@ export function MainComponent(props: any) {
 
     // Empties the board (and the rows it was built from) so the next supervisor's saved rows can be rebuilt into it.
     const resetBoard = useCallback(() => {
-        setPresetsApplied(false); setHasAutoAssignedEveryday(false); setPresetRecords([]); setBoardNote(null); setSaveSuccess(false); setSaveWarning(""); setSubmissionError(null);
+        setPresetsApplied(false); setHasAutoAssignedEveryday(false); setPresetRecords([]); setBoardNote(null); setPresetsReady(false); setSaveSuccess(false); setSaveWarning(""); setSubmissionError(null);
         setSelectedLeadIds(new Set()); setSelectedAreaIds(new Set()); setAreaAssignments({}); setAssignments({}); setAreaDetails({}); setEmployeeStartTimes({}); setCustomLeads([]); setCustomAreas([]); setCustomEmployees([]); setCurrentStep(0);
     }, []);
 
     // Opens a board afresh: the shift is worked out again, the saved rows are read again, and the board is rebuilt from them.
     // supId null (with auto on) lets the default pick choose the supervisor on shift.
-    const reopenBoard = useCallback(async (supId: string | null, auto: boolean) => {
+    // opts.crew / opts.next say which crew the board is about and whether it is that crew's next shift; without them the person's own crew decides.
+    const reopenBoard = useCallback(async (supId: string | null, auto: boolean, opts?: { crew: string; next: boolean }) => {
+        const seq = ++reopenSeq.current;
         setDisableAutoLogin(!auto); resetBoard(); setSelectedSupervisorId(supId);
-        if (GLOBAL_DATA_CACHE?.slots) { const sh = findCurrentShift(GLOBAL_DATA_CACHE.slots); setCurrentShift(sh.crew); setShiftStartMs(sh.startMs); setBoardShiftStart(sh.startMs); setUpNextShift(findUpcomingShift(GLOBAL_DATA_CACHE.slots)); }
+        const slots = GLOBAL_DATA_CACHE?.slots || [];
+        if (GLOBAL_DATA_CACHE?.slots) { const sh = findCurrentShift(slots), up = findUpcomingSlot(slots); setCurrentShift(sh.crew); setShiftStartMs(sh.startMs); setBoardShiftStart(sh.startMs); setUpNextShift(up.crew); setUpNextStartMs(up.startMs); }
+        const sup = supId ? (GLOBAL_DATA_CACHE?.supervisors || []).find((x: any) => getField(x, 'craa5__aa_employeeid') === supId) : null;
+        const v = opts || viewDefaultsFor(sup, slots, GLOBAL_DATA_CACHE?.presetRecords || [], GLOBAL_DATA_CACHE?.supervisors || [], !(GLOBAL_DATA_CACHE?.taskStatus && GLOBAL_DATA_CACHE.taskStatus.ok === false));   // a first guess from the last read; the fresh read below settles it
+        setViewCrew(v.crew); setNextSlot(nextSlotForView(v.crew, v.next, slots));
         setBusyLabel("Reading saved assignments..."); setIsLoading(true);
         try {
-            const t = await readSavedAssignments(propsRef.current);
-            if (GLOBAL_DATA_CACHE) GLOBAL_DATA_CACHE = { ...GLOBAL_DATA_CACHE, presetRecords: t.recent, taskStatus: t.status };
-            setTaskStatus(t.status); setPresetRecords(t.recent);
-        } catch (e: any) { logError('Reading saved assignments failed', e?.message || e); setTaskStatus({ ok: false, error: String(e?.message || e), source: "", read: 0 }); }
-        finally { setIsLoading(false); }
+            const [t, pr] = await Promise.all([readSavedAssignments(propsRef.current), readPresets(propsRef.current)]);
+            if (seq !== reopenSeq.current) return;   // a newer board was asked for while this one was reading
+            if (GLOBAL_DATA_CACHE) GLOBAL_DATA_CACHE = { ...GLOBAL_DATA_CACHE, presetRecords: t.recent, taskStatus: t.status, presets: pr.list, presetStore: pr.store };
+            setPresets(pr.list); setPresetStore(pr.store); setTaskStatus(t.status);
+            if (!opts) { const f = viewDefaultsFor(sup, slots, t.recent, GLOBAL_DATA_CACHE?.supervisors || [], t.status.ok); setViewCrew(f.crew); setNextSlot(nextSlotForView(f.crew, f.next, slots)); }   // the fresh rows decide live or next
+            setPresetRecords(t.recent);   // the setups and the mode first: the rows set here start the rebuild
+        } catch (e: any) { if (seq !== reopenSeq.current) return; logError('Reading saved assignments failed', e?.message || e); setTaskStatus({ ok: false, error: String(e?.message || e), source: "", read: 0 }); }
+        finally { if (seq === reopenSeq.current) { setPresetsReady(true); setIsLoading(false); } }
     }, [resetBoard]);
 
     // View As: another supervisor's board, rebuilt from what they saved — the same as if they had opened the app themselves.
@@ -664,7 +836,9 @@ export function MainComponent(props: any) {
         const i = setInterval(() => {
             setCurrentTime(Date.now());
             const slots = GLOBAL_DATA_CACHE?.slots;
-            if (slots) { const sh = findCurrentShift(slots); setCurrentShift(sh.crew); setShiftStartMs(sh.startMs); setUpNextShift(findUpcomingShift(slots)); }
+            if (slots) { const sh = findCurrentShift(slots), up = findUpcomingSlot(slots); setCurrentShift(sh.crew); setShiftStartMs(sh.startMs); setUpNextShift(up.crew); setUpNextStartMs(up.startMs); }
+            // The shift a setup board was for has begun: the board stays as it is and becomes today's, so Save Progress starts the shift with it.
+            setNextSlot(n => n && n.startMs <= Date.now() ? null : n);
         }, 60000);
         return () => clearInterval(i);
     }, []);
@@ -680,10 +854,16 @@ export function MainComponent(props: any) {
     const areaMap = useMemo(() => { const m = new Map(); [...areas, ...customAreas].forEach(a => { const aId = getField(a, 'craa5_aa_mss_areaid'); if (aId) m.set(aId, a); }); return m; }, [areas, customAreas]);
     const unselectedAvailableLeads = useMemo(() => leads.filter(l => !selectedLeadIds.has(getField(l, 'craa5__aa_employeeid')) && !isEmployeeUtilized(l)), [leads, selectedLeadIds]);
 
+    const activeSupervisorObj = useMemo(() => supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId), [supervisors, selectedSupervisorId]);
+    // A live board is today's: it reads the shift on the clock. A next-shift board is a setup for the crew in viewCrew; it never reads or writes today's assignments.
+    const boardMode: 'live' | 'next' = nextSlot && viewCrew ? 'next' : 'live';
+    const effClock = boardMode === 'next' ? viewCrew : clockCrew, effUp = boardMode === 'next' ? "" : upNextCrew;
+    const presetFor = (crew: string, slotStart: number) => presets.find(b => b.crew === crew && Math.abs(b.slotStart - slotStart) < 60000);
+
     // Available staff: hides anyone whose latest task this shift (and the prep hour before it) is still open; the shift before is over, so its open rows don't count
     const availableStaff = useMemo(() => {
         const latestEmpState = new Map(), liveFrom = shiftStartMs ? shiftStartMs - SHIFT_PREP_MS : 0;
-        presetRecords.filter((t: any) => taskTime(t) >= liveFrom).sort(byTaskTime).forEach((t: any) => {
+        (boardMode === 'next' ? [] : presetRecords).filter((t: any) => taskTime(t) >= liveFrom).sort(byTaskTime).forEach((t: any) => {
             const eName = (getField(t, 'craa5_id') || "").trim();
             const eGuid = getField(t, 'craa5__aaemp_guid') || getField(t, 'craa5_aaemp_guid') || "";
             const empKey = (eGuid || eName).toLowerCase();
@@ -705,31 +885,32 @@ export function MainComponent(props: any) {
             if (!customIds.has(eId) && (activeDbGuids.has(eId) || activeDbNames.has(eName) || isEmployeeUtilized(e))) return false;
             return true;
         });
-    }, [employees, customEmployees, unselectedAvailableLeads, presetRecords, selectedLeadIds, assignments, shiftStartMs]);
+    }, [employees, customEmployees, unselectedAvailableLeads, presetRecords, selectedLeadIds, assignments, shiftStartMs, boardMode]);
 
     const activeBuckets = useMemo(() => {
         const m = new Map(); const s = supervisors.find(x => getField(x, 'craa5__aa_employeeid') === selectedSupervisorId); if (s) m.set(getField(s, 'craa5__aa_employeeid'), s);
         [...leads, ...customLeads].forEach(l => { const id = getField(l, 'craa5__aa_employeeid'); if (selectedLeadIds.has(id) && id !== selectedSupervisorId) m.set(id, l); });
         return Array.from(m.values());
     }, [supervisors, leads, customLeads, selectedLeadIds, selectedSupervisorId]);
-    const activeSupervisorObj = useMemo(() => supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId), [supervisors, selectedSupervisorId]);
     // The crew this board draws its leads and employees from, and whether a manager (not a listed supervisor) is running it.
-    const boardCrew = useMemo(() => activeSupervisorObj ? crewLetterFor(activeSupervisorObj, allEmployees, clockCrew, upNextCrew) : "", [activeSupervisorObj, allEmployees, clockCrew, upNextCrew]);
+    const boardCrew = useMemo(() => activeSupervisorObj ? crewLetterFor(activeSupervisorObj, allEmployees, effClock, effUp) : "", [activeSupervisorObj, allEmployees, effClock, effUp]);
     const isActingBoard = !!activeSupervisorObj && !isSupervisorLike(activeSupervisorObj);
     const supervisorOnClock = useMemo(() => !!clockCrew && supervisors.some(s => isSupervisorLike(s) && crewOfPerson(s) === clockCrew), [supervisors, clockCrew]);
     // Who runs the board, as the line under the title says it: a manager acting names the shift that has no supervisor listed.
     const ownerLabel = useMemo(() => {
         if (!activeSupervisorObj) return "";
         const nm = formatFullName(getField(activeSupervisorObj, 'craa5_name'));
-        return isActingBoard ? `${nm} (acting${clockCrew && !supervisorOnClock ? `; no supervisor is listed for shift ${clockCrew}` : ''})` : nm;
-    }, [activeSupervisorObj, isActingBoard, clockCrew, supervisorOnClock]);
+        const listed = (l: string) => supervisors.some(x => isSupervisorLike(x) && crewOfPerson(x) === l);
+        return isActingBoard ? `${nm} (acting${effClock && !(boardMode === 'next' ? listed(effClock) : supervisorOnClock) ? `; no supervisor is listed for shift ${effClock}` : ''})` : nm;
+    }, [activeSupervisorObj, isActingBoard, effClock, supervisorOnClock, supervisors, boardMode]);
     // The line under the title: whether the saved board could be read, and what it was rebuilt with.
     const headerNote = useMemo((): { tone: 'ok' | 'none' | 'error'; text: string } | null => {
+        if (boardMode === 'next') return selectedSupervisorId && !isLoading ? boardNote : null;   // a next-shift board doesn't read today's assignments
         if (!selectedSupervisorId || isLoading || !taskStatus) return null;
         if (!taskStatus.ok) return { tone: 'error', text: `Saved assignments could not be read (${String(taskStatus.error).slice(0, 140)})` };
         if (boardNote) return boardNote;
         return presetRecords.length === 0 ? { tone: 'none', text: noSavedNote(0, shiftStartMs, false) } : null;
-    }, [selectedSupervisorId, isLoading, taskStatus, boardNote, presetRecords, shiftStartMs]);
+    }, [selectedSupervisorId, isLoading, taskStatus, boardNote, presetRecords, shiftStartMs, boardMode]);
 
     // Tailwind runtime
     useEffect(() => { if (!document.getElementById('tailwind-cdn')) { const s = document.createElement('script'); s.id = 'tailwind-cdn'; s.src = 'https://cdn.tailwindcss.com'; document.head.appendChild(s); } }, []);
@@ -758,11 +939,11 @@ export function MainComponent(props: any) {
                     // Opening the app again: the saved assignments, the employees and the teams are read afresh (who leads which crew can change
                     // from one day to the next); anything that can't be read keeps what the session already had.
                     const prev = GLOBAL_DATA_CACHE;
-                    const [saved, empRaw, teamRaw] = await Promise.all([readSavedAssignments(p), fetchFallbackRecords(EMPLOYEE_TABLES, p), fetchFallbackRecords(TEAM_TABLES, p)]);
+                    const [saved, empRaw, teamRaw, pr] = await Promise.all([readSavedAssignments(p), fetchFallbackRecords(EMPLOYEE_TABLES, p), fetchFallbackRecords(TEAM_TABLES, p), readPresets(p)]);
                     const teams = teamRaw.length ? parseTeams(teamRaw) : (prev.teams || []);
                     TEAMS = teams;
                     const empData = empRaw.length ? empRaw : prev.allEmployees;
-                    GLOBAL_DATA_CACHE = { ...prev, allEmployees: empData, supervisors: supervisorsOf(empData), leads: empData.filter((e: any) => roleOf(e) === 'lead'), teams, teamsRead: teamRaw.length ? teamRaw.length : (prev.teamsRead || 0), presetRecords: saved.recent, taskStatus: saved.status, resolvedUser: resolveUserIdentity(prev.msUser, empData) };
+                    GLOBAL_DATA_CACHE = { ...prev, allEmployees: empData, supervisors: supervisorsOf(empData), leads: empData.filter((e: any) => roleOf(e) === 'lead'), teams, teamsRead: teamRaw.length ? teamRaw.length : (prev.teamsRead || 0), presetRecords: saved.recent, taskStatus: saved.status, presets: pr.list, presetStore: pr.store, resolvedUser: resolveUserIdentity(prev.msUser, empData) };
                     hydrateState(GLOBAL_DATA_CACHE);
                     return;
                 }
@@ -777,12 +958,13 @@ export function MainComponent(props: any) {
                 } else { uName = "Local Developer"; uEmail = "dev@localhost"; uId = "DEV-MODE-ID"; }
                 const msUser = { name: uName, email: uEmail || "", id: uId };
 
-                const [empRaw, areaRaw, shiftRows, teamRaw, saved] = await Promise.all([
+                const [empRaw, areaRaw, shiftRows, teamRaw, saved, pr] = await Promise.all([
                     fetchFallbackRecords(EMPLOYEE_TABLES, p),
                     fetchFallbackRecords(["craa5_aa_mss_area", "craa5_aa_mss_areas"], p),
                     fetchFallbackRecords("craa5_workshift", p),
                     fetchFallbackRecords(TEAM_TABLES, p),
                     readSavedAssignments(p),
+                    readPresets(p),
                 ]);
                 const empData = empRaw.length ? empRaw : (p.inputEmployees || []);
                 const areaData = areaRaw.length ? areaRaw : (p.inputAreas || []);
@@ -793,7 +975,7 @@ export function MainComponent(props: any) {
                 TEAMS = teams;   // before the supervisors and the signed-in person are worked out
                 const lds = empData.filter((e: any) => roleOf(e) === 'lead');
 
-                GLOBAL_DATA_CACHE = { allEmployees: empData, supervisors: supervisorsOf(empData), leads: lds, areas: areaData, presetRecords: saved.recent, taskStatus: saved.status, msUser, slots, teams, teamsRead: teamRaw.length, resolvedUser: resolveUserIdentity(msUser, empData) };
+                GLOBAL_DATA_CACHE = { allEmployees: empData, supervisors: supervisorsOf(empData), leads: lds, areas: areaData, presetRecords: saved.recent, taskStatus: saved.status, msUser, slots, teams, teamsRead: teamRaw.length, presets: pr.list, presetStore: pr.store, resolvedUser: resolveUserIdentity(msUser, empData) };
                 GLOBAL_INIT_STATUS = 'COMPLETE'; hydrateState(GLOBAL_DATA_CACHE);
             } catch (e: any) { logError('Loading failed', e?.message || e); GLOBAL_INIT_STATUS = GLOBAL_DATA_CACHE ? 'COMPLETE' : 'IDLE'; } finally { setIsLoading(false); }
         };
@@ -805,9 +987,9 @@ export function MainComponent(props: any) {
     useEffect(() => {
         if (!selectedSupervisorId || supervisors.length === 0 || allEmployees.length === 0) return;
         const sup = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId); if (!sup) return;
-        const crew = crewOf(sup, allEmployees, clockCrew, upNextCrew);
+        const crew = crewOf(sup, allEmployees, effClock, effUp);
         setLeads(crew.leads); setEmployees(crew.employees);
-    }, [selectedSupervisorId, supervisors, allEmployees, clockCrew, upNextCrew, hydrateTick]);
+    }, [selectedSupervisorId, supervisors, allEmployees, effClock, effUp, hydrateTick]);
 
     // Default board: supervisors get their own (set at sign-in); everyone else — leads, managers, the app owner — lands on the
     // supervisor on shift now, found by the crew the work schedule has on the clock. The shift letters in craa5_workshift and in the
@@ -831,23 +1013,11 @@ export function MainComponent(props: any) {
         if (pick) setSelectedSupervisorId(getField(pick, 'craa5__aa_employeeid'));
     }, [isLoading, supervisors, selectedSupervisorId, disableAutoLogin, clockCrew, upNextCrew, shiftStartMs, currentUser, presetRecords]);
 
-    // Rebuild the board from this supervisor's saved rows
-    useEffect(() => {
-        if (presetsApplied || presetRecords.length === 0 || supervisors.length === 0 || areas.length === 0 || allEmployees.length === 0 || !selectedSupervisorId) return;
-        const sup = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId); if (!sup) return;
+    // Puts rows on the board: the supervisor's saved rows, or a setup turned into rows. Employees are matched by the id on the row, then by name;
+    // a lead who isn't one of the crew's leads (overtime, another crew) joins as a custom lead so their column shows.
+    const applyRows = (tr: any[], sup: any, noteOf: (areas: number, people: number) => string, emptyNote: string) => {
         const supName = String(getField(sup, 'craa5_name') || "");
-        // Employee-hub progress rows share this table and the team name but never carry an employee id (Shift Start always saves it),
-        // so they are left out of the board. If none of the team's rows has an id, nothing is left out.
-        // Only this shift's saves come back (plus up to an hour of set-up before it began): the board of an earlier shift never loads.
-        const restoreFrom = shiftStartMs ? shiftStartMs - SHIFT_PREP_MS : 0;
-        const ofTeam = presetRecords.filter(r => rowBelongsTo(r, sup)), mine = ofTeam.filter(r => taskTime(r) >= restoreFrom);
-        const otherTeams = presetRecords.filter(r => taskTime(r) >= (shiftStartMs || restoreFrom) && !rowBelongsTo(r, sup)).length;   // saved since the shift began (not the outgoing supervisor's last hour), so a name mismatch shows up and the previous shift's rows don't
-        const idOfRow = (r: any) => String(getField(r, 'craa5__aaemp_guid') || getField(r, 'craa5_aaemp_guid') || "").trim();
-        const hasIds = mine.some(r => idOfRow(r));
-        const tr = mine.filter(r => !hasIds || !String(getField(r, 'craa5_id') || "").trim() || idOfRow(r));
-        if (tr.length === 0) { setBoardNote({ tone: 'none', text: noSavedNote(otherTeams, shiftStartMs, ofTeam.length > 0) }); setPresetsApplied(true); return; }
-
-        const shiftLeads = crewOf(sup, allEmployees, clockCrew, upNextCrew).leads;
+        const shiftLeads = crewOf(sup, allEmployees, effClock, effUp).leads;
         const idOf = (e: any) => getField(e, 'craa5__aa_employeeid') || getField(e, 'craa5_aa_employeeid');
         const nl = new Set<string>(), na = new Set<string>(selectedAreaIds), aa: any = {}, as: any = {}, ad: any = {}, est: any = {}, cl: any[] = [], ca: any[] = [], ce: any[] = [];
         const activeEmpRecords = new Map(), latestAreaState = new Map(), latestOpenArea = new Map();
@@ -906,10 +1076,66 @@ export function MainComponent(props: any) {
         if (ce.length) setCustomEmployees(p => [...p, ...ce]);
         setSelectedLeadIds(nl); setSelectedAreaIds(na); setAreaAssignments(aa); setAssignments(as); setAreaDetails(ad); setEmployeeStartTimes(est); setPresetsApplied(true);
         const areaCount = Object.keys(aa).length, people = Object.keys(as).reduce((n, k) => n + as[k].length, 0);
-        if (areaCount > 0) { setBoardNote({ tone: 'ok', text: `Restored ${people} ${people === 1 ? 'person' : 'people'} in ${areaCount} ${areaCount === 1 ? 'area' : 'areas'} from the last save` }); setCurrentStep(4); }
-        else setBoardNote({ tone: 'none', text: `Everything this supervisor saved ${shiftStartMs ? 'this shift' : 'in the last 16 h'} is already finished` });
+        if (areaCount > 0) { setBoardNote({ tone: 'ok', text: noteOf(areaCount, people) }); setCurrentStep(4); }
+        else setBoardNote({ tone: 'none', text: emptyNote });
+    };
+
+    // Rebuild the board from this supervisor's saved rows
+    useEffect(() => {
+        if (boardMode === 'next' || presetsApplied || presetRecords.length === 0 || supervisors.length === 0 || areas.length === 0 || allEmployees.length === 0 || !selectedSupervisorId) return;
+        const sup = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId); if (!sup) return;
+        // Employee-hub progress rows share this table and the team name but never carry an employee id (Shift Start always saves it),
+        // so they are left out of the board. If none of the team's rows has an id, nothing is left out.
+        // Only this shift's saves come back (plus up to an hour of set-up before it began): the board of an earlier shift never loads.
+        const prepFor = boardCrew && boardCrew === upNextCrew && boardCrew !== clockCrew && upNextStartMs ? upNextStartMs : shiftStartMs;   // the crew starting next: from its own prep hour
+        const restoreFrom = prepFor ? prepFor - SHIFT_PREP_MS : 0;
+        const ofTeam = presetRecords.filter(r => rowBelongsTo(r, sup)), mine = ofTeam.filter(r => taskTime(r) >= restoreFrom);
+        const otherTeams = presetRecords.filter(r => taskTime(r) >= (shiftStartMs || restoreFrom) && !rowBelongsTo(r, sup)).length;   // saved since the shift began (not the outgoing supervisor's last hour), so a name mismatch shows up and the previous shift's rows don't
+        const idOfRow = (r: any) => String(getField(r, 'craa5__aaemp_guid') || getField(r, 'craa5_aaemp_guid') || "").trim();
+        const hasIds = mine.some(r => idOfRow(r));
+        const tr = mine.filter(r => !hasIds || !String(getField(r, 'craa5_id') || "").trim() || idOfRow(r));
+        if (tr.length === 0) {
+            if (!presetsReady) return;
+            const pb = liveSetupFor(); if (pb) { applyRows(rowsOfSetup(pb, sup), sup, (areaCount, people) => liveSetupNote(pb, areaCount, people), `The setup for this shift has no areas yet`); return; }
+            setBoardNote({ tone: 'none', text: noSavedNote(otherTeams, shiftStartMs, ofTeam.length > 0) }); setPresetsApplied(true); return;
+        }
+        applyRows(tr, sup, (areaCount, people) => `Restored ${people} ${people === 1 ? 'person' : 'people'} in ${areaCount} ${areaCount === 1 ? 'area' : 'areas'} from the last save`, `Everything this supervisor saved ${shiftStartMs ? 'this shift' : 'in the last 16 h'} is already finished`);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [presetRecords, presetsApplied, supervisors, areas, selectedSupervisorId, allEmployees, clockCrew, upNextCrew, shiftStartMs]);
+    }, [presetRecords, presetsApplied, supervisors, areas, selectedSupervisorId, allEmployees, effClock, effUp, shiftStartMs, upNextStartMs, boardMode, presetsReady, presets]);
+
+    // A stored setup as the rows a save would have written, every one open and started now.
+    const rowsOfSetup = (pb: PresetBoard, sup: any): any[] => {
+        const now = new Date().toISOString(), team = String(getField(sup, 'craa5_name') || "");
+        return pb.rows.map(r => ({ craa5_taskassignmentid: "", craa5_id: r.emp, craa5__aaemp_guid: r.empId, craa5_lead: r.lead, craa5_area: r.area, craa5_team: team, craa5_whatisbeingdone: r.status, craa5_whatislefttodo: r.notes, craa5_starttime: now, craa5_datetimeofassignment: now, createdon: now, craa5_percentagecomplete: 0, craa5_complete: false, statecode: 0 }));
+    };
+    const setupNote = (pb: PresetBoard) => `${pb.supervisor || 'Someone'} set this up${pb.savedAt ? ` ${slotLabel(new Date(pb.savedAt).getTime())}` : ''}`;
+
+    // Next-shift board: the setup saved for that crew and shift, if there is one (never today's assignments).
+    useEffect(() => {
+        if (boardMode !== 'next' || !nextSlot || isLoading || !presetsReady || presetsApplied || areas.length === 0 || allEmployees.length === 0 || !selectedSupervisorId) return;
+        const sup = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId); if (!sup) return;
+        const pb = presetFor(viewCrew, nextSlot.startMs);
+        if (!pb) { setBoardNote({ tone: 'none', text: `Nothing set up yet for shift ${viewCrew} ${slotLabel(nextSlot.startMs)}` }); setPresetsApplied(true); return; }
+        applyRows(rowsOfSetup(pb, sup), sup, (areaCount, people) => `${setupNote(pb)}: ${people} ${people === 1 ? 'person' : 'people'} in ${areaCount} ${areaCount === 1 ? 'area' : 'areas'} for ${slotLabel(nextSlot.startMs)}`, `The setup for ${slotLabel(nextSlot.startMs)} has no areas yet`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [boardMode, nextSlot, isLoading, presetsReady, presetsApplied, areas, allEmployees, supervisors, selectedSupervisorId, presets, viewCrew]);
+
+    // The setup made ahead for the shift this live board is about, if any (the shift on the clock, or the one starting within the hour).
+    const liveSetupFor = (): PresetBoard | undefined => {
+        const slotStart = boardCrew && boardCrew === clockCrew ? shiftStartMs : boardCrew && boardCrew === upNextCrew ? upNextStartMs : 0;
+        return slotStart ? presetFor(boardCrew, slotStart) : undefined;
+    };
+    const liveSetupNote = (pb: PresetBoard, areaCount: number, people: number) => `${setupNote(pb)}: ${people} ${people === 1 ? 'person' : 'people'} in ${areaCount} ${areaCount === 1 ? 'area' : 'areas'}. Save to start the shift with it`;
+    // Live board with no saved assignments at all: the same, when the table holds no rows (the restore above covers a table that holds other teams' rows).
+    useEffect(() => {
+        if (boardMode !== 'live' || isLoading || !presetsReady || presetsApplied || presetRecords.length > 0 || areas.length === 0 || allEmployees.length === 0 || !selectedSupervisorId || presets.length === 0) return;
+        if (taskStatus && taskStatus.ok === false) return;   // the saved rows could not be read: live rows may exist, so a setup must not take their place
+        const sup = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId); if (!sup) return;
+        const pb = liveSetupFor(); if (!pb) return;
+        if (Object.keys(areaAssignments).length > 0 || Object.keys(assignments).length > 0 || selectedLeadIds.size > 0) { setPresetsApplied(true); return; }   // the supervisor already started a board: leave it alone
+        applyRows(rowsOfSetup(pb, sup), sup, (areaCount, people) => liveSetupNote(pb, areaCount, people), `The setup for this shift has no areas yet`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [boardMode, isLoading, presetsReady, presetsApplied, areas, allEmployees, supervisors, selectedSupervisorId, presets, presetRecords, boardCrew, clockCrew, upNextCrew, shiftStartMs, upNextStartMs, taskStatus]);
 
     // Everyday areas start in "Assigned For Today"
     useEffect(() => {
@@ -980,7 +1206,7 @@ export function MainComponent(props: any) {
 
     const toggleIncludeInUpdate = (aid: string, include: boolean) => {
         setAreaDetails(p => ({ ...p, [aid]: { ...p[aid], includeInUpdate: include } }));
-        updateAreaRecord(aid, { craa5_clipboard: include });
+        if (boardMode === 'live') updateAreaRecord(aid, { craa5_clipboard: include });   // the area's flag is shared; a setup for a later shift must not change it
     };
 
     const handleCopyToClipboard = useCallback(() => {
@@ -1035,7 +1261,42 @@ export function MainComponent(props: any) {
     // SAVE PROGRESS — closes the shift's open rows and writes the current board
     // through the new_BulkUpsertTaskAssignments plugin.
     // ============================================================================
+    // SAVE SETUP — a next-shift board is stored as a setup (the table craa5_shiftpreset, or this computer until that exists), never as today's assignments.
+    const handleSavePreset = async () => {
+        if (!nextSlot || !viewCrew) return;
+        if (nextSlot.startMs <= Date.now()) { setNextSlot(null); setSubmissionError("That shift has started, so this board is today's now. Press Save Progress to start the shift with it."); return; }
+        setBusyLabel("Saving setup..."); setIsLoading(true); setSaveSuccess(false); setSaveWarning(""); setSubmissionError(null);
+        const supervisor = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId);
+        try {
+            const rows: PresetRow[] = [];
+            Object.keys(areaAssignments).forEach(areaId => {
+                const lead = employeeMap.get(areaAssignments[areaId]) || supervisor, d = areaDetails[areaId] || {} as any;
+                const base = { area: renderSafe(getField(areaMap.get(areaId), 'craa5_area')), lead: renderSafe(getField(lead, 'craa5_name')), status: String(d.currentStatus || ""), notes: String(d.futureNotes || "") };
+                const ids = assignments[areaId] || [];
+                if (!ids.length) rows.push({ ...base, emp: "", empId: "" });
+                ids.forEach(eid => { const emp = employeeMap.get(eid); if (emp) rows.push({ ...base, emp: renderSafe(getField(emp, 'craa5_name')), empId: String(getField(emp, 'craa5__aa_employeeid') || "") }); });
+            });
+            const existing = presetFor(viewCrew, nextSlot.startMs);
+            const board: PresetBoard = { v: 1, crew: viewCrew, slotStart: nextSlot.startMs, supervisor: renderSafe(getField(supervisor, 'craa5_name')), savedAt: new Date().toISOString(), savedBy: String(msUser?.name || ""), rows, recordId: existing?.recordId };
+            const res = await writePreset(propsRef.current, board);
+            const saved: PresetBoard = { ...board, recordId: res.recordId || undefined, where: res.where };
+            const list = presets.filter(x => !(x.crew === saved.crew && Math.abs(x.slotStart - saved.slotStart) < 60000)).concat([saved]);
+            const store: PresetStore = { remote: res.where === 'dataverse' ? 'ok' : (looksMissing(res.error) ? 'missing' : 'error'), error: res.error, localCount: Object.keys(lsReadPresets()).length };
+            if (GLOBAL_DATA_CACHE) GLOBAL_DATA_CACHE = { ...GLOBAL_DATA_CACHE, presets: list, presetStore: store };
+            setPresets(list); setPresetStore(store);
+            setPresetLog({ at: new Date().toISOString(), where: res.where, error: res.error, refused: res.refused, sent: res.sent, rows: rows.length });
+            setSaveSuccess(true); setCurrentStep(4);
+            setBoardNote({ tone: 'ok', text: `Setup saved ${clockTime(Date.now())} for ${slotLabel(nextSlot.startMs)}` });
+            if (res.where === 'device') setSaveWarning(`Saved on this computer only (${String(res.error).slice(0, 140)}). Create the table ${PRESET_TABLE} (Data check lists its columns) and save again to keep it in Dataverse for everyone.`);
+            else if (res.refused.length) setSaveWarning(`Saved to Dataverse without ${res.refused.join(', ')}: the table refused ${res.refused.length === 1 ? 'that column' : 'those columns'}. Data check lists them.`);
+        } catch (err: any) {
+            logError('Save setup failed', err?.message || err);
+            setSubmissionError(renderSafe(err?.message || err || "An unexpected error occurred while saving the setup."));
+        } finally { setIsLoading(false); }
+    };
+
     const handleSubmission = async () => {
+        if (boardMode === 'next') return handleSavePreset();
         setBusyLabel("Updating Dataverse..."); setIsLoading(true); setSaveSuccess(false); setSaveWarning(""); setSubmissionError(null);
         const supervisor = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId);
         // Rows carry the letter of the crew the board draws from (the letter the employee table uses); the supervisor's own letter or the work shift stand in when there is none.
@@ -1131,6 +1392,21 @@ export function MainComponent(props: any) {
     // ============================================================================
     // RENDER
     // ============================================================================
+    const subtitleHead = boardMode === 'next' && nextSlot ? `Setting up shift ${viewCrew} · ${slotLabel(nextSlot.startMs)}` : `Shift ${currentShift || '?'}${boardCrew && boardCrew !== currentShift ? ` · crew ${boardCrew}` : ''}`;
+    // The shift selector: which crew the board is about, and whether it is that crew's shift on now (live) or its next one (a setup).
+    const slotList: Slot[] = GLOBAL_DATA_CACHE?.slots || [];
+    const shownCrew = boardMode === 'next' ? viewCrew : boardCrew;
+    const crewLetters = ['A', 'B', 'C', 'D'].filter(l => TEAMS.some(t => t.letter === l) || allEmployees.some(e => crewOfPerson(e) === l));
+    const liveOk = !clockCrew || shownCrew === clockCrew || shownCrew === upNextCrew;
+    const peekNext = shownCrew && slotList.length ? nextSlotOf(slotList, shownCrew, new Date(), shownCrew !== clockCrew && shownCrew === upNextCrew) : null;
+    // A crew that is off needs a shift in the work schedule to set up; one with none listed cannot be opened.
+    const crewHasNext = (letter: string) => !slotList.length || !!nextSlotOf(slotList, letter);
+    const chooseCrew = (letter: string) => {
+        const sup = supervisorOfCrew(supervisors, letter) || activeSupervisorObj, live = !clockCrew || letter === clockCrew || letter === upNextCrew;
+        if (!live && !crewHasNext(letter)) return;
+        reopenBoard(sup ? getField(sup, 'craa5__aa_employeeid') : null, false, { crew: live ? "" : letter, next: !live });
+    };
+    const chooseMode = (wantNext: boolean) => { if (shownCrew && selectedSupervisorId) reopenBoard(selectedSupervisorId, false, { crew: wantNext ? shownCrew : "", next: wantNext }); };
     let SC;
     if (!currentUser) SC = (
         <div className="flex items-center justify-center min-h-full p-5">
@@ -1141,7 +1417,7 @@ export function MainComponent(props: any) {
         </div>
     );
     else if (!selectedSupervisorId) SC = <SupervisorSelectionScreen supervisors={supervisors} selectedSupervisorId={selectedSupervisorId} onSelect={switchBoard} note={currentShift ? `The work schedule has shift ${currentShift} on now${shiftStartMs ? ` (since ${clockTime(shiftStartMs)})` : ''}${supervisorOnClock ? '' : ', but no supervisor in the employee list is on that shift'}. Pick who is running it.` : 'No shift in the work schedule covers the current time. Pick the supervisor whose board you want.'} />;
-    else if (currentStep === 0) SC = <LeadSelectionScreen leads={[...leads, ...customLeads]} selectedLeadIds={selectedLeadIds} onSelectChange={setSelectedLeadIds} onSearchCustom={handleSearchCustomLead} crewNote={!currentShift ? (boardCrew ? `Leads and employees on shift ${boardCrew} (no shift in the work schedule covers now, so the supervisor's own shift is used)` : 'Everyone is listed (no shift in the work schedule covers now)') : boardCrew ? `Leads and employees on shift ${boardCrew}${boardCrew !== currentShift ? ` (work schedule shift ${currentShift})` : ' (from the work schedule)'}` : `Everyone is listed: no employee has the shift letter the work schedule has on now (${currentShift})`} />;
+    else if (currentStep === 0) SC = <LeadSelectionScreen leads={[...leads, ...customLeads]} selectedLeadIds={selectedLeadIds} onSelectChange={setSelectedLeadIds} onSearchCustom={handleSearchCustomLead} crewNote={boardMode === 'next' && nextSlot ? `Setting up shift ${viewCrew} for ${slotLabel(nextSlot.startMs)}: leads and employees on shift ${boardCrew || viewCrew}. Nothing here is live until that shift starts` : !currentShift ? (boardCrew ? `Leads and employees on shift ${boardCrew} (no shift in the work schedule covers now, so the supervisor's own shift is used)` : 'Everyone is listed (no shift in the work schedule covers now)') : boardCrew ? `Leads and employees on shift ${boardCrew}${boardCrew !== currentShift ? ` (work schedule shift ${currentShift})` : ' (from the work schedule)'}` : `Everyone is listed: no employee has the shift letter the work schedule has on now (${currentShift})`} />;
     else if (currentStep === 1) SC = <AreaSelectionScreen areas={[...areas, ...customAreas]} selectedAreaIds={selectedAreaIds} onSelectChange={setSelectedAreaIds} onAddCustomArea={(n: string) => setCustomAreas(p => [...p, { craa5_aa_mss_areaid: `c_${Date.now()}`, craa5_area: n, craa5_production: true }])} />;
     else if (currentStep === 2 || currentStep === 3) SC = (
         <div className="flex flex-col h-full p-5 overflow-x-auto box-border">
@@ -1193,7 +1469,7 @@ export function MainComponent(props: any) {
                                             <div onDragOver={e => e.preventDefault()} onDrop={e => { const eid = e.dataTransfer.getData("empId"); if (!eid) return; e.stopPropagation(); setAssignments(p => { const x = { ...p }; Object.keys(x).forEach(k => x[k] = x[k].filter(i => i !== eid)); if (!x[aid]) x[aid] = []; if (!x[aid].includes(eid)) x[aid] = [...x[aid], eid]; return x; }); setEmployeeStartTimes(s => ({ ...s, [eid]: new Date().toISOString() })); }} className="min-h-[40px] bg-slate-50 border border-dashed border-slate-300 rounded p-1 w-full">
                                                 {(assignments[aid] || []).map(eid => (
                                                     <div key={eid} draggable={true} onDragStart={ev => { ev.dataTransfer.setData("empId", eid); ev.stopPropagation(); }} className="text-xs bg-white px-2 py-1 rounded mt-1 cursor-grab border border-slate-300 flex justify-between items-center shadow-sm">
-                                                        <div className="flex items-center gap-1 overflow-hidden"><Text truncate>{formatFullName(getField(employeeMap.get(eid), 'craa5_name'))}</Text><Badge color="brand" appearance="tint" size="small" className="text-[10px]">{formatDuration(employeeStartTimes[eid])}</Badge></div>
+                                                        <div className="flex items-center gap-1 overflow-hidden"><Text truncate>{formatFullName(getField(employeeMap.get(eid), 'craa5_name'))}</Text>{boardMode === 'live' && <Badge color="brand" appearance="tint" size="small" className="text-[10px]">{formatDuration(employeeStartTimes[eid])}</Badge>}</div>
                                                         <Button appearance="transparent" size="small" className="min-w-0 px-1" style={{ color: BRAND.red }} onClick={(e) => { e.stopPropagation(); setAssignments(p => ({ ...p, [aid]: p[aid].filter(i => i !== eid) })); }}>✖</Button>
                                                     </div>
                                                 ))}
@@ -1212,10 +1488,11 @@ export function MainComponent(props: any) {
         const statusIds = Object.keys(areaAssignments).filter(id => isStatusArea(getField(areaMap.get(id), 'craa5_area')));
         SC = (
             <div className="flex flex-col h-full p-5 overflow-y-auto flex-1 box-border">
-                {saveSuccess && <div className="bg-green-50 text-green-800 p-3 rounded-lg mb-4 border border-green-200 font-semibold">✅ Success! Assignments saved.</div>}
+                {saveSuccess && <div className="bg-green-50 text-green-800 p-3 rounded-lg mb-4 border border-green-200 font-semibold">{boardMode === 'next' && nextSlot ? `✅ Setup saved for shift ${viewCrew}, ${slotLabel(nextSlot.startMs)}.` : '✅ Success! Assignments saved.'}</div>}
                 {saveWarning && <div className="p-3 rounded-lg mb-4 border font-semibold" style={{ background: BRAND.yellowSoft, color: '#8A5A00', borderColor: BRAND.yellow }}>⚠️ {saveWarning}</div>}
                 {submissionError && <div className="p-3 rounded-lg mb-4 border font-semibold" style={{ background: BRAND.redSoft, color: BRAND.red, borderColor: BRAND.red }}>❌ Submission Failed: {submissionError}</div>}
                 <ScreenTitle>Update Teams</ScreenTitle>
+                {boardMode === 'next' && nextSlot && <div className="p-3 rounded-lg my-3 border font-semibold" style={{ background: BRAND.yellowSoft, color: '#8A5A00', borderColor: BRAND.yellow }}>Next shift setup for shift {viewCrew}, {slotLabel(nextSlot.startMs)}. Nothing here is live: Save Setup keeps it ({presetStore.remote === 'ok' ? 'in the table craa5_shiftpreset' : 'on this computer until the table craa5_shiftpreset exists'}), and when the shift starts the board opens with it.</div>}
                 {Object.keys(areaAssignments).length === 0 ? <Text className="mt-4">No areas assigned.</Text> : (
                     <div className="flex flex-col gap-8 mt-5">
                         {statusIds.length > 0 && (
@@ -1279,7 +1556,7 @@ export function MainComponent(props: any) {
                     <div className="px-5 h-[64px] flex items-center justify-between gap-4">
                         <div className="min-w-0">
                             <h1 className="text-lg font-black leading-tight tracking-tight truncate" style={{ color: BRAND.blueDark }}>Shift Assignment</h1>
-                            <p className="text-[11px] font-bold text-slate-500 truncate" title={`Shift ${currentShift || '?'}${boardCrew && boardCrew !== currentShift ? ` · crew ${boardCrew}` : ''}${ownerLabel ? ` · ${ownerLabel}` : ''}${headerNote ? ` · ${headerNote.text}` : ''}`}>Shift {currentShift || '?'}{boardCrew && boardCrew !== currentShift ? ` · crew ${boardCrew}` : ''}{ownerLabel ? ` · ${ownerLabel}` : ''}{headerNote && <span style={{ color: headerNote.tone === 'error' ? BRAND.red : headerNote.tone === 'ok' ? BRAND.blue : undefined }}>{` · ${headerNote.text}`}</span>}</p>
+                            <p className="text-[11px] font-bold text-slate-500 truncate" title={`${subtitleHead}${ownerLabel ? ` · ${ownerLabel}` : ''}${headerNote ? ` · ${headerNote.text}` : ''}`}>{subtitleHead}{ownerLabel ? ` · ${ownerLabel}` : ''}{headerNote && <span style={{ color: headerNote.tone === 'error' ? BRAND.red : headerNote.tone === 'ok' ? BRAND.blue : undefined }}>{` · ${headerNote.text}`}</span>}</p>
                         </div>
                         <div className="flex items-center gap-3">
                             {adminMode && (
@@ -1310,19 +1587,30 @@ export function MainComponent(props: any) {
                                     </button>
                                 ))}
                             </div>
-                            {currentStep === 4 && (
-                                <div className="flex items-center gap-2 bg-[#F7F9FC] border border-slate-200 px-2 py-1 rounded-xl">
-                                    <select value={clipboardFormat} onChange={(e) => setClipboardFormat(e.target.value as any)} className="px-2 py-1 rounded-lg border border-slate-300 text-xs font-semibold outline-none bg-white"><option value="headcount">Headcount</option><option value="initials">Initials</option><option value="fullname">Full Name</option></select>
-                                    <Button appearance="secondary" size="small" onClick={handleCopyToClipboard}>Copy</Button>
-                                    <Button appearance="primary" size="small" onClick={handleSubmission}>Save Progress</Button>
+                            <div className="flex items-center gap-2 flex-wrap">
+                                <div className="flex items-center gap-1.5" aria-label="Shift selector">
+                                    {adminMode && crewLetters.map(l => (
+                                        <button key={l} disabled={l !== clockCrew && l !== upNextCrew && !crewHasNext(l)} onClick={() => chooseCrew(l)} title={l === clockCrew ? `Shift ${l} is on now` : crewHasNext(l) || l === upNextCrew ? `Shift ${l}: set up its next shift` : `Shift ${l} has no shift in the work schedule`} className={`relative px-2.5 py-1 text-[11px] font-extrabold rounded-lg border ${shownCrew === l ? 'bg-[#0072CE] text-white border-[#0072CE]' : (l !== clockCrew && l !== upNextCrew && !crewHasNext(l)) ? 'text-slate-300 border-slate-200' : 'text-slate-600 border-slate-300 hover:bg-[#E6F1FB]'}`}>{l}{l === clockCrew && <span aria-hidden="true" style={{ position: 'absolute', top: -3, right: -3, width: 8, height: 8, borderRadius: 8, background: BRAND.yellow }} />}</button>
+                                    ))}
+                                    <div className="flex rounded-lg border border-slate-300 overflow-hidden">
+                                        <button disabled={!liveOk} onClick={() => chooseMode(false)} title={liveOk ? 'Today: the shift on now' : `Shift ${shownCrew} is not on right now`} className={`px-2.5 py-1 text-[11px] font-extrabold ${boardMode === 'live' ? 'bg-[#0072CE] text-white' : liveOk ? 'text-slate-600 hover:bg-[#E6F1FB]' : 'text-slate-300'}`}>Live</button>
+                                        {peekNext && <button onClick={() => chooseMode(true)} title="Set up the next shift ahead of time" className={`px-2.5 py-1 text-[11px] font-extrabold border-l border-slate-300 ${boardMode === 'next' ? 'bg-[#FFB81C] text-slate-900' : 'text-slate-600 hover:bg-[#FFF6E0]'}`}>Next shift · {slotLabel(peekNext.startMs)}</button>}
+                                    </div>
                                 </div>
-                            )}
+                                {currentStep === 4 && (
+                                    <div className="flex items-center gap-2 bg-[#F7F9FC] border border-slate-200 px-2 py-1 rounded-xl">
+                                        {boardMode === 'live' && <select value={clipboardFormat} onChange={(e) => setClipboardFormat(e.target.value as any)} className="px-2 py-1 rounded-lg border border-slate-300 text-xs font-semibold outline-none bg-white"><option value="headcount">Headcount</option><option value="initials">Initials</option><option value="fullname">Full Name</option></select>}
+                                        {boardMode === 'live' && <Button appearance="secondary" size="small" onClick={handleCopyToClipboard}>Copy</Button>}
+                                        <Button appearance="primary" size="small" onClick={handleSubmission}>{boardMode === 'next' ? 'Save Setup' : 'Save Progress'}</Button>
+                                    </div>
+                                )}
+                            </div>
                         </div>
                         <ProgressBar value={(currentStep + 1) / steps.length} color={currentStep === steps.length - 1 ? "success" : "brand"} />
                     </nav>
                 )}
 
-                {showData && <DataCheckPanel onClose={() => setShowData(false)} msUser={msUser} currentUser={currentUser} slotCount={(GLOBAL_DATA_CACHE?.slots || []).length} currentShift={currentShift} shiftStartMs={shiftStartMs} upNextShift={upNextShift} teams={GLOBAL_DATA_CACHE?.teams || []} teamsRead={GLOBAL_DATA_CACHE?.teamsRead || 0} employees={allEmployees} supervisors={supervisors} taskStatus={taskStatus} areaCount={areas.length} boardCrew={boardCrew} ownerName={ownerLabel} />}
+                {showData && <DataCheckPanel onClose={() => setShowData(false)} msUser={msUser} currentUser={currentUser} slotCount={(GLOBAL_DATA_CACHE?.slots || []).length} currentShift={currentShift} shiftStartMs={shiftStartMs} upNextShift={upNextShift} teams={GLOBAL_DATA_CACHE?.teams || []} teamsRead={GLOBAL_DATA_CACHE?.teamsRead || 0} employees={allEmployees} supervisors={supervisors} taskStatus={taskStatus} areaCount={areas.length} boardCrew={boardCrew} ownerName={ownerLabel} presets={presets} presetStore={presetStore} presetLog={presetLog} />}
                 <main style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", position: 'relative' }}>{SC}</main>
             </div>
         </FluentProvider>
