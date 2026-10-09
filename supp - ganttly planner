@@ -2465,6 +2465,10 @@ export default function App(props) {
     const [isLoading, setIsLoading] = useState(true);
     const [zoomLevel, setZoomLevel] = useState(35);
     const [selectedTaskEditor, setSelectedTaskEditor] = useState(null);
+    // PBED: the box that says why a stretch of blank space is blank (hover, or tap to keep it open); the reasons are worked out on hover and kept per plan.
+    const [idleTip, setIdleTip] = useState(null);
+    const idleTipRef = useRef(null);
+    const idleCacheRef = useRef({ sd: null, map: {} });
     const [focusRoom, setFocusRoom] = useState('');
     const [ganttShift, setGanttShift] = useState('');
     // Ganttly's one-line view: which shift's names the left column shows (it follows the scroll; see `stack`).
@@ -5647,6 +5651,274 @@ export default function App(props) {
     };
     const whenOf = function(str) { const ms = localInputMs(str); return isNaN(ms) ? String(str) : formatDayClock(ms); };
     const fmtMins = function(m) { m = Math.round(m); return m >= 60 ? Math.floor(m / 60) + 'h' + (m % 60 ? ' ' + (m % 60) + 'm' : '') : m + 'm'; };
+    // ---- Why is a stretch blank? (PBED, the hover box on the yellow "Idle" boxes) ----
+    // Worked out from the finished plan, only for the stretch being pointed at: the jobs still waiting when this person's free stretch
+    // opens, and what keeps each of them from being done in it (the room not handed over yet, a time block, Max Workers, the person's
+    // role, a stretch too short for Filling gaps, a partner, a team that has the job in its queue ...). It reads the plan and never
+    // changes it. Where the engine's own order of decisions matters (who was dealt a job, the queue of a room's team) the answer
+    // describes the situation, it does not replay the decisions. Returns [{ code, text }], the most important first.
+    const explainIdle = function(lane, gap) {
+        const sd = scheduleData, w = sd.workers[lane], l = laneRoster[lane];
+        if (!w || !l) return [];
+        const clock = function(m) { return formatClockTime(ganttStartDate, ganttStartHour, m).replace(/^\S+ /, ''); };
+        const plural = function(n, one, many) { return n + ' ' + (n === 1 ? one : many); };
+        const tailMin = Math.min(240, Math.max(5, Number(tailFillMins) || 30));
+        const a = gap.start, b = gap.end;
+        const night = function(m) { return sd.isNightAt(Math.max(0, m)); };
+        // The free run around the gap: breaks and plant pauses do not split it, only bookings and the end of the shift do.
+        const win = w.windows.find(function(x) { return a >= x.start - 0.01 && a < x.end - 0.01; }) || null;
+        let rs = Math.max(win ? win.start : 0, reforecastFrom), re = Math.min(win ? win.end : b, planHorizonMins);
+        w.schedule.forEach(function(s) { if (s.end <= a + 0.01) rs = Math.max(rs, s.end); if (s.start >= b - 0.01) re = Math.min(re, s.start); });
+        const winEnd = win ? win.end : b;
+        // When a room may first be cleaned (the engine's own rule: its handoff, moved past a time block under way).
+        const floors = {};
+        const rawHandoff = function(area) { const h = handoffMs[area]; return h !== undefined && h !== null ? Math.max(0, Math.round((h - globalStartMs) / 60000)) : 0; };
+        const areaFloor = function(area) {
+            if (floors[area] === undefined) floors[area] = pushPastBlocks(rawHandoff(area), (planBlocks.byRoom[area] || []).concat(planBlocks.plant));
+            return floors[area];
+        };
+        const floorOf = function(t) { return Math.max(areaFloor(t.originalArea), t.earliestStart || 0, reforecastFrom); };
+        const limitOf = function(t) { return roomCleanTogether[t.originalArea] ? Infinity : (roomLimits[t.originalArea] !== undefined ? roomLimits[t.originalArea] : Infinity); };
+        const crewHeadsCache = {};
+        const headsOf = function(t) {
+            if (t.appliedHeads) return t.appliedHeads;
+            if (!crewHeadsCache[t.kind]) {
+                const per = {};
+                let all = 0;
+                sd.workers.forEach(function(x) { if (x.isLead || !x.canDo(t.kind, true)) return; all++; per[x.crew] = (per[x.crew] || 0) + 1; });
+                crewHeadsCache[t.kind] = { all: all, max: Object.keys(per).reduce(function(m, c) { return Math.max(m, per[c]); }, 0) };
+            }
+            const ch = crewHeadsCache[t.kind];
+            return Math.max(1, Math.min(t.heads, limitOf(t), ch.max || 1, Math.max(1, ch.all)));
+        };
+        const isSpec = function(wk, t) { if (wk.isLead) return false; return t.kind === 'pic' ? (wk.kind === 'pic' || wk.kind === 'inspector') : wk.kind === t.kind; };
+        // Shift Start / auto crew plans of the shifts that have rooms staffed (the engine's own list).
+        const planWinsOf = roomSource === 'shiftstart' ? shiftWindows.filter(function(x) { const p = windowPlans[x.key]; return p && Object.keys(p.lineWorkers).length > 0; }) : [];
+        const shiftOfTask = function(t) { return shiftWindows.find(function(x) { return x.crew === t.crew && t.startMin >= x.start - 0.01 && t.startMin < x.end - 0.01; }) || null; };
+        // Who a job was dealt to, who is on its room and team, and whether a later shift's crew holds the room.
+        const whoPost = function(t, Wt) {
+            const res = { must: null, room: [], team: [], staffed: false, held: false, lid: areaLine[String(t.originalArea)], plan: null, heldBy: null };
+            if (!Wt) return res;
+            const plan = planWinsOf.indexOf(Wt) > -1 ? windowPlans[Wt.key] : null;
+            res.plan = plan;
+            const laneOfEmp = function(id) { return laneByEmpCrew[id + '|' + Wt.crew]; };
+            if (plan) {
+                const emp = plan.assign[t.parentId];
+                if (emp && laneOfEmp(emp) !== undefined) res.must = laneOfEmp(emp);
+                if (res.must !== null && laneRoster[res.must].isLead && !sd.workers[res.must].canDo(t.kind, true)) res.must = null;
+                if (res.lid && plan.lineWorkers[res.lid]) {
+                    res.staffed = true;
+                    res.room = (plan.lineWorkers[res.lid] || []).map(laneOfEmp).filter(function(x) { return x !== undefined && !laneRoster[x].isLead; });
+                    res.team = ((plan.lineTeam || {})[res.lid] || []).map(laneOfEmp).filter(function(x) { return x !== undefined && !laneRoster[x].isLead && res.room.indexOf(x) === -1; });
+                }
+            }
+            if (!res.staffed && res.lid && !t.isSplitPart2 && String(t.parentId).indexOf('custom_') !== 0) {
+                const later = planWinsOf.find(function(p) { return p.start > Wt.start && windowPlans[p.key].lineWorkers[res.lid]; });
+                if (later) { res.held = true; res.heldBy = later; }
+            }
+            return res;
+        };
+        const nameOf = function(x) { return laneRoster[x] ? laneRoster[x].name : 'someone'; };
+        const roleSentence = function() {
+            if (w.kind === 'pic') return 'Tech 3s only do PIC items';
+            if (w.kind === 'inspector') return 'Inspectors do PIC items, and admin work only on nights';
+            if (w.kind === 'chemical') return 'a Chemical Clerk only works the chemical area';
+            if (w.kind === 'admin') return 'a Sanitation Admin only works the admin area';
+            if (w.kind === 'janitorial') return 'Janitorial only works the janitorial area';
+            if (w.kind === 'none') return 'this job role has no work type set on the Crew tab';
+            return 'this role cannot do them';
+        };
+
+        // 1. The jobs still waiting when this stretch opens: everything planned to start after that moment (one that starts the moment it opens is already taken), and everything the plan could not place.
+        const cands = [], cannot = [];
+        const addCand = function(t, planned) {
+            const x = Math.max(a, floorOf(t));
+            if (w.canDo(t.kind, night(x))) cands.push({ t: t, planned: planned }); else cannot.push(t);
+        };
+        sd.groups.forEach(function(g) { g.tasks.forEach(function(t) { if (t.isFrozen || t.startMin <= a + 0.5) return; addCand(t, true); }); });
+        sd.unscheduled.forEach(function(t) { addCand(t, false); });
+
+        const groups = {}, order = [];
+        const hit = function(code, t, info) {
+            info = info || {};
+            const key = code + '|' + (info.room !== undefined ? info.room : t.originalArea) + '|' + (info.key || '');
+            let e = groups[key];
+            if (!e) { e = groups[key] = { code: code, room: info.room !== undefined ? info.room : t.originalArea, n: 0, mins: 0, names: [], info: info, later: 0, laneSet: [], firstStart: Infinity, lastEnd: 0 }; order.push(e); }
+            e.n++;
+            e.mins += t.rawWorkloadMins || 0;
+            if (e.names.length < 3 && e.names.indexOf(t.name) === -1) e.names.push(t.name);
+            if (info.planned && (t.startMin >= winEnd - 0.01 || (t.crew && t.crew !== l.crew))) e.later++;
+            if (info.lane !== undefined && e.laneSet.indexOf(info.lane) === -1) e.laneSet.push(info.lane);
+            if (info.planned) { e.firstStart = Math.min(e.firstStart, t.startMin); e.lastEnd = Math.max(e.lastEnd, t.startMin + t.finalDuration); }
+            return e;
+        };
+        let shortNeed = Infinity;
+        cands.forEach(function(c) {
+            const t = c.t, planned = c.planned, area = t.originalArea;
+            const y = planned ? t.assignedLanes[0] : undefined;
+            const floor = floorOf(t);
+            // Their own next job: nothing keeps it from starting here except what is listed for the others.
+            if (planned && t.assignedLanes.indexOf(lane) > -1 && floor <= a + 0.5) return;
+            const H = headsOf(t);
+            if (t.noEligible) { hit('NO_ELIGIBLE', t, { planned: false }); return; }
+            if (planned && (t.isPinned || overrides[t.id] !== undefined)) { hit('HAND', t, { planned: true, lane: y, key: String(y) }); return; }
+            let x = Math.max(a, floor);
+            // Not handed over yet (or the first part of the clean is still running).
+            if (floor > a + 0.5 && floor >= b - 0.5) {
+                if (t.isSplitPart2 && (t.earliestStart || 0) >= floor - 0.01 && (t.earliestStart || 0) > areaFloor(area)) hit('PART_WAIT', t, { planned: planned, floor: floor, key: String(t.parentId) });
+                else hit('HANDOFF', t, { planned: planned, floor: floor });
+                return;
+            }
+            // A time block in the room.
+            const walls = t.walls || [];
+            let guard = 0;
+            while (x < b - 0.5 && wallAt(walls, x) && guard++ < 50) {
+                const wl = walls.find(function(q) { return q.start <= x + 0.01 && x < q.end - 0.01; });
+                if (!wl) break;
+                x = wl.end;
+            }
+            if (x >= b - 0.5) {
+                const wl = walls.find(function(q) { return q.end > a - 0.01 && q.start < b; }) || walls[0] || {};
+                hit('WALL', t, { planned: planned, label: wl.label || 'a time block', from: wl.start, to: wl.end, key: String(wl.blockId || wl.label) });
+                return;
+            }
+            // Max Workers: the room already has as many people in it as it allows.
+            const lim = limitOf(t);
+            if (lim < Infinity) {
+                const occ = [];
+                sd.workers.forEach(function(wk, yy) { if (yy === lane || t.assignedLanes.indexOf(yy) > -1) return; wk.schedule.forEach(function(s) { if (s.area === area) occ.push({ start: s.start, end: s.end, id: yy }); }); });
+                const occAt = function(m) { const seen = []; occ.forEach(function(o) { if (o.start <= m + 0.01 && m < o.end - 0.01 && seen.indexOf(o.id) === -1) seen.push(o.id); }); return seen.length; };
+                let g2 = 0;
+                while (x < b - 0.5 && occAt(x) + H > lim && g2++ < 200) {
+                    let nx = Infinity;
+                    occ.forEach(function(o) { if (o.start <= x + 0.01 && x < o.end - 0.01 && o.end < nx) nx = o.end; });
+                    if (nx === Infinity) break;
+                    x = nx;
+                }
+                if (x >= b - 0.5) { hit('ROOM_FULL', t, { planned: planned, lim: lim, key: String(lim) }); return; }
+            }
+            // Too short: not even the first part of the clean fits (Filling gaps) and nothing waiting fits whole.
+            const runEnd = Math.min(re, nextWallStart(walls, x));
+            const net = netWorkingMins(x, runEnd, t.customInterrupts || []);
+            const dur = t.calculateDuration(x, t.customInterrupts || [], H);
+            const fitsWhole = x + dur <= runEnd + 0.01, partOk = net >= tailMin - 0.01;
+            if (!fitsWhole && !partOk) { shortNeed = Math.min(shortNeed, dur); hit('SHORT', t, { planned: planned, key: 'short' }); return; }
+            // A clean for several people: nobody else who can do it is free at the same time.
+            if (H > 1) {
+                let partners = 0;
+                const len = Math.min(dur, tailMin);
+                sd.workers.forEach(function(wk, yy) {
+                    if (yy === lane || wk.isLead || wk.kind === 'none' || wk.crew !== w.crew || t.assignedLanes.indexOf(yy) > -1 || !wk.canDo(t.kind, night(x))) return;
+                    if (wk.isOnShift(x, x + len) && wk.isFree(x, x + len)) partners++;
+                });
+                if (partners < H - 1) { hit('PARTNER', t, { planned: planned, heads: H, key: String(H) }); return; }
+            }
+            // Everything below is policy: it could have been done here, but the plan gave it to somebody else.
+            if (!planned) { hit('OTHER', t, { planned: false }); return; }
+            const Wt = shiftOfTask(t);
+            const who = whoPost(t, Wt);
+            if (who.held && !t.isSplitPart2) { hit('HELD', t, { planned: true, heldBy: who.heldBy, key: who.heldBy.crew }); return; }
+            if (t.kind === 'pic' || t.kind === 'admin') {
+                if (w.kind === 'general' && laneRoster[y] && laneRoster[y].isLead && leadKind === 'pic') { hit('LEAD_PIC', t, { planned: true, lane: y, key: String(y) }); return; }
+                if (w.kind === 'general' && isSpec(sd.workers[y], t)) { hit('SPECIALIST', t, { planned: true, lane: y, key: String(y) }); return; }
+            }
+            // Why the queued-clean rule did not bring it here (a whole sentence).
+            let why;
+            if (t.kind !== 'general') why = 'Only regular cleaning is moved between people to fill a gap.';
+            else if (t.isSplitPart1 || t.isSplitPart2) why = 'The parts of a longer clean stay with the person who starts it.';
+            else if (t.assignedLanes.length !== 1 || t.appliedHeads !== 1) why = 'A clean for more than one person is not moved to fill a gap.';
+            else if (!who.plan) why = 'That shift has no crew plan to move work within.';
+            else if (t.startMin - Math.max(floorOf(t), Wt ? Wt.start : 0) < tailMin) why = 'This work already starts within ' + tailMin + ' minutes of the earliest it could, so moving it here would not finish it sooner.';
+            else if (who.must !== null && who.plan.manualLine && who.plan.manualLine[who.lid]) why = 'This work was hand-placed on a person in Shift Start, and hand-placed work is not moved.';
+            else if (x + dur > runEnd + 0.01) why = 'This work needs ' + fmtMins(dur) + ' and only ' + fmtMins(Math.max(0, runEnd - x)) + ' is free here; a job only moves into a stretch when it fits whole.';
+            else if (x + dur > t.startMin + t.finalDuration - tailMin) why = 'Moving this work here would not finish it at least ' + tailMin + ' minutes sooner.';
+            else why = 'The plan did not move this work into this stretch.';
+            const code = y === who.must ? 'DEALT' : who.room.indexOf(y) > -1 || who.team.indexOf(y) > -1 ? 'ROOM_TEAM' : 'CREW_ORDER';
+            hit(code, t, { planned: true, lane: y, why: why, key: why });
+        });
+
+        // 2. Turn the groups into sentences, the biggest first.
+        const rank = ['NO_ELIGIBLE', 'HANDOFF', 'PART_WAIT', 'WALL', 'ROOM_FULL', 'HELD', 'SHORT', 'PARTNER', 'DEALT', 'ROOM_TEAM', 'CREW_ORDER', 'SPECIALIST', 'LEAD_PIC', 'HAND', 'OTHER'];
+        const lines = [];
+        const folks = function(ids) { const nm = ids.map(nameOf); return nm.length > 3 ? nm.slice(0, 3).join(', ') + ' and ' + (nm.length - 3) + ' more' : nm.length > 1 ? nm.slice(0, -1).join(', ') + ' and ' + nm[nm.length - 1] : nm.join(''); };
+        const names = function(e) { return e.names.join(', ') + (e.n > e.names.length ? ' and ' + (e.n - e.names.length) + ' more' : ''); };
+        const jobs = function(e) { return plural(e.n, 'job', 'jobs') + ' (' + fmtMins(e.mins) + ')'; };
+        const later = function(e) { return e.later > 0 ? ' ' + (e.later === e.n ? 'They are' : e.later + ' of them are') + ' carried to a later shift.' : ''; };
+        const sorted = order.slice().sort(function(p, q) { return q.mins - p.mins || rank.indexOf(p.code) - rank.indexOf(q.code); });
+        sorted.forEach(function(e) {
+            const room = e.room;
+            let text = '';
+            if (e.code === 'NO_ELIGIBLE') text = 'Nobody on the roster is set to do ' + names(e) + ', so it stays unplanned.';
+            else if (e.code === 'HANDOFF') {
+                const hi = handoffInfo[room] || {};
+                const raw = rawHandoff(room);
+                const blk = e.info.floor > raw + 0.5 ? (planBlocks.byRoom[room] || []).concat(planBlocks.plant).find(function(q) { return q.start <= raw + 0.01 && raw < q.end; }) : null;
+                const src = blk ? ' (then ' + blk.label + ' is under way)' : hi.src === 'hand' ? ' (the Handover typed on the room)' : hi.src === 'schedule' && hi.lines && hi.lines.length ? ' (production on ' + hi.lines.join(', ') + ' runs until then)' : '';
+                text = room + ' isn\'t handed over until ' + clock(e.info.floor) + src + '. ' + jobs(e) + (e.n === 1 ? ' waits' : ' wait') + ' for it.' + later(e);
+            }
+            else if (e.code === 'PART_WAIT') text = 'The rest of ' + names(e) + ' can\'t start until its first part ends at ' + clock(e.info.floor) + '.';
+            else if (e.code === 'WALL') text = room + ' is closed for ' + e.info.label + ' (' + clock(e.info.from) + ' to ' + clock(e.info.to) + '), so nothing can be cleaned there. ' + jobs(e) + (e.n === 1 ? ' waits' : ' wait') + '.' + later(e);
+            else if (e.code === 'ROOM_FULL') text = room + ' already has its Max Workers (' + e.info.lim + ') busy, so nobody else can go in. ' + jobs(e) + (e.n === 1 ? ' waits' : ' wait') + '.' + later(e);
+            else if (e.code === 'HELD') text = room + ' is saved for the ' + e.info.heldBy.crew + ' crew that starts at ' + clock(e.info.heldBy.start) + '; this shift only takes it when that crew can\'t finish it. ' + jobs(e) + '.';
+            else if (e.code === 'SHORT') text = 'This free stretch is only ' + fmtMins(netWorkingMins(rs, re, allInterrupts)) + ' of working time. Filling gaps needs ' + tailMin + ' minutes, and no whole job that short is waiting (the smallest needs ' + fmtMins(shortNeed) + ').';
+            else if (e.code === 'PARTNER') text = names(e) + (e.n === 1 ? ' needs ' : ' need ') + e.info.heads + ' people together, and nobody else who can do it is free at the same time.';
+            else if (e.code === 'DEALT') text = jobs(e) + ' in ' + room + ' (' + names(e) + ') ' + (e.n === 1 ? 'was' : 'were') + ' dealt to ' + folks(e.laneSet) + ' (' + (e.firstStart >= winEnd - 0.01 ? 'from ' : 'first at ') + clock(e.firstStart) + '). ' + e.info.why + later(e);
+            else if (e.code === 'ROOM_TEAM') text = room + '\'s own team (' + folks(e.laneSet) + ') works through ' + jobs(e) + ' one after another until ' + clock(e.lastEnd) + '. ' + e.info.why + later(e);
+            else if (e.code === 'CREW_ORDER') text = jobs(e) + ' in ' + room + ' (' + names(e) + ') went to ' + folks(e.laneSet) + ' as the earliest that fit (from ' + clock(e.firstStart) + '). ' + e.info.why + later(e);
+            else if (e.code === 'SPECIALIST') text = jobs(e) + ' of PIC / admin work (' + names(e) + ') ' + (e.n === 1 ? 'is' : 'are') + ' kept for ' + folks(e.laneSet) + ', who can do nothing else.' + later(e);
+            else if (e.code === 'LEAD_PIC') text = jobs(e) + ' of PIC work (' + names(e) + ') ' + (e.n === 1 ? 'is' : 'are') + ' kept for lead ' + folks(e.laneSet) + ' (leads take PIC items first).' + later(e);
+            else if (e.code === 'HAND') text = names(e) + (e.n === 1 ? ' was' : ' were') + ' placed by hand on ' + folks(e.laneSet) + '; hand-placed work isn\'t moved.';
+            else text = 'The plan found no job it could safely give here (' + names(e) + ').';
+            lines.push({ code: e.code, text: text, room: room });
+        });
+        // 3. Roles, and the case where nothing is left at all.
+        if (cannot.length) {
+            const mins = cannot.reduce(function(s2, t) { return s2 + (t.rawWorkloadMins || 0); }, 0);
+            lines.push({ code: 'ROLE', text: plural(cannot.length, 'job', 'jobs') + ' (' + fmtMins(mins) + ') ' + (cannot.length === 1 ? 'is' : 'are') + ' still waiting, but ' + roleSentence() + '.', room: '' });
+        }
+        if (!cands.length) {
+            const myRoom = l.room || '';
+            const rg = myRoom ? sd.groups.find(function(g) { return g.name === myRoom; }) : null;
+            const rEnd = rg ? rg.tasks.reduce(function(m, t) { return Math.max(m, t.startMin + t.finalDuration); }, 0) : 0;
+            let text = cannot.length ? 'No job is left that this role is allowed to do.' : 'Nothing is left for this role to do: every job in the plan that ' + (w.kind === 'general' ? 'a Tech 1 / 2' : 'this role') + ' can take is done or under way by ' + clock(a) + '.';
+            if (rg && rEnd > 0 && rEnd <= a + 0.5) text += ' ' + myRoom + ' finished at ' + clock(rEnd) + '.';
+            lines.unshift({ code: 'NO_WORK', text: text, room: myRoom });
+            const ct = cleanTypeCounts;
+            if (ct && ct.planned < ct.inRooms) lines.push({ code: 'SCOPE', text: 'Only ' + ct.planned + ' of ' + ct.inRooms + ' pieces of equipment are in this plan (' + (planMode === 'overdueweekly' ? 'Overdue + weekly' : planMode === 'overdue' ? 'Overdue' : 'By type of clean') + '). Setup has the Plan equipment setting.', room: '' });
+        }
+        // A person who is on no room's team only gets what no room or team could start.
+        if (cands.length && (l.isPlaceholder || !l.room)) lines.push({ code: 'NOROOM', text: (l.isPlaceholder ? 'This is an extra seat' : l.name + ' is on no room\'s team') + ', so only jobs that no room or team could start reach ' + (l.isPlaceholder ? 'it' : 'them') + '.', room: '' });
+        if (!lines.length) lines.push({ code: 'OTHER', text: 'The plan found no job it could safely give here.', room: '' });
+        const top = lines.slice(0, 5);
+        if (lines.length > 5) top.push({ code: 'MORE', text: 'and ' + (lines.length - 5) + ' more reason' + (lines.length - 5 === 1 ? '' : 's') + ' of the same kind.', room: '' });
+        return top;
+    };
+    // The hover box: shown near the pointer (moved without re-drawing the page); a tap or click keeps it open until it is closed.
+    const placeIdleTip = function(e) {
+        const el = idleTipRef.current;
+        if (!el || !e || el.getAttribute('data-idle-tip') === 'pinned') return;
+        const vw = typeof window !== 'undefined' ? window.innerWidth : 1200, vh = typeof window !== 'undefined' ? window.innerHeight : 800;
+        const x = Math.max(8, Math.min(e.clientX + 14, vw - el.offsetWidth - 8));
+        el.style.left = x + 'px';
+        if (e.clientY > vh * 0.55) { el.style.top = 'auto'; el.style.bottom = Math.max(8, vh - e.clientY + 14) + 'px'; }
+        else { el.style.bottom = 'auto'; el.style.top = Math.max(8, e.clientY + 14) + 'px'; }
+    };
+    const showIdleTip = function(e, lane, g) {
+        if (IS_CURRENT) return;
+        const key = lane + ':' + Math.round(g.start) + '-' + Math.round(g.end);
+        if (idleCacheRef.current.sd !== scheduleData) idleCacheRef.current = { sd: scheduleData, map: {} };
+        const cache = idleCacheRef.current.map;
+        if (!cache[key]) cache[key] = explainIdle(lane, g);
+        const l = laneRoster[lane];
+        const x = e && typeof e.clientX === 'number' ? e.clientX : 0, y = e && typeof e.clientY === 'number' ? e.clientY : 0;
+        setIdleTip(function(prev) { return prev && prev.pinned && prev.key !== key ? prev : { key: key, x: x, y: y, pinned: prev && prev.key === key ? prev.pinned : false, head: l.name + ' has nothing booked from ' + formatClockTime(ganttStartDate, ganttStartHour, g.start).replace(/^\S+ /, '') + ' to ' + formatClockTime(ganttStartDate, ganttStartHour, g.end).replace(/^\S+ /, '') + ' (' + fmtMins(g.end - g.start) + ')', lines: cache[key] }; });
+    };
+    const hideIdleTip = function() { setIdleTip(function(prev) { return prev && prev.pinned ? prev : null; }); };
+    const pinIdleTip = function(e, lane, g) {
+        showIdleTip(e, lane, g);
+        const key = lane + ':' + Math.round(g.start) + '-' + Math.round(g.end);
+        setIdleTip(function(prev) { return prev && prev.key === key ? Object.assign({}, prev, { pinned: !prev.pinned }) : prev; });
+    };
     // PBED's room-first Gantt: the left column lists the rooms and, under each room, a second list of the people cleaning it in
     // the order they get going (with when they start); the chart gives each room a straight bar from when it starts to when it
     // is done, and each person's own cleans on their line, so the team reads as a staircase. Click a block to open it.
@@ -5787,7 +6059,7 @@ export default function App(props) {
                                     return laneIdle[q.lane].gaps.map(function(g, gi) {
                                         const gl = xOf(g.start), gw = xEnd(g.end) - gl;
                                         return (
-                                            <div key={`ri-${q.lane}-${gi}`} data-idle-gap={`${Math.round(g.start)}-${Math.round(g.end)}`} data-room-idle={r.g.name} className="absolute z-[5] rounded border-2 border-dashed border-[#FFB81C] bg-[#FFF6E0]/70 pointer-events-none flex items-center justify-center overflow-hidden" style={{ left: `${gl}px`, width: `${gw}px`, top: `${ROOM_HEAD_PX + q.row * ROOM_ROW_PX + 3}px`, height: `${ROOM_ROW_PX - 6}px` }}>
+                                            <div key={`ri-${q.lane}-${gi}`} data-idle-gap={`${Math.round(g.start)}-${Math.round(g.end)}`} data-room-idle={r.g.name} className={'absolute z-[5] rounded border-2 border-dashed border-[#FFB81C] bg-[#FFF6E0]/70 flex items-center justify-center overflow-hidden ' + (IS_CURRENT ? 'pointer-events-none' : 'pointer-events-auto cursor-help')} onMouseEnter={IS_CURRENT ? undefined : function(e) { showIdleTip(e, q.lane, g); }} onMouseMove={IS_CURRENT ? undefined : placeIdleTip} onMouseLeave={IS_CURRENT ? undefined : hideIdleTip} onClick={IS_CURRENT ? undefined : function(e) { pinIdleTip(e, q.lane, g); }} style={{ left: `${gl}px`, width: `${gw}px`, top: `${ROOM_HEAD_PX + q.row * ROOM_ROW_PX + 3}px`, height: `${ROOM_ROW_PX - 6}px` }}>
                                                 {gw > 48 && <span className="text-[9px] font-black text-[#B07800] uppercase tracking-wider truncate px-1">Idle {fmtMins(g.end - g.start)}</span>}
                                             </div>
                                         );
@@ -7241,7 +7513,7 @@ export default function App(props) {
                     {activeTab === 'gantt' && visibleIdle.mins > 0 && (
                         <div className="bg-[#FFF6E0] border-b border-[#FFB81C]/60 px-5 py-1.5 text-[11px] font-bold text-[#8A5A00] flex items-center gap-2 flex-shrink-0" data-blank-total={Math.round(visibleIdle.mins)}>
                             <Clock className="w-3.5 h-3.5 flex-shrink-0" />
-                            <span>{fmtMins(visibleIdle.mins)} of blank space {ganttWindow ? 'in this shift' : 'on shift'} across {visibleIdle.people} {visibleIdle.people === 1 ? 'person' : 'people'}, outlined in yellow: none of the work left for that shift that they're allowed to do fits there.</span>
+                            <span>{fmtMins(visibleIdle.mins)} of blank space {ganttWindow ? 'in this shift' : 'on shift'} across {visibleIdle.people} {visibleIdle.people === 1 ? 'person' : 'people'}, outlined in yellow: none of the work left for that shift that they're allowed to do fits there.{!IS_CURRENT && ' Point at one to see why it is blank.'}</span>
                         </div>
                     )}
 
@@ -7433,7 +7705,7 @@ export default function App(props) {
                                                     const leftPx = xOf(g.start);
                                                     const widthPx = xEnd(g.end) - leftPx;
                                                     return (
-                                                        <div key={`idle-${l.lane}-${seat.start}-${gi}`} data-idle-gap={`${Math.round(g.start)}-${Math.round(g.end)}`} className="absolute rounded-md border-2 border-dashed border-[#FFB81C] bg-[#FFF6E0]/70 pointer-events-none flex items-center justify-center overflow-hidden" style={{ left: `${leftPx}px`, width: `${widthPx}px`, top: `${row * LANE_HEIGHT_PX + 4}px`, height: `${LANE_HEIGHT_PX - 8}px` }}>
+                                                        <div key={`idle-${l.lane}-${seat.start}-${gi}`} data-idle-gap={`${Math.round(g.start)}-${Math.round(g.end)}`} className={'absolute rounded-md border-2 border-dashed border-[#FFB81C] bg-[#FFF6E0]/70 flex items-center justify-center overflow-hidden ' + (IS_CURRENT ? 'pointer-events-none' : 'pointer-events-auto cursor-help')} onMouseEnter={IS_CURRENT ? undefined : function(e) { showIdleTip(e, l.lane, g); }} onMouseMove={IS_CURRENT ? undefined : placeIdleTip} onMouseLeave={IS_CURRENT ? undefined : hideIdleTip} onClick={IS_CURRENT ? undefined : function(e) { pinIdleTip(e, l.lane, g); }} style={{ left: `${leftPx}px`, width: `${widthPx}px`, top: `${row * LANE_HEIGHT_PX + 4}px`, height: `${LANE_HEIGHT_PX - 8}px` }}>
                                                             {widthPx > 48 && <span className="text-[9px] font-black text-[#B07800] uppercase tracking-wider truncate px-1">Idle {fmtMins(g.end - g.start)}</span>}
                                                         </div>
                                                     );
@@ -7628,6 +7900,27 @@ export default function App(props) {
                             <Button className="w-full mt-4" onClick={handleAddCustomTask}>Create Task</Button>
                         </div>
                     </div>
+                </div>
+            )}
+
+            {/* WHY IS THIS STRETCH BLANK? (PBED hover box; a click keeps it open) */}
+            {!IS_CURRENT && idleTip && (
+                <div ref={idleTipRef} data-idle-tip={idleTip.pinned ? 'pinned' : 'hover'} className={'fixed z-[120] w-[340px] max-w-[calc(100vw-16px)] bg-white border border-[#FFB81C] rounded-xl shadow-2xl p-3 text-slate-700 ' + (idleTip.pinned ? '' : 'pointer-events-none')} style={(function() {
+                    const vw = typeof window !== 'undefined' ? window.innerWidth : 1200, vh = typeof window !== 'undefined' ? window.innerHeight : 800;
+                    const st = { left: Math.max(8, Math.min(idleTip.x + 14, vw - 348)) + 'px', maxHeight: '70vh', overflowY: 'auto' };
+                    if (idleTip.y > vh * 0.55) st.bottom = Math.max(8, vh - idleTip.y + 14) + 'px'; else st.top = Math.max(8, idleTip.y + 14) + 'px';
+                    return st;
+                })()} onPointerDown={function(e) { if (e && typeof e.stopPropagation === 'function') e.stopPropagation(); }}>
+                    <div className="flex items-start justify-between gap-2 mb-1.5">
+                        <div data-idle-tip-head className="text-[11px] font-black text-[#8A5A00] leading-snug">{idleTip.head}</div>
+                        {idleTip.pinned && <button data-idle-tip-close onClick={function() { setIdleTip(null); }} className="text-slate-400 hover:text-slate-800 text-xs font-black px-1">✕</button>}
+                    </div>
+                    <ul className="space-y-1.5">
+                        {idleTip.lines.map(function(ln, i) {
+                            return <li key={i} data-idle-why={ln.code} className="text-[11px] font-bold leading-snug text-slate-700">{ln.text}</li>;
+                        })}
+                    </ul>
+                    {!idleTip.pinned && <div className="mt-2 text-[10px] font-bold text-slate-400">Click to keep this open.</div>}
                 </div>
             )}
 
