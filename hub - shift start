@@ -101,20 +101,72 @@ const sameText = (a: any, b: any) => normText(a) === normText(b);
 const CREW_OF_WORKSHIFT: Record<string, string> = { A: 'A', B: 'B', C: 'C', D: 'D' };
 const crewLetterOf = (workshiftLetter: string) => (workshiftLetter ? (CREW_OF_WORKSHIFT[workshiftLetter] || workshiftLetter) : "");
 
+// ============================================================================
+// LEADERSHIP TEAMS (craa5__aa_leadershipteam: one row per crew, A-D)
+// craa5_teamname = the crew letter, _craa5_teamleademployeeid_value = the team lead (the supervisor of that crew, whatever their role is).
+// Employees point at their crew with _craa5_leadershipteamid_value; when that is empty the shift letter on the employee decides.
+// craa5_active is false on every row in Gerald's table, so it is never used as a filter.
+// ============================================================================
+type TeamRow = { id: string; letter: string; leadId: string };
+const TEAM_TABLES = ["craa5__aa_leadershipteam", "craa5_aa_leadershipteam", "craa5__aa_leadershipteams"];
+let TEAMS: TeamRow[] = [];   // the teams as last read; the crew helpers below look people up in it (empty = shift letters only, as before)
+const lookupId = (v: any): string => String((v && typeof v === 'object' ? (v.id || v.Id || v.guid || v.value || "") : v) || "").replace(/[{}]/g, "").trim().toLowerCase();
+const empIdOf = (e: any) => lookupId(getField(e, 'craa5__aa_employeeid') ?? getField(e, 'craa5_aa_employeeid'));
+const teamIdOfEmp = (e: any) => lookupId(getField(e, '_craa5_leadershipteamid_value') ?? getField(e, 'craa5_leadershipteamid'));
+function parseTeams(rows: any[]): TeamRow[] {
+    const out: TeamRow[] = [];
+    (rows || []).forEach(r => {
+        const id = lookupId(getField(r, 'craa5__aa_leadershipteamid') ?? getField(r, 'craa5_aa_leadershipteamid') ?? getField(r, 'craa5_leadershipteamid'));
+        const letter = normalizeShift(getField(r, 'craa5_teamname')), leadId = lookupId(getField(r, '_craa5_teamleademployeeid_value') ?? getField(r, 'craa5_teamleademployeeid'));
+        if (id && letter && !out.some(t => t.letter === letter)) out.push({ id, letter, leadId });
+    });
+    return out;
+}
+const teamLedBy = (e: any): TeamRow | undefined => { const id = empIdOf(e); return id ? TEAMS.find(t => t.leadId === id) : undefined; };
+// The crew a person belongs to: the team they lead, else the team on their lookup, else their shift letter.
+function crewOfPerson(e: any): string {
+    const led = teamLedBy(e); if (led) return led.letter;
+    const tid = teamIdOfEmp(e), t = tid ? TEAMS.find(x => x.id === tid) : undefined;
+    return t ? t.letter : getShiftOf(e);
+}
+// A supervisor is anyone with the supervisor role, or who leads a team in the teams table.
+const isSupervisorLike = (e: any) => roleOf(e) === 'supervisor' || !!teamLedBy(e);
+// A signed-in person with the role the app treats them as: a team lead who isn't a manager is a supervisor, whatever their role column says.
+const withCalculatedRole = (m: any) => ({ ...m, calculatedRole: roleOf(m) !== 'manager' && teamLedBy(m) ? 'supervisor' : roleOf(m) });
+// 'Last, First M' and 'First M Last' (a Microsoft display name) both reduce to 'first last', so the two can be compared.
+function personKey(n: any): string {
+    const s = String(n ?? "").trim(); if (!s) return "";
+    const toks = (t: string) => t.toLowerCase().replace(/[^a-z\s'-]/g, " ").split(/\s+/).filter(Boolean);
+    let first: string[], last: string[];
+    if (s.indexOf(",") >= 0) { const i = s.indexOf(","); last = toks(s.slice(0, i)); first = toks(s.slice(i + 1)); }
+    else { const t = toks(s); first = t.slice(0, 1); last = t.slice(-1); if (t.length < 2) return ""; }
+    return first.length && last.length ? `${first[0]} ${last[last.length - 1]}` : "";
+}
+// The supervisor to open for a crew: the team's lead, else a listed supervisor on that letter, else anyone listed on it (a manager acting).
+function supervisorOfCrew(sups: any[], letter: string): any {
+    if (!letter) return undefined;
+    const t = TEAMS.find(x => x.letter === letter), lead = t && t.leadId ? sups.find(s => empIdOf(s) === t.leadId) : undefined;
+    return lead || sups.find(s => roleOf(s) === 'supervisor' && crewOfPerson(s) === letter) || sups.find(s => crewOfPerson(s) === letter);
+}
+
+const EMPLOYEE_TABLES = ["craa5__aa_employee", "craa5_aa_employee", "craa5__aa_employees"];
+// The supervisors: everyone with the supervisor role plus every team lead (whatever their role), by name.
+const supervisorsOf = (everyone: any[]) => everyone.filter(isSupervisorLike).sort((a: any, b: any) => (getField(a, 'craa5_name') || "").localeCompare(getField(b, 'craa5_name') || ""));
+
 // The employee-table letter a board draws its leads and employees from. The work schedule decides which crew is on now: a supervisor
 // listed on that crew (or, for a listed supervisor, on the one about to start, while setting up) uses their own letter; anyone else
 // (a manager acting, or a supervisor listed under another letter) gets the crew on the clock. With no shift known it is the supervisor's own letter.
 function crewLetterFor(sup: any, everyone: any[], onNow: string, upNext: string): string {
-    const own = getShiftOf(sup), has = (l: string) => !!l && everyone.some(e => getShiftOf(e) === l);
-    if (has(own) && (own === onNow || (own === upNext && roleOf(sup) === 'supervisor'))) return own;
+    const own = crewOfPerson(sup), has = (l: string) => !!l && everyone.some(e => crewOfPerson(e) === l);
+    if (has(own) && (own === onNow || (own === upNext && isSupervisorLike(sup)))) return own;
     if (has(onNow)) return onNow;
     return has(own) ? own : "";
 }
 
-// Everyone on that crew (everyone, if that letter matches nobody).
+// Everyone on that crew (everyone, if that letter matches nobody), except the board's own supervisor.
 function crewOf(sup: any, everyone: any[], onNow: string, upNext: string) {
     const letter = crewLetterFor(sup, everyone, onNow, upNext), supId = getField(sup, 'craa5__aa_employeeid');
-    const staff = letter ? everyone.filter(e => getShiftOf(e) === letter) : everyone;
+    const staff = letter ? everyone.filter(e => crewOfPerson(e) === letter) : everyone;
     return {
         letter,
         leads: staff.filter(e => roleOf(e) === 'lead' && getField(e, 'craa5__aa_employeeid') !== supId),
@@ -319,7 +371,7 @@ const AuthBox = ({ users, onLogin }: any) => (
         <select className="w-full max-w-[300px] p-3 rounded-lg border border-slate-300 outline-none text-sm focus:ring-2 focus:ring-[#0072CE]/40" onChange={(e) => { const s = users.find((u: any) => getField(u, 'craa5__aa_employeeid') === e.target.value); if (s) onLogin(s); }} defaultValue="">
             <option value="" disabled>-- Select Profile --</option>
             {['A', 'B', 'C', 'D', ''].map(shift => {
-                const su = users.filter((u: any) => getShiftOf(u) === shift);
+                const su = users.filter((u: any) => crewOfPerson(u) === shift);
                 if (su.length === 0) return null;
                 return (
                     <optgroup key={shift || 'none'} label={shift ? `Shift ${shift}` : 'Unassigned'}>
@@ -332,6 +384,53 @@ const AuthBox = ({ users, onLogin }: any) => (
         </select>
     </div>
 );
+
+// What the app read and how it used it, so a wrong crew can be traced without a console: who is signed in, the shift on the clock,
+// each team's lead and crew size, and which columns were found.
+function DataCheckPanel({ onClose, msUser, currentUser, slotCount, currentShift, shiftStartMs, upNextShift, teams, teamsRead, employees, supervisors, taskStatus, areaCount, boardCrew, ownerName }: any) {
+    const nameOf = (id: string) => { const e = employees.find((x: any) => empIdOf(x) === id); return e ? formatFullName(getField(e, 'craa5_name')) : ""; };
+    const withLookup = employees.filter((e: any) => !!teamIdOfEmp(e)).length;
+    const sample = employees[0] || {}, hasKey = (k: string) => Object.keys(sample).some(x => x.toLowerCase() === k.toLowerCase());
+    const sourceOf = (e: any) => teamLedBy(e) ? 'lead of the team' : teamIdOfEmp(e) && TEAMS.some(t => t.id === teamIdOfEmp(e)) ? 'team lookup' : 'shift letter';
+    const row = (k: string, v: any, bad?: boolean) => <div key={k} className="flex gap-3 py-1 border-b border-slate-100"><Text size={200} weight="semibold" style={{ width: 150, flexShrink: 0 }}>{k}</Text><Text size={200} style={{ color: bad ? BRAND.red : undefined }}>{v}</Text></div>;
+    const col = (name: string, ok: boolean, why: string) => <div key={name} className="flex gap-2 py-0.5 items-center"><Badge size="small" appearance="filled" color={ok ? 'success' : 'danger'}>{ok ? 'found' : 'missing'}</Badge><Text size={200} weight="semibold">{name}</Text><Text size={200} color="neutralSecondary">{why}</Text></div>;
+    return (
+        <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,30,60,0.45)', zIndex: 10000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }} onClick={onClose}>
+            <div className="bg-white rounded-2xl shadow-lg border border-slate-200 w-full max-w-[860px] flex flex-col" style={{ maxHeight: '100%' }} onClick={e => e.stopPropagation()}>
+                <div className="flex justify-between items-center px-5 py-3 border-b-4 border-[#FFB81C] shrink-0"><Text size={500} weight="bold" style={{ color: BRAND.blueDark }}>Data check</Text><Button size="small" appearance="primary" onClick={onClose}>Close</Button></div>
+                <div className="p-5 overflow-y-auto">
+                    {row('Signed in', msUser ? `${msUser.name || '?'}${msUser.email ? ` <${msUser.email}>` : ' (no email came from the host)'}` : 'nobody yet')}
+                    {row('Matched employee', currentUser ? `${formatFullName(getField(currentUser, 'craa5_name'))} · ${currentUser.calculatedRole}${currentUser.calculatedRole === 'supervisor' && roleOf(currentUser) !== 'supervisor' ? ' (leads a team)' : ''}` : 'no employee matched, so a profile was picked from the list', !currentUser)}
+                    {row('Work schedule', `${slotCount} shift slot${slotCount === 1 ? '' : 's'} read · ${currentShift ? `shift ${currentShift} on now since ${clockTime(shiftStartMs)}` : 'no shift covers now'}${upNextShift ? ` · shift ${upNextShift} starts within the hour` : ''}`, !slotCount)}
+                    {row('Board', `${ownerName || 'no board open'}${boardCrew ? ` · drawing from crew ${boardCrew}` : ''}`)}
+                    {row('Saved assignments', taskStatus ? (taskStatus.ok ? `read through ${taskStatus.source}: ${taskStatus.read} row${taskStatus.read === 1 ? '' : 's'} from the last 24 h` : `could not be read: ${String(taskStatus.error).slice(0, 160)}`) : 'not read yet', !!taskStatus && !taskStatus.ok)}
+                    {row('Employees', `${employees.length} read · ${withLookup} with a team set · ${employees.length - withLookup} on their shift letter · ${supervisors.length} supervisors · ${areaCount} areas`)}
+                    <div className="mt-4 mb-1"><Text size={300} weight="bold" style={{ color: BRAND.blueDark }}>Teams table (craa5__aa_leadershipteam)</Text></div>
+                    {teamsRead === 0
+                        ? <Text size={200} block style={{ color: BRAND.red }}>No team rows were read (the table was not found or is empty), so every crew comes from the shift letter on each employee.</Text>
+                        : <table className="w-full text-sm" style={{ borderCollapse: 'collapse' }}><thead><tr style={{ background: BRAND.blueSoft }}>{['Team', 'Team lead (supervisor)', 'Crew size', 'How the crew is found', 'On the clock'].map(h => <th key={h} className="text-left px-2 py-1"><Text size={200} weight="bold">{h}</Text></th>)}</tr></thead>
+                            <tbody>{teams.map((t: TeamRow) => {
+                                const crew = employees.filter((e: any) => crewOfPerson(e) === t.letter), viaLookup = crew.filter((e: any) => teamIdOfEmp(e) === t.id).length;
+                                const lead = nameOf(t.leadId);
+                                return <tr key={t.id} className="border-b border-slate-100"><td className="px-2 py-1"><Text size={200} weight="bold">{t.letter}</Text></td>
+                                    <td className="px-2 py-1"><Text size={200} style={{ color: lead ? undefined : BRAND.red }}>{lead || (t.leadId ? 'lead id is not in the employee list' : 'no lead set')}</Text></td>
+                                    <td className="px-2 py-1"><Text size={200}>{crew.length}</Text></td>
+                                    <td className="px-2 py-1"><Text size={200}>{viaLookup} by team lookup, {crew.length - viaLookup} by shift letter</Text></td>
+                                    <td className="px-2 py-1"><Text size={200} weight={t.letter === currentShift ? 'bold' : 'regular'}>{t.letter === currentShift ? 'on now' : t.letter === upNextShift ? 'starts soon' : ''}</Text></td></tr>;
+                            })}</tbody></table>}
+                    <div className="mt-4 mb-1"><Text size={300} weight="bold" style={{ color: BRAND.blueDark }}>Columns this screen reads</Text></div>
+                    {col('craa5__aa_leadershipteam.craa5_teamname', teamsRead > 0, 'text: the crew letter A-D')}
+                    {col('craa5__aa_leadershipteam._craa5_teamleademployeeid_value', teams.some((t: TeamRow) => !!t.leadId), 'lookup to the employee: the supervisor of that crew')}
+                    {col('craa5__aa_employee._craa5_leadershipteamid_value', hasKey('_craa5_leadershipteamid_value') || hasKey('craa5_leadershipteamid'), 'lookup to the team: which crew the employee is on')}
+                    {col('craa5__aa_employee.craa5_shift', hasKey('craa5_shift'), 'choice: the crew letter used when the team lookup is empty')}
+                    {col('craa5_workshift (craa5_shiftcode, craa5_dayname, craa5_shiftstarthour, craa5_shiftendhour)', slotCount > 0, 'which crew is on the clock')}
+                    {employees.length > 0 && <div className="mt-3"><Text size={200} weight="bold" block className="mb-1">Who is on crew {currentShift || boardCrew || '?'} and how they were placed</Text>
+                        <Text size={200} color="neutralSecondary" block>{employees.filter((e: any) => crewOfPerson(e) === (currentShift || boardCrew)).map((e: any) => `${formatFullName(getField(e, 'craa5_name'))} (${roleOf(e)}, ${sourceOf(e)})`).join(' · ') || 'nobody'}</Text></div>}
+                </div>
+            </div>
+        </div>
+    );
+}
 
 const ScreenTitle = ({ children, sub }: any) => (
     <div className="mb-1">
@@ -347,7 +446,7 @@ const Grid = ({ items, columns, selectionMode, selectedItems, onSelectionChange 
     </DataGrid>
 );
 const nameColumn = (label: string) => createTableColumn({ columnId: "craa5_name", renderHeaderCell: () => <Text weight="bold">{label}</Text>, renderCell: (item: any) => <TableCellLayout media={<span>👤</span>}>{renderSafe(formatFullName(getField(item, 'craa5_name')))}</TableCellLayout> });
-const shiftColumn = createTableColumn({ columnId: "craa5_shift", renderHeaderCell: () => <Text weight="bold">Shift</Text>, renderCell: (item: any) => <TableCellLayout>{renderSafe(getFormattedField(item, 'craa5_shift') || getField(item, 'craa5_shift') || "N/A")}</TableCellLayout> });
+const shiftColumn = createTableColumn({ columnId: "craa5_shift", renderHeaderCell: () => <Text weight="bold">Shift</Text>, renderCell: (item: any) => <TableCellLayout>{renderSafe(crewOfPerson(item) || getFormattedField(item, 'craa5_shift') || getField(item, 'craa5_shift') || "N/A")}</TableCellLayout> });
 
 function SupervisorSelectionScreen({ supervisors, selectedSupervisorId, onSelect, note }: any) {
     const columns = useMemo(() => [
@@ -482,6 +581,7 @@ export function MainComponent(props: any) {
     const [areaDetails, setAreaDetails] = useState<Record<string, { currentStatus: string, futureNotes: string, includeInUpdate?: boolean }>>({});
     const [employeeStartTimes, setEmployeeStartTimes] = useState<Record<string, string>>({});
     const [currentTime, setCurrentTime] = useState(Date.now());
+    const [showData, setShowData] = useState(false);
 
     const [clipboardFormat, setClipboardFormat] = useState<"headcount" | "initials" | "fullname">("headcount");
     const [disableAutoLogin, setDisableAutoLogin] = useState(false);
@@ -506,14 +606,20 @@ export function MainComponent(props: any) {
         if (p) Promise.resolve(p).catch((e: any) => logError('Clipboard flag update failed', e?.message || e));
     }, []);
 
+    // The signed-in Microsoft account is matched to an employee by email; when no employee carries that email, by name (first and last),
+    // but only when exactly one employee has that name, so nobody is signed in as the wrong person.
     const resolveUserIdentity = useCallback((u: any, ed: any[]) => {
-        if (!u?.email) return null;
-        const m = ed.find(e => getEmployeeEmail(e).toLowerCase().trim() === String(u.email).toLowerCase().trim());
-        return m ? { ...m, calculatedRole: roleOf(m) } : null;
+        if (!u) return null;
+        const em = String(u.email || "").toLowerCase().trim();
+        const byMail = em ? ed.find(e => getEmployeeEmail(e).toLowerCase().trim() === em) : null;
+        if (byMail) return withCalculatedRole(byMail);
+        const key = personKey(u.name), byName = key ? ed.filter(e => personKey(getField(e, 'craa5_name')) === key) : [];
+        return byName.length === 1 ? withCalculatedRole(byName[0]) : null;
     }, []);
 
     const hydrateState = useCallback((c: any) => {
         if (!c) return;
+        TEAMS = c.teams || [];   // before anything reads a crew
         // Shift and user first: React 17 renders each set separately, and the board defaults read these.
         // The shift is worked out again every time the app opens, so a page that has been loaded for hours still knows which shift it is.
         const sh = findCurrentShift(c.slots || []);
@@ -609,8 +715,8 @@ export function MainComponent(props: any) {
     const activeSupervisorObj = useMemo(() => supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId), [supervisors, selectedSupervisorId]);
     // The crew this board draws its leads and employees from, and whether a manager (not a listed supervisor) is running it.
     const boardCrew = useMemo(() => activeSupervisorObj ? crewLetterFor(activeSupervisorObj, allEmployees, clockCrew, upNextCrew) : "", [activeSupervisorObj, allEmployees, clockCrew, upNextCrew]);
-    const isActingBoard = !!activeSupervisorObj && roleOf(activeSupervisorObj) !== 'supervisor';
-    const supervisorOnClock = useMemo(() => !!clockCrew && supervisors.some(s => roleOf(s) === 'supervisor' && getShiftOf(s) === clockCrew), [supervisors, clockCrew]);
+    const isActingBoard = !!activeSupervisorObj && !isSupervisorLike(activeSupervisorObj);
+    const supervisorOnClock = useMemo(() => !!clockCrew && supervisors.some(s => isSupervisorLike(s) && crewOfPerson(s) === clockCrew), [supervisors, clockCrew]);
     // Who runs the board, as the line under the title says it: a manager acting names the shift that has no supervisor listed.
     const ownerLabel = useMemo(() => {
         if (!activeSupervisorObj) return "";
@@ -649,8 +755,14 @@ export function MainComponent(props: any) {
             try {
                 const p = propsRef.current;
                 if (cached) {
-                    const saved = await readSavedAssignments(p);
-                    GLOBAL_DATA_CACHE = { ...GLOBAL_DATA_CACHE, presetRecords: saved.recent, taskStatus: saved.status };
+                    // Opening the app again: the saved assignments, the employees and the teams are read afresh (who leads which crew can change
+                    // from one day to the next); anything that can't be read keeps what the session already had.
+                    const prev = GLOBAL_DATA_CACHE;
+                    const [saved, empRaw, teamRaw] = await Promise.all([readSavedAssignments(p), fetchFallbackRecords(EMPLOYEE_TABLES, p), fetchFallbackRecords(TEAM_TABLES, p)]);
+                    const teams = teamRaw.length ? parseTeams(teamRaw) : (prev.teams || []);
+                    TEAMS = teams;
+                    const empData = empRaw.length ? empRaw : prev.allEmployees;
+                    GLOBAL_DATA_CACHE = { ...prev, allEmployees: empData, supervisors: supervisorsOf(empData), leads: empData.filter((e: any) => roleOf(e) === 'lead'), teams, teamsRead: teamRaw.length ? teamRaw.length : (prev.teamsRead || 0), presetRecords: saved.recent, taskStatus: saved.status, resolvedUser: resolveUserIdentity(prev.msUser, empData) };
                     hydrateState(GLOBAL_DATA_CACHE);
                     return;
                 }
@@ -665,10 +777,11 @@ export function MainComponent(props: any) {
                 } else { uName = "Local Developer"; uEmail = "dev@localhost"; uId = "DEV-MODE-ID"; }
                 const msUser = { name: uName, email: uEmail || "", id: uId };
 
-                const [empRaw, areaRaw, shiftRows, saved] = await Promise.all([
-                    fetchFallbackRecords(["craa5__aa_employee", "craa5_aa_employee", "craa5__aa_employees"], p),
+                const [empRaw, areaRaw, shiftRows, teamRaw, saved] = await Promise.all([
+                    fetchFallbackRecords(EMPLOYEE_TABLES, p),
                     fetchFallbackRecords(["craa5_aa_mss_area", "craa5_aa_mss_areas"], p),
                     fetchFallbackRecords("craa5_workshift", p),
+                    fetchFallbackRecords(TEAM_TABLES, p),
                     readSavedAssignments(p),
                 ]);
                 const empData = empRaw.length ? empRaw : (p.inputEmployees || []);
@@ -676,10 +789,11 @@ export function MainComponent(props: any) {
                 const slots = parseWorkShiftRows(shiftRows);
                 if (!findCurrentShift(slots).crew) logError('No craa5_workshift row covers the current time; shift left blank.');
 
-                const sups = empData.filter((e: any) => roleOf(e) === 'supervisor').sort((a: any, b: any) => (getField(a, 'craa5_name') || "").localeCompare(getField(b, 'craa5_name') || ""));
+                const teams = parseTeams(teamRaw);
+                TEAMS = teams;   // before the supervisors and the signed-in person are worked out
                 const lds = empData.filter((e: any) => roleOf(e) === 'lead');
 
-                GLOBAL_DATA_CACHE = { allEmployees: empData, supervisors: sups, leads: lds, areas: areaData, presetRecords: saved.recent, taskStatus: saved.status, msUser, slots, resolvedUser: resolveUserIdentity(msUser, empData) };
+                GLOBAL_DATA_CACHE = { allEmployees: empData, supervisors: supervisorsOf(empData), leads: lds, areas: areaData, presetRecords: saved.recent, taskStatus: saved.status, msUser, slots, teams, teamsRead: teamRaw.length, resolvedUser: resolveUserIdentity(msUser, empData) };
                 GLOBAL_INIT_STATUS = 'COMPLETE'; hydrateState(GLOBAL_DATA_CACHE);
             } catch (e: any) { logError('Loading failed', e?.message || e); GLOBAL_INIT_STATUS = GLOBAL_DATA_CACHE ? 'COMPLETE' : 'IDLE'; } finally { setIsLoading(false); }
         };
@@ -701,19 +815,19 @@ export function MainComponent(props: any) {
     // When nobody is listed for the shift, a manager runs it themselves; anyone else picks a supervisor (never an arbitrary one).
     useEffect(() => {
         if (isLoading || disableAutoLogin || supervisors.length === 0 || selectedSupervisorId) return;
-        const byLetter = (l: string) => (l ? supervisors.find(s => getShiftOf(s) === l) : undefined);
+        const byLetter = (l: string) => supervisorOfCrew(supervisors, l);
         const since = shiftStartMs || Date.now() - 4 * 3600000;   // saves made during this shift (the last hour of the shift before is the outgoing supervisor's)
         const savedSince = (s: any, from: number) => presetRecords.some(r => taskTime(r) >= from && rowBelongsTo(r, s));
         const newestSaver = (from: number) => {
             let best: any = null, bestT = 0;
-            presetRecords.forEach(r => { const t = taskTime(r); if (t < from || t <= bestT) return; const s = supervisors.find(x => rowBelongsTo(r, x)); if (s && !(upNextCrew && upNextCrew !== clockCrew && roleOf(s) === 'supervisor' && getShiftOf(s) === upNextCrew)) { best = s; bestT = t; } });
+            presetRecords.forEach(r => { const t = taskTime(r); if (t < from || t <= bestT) return; const s = supervisors.find(x => rowBelongsTo(r, x)); if (s && !(upNextCrew && upNextCrew !== clockCrew && isSupervisorLike(s) && crewOfPerson(s) === upNextCrew)) { best = s; bestT = t; } });
             return best;
         };
         const onShift = byLetter(clockCrew);
         const myId = currentUser ? getField(currentUser, 'craa5__aa_employeeid') : "";
-        const acting = myId ? supervisors.find(s => getField(s, 'craa5__aa_employeeid') === myId && roleOf(s) !== 'supervisor') : undefined;   // a manager running the shift themselves
+        const acting = myId ? supervisors.find(s => getField(s, 'craa5__aa_employeeid') === myId && !isSupervisorLike(s)) : undefined;   // a manager running the shift themselves
         // With a shift known, the previous shift's last saver is never the default. With none known (no craa5_workshift row covers now), the last 16 hours stand in for it.
-        const pick = (onShift && savedSince(onShift, since - SHIFT_PREP_MS)) ? onShift : (newestSaver(since) || onShift || (shiftStartMs ? null : newestSaver(0)) || (shiftStartMs ? null : byLetter(currentUser ? getShiftOf(currentUser) : "")) || acting);
+        const pick = (onShift && savedSince(onShift, since - SHIFT_PREP_MS)) ? onShift : (newestSaver(since) || onShift || (shiftStartMs ? null : newestSaver(0)) || (shiftStartMs ? null : byLetter(currentUser ? crewOfPerson(currentUser) : "")) || acting);
         if (pick) setSelectedSupervisorId(getField(pick, 'craa5__aa_employeeid'));
     }, [isLoading, supervisors, selectedSupervisorId, disableAutoLogin, clockCrew, upNextCrew, shiftStartMs, currentUser, presetRecords]);
 
@@ -809,7 +923,7 @@ export function MainComponent(props: any) {
     // ============================================================================
     // INTERACTION HANDLERS
     // ============================================================================
-    const isOvertimeCandidate = useCallback((e: any) => roleOf(e) !== 'supervisor' && getField(e, 'craa5__aa_employeeid') !== selectedSupervisorId && !selectedLeadIds.has(getField(e, 'craa5__aa_employeeid')), [selectedSupervisorId, selectedLeadIds]);
+    const isOvertimeCandidate = useCallback((e: any) => !isSupervisorLike(e) && getField(e, 'craa5__aa_employeeid') !== selectedSupervisorId && !selectedLeadIds.has(getField(e, 'craa5__aa_employeeid')), [selectedSupervisorId, selectedLeadIds]);
 
     useEffect(() => {
         const delay = setTimeout(() => {
@@ -887,7 +1001,7 @@ export function MainComponent(props: any) {
             validIds.filter(id => areaAssignments[id] === getField(l, 'craa5__aa_employeeid') && !isStatus(id)).forEach(id => {
                 const ea = assignments[id] || [];
                 th += ea.length;
-                ea.forEach(eId => { const e = employeeMap.get(eId); if (e && crewRef && getShiftOf(e) !== crewRef) osh++; });
+                ea.forEach(eId => { const e = employeeMap.get(eId); if (e && crewRef && crewOfPerson(e) !== crewRef) osh++; });
             });
         });
 
@@ -925,7 +1039,7 @@ export function MainComponent(props: any) {
         setBusyLabel("Updating Dataverse..."); setIsLoading(true); setSaveSuccess(false); setSaveWarning(""); setSubmissionError(null);
         const supervisor = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId);
         // Rows carry the letter of the crew the board draws from (the letter the employee table uses); the supervisor's own letter or the work shift stand in when there is none.
-        const boardShift = boardCrew || getShiftOf(supervisor) || clockCrew;
+        const boardShift = boardCrew || crewOfPerson(supervisor) || clockCrew;
         try {
             Object.keys(areaAssignments).forEach(areaId => {
                 const details = areaDetails[areaId] || {} as any;
@@ -1022,7 +1136,7 @@ export function MainComponent(props: any) {
         <div className="flex items-center justify-center min-h-full p-5">
             <div className="bg-white shadow-lg border border-slate-200 rounded-2xl w-full max-w-[400px] overflow-hidden">
                 <div className="bg-white border-b-4 border-[#FFB81C] p-5 flex flex-col items-center gap-2"><BrandLogo /><h2 className="text-lg font-black uppercase tracking-widest" style={{ color: BRAND.blueDark }}>Supervisor Hub</h2></div>
-                <AuthBox users={allEmployees} onLogin={(u: any) => { resetBoard(); setSelectedSupervisorId(null); setDisableAutoLogin(false); hydrateState({ ...GLOBAL_DATA_CACHE, resolvedUser: { ...u, calculatedRole: roleOf(u) } }); }} />
+                <AuthBox users={allEmployees} onLogin={(u: any) => { resetBoard(); setSelectedSupervisorId(null); setDisableAutoLogin(false); hydrateState({ ...GLOBAL_DATA_CACHE, resolvedUser: withCalculatedRole(u) }); }} />
             </div>
         </div>
     );
@@ -1043,7 +1157,7 @@ export function MainComponent(props: any) {
                                 </div>
                                 {searchSuggestions.length > 0 && (
                                     <div className="absolute top-full left-0 right-0 bg-white border border-slate-300 rounded-lg z-50 max-h-[150px] overflow-y-auto shadow-md mt-1">
-                                        {searchSuggestions.map(s => <div key={getField(s, 'craa5__aa_employeeid')} onClick={() => handleAddSuggestedEmployee(s)} className="p-2 cursor-pointer border-b border-slate-100 hover:bg-[#E6F1FB] flex justify-between items-center"><Text>{formatFullName(getField(s, 'craa5_name'))}</Text>{getShiftOf(s) && <Badge size="small" appearance="outline" color="brand">Shift {getShiftOf(s)}</Badge>}</div>)}
+                                        {searchSuggestions.map(s => <div key={getField(s, 'craa5__aa_employeeid')} onClick={() => handleAddSuggestedEmployee(s)} className="p-2 cursor-pointer border-b border-slate-100 hover:bg-[#E6F1FB] flex justify-between items-center"><Text>{formatFullName(getField(s, 'craa5_name'))}</Text>{crewOfPerson(s) && <Badge size="small" appearance="outline" color="brand">Shift {crewOfPerson(s)}</Badge>}</div>)}
                                     </div>
                                 )}
                             </div>
@@ -1171,7 +1285,7 @@ export function MainComponent(props: any) {
                             {adminMode && (
                                 <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg border" style={{ background: BRAND.redSoft, borderColor: '#F6B3C0' }}>
                                     <Text size={200} weight="semibold" style={{ color: BRAND.red }}>View As:</Text>
-                                    <select value={selectedSupervisorId || ""} onChange={(e) => switchBoard(e.target.value)} className="px-1 py-0.5 rounded border border-[#F6B3C0] text-xs outline-none bg-white"><option value="" disabled>-- Select Supervisor --</option>{supervisors.map(s => <option key={getField(s, 'craa5__aa_employeeid')} value={getField(s, 'craa5__aa_employeeid')}>{formatFullName(getField(s, 'craa5_name'))}{roleOf(s) !== 'supervisor' ? ' (acting)' : ''}</option>)}</select>
+                                    <select value={selectedSupervisorId || ""} onChange={(e) => switchBoard(e.target.value)} className="px-1 py-0.5 rounded border border-[#F6B3C0] text-xs outline-none bg-white"><option value="" disabled>-- Select Supervisor --</option>{supervisors.map(s => <option key={getField(s, 'craa5__aa_employeeid')} value={getField(s, 'craa5__aa_employeeid')}>{formatFullName(getField(s, 'craa5_name'))}{!isSupervisorLike(s) ? ' (acting)' : ''}</option>)}</select>
                                 </div>
                             )}
                             <div className={`flex items-center gap-1 px-2 py-0.5 rounded-lg border ${adminMode ? 'bg-[#E6F1FB] border-[#B3D4F2]' : 'border-transparent'}`}>
@@ -1179,6 +1293,7 @@ export function MainComponent(props: any) {
                             </div>
                             <Text size={200} weight="semibold" className="hidden md:block">{selectedSupervisorId && getField(currentUser, 'craa5__aa_employeeid') !== selectedSupervisorId ? `🕵️ ${formatFullName(getField(activeSupervisorObj, 'craa5_name'))}` : `👤 ${msUser ? msUser.name : "Signing in..."}`}</Text>
                             {!isLoading && selectedSupervisorId && shiftStartMs !== boardShiftStart && <Button size="small" appearance="primary" className="whitespace-nowrap" onClick={() => refreshShift()}>{currentShift ? `Shift ${currentShift} started: refresh` : 'Shift ended: refresh'}</Button>}
+                            <Button size="small" appearance="subtle" className="whitespace-nowrap" onClick={() => setShowData(true)} title="What the app read: who you are, the shift on the clock, each team's lead and crew">Data check</Button>
                             <Badge appearance="filled" color="brand">Shift {currentShift || '?'}</Badge>
                             <div className="hidden sm:block pl-3 border-l border-slate-200"><BrandLogo /></div>
                         </div>
@@ -1207,6 +1322,7 @@ export function MainComponent(props: any) {
                     </nav>
                 )}
 
+                {showData && <DataCheckPanel onClose={() => setShowData(false)} msUser={msUser} currentUser={currentUser} slotCount={(GLOBAL_DATA_CACHE?.slots || []).length} currentShift={currentShift} shiftStartMs={shiftStartMs} upNextShift={upNextShift} teams={GLOBAL_DATA_CACHE?.teams || []} teamsRead={GLOBAL_DATA_CACHE?.teamsRead || 0} employees={allEmployees} supervisors={supervisors} taskStatus={taskStatus} areaCount={areas.length} boardCrew={boardCrew} ownerName={ownerLabel} />}
                 <main style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", position: 'relative' }}>{SC}</main>
             </div>
         </FluentProvider>
