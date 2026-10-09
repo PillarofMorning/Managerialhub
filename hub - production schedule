@@ -116,13 +116,15 @@ const F_NOTES = "craa5_notes", F_AREA_ID = "craa5_mssareaguid", F_BATCH = "craa5
 const OPTIONAL_COLS = [F_ORDER, F_CASES, F_NOTES, F_AREA_ID, F_BATCH];
 const NOTES_MAX = 2000, BATCH_MAX = 200;
 const PAYLOAD_KEEP = 300;     // payloads remembered for the Data Check tab
-const SIDE_MAX = 1500;         // runs whose Order # / Cases / Notes are kept in this browser when their columns are missing
+const SIDE_MAX = 3000;         // runs whose Order # / Cases / Notes are kept in this browser when their columns are missing
 const API_TIMEOUT_MS = 20000;
 const QUERY_LIMIT = 1000;
 const RANGE_LIMIT = 2000;
 const APPLY_CONC = 4;          // saves in flight at once when a bulk upload is applied
+const MAX_OPEN_WEEKS = 6;       // 'Open all' in step 3 opens this many weeks at most
 const MAX_SHEETS = 120;        // plans (weekly sheets) held at once in the Import view
 const AUDIT_MAX_RUNS = 30000;  // the run check stops here and says so
+const SPECIAL_READ = 1000;     // the blank-date / far-date reads; a read that fills this is said to be cut off
 const HOUR = 3600000, DAY = 86400000;
 
 // ----------------------------------------------------------------------------
@@ -334,14 +336,16 @@ async function poolRun(list, n, fn) {
 }
 // Which of the optional columns a refused save names. Dataverse says "Could not find a property named 'craa5_notes' on type ...";
 // when the message names none of them, every optional column that was sent is blamed (the caller undoes that when the retry fails too).
+const NOT_FOUND_RE = /could not find|not found|does not exist|doesn.t exist|undeclared|(invalid|unknown|unrecognized|unrecognised) (property|column|field|attribute)|not a valid (property|column|field)|no such (property|column|field)/;
 function badColumns(err, cols) {
     const msg = String(err && err.message ? err.message : err || '').toLowerCase();
+    if (!NOT_FOUND_RE.test(msg)) return [];   // a timeout, a value Dataverse did not like or a network drop says nothing about a column missing
     const named = cols.filter(c => msg.indexOf(c.toLowerCase()) >= 0);
     return named.length ? named : (/propert|column|attribute|field/.test(msg) ? cols : []);
 }
 const errText = (e) => String(e && e.message ? e.message : e || 'Unknown error');
 const clipFields = (b) => { const o = {}; Object.keys(b).forEach(k => { const v = b[k]; o[k] = typeof v === 'string' && v.length > 160 ? v.slice(0, 159) + '…' : v; }); return o; };
-const colLabel = (c) => ({ [F_ORDER]: 'Order #', [F_CASES]: 'Cases', [F_NOTES]: 'Notes', [F_AREA_ID]: 'MSS area id', [F_BATCH]: 'Imported from' }[c] || c);
+const colLabel = (c) => ({ [F_ORDER]: 'Order Number', [F_CASES]: 'Cases', [F_NOTES]: 'Notes', [F_AREA_ID]: 'MSS Area GUID', [F_BATCH]: 'Import Batch' }[c] || c);   // the display names the Columns list tells Gerald to create
 
 // "Doe, John" -> "John Doe"
 function formatFullName(name) {
@@ -356,7 +360,8 @@ function formatFullName(name) {
 // ============================================================================
 const LS_SETTINGS = 'prodsched_settings_v1', LS_SIDE = 'prodsched_extras_v1';
 function lsRead(key, fallback) { try { const s = localStorage.getItem(key); if (s) return JSON.parse(s); } catch (e) {} return fallback; }
-function lsWrite(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {} }
+let lsOk = true;   // false after a browser-storage write failed (blocked or full): "kept in this browser" is then only true until the page is left
+function lsWrite(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); lsOk = true; return true; } catch (e) { lsOk = false; return false; } }
 const DEFAULT_SETTINGS = {
     lineMap: {},            // Excel section label (lower case) -> { area, line, dayStart, dayStop, chain, gapMins, rate, defaultHours, skip }
     shifts: [],             // { id, lineKey ('*' = every line), group: production | sanitation, label, crew, days: [0-6], start, stop, heads }
@@ -377,7 +382,7 @@ const rowEnd = (r) => new Date(r.craa5_dateendtime || r.craa5_Dateendtime || r.c
 function normRun(row, side) {
     const id = runIdOf(row), sc = (side && side[id]) || {};
     const codeRaw = row.craa5_productcode ?? row.craa5_productCode;
-    const order = row[F_ORDER], cases = row[F_CASES], notes = rv(row, F_NOTES), areaId = rv(row, F_AREA_ID), batch = rv(row, F_BATCH);
+    const order = rv(row, F_ORDER), cases = rv(row, F_CASES), notes = rv(row, F_NOTES), areaId = rv(row, F_AREA_ID), batch = rv(row, F_BATCH);
     return {
         id, area: renderSafe(row.craa5_area || row.craa5_Area), line: parseInt(row.craa5_line || row.craa5_Line, 10) || 1,
         code: codeRaw === null || codeRaw === undefined || codeRaw === '' || isNaN(Number(codeRaw)) ? null : Number(codeRaw),
@@ -387,7 +392,7 @@ function normRun(row, side) {
         crumb: truthy(row.craa5_crumbclean) || truthy(row.craa5_CrumbClean),
         order: order !== undefined && order !== null && order !== '' ? String(order) : (sc.order || ''),
         cases: cases !== undefined && cases !== null && cases !== '' ? Number(cases) : (sc.cases !== undefined ? sc.cases : null),
-        notes: notes !== undefined && notes !== null && notes !== '' ? String(notes) : (sc.notes || ''),
+        notes: notes !== undefined && notes !== null && notes !== '' ? String(notes).replace(/\r\n?/g, '\n') : (sc.notes || ''),
         areaId: areaId ? String(areaId) : '', batch: batch ? String(batch) : '',
         // what the row really held, for the run check (the numbers above fall back to 0 / line 1 when a column is empty)
         flags: { lineBlank: !(parseInt(row.craa5_line === undefined ? row.craa5_Line : row.craa5_line, 10) >= 1), startBlank: !rowStart(row), endBlank: !rowEnd(row) },
@@ -405,7 +410,7 @@ function optionalFields(op, extras, areaId) {
     // undefined = leave the column alone; a value = send it; empty / null = send nothing, or clear the column when asked to
     const text = (col, v, max) => { if (v === undefined) return; const s = v === null ? '' : String(v); if (s) out[col] = max ? clipText(s, max) : s; else if (clear) out[col] = null; };
     text(F_ORDER, x.order);
-    if (x.cases !== undefined) { if (x.cases !== null && x.cases !== '' && !isNaN(Number(x.cases))) out[F_CASES] = Number(x.cases); else if (clear) out[F_CASES] = null; }
+    if (x.cases !== undefined) { const n = x.cases === null || x.cases === '' ? NaN : Math.round(Number(x.cases)); if (isFinite(n) && Math.abs(n) <= 2147483647) out[F_CASES] = n; else if (clear) out[F_CASES] = null; }   // the column is a Whole number
     text(F_NOTES, x.notes, NOTES_MAX);
     if (areaId) out[F_AREA_ID] = areaId;
     text(F_BATCH, x.batch, BATCH_MAX);
@@ -426,7 +431,9 @@ const runTitle = (r) => `${r.product || 'Run'}${r.code ? ` (${r.code})` : ''}`;
 function parseDelimited(text) {
     const rows = []; let row = [], cell = '', inQ = false;
     const t = String(text || '').replace(/\r\n?/g, '\n');
-    const delim = t.indexOf('\t') >= 0 ? '\t' : ',';
+    // a tab outside the quotes means a pasted Excel table; a tab inside a quoted note of a CSV does not
+    let delim = ',';
+    for (let i = 0, q = false; i < t.length; i++) { const c = t[i]; if (c === '"') q = !q; else if (c === '\t' && !q) { delim = '\t'; break; } }
     for (let i = 0; i < t.length; i++) {
         const ch = t[i];
         if (inQ) { if (ch === '"') { if (t[i + 1] === '"') { cell += '"'; i++; } else inQ = false; } else cell += ch; }
@@ -452,8 +459,9 @@ function cellStr(v) {
     return String(v).trim();
 }
 function parseSheetDate(v) {
-    if (v instanceof Date && !isNaN(v.getTime())) return new Date(v.getFullYear(), v.getMonth(), v.getDate());
-    if (typeof v === 'number' && v > 30000 && v < 80000) { const d = new Date(Date.UTC(1899, 11, 30) + v * DAY); return new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); }
+    const sane = (d) => d && d.getFullYear() >= 2000 && d.getFullYear() <= 2100 ? d : null;   // anything else (a stray 1998 cell) is not a week of this schedule
+    if (v instanceof Date && !isNaN(v.getTime())) return sane(new Date(v.getFullYear(), v.getMonth(), v.getDate()));
+    if (typeof v === 'number' && v > 30000 && v < 80000) { const d = new Date(Date.UTC(1899, 11, 30) + v * DAY); return sane(new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())); }
     const s = cellStr(v);
     let m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s);
     if (m) return parseYMD(`${m[1]}-${pad2(m[2])}-${pad2(m[3])}`);
@@ -461,11 +469,23 @@ function parseSheetDate(v) {
     if (m) { const y = m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]); return parseYMD(`${y}-${pad2(m[1])}-${pad2(m[2])}`); }
     return null;
 }
+// formula errors and "nothing here" markers are not notes ("#DIV/0!" pasted from a broken cell, "-", "N/A", "TBD")
+const isPlaceholder = (t) => /^(#(n\/a|div\/0!?|ref!?|value!?|name\??|num!?|null!?)|n\/?a|-+|tbd)$/i.test(String(t === undefined || t === null ? '' : t).trim());
 const numCell = (v) => {
     const t = cellStr(v).replace(/,/g, '');
-    if (t === '' || /^#n\/a$/i.test(t)) return null;
+    if (t === '' || isPlaceholder(t)) return null;
     const n = Number(t);
     return isFinite(n) ? n : NaN;
+};
+// Hours may be typed 8, 8.5, "8:30", "8h" or be an Excel time cell (which arrives as a Date on 1899-12-30).
+const hoursCell = (v) => {
+    if (v instanceof Date && !isNaN(v.getTime())) { const h = (v.getTime() - Date.UTC(1899, 11, 30)) / 3600000; return h > 0 && h < 24 ? Math.round(h * 60) / 60 : NaN; }
+    const t = cellStr(v);
+    let m = /^(\d{1,2}):(\d{2})(?::\d{2})?$/.exec(t);
+    if (m) return Number(m[1]) + Number(m[2]) / 60;
+    m = /^(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hours?)$/i.exec(t);
+    if (m) return Number(m[1]);
+    return numCell(v);
 };
 const lineCfgKey = (label) => String(label || '').trim().toLowerCase();
 
@@ -480,6 +500,10 @@ function parseSheet(grid, opts) {
         if (found.length >= 3) { hRow = r; dayCols = found; }
     }
     if (hRow < 0) return { error: 'Could not find the weekday header row (Sunday, Monday ...). Copy the whole table including its top rows.' };
+    { // two weeks side by side on one sheet: the first week is read (the second would be laid on the first one's dates)
+        const seen = {}, keep = dayCols.filter(f => { if (seen[f.dow]) return false; seen[f.dow] = true; return true; });
+        if (keep.length < dayCols.length) { warnings.push('This sheet has more than one week side by side. Only the first week was read: put each week on its own sheet.'); dayCols = keep; }
+    }
     const hdr = grid[hRow] || [];
     const week = cellStr((grid[hRow] || [])[0]) || cellStr((grid[Math.max(0, hRow - 1)] || [])[0]);
     // 2. a date for every weekday: the cell(s) right after the name, else derived from any one known date
@@ -489,6 +513,7 @@ function parseSheet(grid, opts) {
     if (!known.length) {
         const ws = opts && opts.weekStart ? parseYMD(opts.weekStart) : null;
         if (!ws) return { error: 'Found the weekdays but no dates next to them. Enter the Sunday date of the week below.', needWeekStart: true };
+        if (ws.getDay() !== 0) return { error: `${getLocalYMD(ws)} is a ${DOW[ws.getDay()]}. Enter the Sunday that starts the week.`, needWeekStart: true };
         dayCols.forEach(dc => { dates[dc.dow] = addDaysLocal(ws, dc.dow); });
     } else {
         const k0 = Number(known[0]);
@@ -510,7 +535,7 @@ function parseSheet(grid, opts) {
     // a column headed Notes / Comments / Remarks holds a note for the whole row
     const noteCols = [];
     [hdr, lab].forEach(hr => hr.forEach((c, ci) => { if (/^(notes?|comments?|remarks?)$/i.test(cellStr(c)) && noteCols.indexOf(ci) < 0) noteCols.push(ci); }));
-    const noteIn = (row) => noteCols.map(ci => cellStr(row[ci])).filter(t => t && !/^#n\/a$/i.test(t));
+    const noteIn = (row) => noteCols.map(ci => cellStr(row[ci])).filter(t => t && !isPlaceholder(t));
     // 4. sections, items, notes
     const lines = [];
     let cur = null;
@@ -528,11 +553,13 @@ function parseSheet(grid, opts) {
             rowOwner[r] = { item: it, line: L };
             noteIn(row).forEach(t => it.notes.push({ ymd: '', text: t }));
             days.forEach(D => {
-                const cases = numCell(row[D.cols.cases]), hours = numCell(row[D.cols.hours]);
-                const orderRaw = cellStr(row[D.cols.order]).replace(/^#n\/a$/i, '');
-                [row[D.cols.cases], row[D.cols.hours]].forEach(raw => {
-                    const t = cellStr(raw);
-                    if (t && Number.isNaN(numCell(raw))) it.notes.push({ ymd: D.ymd, text: t });
+                const cases = numCell(row[D.cols.cases]), hours = hoursCell(row[D.cols.hours]);
+                const orderRaw = isPlaceholder(cellStr(row[D.cols.order])) ? '' : cellStr(row[D.cols.order]);
+                [[row[D.cols.cases], cases], [row[D.cols.hours], hours]].forEach(pr => {
+                    const raw = pr[0], t = cellStr(raw);
+                    if (!t || !Number.isNaN(pr[1])) return;
+                    if (raw instanceof Date) warnings.push(`Row ${r + 1}, ${D.label}: "${t}" is not a number of hours or cases and was ignored.`);
+                    else it.notes.push({ ymd: D.ymd, text: t });
                 });
                 const hasCases = cases !== null && !Number.isNaN(cases) && cases > 0;
                 const hasHours = hours !== null && !Number.isNaN(hours) && hours > 0;
@@ -543,15 +570,15 @@ function parseSheet(grid, opts) {
             L.items.push(it);
         } else if (a) {
             const parts = b.split(/\s{2,}|\t/).map(s => s.trim()).filter(Boolean);
-            cur = { label: a, leads: parts[0] || '', supervisor: parts.length > 1 ? parts[parts.length - 1] : '', items: [], notes: [] };
-            lines.push(cur);
+            cur = lines.find(x => lineCfgKey(x.label) === lineCfgKey(a));   // the same line named twice is one line
+            if (!cur) { cur = { label: a, leads: parts[0] || '', supervisor: parts.length > 1 ? parts[parts.length - 1] : '', items: [], notes: [] }; lines.push(cur); }
             rowOwner[r] = { line: cur };
             noteIn(row).forEach(t => cur.notes.push({ ymd: '', text: t }));
         } else {
             // blank / "#N/A" placeholder rows can still carry a note under a day
             Object.keys(colToDay).forEach(c => {
                 const t = cellStr(row[c]);
-                if (t && !/^#n\/a$/i.test(t) && !isFinite(Number(t.replace(/,/g, '')))) ensureLine().notes.push({ ymd: colToDay[c].ymd, text: t });
+                if (t && !isPlaceholder(t) && !isFinite(Number(t.replace(/,/g, '')))) ensureLine().notes.push({ ymd: colToDay[c].ymd, text: t });
             });
             const rowNotes = noteIn(row);
             if (rowNotes.length) { ensureLine(); rowNotes.forEach(t => cur.notes.push({ ymd: '', text: t })); }
@@ -687,7 +714,7 @@ function planRuns(parsed, cfgs, edits, prefix) {
                 out.push({
                     key, lineKey: lk, lineLabel: L.label, ymd: D.ymd, item: it.item, row: it.row, desc: it.desc, cases: e.cases, hours, hoursSource,
                     order: e.order, orderWarn: e.orderWarn, start, end, area: cfg.area, line: Math.max(1, parseInt(cfg.line, 10) || 1),
-                    pushedMs: !edStart && start > dayStart ? start - dayStart : 0, afterCutoff, cutAt: win.cut, bad: !(end > start),
+                    pushedMs: !edStart && start > dayStart ? start - dayStart : 0, afterCutoff, cutAt: win.cut, bad: !(end > start) || (end - start) > 31 * DAY,   // a mistyped order # in the hours cell would plan a run centuries long
                 });
                 cursor = end; dayCursor = end;
             });
@@ -716,7 +743,13 @@ function attachNotes(parsed, cfgs, planned) {
     };
     (parsed.lines || []).forEach(L => {
         const lk = lineCfgKey(L.label), cfg = cfgs && cfgs[lk];
-        if (!cfg || cfg.skip || !cfg.area) return;   // a skipped line takes its notes with it
+        if (!cfg) {   // a line with no run on the sheet has no setting: its notes are still reported, never lost
+            const why = 'this line has no runs on the sheet';
+            L.notes.forEach(n => left.push({ line: L.label, ymd: n.ymd, text: n.text, why }));
+            L.items.forEach(it => it.notes.forEach(n => left.push({ line: L.label, ymd: n.ymd, text: `${it.item}: ${n.text}`, why })));
+            return;
+        }
+        if (cfg.skip || !cfg.area) return;   // a skipped line takes its notes with it
         const runs = (byLine[lk] || []).slice().sort(byStart);
         const lineNote = (n, tag, why) => {
             const to = n.ymd ? nearest(runs, n.ymd) : runs;
@@ -741,7 +774,7 @@ function attachNotes(parsed, cfgs, planned) {
             const t = pre ? `${pre}: ${n.text}` : n.text;
             if (!seen[t]) { seen[t] = true; out.push(t); }
         });
-        p.notes = clipText(out.join('\n'), NOTES_MAX);
+        p.notes = mergeNotes('', out.join('\n'));   // the same tidy text the next import compares against
     });
     return left;
 }
@@ -751,12 +784,14 @@ function attachNotes(parsed, cfgs, planned) {
 function matchExisting(p, existing, used) {
     const code = Number(p.item);
     const cand = existing.filter(r => r.code === code && !used[r.id]);
-    let m = p.order ? cand.find(r => r.order && String(r.order) === String(p.order)) : null;
-    if (!m) {
-        let best = Infinity;
-        cand.forEach(r => { const d = Math.abs(r.start - p.start); if (d < 12 * HOUR && d < best) { best = d; m = r; } });
-    }
-    return m || null;
+    // the nearest start wins, so one order that repeats its Order # on consecutive days is matched day by day; an Order # widens the reach
+    // from 12 h to 36 h but never removes it (last week's Saturday run must not become this week's Sunday run)
+    let m = null, best = Infinity;
+    cand.forEach(r => {
+        const d = Math.abs(r.start - p.start), same = p.order && r.order && String(r.order) === String(p.order);
+        if (d < (same ? 36 : 12) * HOUR && d < best) { best = d; m = r; }
+    });
+    return m;
 }
 
 // ============================================================================
@@ -764,15 +799,19 @@ function matchExisting(p, existing, used) {
 // ============================================================================
 // Sheet notes first, then any text already on the run that the sheet does not have: a re-import never loses what someone typed in the app.
 function mergeNotes(old, add) {
-    const out = [], seen = {};
-    String(add || '').split('\n').concat(String(old || '').split('\n')).forEach(l => { const t = l.trim(); if (t && !seen[t]) { seen[t] = true; out.push(t); } });
-    return clipText(out.join('\n'), NOTES_MAX);
+    const lines = (a, b) => { const out = [], seen = {}; String(a || '').split('\n').concat(String(b || '').split('\n')).forEach(l => { const t = l.trim(); if (t && !seen[t]) { seen[t] = true; out.push(t); } }); return out.join('\n'); };
+    const sheetFirst = lines(add, old);
+    // too long for the column: keep what someone typed in the app and cut the sheet's text instead
+    return clipText(sheetFirst.length > NOTES_MAX ? lines(old, add) : sheetFirst, NOTES_MAX);
 }
 // The window of existing runs that one sheet is checked against: whole days, a day either side, so a small edit does not mean a new read.
-function planWindow(planned) {
+// `days` = the sheet's own days: the window always covers the whole week, so a run the revised sheet dropped on its first or last day is found.
+function planWindow(planned, days) {
     if (!planned.length) return null;
     let lo = Infinity, hi = -Infinity;
-    planned.forEach(p => { if (p.start < lo) lo = p.start; if (p.end > hi) hi = p.end; });
+    planned.forEach(p => { if (isFinite(p.start) && isFinite(p.end)) { if (p.start < lo) lo = p.start; if (p.end > hi) hi = p.end; } });
+    if (days && days.length) { const a = parseYMD(days[0].ymd), b = parseYMD(days[days.length - 1].ymd); if (a && a.getTime() < lo) lo = a.getTime(); if (b && addDaysLocal(b, 1).getTime() > hi) hi = addDaysLocal(b, 1).getTime(); }
+    if (!isFinite(lo) || !isFinite(hi)) return null;
     const from = midnightOf(lo).getTime() - DAY, to = midnightOf(hi).getTime() + 2 * DAY;
     return { from, to, key: `${from}|${to}` };
 }
@@ -808,7 +847,7 @@ function statusPlan(planned, existing, recallMap, flags, inc) {
             if (r.allergen !== m.allergen) changes.push(r.allergen ? 'allergen on' : 'allergen off');
             if (r.crumb !== m.crumb) changes.push(r.crumb ? 'crumb clean on' : 'crumb clean off');
             if (p.desc && m.product !== p.desc) changes.push('description');
-            if (p.notes && r.notes !== (m.notes || '')) changes.push('notes');
+            if (p.notes && r.notes !== mergeNotes('', m.notes)) changes.push('notes');
             r.status = changes.length ? 'update' : 'same'; r.changes = changes; r.clashWith = null;
         } else {
             const others = (byLine[r.cl] || []).filter(e => !used[e.id] && e.start < p.end && e.end > p.start);
@@ -902,8 +941,19 @@ function sheetComments(ws, X) {
     return out;
 }
 // One file -> { sheets: [{ name, grid, comments }], skipped: [{ name, why }] }. Only sheets with a Sunday ... Saturday header are returned.
+// A sheet that saved a huge range (A1:XFD1048576 is common) is cut back to where its cells really are, so reading it stays quick.
+function trimSheetRange(ws, X) {
+    if (!ws || !ws['!ref']) return;
+    const r = X.utils.decode_range(ws['!ref']);
+    if ((r.e.r - r.s.r + 1) * (r.e.c - r.s.c + 1) <= 100000) return;
+    let maxR = -1, maxC = -1;
+    Object.keys(ws).forEach(k => { if (k.charAt(0) === '!') return; const c = X.utils.decode_cell(k); if (c.r > maxR) maxR = c.r; if (c.c > maxC) maxC = c.c; });
+    ws['!ref'] = maxR < 0 ? 'A1:A1' : X.utils.encode_range({ s: r.s, e: { r: Math.max(r.s.r, Math.min(maxR, r.e.r)), c: Math.max(r.s.c, Math.min(maxC, r.e.c)) } });
+}
+const MAX_FILE_MB = 30;
 async function readPlanFile(file) {
     const lower = file.name.toLowerCase(), sheets = [], skipped = [];
+    if (file.size > MAX_FILE_MB * 1024 * 1024) return { sheets, skipped: [{ name: file.name, why: `the file is over ${MAX_FILE_MB} MB` }] };
     if (/\.(csv|tsv|txt)$/.test(lower)) {
         const grid = parseDelimited(await readAsText(file)), p = parseSheet(grid, {});
         if (!p.error || p.needWeekStart) sheets.push({ name: file.name, grid, comments: {} }); else skipped.push({ name: file.name, why: p.error });
@@ -913,6 +963,7 @@ async function readPlanFile(file) {
     const wb = X.read(buf, { type: 'array', cellDates: true });
     wb.SheetNames.forEach(n => {
         const ws = wb.Sheets[n];
+        trimSheetRange(ws, X);
         const grid = X.utils.sheet_to_json(ws, { header: 1, raw: true, defval: '' });
         const comments = sheetComments(ws, X), p = parseSheet(grid, { comments });
         if (!p.error || p.needWeekStart) sheets.push({ name: wb.SheetNames.length > 1 ? `${file.name} · ${n}` : file.name, grid, comments });
@@ -1010,10 +1061,11 @@ function matchMssArea(area, line, idx) {
         const n = Math.max(1, parseInt(m[2], 10) || 1), base = idx.byCanon[canon(m[1])];
         if (ln === 1 || ln === n) return { kind: 'linestyle', item: base, line: n, suggest: sug(base, n) };
     }
-    // a typo: one best name within one or two letters (4 letters or more)
+    // a typo: one best name within one or two letters (4 letters or more). The number on the end is never a typo: "IBL5" is not
+    // "IBL4", so a name whose trailing digits differ is shown as a choice but never offered as a one-click fix.
     if (c.length >= 4) {
-        const cap = c.length >= 8 ? 2 : 1;
-        const near = idx.items.map(it => ({ it, d: it.canon ? levenshtein(c, it.canon, cap) : 99 })).filter(x => x.d <= cap).sort((a, b) => a.d - b.d);
+        const cap = c.length >= 8 ? 2 : 1, tail = (s) => (/(\d+)$/.exec(s) || ['', ''])[1];
+        const near = idx.items.map(it => ({ it, d: it.canon && tail(c) === tail(it.canon) ? levenshtein(c, it.canon, cap) : 99 })).filter(x => x.d <= cap).sort((a, b) => a.d - b.d);
         if (near.length && (near.length === 1 || near[0].d < near[1].d)) return { kind: 'spelling', item: near[0].it, line: ln, suggest: sug(near[0].it, ln, true) };
     }
     return { kind: 'unknown', alts: nearestNames(text, idx, 3) };
@@ -1030,7 +1082,9 @@ function classifyRun(r, idx, nowMs, opt) {
         if (Math.abs(r.start - nowMs) > FAR_DAYS * DAY || Math.abs(r.end - nowMs) > FAR_DAYS * DAY) add('far_date', `Start ${fmtDT(r.start)}, stop ${fmtDT(r.end)}`);
     }
     if (idx && !idx.empty) {
-        const m = matchMssArea(r.area, r.line, idx);
+        // the answer depends only on the saved area text and line, so thousands of runs on "IBL 4" are matched once
+        const mk = `k${r.area}|${r.line}`;
+        const m = o.matchCache ? (o.matchCache[mk] || (o.matchCache[mk] = matchMssArea(r.area, r.line, idx))) : matchMssArea(r.area, r.line, idx);
         if (m.kind === 'blank') add('no_area', 'The area is blank', { alts: [] });
         else if (m.kind === 'unknown') add('unknown_area', `"${r.area}" is not an MSS area`, { alts: m.alts });
         else {
@@ -1046,28 +1100,57 @@ function classifyRun(r, idx, nowMs, opt) {
     if (r.code === null && !maint) add('no_code', 'No product code');
     return out;
 }
-// Duplicates (same line, product, start and stop to the minute) and overlaps between neighbours on one line. { runId: [problems] }
+// Duplicates (same line, product code, product, start and stop to the minute) and overlaps between neighbours on one line.
+// Of a set of look-alikes the run holding the most data (notes, Order #, cases, area id) stays, ties broken by id, so the answer does
+// not depend on the order the runs were read in. A look-alike that differs from the one that stays in allergen, crumb clean, notes,
+// Order # or cases is named ("differs") but never offered for deletion. A run with no code and no product is not compared at all.
 function crossChecks(runs) {
     const byLine = {}, out = {};
     runs.forEach(r => { if (r.start > 0 && r.end > r.start) (byLine[canonLine(r.area, r.line)] = byLine[canonLine(r.area, r.line)] || []).push(r); });
     const put = (id, p) => { (out[id] = out[id] || []).push(p); };
+    const has = (v) => v !== null && v !== undefined && v !== '';
+    const rich = (r) => (has(r.notes) ? 8 : 0) + (has(r.order) ? 4 : 0) + (has(r.cases) ? 2 : 0) + (r.areaId ? 1 : 0) + (r.batch ? 1 : 0);
+    const sigOf = (r) => r.code === null && !canon(r.product) ? '' : `${r.code}|${canon(r.product)}|${Math.round(r.start / 60000)}|${Math.round(r.end / 60000)}`;
+    const differsIn = (r, keep) => {
+        const d = [];
+        if (!!r.allergen !== !!keep.allergen || (r.allergen && canon(r.allergenType) !== canon(keep.allergenType))) d.push('allergen');
+        if (!!r.crumb !== !!keep.crumb) d.push('crumb clean');
+        // empty on the run that would go is fine; anything it holds that the one that stays does not is not
+        if (has(r.notes) && String(r.notes).trim() !== String(keep.notes || '').trim()) d.push('notes');
+        if (has(r.order) && String(r.order) !== String(keep.order || '')) d.push('Order #');
+        if (has(r.cases) && Number(r.cases) !== Number(keep.cases)) d.push('cases');
+        return d;
+    };
     Object.keys(byLine).forEach(k => {
-        const l = byLine[k].sort(byStart), sig = {};
+        const l = byLine[k].sort(byStart), groups = {}, keeperOf = {};
+        l.forEach(r => { const s = sigOf(r); if (s) (groups[s] = groups[s] || []).push(r); });
+        Object.keys(groups).forEach(s => {
+            const g = groups[s];
+            if (g.length < 2) return;
+            let keep = g[0];
+            g.forEach(r => { if (rich(r) > rich(keep) || (rich(r) === rich(keep) && String(r.id) < String(keep.id))) keep = r; });
+            keeperOf[s] = keep;
+            g.forEach(r => {
+                if (r === keep) return;
+                const diff = differsIn(r, keep);
+                put(r.id, { kind: 'dup', text: `${diff.length ? 'Looks the same as' : 'Same as'} ${runTitle(keep)} at ${fmtDT(keep.start)}${diff.length ? `, but differs in ${diff.join(', ')}` : ''}`, other: keep.id, differs: diff });
+            });
+        });
+        // overlaps are judged between the runs that stay
         let reach = null;
-        for (let i = 0; i < l.length; i++) {
-            const cur = l[i], s = `${cur.code}|${Math.round(cur.start / 60000)}|${Math.round(cur.end / 60000)}`;
-            if (sig[s]) { put(cur.id, { kind: 'dup', text: `Same as ${runTitle(sig[s])} at ${fmtDT(sig[s].start)}`, other: sig[s].id }); }
-            else {
-                sig[s] = cur;
-                if (reach && cur.start < reach.end - 60000) put(cur.id, { kind: 'overlap', text: `Starts ${fmtDT(cur.start)}, before ${runTitle(reach)} ends (${fmtDT(reach.end)})`, other: reach.id });
-            }
+        l.forEach(cur => {
+            const s = sigOf(cur);
+            if (s && keeperOf[s] && keeperOf[s] !== cur) return;
+            if (reach && cur.start < reach.end - 60000) put(cur.id, { kind: 'overlap', text: `Starts ${fmtDT(cur.start)}, before ${runTitle(reach)} ends (${fmtDT(reach.end)})`, other: reach.id });
             if (!reach || cur.end > reach.end) reach = cur;
-        }
+        });
     });
     return out;
 }
 // Everything at once. Returns { list: [{ run, problems }] (runs with at least one problem, worst first), counts: { total, bad, byKind, bySev } }.
-function checkRuns(runs, idx, nowMs, opt) {
+function checkRuns(runs, idx, nowMs, opt0) {
+    const opt = { ...(opt0 || {}) };
+    if (!opt.matchCache) opt.matchCache = {};
     const cross = crossChecks(runs), list = [], byKind = {}, bySev = { error: 0, warn: 0, info: 0 };
     let bad = 0;
     runs.forEach(r => {
@@ -2027,7 +2110,7 @@ function RunRow({ r, ed, onInclude, onEdit, onReset, onFlag }) {
     if (p.afterCutoff) notes.push({ t: `ends after the stop time (${fmtTime(p.cutAt)})`, c: 'text-[#B27B00]' });
     if (p.pushedMs > 0) notes.push({ t: `pushed ${fmtHrs(p.pushedMs)} by the run before`, c: 'text-slate-400' });
     if (guessed) notes.push({ t: p.hoursSource === 'window' ? 'no hours on the sheet: filled to the end of the window' : 'no hours on the sheet: the line default was used', c: 'text-[#B27B00]' });
-    if (p.bad) notes.push({ t: 'stop is not after start', c: 'text-[#B00020] font-bold' });
+    if (p.bad) notes.push({ t: p.end > p.start ? 'run is longer than 31 days: check the hours' : 'stop is not after start', c: 'text-[#B00020] font-bold' });
     if (p.notes) notes.push({ t: `✎ ${clipText(p.notes.replace(/\n/g, ' / '), 160)}`, c: 'text-[#00468B]', title: p.notes });
     return (
         <div className={`px-3 py-2 border-t border-slate-100 ${r.include ? '' : 'opacity-60'} ${p.bad || r.selfOverlap ? 'bg-[#FDE8EC]/60' : ''}`}>
@@ -2078,7 +2161,7 @@ function Section({ title, open, onToggle, summary, right, children }) {
     );
 }
 
-function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, gapCtx, onDone, onView, apiReady, onOpenCheck }) {
+function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, gapCtx, onDone, onView, apiReady, onOpenCheck, reloadTick }) {
     const [text, setText] = useState('');
     const [sheets, setSheets] = useState([]);        // [{ id, name, grid, comments, weekStart, parsed }] one per week sheet read
     const [pick, setPick] = useState({});            // sheet id -> true / false when ticked by hand (default: the last sheet read for each week)
@@ -2123,7 +2206,7 @@ function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, g
             const names = {}; list.forEach(s => { names[s.name] = true; });
             const kept = prev.filter(s => !names[s.name]);
             const room = Math.max(0, MAX_SHEETS - kept.length), take = list.slice(0, room);
-            if (take.length < list.length) skip.push({ name: `${list.length - take.length} more sheet${list.length - take.length === 1 ? '' : 's'}`, why: `only ${MAX_SHEETS} weeks are held at once: apply these, then add the rest` });
+            if (take.length < list.length) skip.push({ name: `${list.length - take.length} more sheet${list.length - take.length === 1 ? '' : 's'}`, why: `only ${MAX_SHEETS} weeks are held at once: after applying, press Clear all (or remove sheets with the x) and add these again` });
             return kept.concat(take.map(s => ({ id: `s${seqRef.current}`, n: seqRef.current++, name: s.name, grid: s.grid, comments: s.comments || {}, weekStart: '', parsed: parseSheet(s.grid, { comments: s.comments }) })));
         });
         setSkipped(skip);
@@ -2179,7 +2262,7 @@ function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, g
         return out;
     }, [active, plans]);
     const noteTotals = useMemo(() => { let saved = 0; planned.forEach(p => { if (p.notes) saved++; }); return { saved, left: notesLeft.length }; }, [planned, notesLeft]);
-    const wins = useMemo(() => active.map((sh, i) => { const w = planWindow(plans[i]); return w ? { id: sh.id, ...w } : null; }).filter(Boolean), [active, plans]);
+    const wins = useMemo(() => active.map((sh, i) => { const w = planWindow(plans[i], sh.parsed.days); return w ? { id: sh.id, ...w } : null; }).filter(Boolean), [active, plans]);
     const winKey = wins.map(w => w.key).join(',');
     const winOf = useMemo(() => { const m = {}; wins.forEach(w => { m[w.id] = w; }); return m; }, [wins]);
 
@@ -2202,7 +2285,7 @@ function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, g
             setExisting({ key: winKey, byWin, failed, loading: false, done: need.length, total: need.length });
         }, 400);
         return () => { alive = false; clearTimeout(t); };
-    }, [winKey, apiReady, result && result.tick]);
+    }, [winKey, apiReady, result && result.tick, reloadTick]);   // Reload (top right) reads the failed weeks again
     const existingAll = useMemo(() => {
         const seen = {}, out = [];
         wins.forEach(w => (existing.byWin[w.key] || []).forEach(e => { if (!seen[e.id]) { seen[e.id] = true; out.push(e); } }));
@@ -2242,7 +2325,8 @@ function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, g
 
     const toApply = useMemo(() => view.rows.filter(r => r.include && (r.status === 'new' || r.status === 'update' || inc[r.p.key])), [view.rows, inc]);
     const toRemove = view.orphans.filter(o => removeIds[o.id]);
-    const canApply = readOk && !pending && !failed && !applying && unmapped.length === 0 && (toApply.length > 0 || toRemove.length > 0) && !toApply.some(r => r.p.bad);
+    const dupWeek = useMemo(() => { const seen = {}; let d = ''; active.forEach(sh => { const k = sh.parsed.days[0].ymd; if (seen[k] && !d) d = k; seen[k] = true; }); return d; }, [active]);   // two ticked sheets for one week would save the week twice
+    const canApply = readOk && !pending && !failed && !applying && !dupWeek && unmapped.length === 0 && (toApply.length > 0 || toRemove.length > 0) && !toApply.some(r => r.p.bad);
     const stampNow = () => { const d = new Date(); return `${getLocalYMD(d)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
 
     // After the saves: read every touched week back and compare, so a column that quietly took nothing shows up here and not months later.
@@ -2275,11 +2359,26 @@ function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, g
     const apply = async () => {
         if (applyingRef.current || !canApply) return;
         applyingRef.current = true; cancelRef.current = false;
-        const stamp = stampNow(), nameOf = {}; active.forEach(sh => { nameOf[sh.id] = sh.name; });
+        const stamp = stampNow(), nameOf = {}, sideBase = api.sideReport().skipped; active.forEach(sh => { nameOf[sh.id] = sh.name; });
         const work = toApply.map(r => ({ kind: 'save', r })).concat(toRemove.map(o => ({ kind: 'remove', o })));
         const total = work.length;
+        // the plan may be hours old, or the schedule edited on another tab or by someone else: look again first, and if it changed show the new picture
+        setApplying({ done: 0, total, phase: 'looking' });
+        const sig = (rows) => rows.map(e => `${e.id}|${e.start}|${e.end}|${e.area}|${e.line}|${e.order}|${e.cases}|${e.notes}`).sort().join(';');
+        const look = {}; let lookFailed = false;
+        try { await poolRun(wins, 3, async (w) => { const rows = await api.readWindow(w.from, w.to); if (rows === null) lookFailed = true; else look[w.key] = rows; }); } catch (e) { lookFailed = true; }
+        if (!mountedRef.current) { applyingRef.current = false; return; }
+        const changedSince = wins.some(w => look[w.key] && sig(look[w.key]) !== sig(winCache.current[w.key] || []));
+        if (lookFailed || changedSince) {
+            applyingRef.current = false; setApplying(null);
+            const tick0 = Date.now();
+            if (changedSince) { Object.keys(look).forEach(k => { winCache.current[k] = look[k]; }); cacheTick.current = tick0; }
+            setResult({ type: 'warn', message: lookFailed ? 'Could not read the schedule again to check it before saving, so nothing was saved. Press Apply to try again.' : 'The schedule changed since this plan was checked (a run was added, moved or deleted). Nothing was saved. The plan below is updated: look at it, then press Apply.', tick: changedSince ? tick0 : (result && result.tick) || 0 });
+            return;
+        }
+        const resumed = result && result.resumable && result.changes ? result.changes.slice() : [];   // carrying on after a stop: Undo still covers the first part
         setApplying({ done: 0, total, phase: 'saving' }); setResult(null);
-        const changes = [], saved = [];
+        const changes = resumed, saved = [];
         let failure = null, done = 0, created = 0, updated = 0, removed = 0;
         try {
             await poolRun(work, APPLY_CONC, async (job) => {
@@ -2299,7 +2398,7 @@ function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, g
                     }
                 } catch (err) { if (!failure) failure = err; return; }
                 done++;
-                if (done % 4 === 0 || done === total) setApplying({ done, total, phase: 'saving' });
+                if (done % 8 === 0 || done === total) setApplying({ done, total, phase: 'saving' });
             });
         } finally { applyingRef.current = false; }
         const cancelled = cancelRef.current && !failure;
@@ -2325,17 +2424,21 @@ function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, g
         if (verify) {
             lines.push(`Read back ${verify.found} of ${verify.checked} saved runs${verify.readFailed ? ` (${verify.readFailed} week${verify.readFailed === 1 ? '' : 's'} could not be read back)` : ''}.`);
             if (verify.missing.length) lines.push(`Not found when read back: ${verify.missing.map(j => `${j.run.product || j.run.code} ${fmtDT(j.run.start)}`).join('; ')}${verify.checked - verify.found > verify.missing.length ? ' ...' : ''}`);
-            if (verify.notesExpected) lines.push(refusedNow[F_NOTES] ? `Notes: ${verify.notesExpected} run${verify.notesExpected === 1 ? ' has' : 's have'} notes, kept in this browser only until the Notes column exists.` : `Notes: ${verify.notesOk} of ${verify.notesExpected} runs came back with their notes.`);
+            if (verify.notesExpected) lines.push(refusedNow[F_NOTES] ? `Notes: ${verify.notesExpected} run${verify.notesExpected === 1 ? ' has' : 's have'} notes, ${lsOk ? 'kept in this browser only' : 'held only until this page is closed'}. They are not copied to Dataverse when the column is added: import those weeks again then.` : `Notes: ${verify.notesOk} of ${verify.notesExpected} runs came back with their notes.`);
         }
-        if (notStored.length) lines.push(`Dataverse does not have these columns yet: ${notStored.map(colLabel).join(', ')}. ${keptHere.length ? `${keptHere.map(colLabel).join(', ')} ${keptHere.length === 1 ? 'is' : 'are'} kept in this browser only. ` : ''}${lostCols.length ? `${lostCols.map(colLabel).join(', ')} ${lostCols.length === 1 ? 'was' : 'were'} not saved. ` : ''}See Data Check > Columns.`);
+        const sd = { skipped: api.sideReport().skipped - sideBase };
+        const keptWords = lsOk ? 'kept in this browser only' : 'held only until this page is closed (this browser is blocking storage)';
+        if (notStored.length) lines.push(`Dataverse does not have these columns yet: ${notStored.map(colLabel).join(', ')}. ${keptHere.length ? `${keptHere.map(colLabel).join(', ')} ${keptHere.length === 1 ? 'is' : 'are'} ${keptWords}. ` : ''}${lostCols.length ? `${lostCols.map(colLabel).join(', ')} ${lostCols.length === 1 ? 'was' : 'were'} not saved. ` : ''}See Data Check > Columns.`);
+        if (sd.skipped > 0) lines.push(`${sd.skipped} run${sd.skipped === 1 ? '' : 's'} could not be kept in this browser (it holds up to ${SIDE_MAX} runs), so their Order Number, Cases and Notes were not saved anywhere. Create the columns in Dataverse, then import those weeks again.`);
         setRemoveIds({}); setInc({});
         updateSettings(s => { const ord = s.lineOrder.slice(); active.forEach(sh => sh.parsed.lines.forEach(L => { const c = cfgs[lineCfgKey(L.label)]; if (c && !c.skip && c.area) { const k = lineKeyOf(c.area, Math.max(1, parseInt(c.line, 10) || 1)); if (ord.indexOf(k) < 0) ord.push(k); } })); return { ...s, lineOrder: ord }; });
         // the weeks just read back are the new picture of what exists
         const tick = Date.now();
         winCache.current = verify ? verify.fresh : {}; cacheTick.current = tick;
         const bad = verify && (verify.found < verify.checked || (verify.notesExpected > 0 && verify.notesOk < verify.notesExpected)) || notStored.length > 0;
-        if (failure) setResult({ type: 'error', message: `Stopped after ${done} of ${total}: ${errText(failure)}. What was already saved (${summary}) stays on the schedule. Press Apply again to carry on: those runs show as ALREADY THERE.`, lines, changes, tick, notStored });
-        else if (cancelled) setResult({ type: 'error', message: `Stopped by you after ${done} of ${total} (${summary}). Press Apply again to carry on: the saved runs show as ALREADY THERE.`, lines, changes, tick, notStored });
+        setExisting(ex => ({ ...ex, loading: true }));   // the plan is out of date until it has been checked against what was just saved: Apply stays off meanwhile
+        if (failure) setResult({ type: 'error', message: `Stopped after ${done} of ${total}: ${errText(failure)}. What was already saved (${summary}) stays on the schedule. Press Apply again to carry on: those runs show as ALREADY THERE.`, lines, changes, tick, notStored, resumable: true });
+        else if (cancelled) setResult({ type: 'warn', message: `Stopped by you after ${done} of ${total} (${summary}). Press Apply again to carry on: the saved runs show as ALREADY THERE.`, lines, changes, tick, notStored, resumable: true });
         else setResult({ type: bad ? 'warn' : 'success', message: `Import finished: ${summary}.`, lines, changes, tick, notStored });
         onDone();
     };
@@ -2344,20 +2447,23 @@ function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, g
         if (!result.confirmUndo) { setResult({ ...result, confirmUndo: true }); return; }
         const list = result.changes.slice();
         setResult({ ...result, busy: true });
-        let failure = null, n = 0;
-        await poolRun(list, APPLY_CONC, async (c) => {
+        let failure = null;
+        const doneAt = {};
+        await poolRun(list.map((c, i) => ({ c, i })), APPLY_CONC, async (it) => {
             if (failure) return;
+            const c = it.c;
             try {
                 if (c.type === 'create') await api.deleteRun(c.id, { quiet: true, what: 'undo import' });
                 else if (c.type === 'update') await api.saveRun('update', c.id, c.before, { order: c.before.order, cases: c.before.cases, notes: c.before.notes, batch: c.before.batch || '', clear: true }, { quiet: true, what: 'undo import' });
                 else await api.saveRun('create', null, c.run, { order: c.run.order, cases: c.run.cases, notes: c.run.notes, batch: c.run.batch }, { quiet: true, what: 'undo import' });
-                n++;
+                doneAt[it.i] = true;
             } catch (err) { if (!failure) failure = err; }
         });
+        const n = Object.keys(doneAt).length, left = list.filter((c, i) => !doneAt[i]);
         winCache.current = {};
         onDone();
         if (!mountedRef.current) return;
-        setResult(failure ? { type: 'error', message: `Undid ${n} of ${list.length} changes, then failed: ${errText(failure)}.`, changes: [], tick: Date.now() } : { type: 'success', message: `Import undone (${n} changes reverted).`, tick: Date.now() });
+        setResult(failure ? { type: 'error', message: `Undid ${n} of ${list.length} changes, then failed: ${errText(failure)}. ${left.length} still to undo: press Undo this import again to carry on.`, changes: left, tick: Date.now() } : { type: 'success', message: `Import undone (${n} changes reverted).`, tick: Date.now() });
     };
 
     const setEdit = (key, patch) => setEdits(e => ({ ...e, [key]: { ...(e[key] || {}), ...patch } }));
@@ -2395,16 +2501,17 @@ function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, g
     }, [view.rows, sheetById]);
     const single = weeks.length === 1;
     const isWeekOpen = (id) => weekOpen[id] !== undefined ? weekOpen[id] : single;
-    const setAllWeeks = (fn) => { const m = {}; weeks.forEach(W => { m[W.id] = fn(W); }); setWeekOpen(m); };
+    const setAllWeeks = (fn) => { const m = {}; let n = 0; weeks.forEach(W => { m[W.id] = fn(W) && n++ < MAX_OPEN_WEEKS; }); setWeekOpen(m); };   // a year of open weeks is 40,000 page elements and freezes the page
     const setAllFolded = (v) => { const m = {}; weeks.forEach(W => W.lines.forEach(G => { m[G.key] = v; })); setFolded(m); };
 
     // why the Apply button is off, so it never just sits there grey
     const applyHint = canApply || applying ? '' :
         !readOk ? 'Read a plan in step 1 first.' :
+        dupWeek ? `Two sheets are ticked for the week of ${fmtDay(parseYMD(dupWeek).getTime())}: untick one in step 1.` :
         unmapped.length > 0 ? `Pick a line for ${unmapped.map(l => l.label).join(', ')} in step 2 (or tick Skip).` :
         failed ? 'Could not read what is already scheduled: press Reload (top right) and try again.' :
         pending ? `Checking what is already on the schedule${existing.total ? ` (${existing.done} of ${existing.total} weeks)` : ''}...` :
-        toApply.some(r => r.p.bad) ? 'A run stops before it starts: fix its start or stop in step 3.' :
+        toApply.some(r => r.p.bad) ? 'A run stops before it starts, or is longer than 31 days: fix its start, stop or hours in step 3.' :
         'Nothing to apply: every run is already on the schedule, or unticked.';
     const weekLabel = (sh) => `${fmtDay(parseYMD(sh.parsed.days[0].ymd).getTime())} to ${fmtDay(parseYMD(sh.parsed.days[sh.parsed.days.length - 1].ymd).getTime())}`;
     const totals = useMemo(() => active.reduce((t, sh) => ({ runs: t.runs + sh.parsed.runCount, notes: t.notes + sh.parsed.noteCount }), { runs: 0, notes: 0 }), [active]);
@@ -2440,7 +2547,7 @@ function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, g
                                 const ps = sh.parsed, good = ps && !ps.error;
                                 return (
                                     <div key={sh.id} className={`px-3 py-1.5 border-t border-slate-100 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs ${good && !isUsed(sh) ? 'opacity-60' : ''}`}>
-                                        {good ? <input type="checkbox" checked={isUsed(sh)} title="Use this sheet" onChange={(e) => setPick(p => ({ ...p, [sh.id]: e.target.checked }))} /> : <span className="w-3.5" />}
+                                        {good ? <input type="checkbox" checked={isUsed(sh)} title="Use this sheet" onChange={(e) => { const on = e.target.checked, wk = sh.parsed.days[0].ymd; setPick(p => { const n = { ...p, [sh.id]: on }; if (on) usable.forEach(o => { if (o.id !== sh.id && o.parsed.days[0].ymd === wk) n[o.id] = false; }); return n; }); }} /> : <span className="w-3.5" />}
                                         <span className="font-bold text-slate-700 min-w-0 flex-1 basis-48 truncate" title={sh.name}>{sh.name}</span>
                                         {good && <span className="text-slate-600 whitespace-nowrap">{ps.week || 'Week'} · {weekLabel(sh)}</span>}
                                         {good && <span className="text-slate-500 whitespace-nowrap">{ps.lines.length} lines · {ps.runCount} runs{ps.noteCount ? ` · ${ps.noteCount} notes` : ''}</span>}
@@ -2492,7 +2599,7 @@ function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, g
                                 {weeks.length > 1 && <>
                                     <span className="text-slate-400">Weeks:</span>
                                     <button type="button" className="text-[#0072CE] hover:underline" onClick={() => setAllWeeks(() => false)}>Fold all</button>
-                                    <button type="button" className="text-[#0072CE] hover:underline" onClick={() => setAllWeeks(() => true)}>Open all</button>
+                                    <button type="button" className="text-[#0072CE] hover:underline" onClick={() => setAllWeeks(() => true)} title={`Opens up to ${MAX_OPEN_WEEKS} weeks at a time: more would make the page slow`}>{weeks.length > MAX_OPEN_WEEKS ? `Open the first ${MAX_OPEN_WEEKS}` : 'Open all'}</button>
                                     <button type="button" className="text-[#0072CE] hover:underline" onClick={() => setAllWeeks(W => W.attention > 0)}>Open the weeks that need a look</button>
                                 </>}
                                 {(weeks.length > 1 || weeks[0].lines.length > 1) && <>
@@ -2532,7 +2639,7 @@ function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, g
                                                                 <span>{G.rows.length} run{G.rows.length === 1 ? '' : 's'} · {fmtHrs(G.hours * HOUR)} · {G.apply} to apply</span>
                                                             </span>
                                                         </button>
-                                                        {!folded[G.key] && G.rows.map(r => <RunRow key={r.p.key} r={r} ed={edits[r.p.key] || {}}
+                                                        {!folded[G.key] && !applying && G.rows.map(r => <RunRow key={r.p.key} r={r} ed={edits[r.p.key] || {}}
                                                             onInclude={(v) => setInc(i => ({ ...i, [r.p.key]: v }))}
                                                             onEdit={(patch) => setEdit(r.p.key, patch)}
                                                             onReset={() => setEdits(e => { const n = { ...e }; delete n[r.p.key]; return n; })}
@@ -2546,7 +2653,7 @@ function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, g
                             </div>
                         </div>
                     )}
-                    {readOk && noteTotals.saved > 0 && <p className="mt-3 text-xs text-slate-600"><b>{noteTotals.saved}</b> run{noteTotals.saved === 1 ? '' : 's'} carry notes from the sheet. They are saved in the run's Notes column and shown on the Gantt (pencil) and in the Run dialog.</p>}
+                    {readOk && noteTotals.saved > 0 && <p className="mt-3 text-xs text-slate-600"><b>{noteTotals.saved}</b> run{noteTotals.saved === 1 ? '' : 's'} carry notes from the sheet. {api.columnReport().refused[F_NOTES] ? `The Notes column is not in Dataverse yet, so they are ${lsOk ? 'kept in this browser only' : 'held only until this page is closed'} (see Data Check > Columns).` : "They are saved in the run's Notes column"} and shown on the Gantt (pencil) and in the Run dialog.</p>}
                     {notesLeft.length > 0 && (
                         <div className="mt-3 p-3 rounded-lg bg-[#FFF6E0] border border-[#FFB81C]/60" data-testid="notes-left">
                             <div className="text-[10px] font-black uppercase tracking-wider text-slate-600 mb-1">Notes that found no run to go with ({notesLeft.length}). Read them, they are not saved</div>
@@ -2581,13 +2688,15 @@ function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, g
                             {result.notStored && result.notStored.length > 0 && onOpenCheck && <button type="button" className="mt-1 text-xs underline text-[#00468B]" onClick={() => onOpenCheck('columns')}>Show the columns to create</button>}
                         </div>
                     )}
-                    {applying && <div className="mb-2 h-1.5 rounded bg-slate-200 overflow-hidden"><div className="h-full bg-[#0072CE] transition-all" style={{ width: `${applying.phase === 'checking' ? 100 : pct}%`, background: applying.phase === 'checking' ? '#FFB81C' : undefined }} /></div>}
+                    {applying && <div className="mb-2 h-1.5 rounded bg-slate-200 overflow-hidden"><div className="h-full bg-[#0072CE] transition-all" style={{ width: `${applying.phase === 'checking' || applying.phase === 'looking' ? 100 : pct}%`, background: applying.phase === 'checking' || applying.phase === 'looking' ? '#FFB81C' : undefined }} /></div>}
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-                        <Btn onClick={apply} disabled={!canApply} className="min-w-[15rem]">{applying ? (applying.phase === 'checking' ? 'Checking what was saved...' : `Saving ${applying.done} of ${applying.total}...`) : `Apply to schedule (${toApply.length} run${toApply.length === 1 ? '' : 's'}${toRemove.length ? `, remove ${toRemove.length}` : ''})`}</Btn>
+                        <Btn onClick={apply} disabled={!canApply} className="min-w-[15rem]">{applying ? (applying.phase === 'looking' ? 'Looking at the schedule again...' : applying.phase === 'checking' ? 'Checking what was saved...' : `Saving ${applying.done} of ${applying.total}...`) : `Apply to schedule (${toApply.length} run${toApply.length === 1 ? '' : 's'}${toRemove.length ? `, remove ${toRemove.length}` : ''})`}</Btn>
                         {applying && applying.phase === 'saving' && <Btn kind="danger" onClick={() => { cancelRef.current = true; }}>Stop</Btn>}
                         {applyHint && <span className="text-xs text-slate-500 font-semibold min-w-0 flex-1 basis-56">{applyHint}</span>}
                         {!apiReady && <span className="text-xs text-[#B27B00] font-bold">Preview mode: nothing is saved to Dataverse.</span>}
-                        {result && result.changes && result.changes.length > 0 && !applying && <Btn kind="danger" onClick={undoImport} disabled={result.busy}>{result.busy ? 'Undoing...' : result.confirmUndo ? 'Really undo this import?' : 'Undo this import'}</Btn>}
+                        {result && result.changes && result.changes.length > 0 && !applying && (result.confirmUndo || result.busy ? (() => { const nc = result.changes.filter(c => c.type === 'create').length, nu = result.changes.filter(c => c.type === 'update').length, nd = result.changes.filter(c => c.type === 'delete').length; return (
+                            <span className="flex flex-wrap items-center gap-2"><span className="text-xs font-bold text-[#B00020]">{result.busy ? 'Undoing...' : `Delete the ${nc} run${nc === 1 ? '' : 's'} this import added${nu ? `, put back the ${nu} it changed` : ''}${nd ? `, restore the ${nd} it removed` : ''}? Edits made since are lost.`}</span>
+                                <Btn kind="dangerSolid" onClick={undoImport} disabled={result.busy}>Yes, undo</Btn><Btn kind="ghost" onClick={() => setResult({ ...result, confirmUndo: false })} disabled={result.busy}>No</Btn></span>); })() : <Btn kind="danger" onClick={undoImport}>Undo this import</Btn>)}
                         {result && (result.type === 'success' || result.type === 'warn') && active.length > 0 && !applying && <Btn kind="ghost" onClick={() => onView(parseYMD(active[0].parsed.days[0].ymd).getTime())}>View {active.length > 1 ? 'the first week' : 'week'} on the schedule</Btn>}
                     </div>
                 </div>
@@ -2844,7 +2953,13 @@ function RunCheckPanel({ A, startAudit, cancelAudit, fixRuns, deleteRuns, undoFi
     const [shown, setShown] = useState(60);
     const [mapPick, setMapPick] = useState({});     // group key -> { text, line }
     const [confirmDel, setConfirmDel] = useState(false);
+    const [sure, setSure] = useState('');             // a closest-name guess waits for a second click: the key of the one asked about
+    const fixBarRef = useRef(null);
     const running = A.status === 'running', res = A.result;
+    // the progress and the result (with Undo) sit above the cards: bring them into view when a fix starts and when it ends
+    useEffect(() => { if ((A.fixing || A.fixed) && fixBarRef.current && fixBarRef.current.scrollIntoView) fixBarRef.current.scrollIntoView({ block: 'nearest' }); }, [!!A.fixing, A.fixed]);
+    // a clean result only means something when everything was read and judged
+    const notWhole = A.stopped ? 'the check was stopped before it finished' : A.capped ? `only the first ${fmtNum(AUDIT_MAX_RUNS)} runs of the period were read` : A.error ? 'some reads failed' : mssIdx.empty ? 'the MSS areas could not be read (the areas were not judged)' : (A.cut && A.cut.length) ? `the read of runs with ${A.cut.join(' / ')} stopped at ${fmtNum(SPECIAL_READ)} runs` : '';
     A.scopeSel = scope; A.fromSel = from; A.toSel = to;
     const mapChoices = useMemo(() => mssIdx.items.map(it => ({ value: it.name, label: it.name, group: it.line ? 'Production lines (MSS)' : 'Other MSS areas' })), [mssIdx]);
     const go = () => {
@@ -2871,7 +2986,9 @@ function RunCheckPanel({ A, startAudit, cancelAudit, fixRuns, deleteRuns, undoFi
     const showRows = !kind || AREA_KINDS.indexOf(kind) < 0;
     const fixAllKind = kind === 'no_line' || kind === 'no_link';
     const fixable = fixAllKind ? rows.filter(it => it.problems.some(p => p.kind === kind && p.fix)) : [];
-    const dupes = kind === 'dup' ? rows.filter(it => it.problems.some(p => p.kind === 'dup')) : [];
+    // only a true copy can be deleted; one that differs in allergen, notes, Order # or cases is shown with what differs and left alone
+    const dupes = kind === 'dup' ? rows.filter(it => it.problems.some(p => p.kind === 'dup' && !(p.differs && p.differs.length))) : [];
+    const dupesDiffer = kind === 'dup' ? rows.length - dupes.length : 0;
     const groupMap = (G) => mapPick[G.key] || { text: '', line: String(G.line || 1) };
     const mapTarget = (G) => {
         const m = groupMap(G), r = resolveArea(m.text, mssIdx.items.map(i => i.name));
@@ -2902,21 +3019,27 @@ function RunCheckPanel({ A, startAudit, cancelAudit, fixRuns, deleteRuns, undoFi
                 {A.error && <p className="mt-3 text-sm font-bold text-[#B00020]">{A.error}</p>}
             </div>
 
-            {A.fixing && (
-                <div className="bg-[#FFF6E0] border border-[#FFB81C] rounded-xl p-3 text-sm font-semibold text-slate-800" data-testid="fix-progress">
-                    {A.fixing.label}: {A.fixing.done} of {A.fixing.total}
-                    <div className="h-1.5 rounded bg-white mt-1 overflow-hidden"><div className="h-full bg-[#0072CE]" style={{ width: `${A.fixing.total ? Math.round((A.fixing.done / A.fixing.total) * 100) : 0}%` }} /></div>
-                </div>
-            )}
-            {A.fixed && !A.fixing && (
-                <div className={`rounded-xl p-3 text-sm font-semibold border flex flex-wrap items-center gap-3 ${A.fixed.error ? 'bg-[#FDE8EC] border-[#E4002B]/40 text-[#B00020]' : 'bg-[#DCFCE7] border-[#16A34A]/50 text-[#166534]'}`} data-testid="fix-result">
-                    <span className="min-w-0 flex-1 basis-64">{A.fixed.message}</span>
-                    {A.fixed.undo && <Btn kind="ghost" onClick={undoFix}>Undo this fix</Btn>}
+            {(A.fixing || A.fixed) && (
+                <div ref={fixBarRef} className="space-y-4">
+                    {A.fixing && (
+                        <div className="bg-[#FFF6E0] border border-[#FFB81C] rounded-xl p-3 text-sm font-semibold text-slate-800" data-testid="fix-progress">
+                            <div className="flex flex-wrap items-center gap-3"><span className="min-w-0 flex-1 basis-64">{A.fixing.label}: {fmtNum(A.fixing.done)} of {fmtNum(A.fixing.total)}</span><Btn kind="danger" onClick={cancelAudit}>Stop</Btn></div>
+                            <div className="h-1.5 rounded bg-white mt-1 overflow-hidden"><div className="h-full bg-[#0072CE]" style={{ width: `${A.fixing.total ? Math.round((A.fixing.done / A.fixing.total) * 100) : 0}%` }} /></div>
+                        </div>
+                    )}
+                    {A.fixed && !A.fixing && (
+                        <div className={`rounded-xl p-3 text-sm font-semibold border flex flex-wrap items-center gap-3 ${A.fixed.error ? 'bg-[#FDE8EC] border-[#E4002B]/40 text-[#B00020]' : 'bg-[#DCFCE7] border-[#16A34A]/50 text-[#166534]'}`} data-testid="fix-result">
+                            <span className="min-w-0 flex-1 basis-64">{A.fixed.message}</span>
+                            {A.fixed.undo && <Btn kind="ghost" onClick={undoFix}>{A.fixed.undoLeft ? `Carry on undoing (${fmtNum(A.fixed.undoLeft)} left)` : 'Undo this fix'}</Btn>}
+                        </div>
+                    )}
                 </div>
             )}
 
             {res && mssIdx.empty && <div className="p-3 rounded-xl bg-[#FFF6E0] border border-[#FFB81C] text-sm font-semibold text-slate-800">The MSS areas could not be read, so the areas of the runs are not judged. Press Reload (top right) and check again.</div>}
-            {A.capped && <div className="p-3 rounded-xl bg-[#FFF6E0] border border-[#FFB81C] text-sm font-semibold text-slate-800">Stopped after {fmtNum(AUDIT_MAX_RUNS)} runs: pick a shorter period to see the rest.</div>}
+            {A.capped && <div className="p-3 rounded-xl bg-[#FFF6E0] border border-[#FFB81C] text-sm font-semibold text-slate-800">Stopped after {fmtNum(AUDIT_MAX_RUNS)} runs of the period: pick a shorter period to see the rest. The runs with blank or far-off dates were read first and are included.</div>}
+            {A.cut && A.cut.length > 0 && <div className="p-3 rounded-xl bg-[#FFF6E0] border border-[#FFB81C] text-sm font-semibold text-slate-800">More than {fmtNum(SPECIAL_READ)} runs have {A.cut.join(' / ')}: only the first {fmtNum(SPECIAL_READ)} of each are listed. Fix these and press Check again for the rest.</div>}
+            {A.stopped && <div className="p-3 rounded-xl bg-[#FFF6E0] border border-[#FFB81C] text-sm font-semibold text-slate-800">The check was stopped early, so the runs below are only the part that was read.</div>}
 
             {res && (
                 <>
@@ -2926,7 +3049,8 @@ function RunCheckPanel({ A, startAudit, cancelAudit, fixRuns, deleteRuns, undoFi
                         <div className="bg-white border border-slate-200 rounded-xl p-3"><div className="text-[10px] font-black uppercase tracking-wider text-slate-500">Worth fixing</div><div className="text-2xl font-black" style={{ color: res.counts.bySev.warn ? '#B27B00' : '#16A34A' }}>{fmtNum(res.counts.bySev.warn)}</div><div className="text-[10px] text-slate-400">spelling, line number, overlaps</div></div>
                         <div className="bg-white border border-slate-200 rounded-xl p-3"><div className="text-[10px] font-black uppercase tracking-wider text-slate-500">Just so you know</div><div className="text-2xl font-black text-slate-500">{fmtNum(res.counts.bySev.info)}</div><div className="text-[10px] text-slate-400">no code, no area id</div></div>
                     </div>
-                    {res.list.length === 0 && <div className="p-4 rounded-xl bg-[#DCFCE7] border border-[#16A34A]/50 text-sm font-bold text-[#166534]" data-testid="audit-clean">Every one of the {fmtNum(res.counts.total)} runs is saved completely and sits on an MSS production area.</div>}
+                    {res.list.length === 0 && !notWhole && <div className="p-4 rounded-xl bg-[#DCFCE7] border border-[#16A34A]/50 text-sm font-bold text-[#166534]" data-testid="audit-clean">Every one of the {fmtNum(res.counts.total)} runs is saved completely and sits on an MSS production area.</div>}
+                    {res.list.length === 0 && notWhole && <div className="p-4 rounded-xl bg-[#FFF6E0] border border-[#FFB81C] text-sm font-bold text-slate-800" data-testid="audit-unsure">No problems in the {fmtNum(res.counts.total)} runs that were read, but {notWhole}, so this is not the whole picture.</div>}
                     {res.list.length > 0 && (
                         <div className="flex flex-wrap items-center gap-1.5">
                             <Chip on={!kind} onClick={() => { setKind(''); setShown(60); }}>All problems ({fmtNum(res.list.length)})</Chip>
@@ -2948,9 +3072,13 @@ function RunCheckPanel({ A, startAudit, cancelAudit, fixRuns, deleteRuns, undoFi
                                             <div className="text-xs text-slate-600">{CHECK_KINDS[G.kind].label}: {G.text}</div>
                                             {G.alts && G.alts.length > 0 && !G.fix && <div className="text-[11px] text-slate-500">Closest MSS areas: {G.alts.map((a, i) => <button key={a} type="button" className="underline text-[#0072CE] mr-2" onClick={() => setMapPick(p => ({ ...p, [G.key]: { text: a, line: String(G.line || 1) } }))}>{a}</button>)}</div>}
                                         </div>
-                                        {G.fix ? (
-                                            <Btn kind={G.fix.fuzzy ? 'yellow' : 'primary'} disabled={fixBusy || running} onClick={() => fixRuns(G.runs.map(r => ({ id: r.id, patch: { area: G.fix.area, line: G.fix.line, areaId: G.fix.areaId } })), `${G.fix.fuzzy ? 'Closest name' : 'Spelling'}: ${G.area} to ${G.fix.area}`)}>
-                                                {G.fix.fuzzy ? `Use the closest name: ${G.fix.label.replace('Save as ', '')}` : `${G.fix.label} (${fmtNum(G.runs.length)} run${G.runs.length === 1 ? '' : 's'})`}</Btn>
+                                        {G.fix && G.fix.fuzzy && sure !== G.key ? (
+                                            <Btn kind="yellow" disabled={fixBusy || running} onClick={() => setSure(G.key)} title="This is a guess from the letters: you confirm it on the next click">{`Closest name: ${G.fix.label.replace('Save as ', '')}?`}</Btn>
+                                        ) : G.fix && G.fix.fuzzy ? (
+                                            <div className="flex flex-wrap items-center gap-2"><span className="text-xs font-bold text-slate-700">Move {fmtNum(G.runs.length)} run{G.runs.length === 1 ? '' : 's'} from "{G.area}" to {G.fix.area}?</span>
+                                                <Btn kind="dangerSolid" disabled={fixBusy || running} onClick={() => { setSure(''); fixRuns(G.runs.map(r => ({ id: r.id, patch: { area: G.fix.area, line: G.fix.line, areaId: G.fix.areaId } })), `Closest name: ${G.area} to ${G.fix.area}`); }}>{`Yes, use ${G.fix.area}`}</Btn><Btn kind="ghost" onClick={() => setSure('')}>No</Btn></div>
+                                        ) : G.fix ? (
+                                            <Btn kind="primary" disabled={fixBusy || running} onClick={() => fixRuns(G.runs.map(r => ({ id: r.id, patch: { area: G.fix.area, line: G.fix.line, areaId: G.fix.areaId } })), `Spelling: ${G.area} to ${G.fix.area}`)}>{`${G.fix.label} (${fmtNum(G.runs.length)} run${G.runs.length === 1 ? '' : 's'})`}</Btn>
                                         ) : (
                                             <div className="flex flex-wrap items-end gap-2">
                                                 <Field label="Move to" plain className="w-52"><ComboBox value={m.text} options={mapChoices} ariaLabel={`Move ${G.area} to`} placeholder="pick an MSS area" className={inputCls}
@@ -2971,8 +3099,9 @@ function RunCheckPanel({ A, startAudit, cancelAudit, fixRuns, deleteRuns, undoFi
                             <div className="px-3 py-2 bg-[#E6F1FB] flex flex-wrap items-center gap-3">
                                 <h3 className="text-xs font-black uppercase tracking-wider text-[#00468B]">Runs ({fmtNum(rows.length)})</h3>
                                 {fixAllKind && fixable.length > 0 && <Btn disabled={fixBusy || running} onClick={() => fixRuns(fixable.map(it => ({ id: it.run.id, patch: kind === 'no_line' ? { line: 1 } : { areaId: it.problems.find(p => p.kind === 'no_link').fix.areaId } })), kind === 'no_line' ? 'Saved line 1' : 'Saved the area id')}>{kind === 'no_line' ? `Save line 1 on all ${fmtNum(fixable.length)}` : `Link all ${fmtNum(fixable.length)} to their MSS area id`}</Btn>}
+                                {dupesDiffer > 0 && <span className="text-xs text-slate-600" data-testid="dup-differ-note">{fmtNum(dupesDiffer)} look{dupesDiffer === 1 ? 's' : ''} the same but differ{dupesDiffer === 1 ? 's' : ''} in allergen, notes, Order # or cases: not offered for deletion, open them with Edit.</span>}
                                 {dupes.length > 0 && !confirmDel && <Btn kind="danger" disabled={fixBusy || running} onClick={() => setConfirmDel(true)}>Delete the {fmtNum(dupes.length)} duplicate{dupes.length === 1 ? '' : 's'}</Btn>}
-                                {dupes.length > 0 && confirmDel && <span className="flex items-center gap-2"><span className="text-xs font-bold text-[#E4002B]">Delete {fmtNum(dupes.length)} run{dupes.length === 1 ? '' : 's'}? The first of each pair stays.</span><Btn kind="dangerSolid" onClick={() => { setConfirmDel(false); deleteRuns(dupes.map(it => it.run.id), 'Deleted duplicate runs'); }}>Yes, delete</Btn><Btn kind="ghost" onClick={() => setConfirmDel(false)}>No</Btn></span>}
+                                {dupes.length > 0 && confirmDel && <span className="flex items-center gap-2"><span className="text-xs font-bold text-[#E4002B]">Delete {fmtNum(dupes.length)} run{dupes.length === 1 ? '' : 's'}? The copy holding the most data (notes, Order #, cases) stays.</span><Btn kind="dangerSolid" onClick={() => { setConfirmDel(false); deleteRuns(dupes.map(it => it.run.id), 'Deleted duplicate runs'); }}>Yes, delete</Btn><Btn kind="ghost" onClick={() => setConfirmDel(false)}>No</Btn></span>}
                             </div>
                             {rows.slice(0, shown).map(it => {
                                 const r = it.run, worst = it.problems.reduce((w, p) => CHECK_KINDS[p.kind].sev === 'error' ? 'error' : (CHECK_KINDS[p.kind].sev === 'warn' && w !== 'error' ? 'warn' : w), 'info');
@@ -2984,8 +3113,11 @@ function RunCheckPanel({ A, startAudit, cancelAudit, fixRuns, deleteRuns, undoFi
                                             <div className="mt-0.5 flex flex-wrap gap-1">{it.problems.map((p, i) => <span key={i} title={CHECK_KINDS[p.kind].hint} className={`px-1.5 py-0.5 rounded border text-[10px] font-bold ${SEV_LOOK[CHECK_KINDS[p.kind].sev].cls}`}>{CHECK_KINDS[p.kind].label}: {p.text}</span>)}</div>
                                         </div>
                                         <div className="flex gap-1.5">
-                                            {it.problems.filter(p => p.fix && (p.kind === 'no_line' || p.kind === 'no_link' || p.kind === 'spelling' || p.kind === 'linestyle')).slice(0, 1).map((p, i) => (
-                                                <Btn key={i} kind="ghost" disabled={fixBusy || running} onClick={() => fixRuns([{ id: r.id, patch: { area: p.fix.area, line: p.fix.line, areaId: p.fix.areaId } }], p.fix.label)}>{p.fix.label}</Btn>))}
+                                            {it.problems.filter(p => p.fix && (p.kind === 'no_line' || p.kind === 'no_link' || p.kind === 'spelling' || p.kind === 'linestyle')).slice(0, 1).map((p, i) => {
+                                                const ask = !!p.fix.fuzzy, rk = `row|${r.id}`;
+                                                return <Btn key={i} kind={ask ? 'yellow' : 'ghost'} disabled={fixBusy || running} title={ask ? 'A guess from the letters: press again to confirm' : ''}
+                                                    onClick={() => { if (ask && sure !== rk) { setSure(rk); return; } setSure(''); fixRuns([{ id: r.id, patch: { area: p.fix.area, line: p.fix.line, areaId: p.fix.areaId } }], p.fix.label); }}>{ask ? (sure === rk ? `Yes, use ${p.fix.area}` : `Closest name: ${p.fix.area}?`) : p.fix.label}</Btn>;
+                                            })}
                                             <Btn kind="ghost" onClick={() => openRun(r)}>Edit</Btn>
                                         </div>
                                     </div>
@@ -3015,7 +3147,7 @@ function ColumnsPanel({ colStatus, probeColumns, probing, resetRefused, apiReady
     return (
         <div className="space-y-4">
             <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
-                <p className="text-sm text-slate-600">Every Dataverse column this app reads or writes, what it is for, and whether it was found. <b>Required</b> columns are needed to save a run; <b>optional</b> ones are tried on every save and, when Dataverse says a column does not exist, the app names it here, keeps going without it and keeps that value in this browser only.</p>
+                <p className="text-sm text-slate-600">Every Dataverse column this app reads or writes, what it is for, and whether it was found. <b>Required</b> columns are needed to save a run; <b>optional</b> ones are tried on every save and, when Dataverse says a column does not exist, the app names it here, keeps going without it and keeps that value in this browser only (Order #, Cases and Notes; the others are not saved).</p>
                 <div className="flex flex-wrap items-center gap-2 mt-3">
                     <Btn onClick={probeColumns} disabled={probing || !apiReady}>{probing ? 'Testing...' : 'Test the columns in Dataverse'}</Btn>
                     <Btn kind="ghost" onClick={resetRefused} disabled={!refusedCols.length}>I added them, try again</Btn>
@@ -3111,7 +3243,7 @@ function DataCheckView({ sub, setSub, auditRef, subscribe, startAudit, cancelAud
     useEffect(() => { if (sub === 'columns' && apiReady && !probedOnce.current) { probedOnce.current = true; probeColumns(); } }, [sub, apiReady]);
     const A = auditRef.current, nPay = payloadsRef.current.length, nBad = payloadsRef.current.filter(e => !e.ok || e.dropped.length).length;
     const SUBS = [
-        { id: 'run', label: 'Run check', badge: A.result ? (A.result.counts.bad ? A.result.counts.bad : '✓') : '' },
+        { id: 'run', label: 'Run check', badge: A.result ? (A.result.counts.bad ? A.result.counts.bad : (A.stopped || A.capped || A.error || (A.cut && A.cut.length) ? '' : '✓')) : '' },
         { id: 'columns', label: 'Columns', badge: refusedCols.length ? refusedCols.length : '' },
         { id: 'payloads', label: 'Payloads', badge: nPay ? (nBad ? `${nBad}!` : nPay) : '' },
     ];
@@ -3153,7 +3285,7 @@ export default function ProductionScheduleApp({ dataApi }) {
     const [nowMs, setNowMs] = useState(Date.now());
     const [notice, setNotice] = useState(null);
     const noticeTimer = useRef(null);
-    const notify = (message, type = 'info') => { setNotice({ message, type }); clearTimeout(noticeTimer.current); noticeTimer.current = setTimeout(() => setNotice(null), type === 'error' ? 12000 : 4500); };   // alert() is blocked inside Power Apps frames
+    const notify = (message, type = 'info') => { setNotice({ message, type }); clearTimeout(noticeTimer.current); noticeTimer.current = setTimeout(() => setNotice(null), type === 'error' || type === 'warn' ? 12000 : 4500); };   // alert() is blocked inside Power Apps frames
 
     const [view, setView] = useState(() => ({ from: addDaysLocal(midnightOf(Date.now()), -new Date().getDay()).getTime(), days: 7 }));
     const [month, setMonth] = useState(() => new Date(new Date().getFullYear(), new Date().getMonth(), 1));
@@ -3296,19 +3428,29 @@ export default function ProductionScheduleApp({ dataApi }) {
         return null;
     };
     // Browser-kept copy of Order # / Cases / Notes for runs whose Dataverse columns refused them, so the value still shows.
-    const sideTimer = useRef(null);
+    const lastDropRef = useRef([]);   // Order # / Cases / Notes the last dialog save could not store in Dataverse
+    const sideTimer = useRef(null), sideSkipRef = useRef(0), sideProbed = useRef(false);
+    const flushSide = () => { if (sideTimer.current) { clearTimeout(sideTimer.current); sideTimer.current = null; lsWrite(LS_SIDE, sideRef.current); } };
+    const scheduleSide = () => {
+        if (!sideProbed.current) { sideProbed.current = true; lsWrite(LS_SIDE, sideRef.current); }   // the first write is straight away, so a blocked or full browser store is known at once
+        if (!sideTimer.current) sideTimer.current = setTimeout(() => { sideTimer.current = null; lsWrite(LS_SIDE, sideRef.current); }, 1000);   // then at most one write a second
+    };
     const rememberSide = (id, extras, dropped) => {
         if (!id) return;
         const d = dropped || [], x = extras || {}, keep = {};
         if (d.indexOf(F_ORDER) >= 0 && x.order) keep.order = x.order;
-        if (d.indexOf(F_CASES) >= 0 && x.cases !== null && x.cases !== undefined && x.cases !== '' && !isNaN(Number(x.cases))) keep.cases = Number(x.cases);
+        if (d.indexOf(F_CASES) >= 0 && x.cases !== null && x.cases !== undefined && x.cases !== '' && !isNaN(Number(x.cases))) keep.cases = Math.round(Number(x.cases));
         if (d.indexOf(F_NOTES) >= 0 && x.notes) keep.notes = x.notes;
         const next = sideRef.current, had = !!next[id], has = Object.keys(keep).length > 0;
         if (!has && !had) return;
-        if (has) { if (!had && Object.keys(next).length >= SIDE_MAX) return; next[id] = keep; } else delete next[id];
-        clearTimeout(sideTimer.current);
-        sideTimer.current = setTimeout(() => lsWrite(LS_SIDE, sideRef.current), 1000);
+        if (has) { if (!had && Object.keys(next).length >= SIDE_MAX) { sideSkipRef.current++; return; } next[id] = keep; } else delete next[id];
+        scheduleSide();
     };
+    const forgetSide = (id) => { if (sideRef.current[id]) { delete sideRef.current[id]; scheduleSide(); } };   // a deleted run gives its place back
+    useEffect(() => {
+        window.addEventListener('pagehide', flushSide);
+        return () => { window.removeEventListener('pagehide', flushSide); flushSide(); };
+    }, []);
 
     // ------------------------------------------------------------------------
     // PAYLOADS. Every save goes through deliver(): it sends the run's columns plus the optional ones (Order #, Cases, Notes, MSS area id,
@@ -3322,7 +3464,7 @@ export default function ProductionScheduleApp({ dataApi }) {
     const [payloadTick, setPayloadTick] = useState(0);
     const tickTimer = useRef(null);
     const bumpPayloads = () => { if (tickTimer.current) return; tickTimer.current = setTimeout(() => { tickTimer.current = null; setPayloadTick(n => n + 1); }, 350); };   // at most ~3 redraws a second, even in a 5,000-run upload
-    useEffect(() => () => { clearTimeout(tickTimer.current); clearTimeout(noticeTimer.current); clearTimeout(sideTimer.current); }, []);
+    useEffect(() => () => { clearTimeout(tickTimer.current); clearTimeout(noticeTimer.current); }, []);
     const logPayload = (entry) => {
         const e = { n: ++payloadSeq.current, t: Date.now(), ...entry };
         const list = payloadsRef.current; list.push(e);
@@ -3342,7 +3484,7 @@ export default function ProductionScheduleApp({ dataApi }) {
         if (!w) throw new Error("No Dataverse write connection in this environment. Nothing was saved.");
         const st = colStateRef.current, wanted = Object.keys(optional || {});
         let cols = wanted.filter(c => !(apiReady && st.refused[c]));
-        const generic = [];
+        const generic = [];   // columns blamed because an error named none: only believed once the retry without them went through
         let res = null, failure = null, body = {};
         for (let attempt = 0; attempt <= wanted.length; attempt++) {   // Dataverse names one unknown column per answer, so every optional column may cost one more try
             body = { ...required }; cols.forEach(c => { body[c] = optional[c]; });
@@ -3352,11 +3494,11 @@ export default function ProductionScheduleApp({ dataApi }) {
                 const bad = apiReady && cols.length ? badColumns(e, cols) : [];
                 if (!bad.length) break;
                 const msg = errText(e).toLowerCase();
-                bad.forEach(c => { st.refused[c] = errText(e); if (msg.indexOf(c.toLowerCase()) < 0) generic.push(c); });
+                bad.forEach(c => { if (msg.indexOf(c.toLowerCase()) >= 0) st.refused[c] = errText(e); else generic.push(c); });   // a named column is refused at once; the others only after the retry works
                 cols = cols.filter(c => bad.indexOf(c) < 0);
             }
         }
-        if (failure) generic.forEach(c => { delete st.refused[c]; });   // a failure that named no column was not about them
+        if (!failure) generic.forEach(c => { if (!st.refused[c]) st.refused[c] = 'Dataverse refused a save without naming a column; it went through without this one'; });
         const sent = failure ? [] : cols.slice();
         if (!failure && apiReady) sent.forEach(c => { st.sent[c] = (st.sent[c] || 0) + 1; });
         const entry = logPayload({ op, table: TABLE_PROD, id: id || (typeof res === 'string' ? res : ''), what: (meta && meta.what) || '', fields: clipFields(body), sent, dropped: failure ? [] : wanted.filter(c => sent.indexOf(c) < 0), ok: !failure, error: failure ? errText(failure) : '', preview: !apiReady });
@@ -3365,7 +3507,10 @@ export default function ProductionScheduleApp({ dataApi }) {
     };
     const saveRun = async (op, id, run, extras, meta) => {
         const x = extras || {}, quiet = !!(meta && meta.quiet);
-        const res = await deliver(op, id, runFields(run), optionalFields(op, x, areaIdFor(run.area)), meta);
+        const opt = optionalFields(op, x, areaIdFor(run.area));
+        if (op === 'update' && !opt[F_AREA_ID]) opt[F_AREA_ID] = null;   // an area that is not an MSS area must not keep the old area's id
+        const res = await deliver(op, id, runFields(run), opt, meta);
+        res.dropped.forEach(c => { if ((c === F_NOTES || c === F_ORDER || c === F_CASES) && lastDropRef.current.indexOf(c) < 0) lastDropRef.current.push(c); });
         const rid = res.id;
         if (op === 'create' && !rid) throw new Error("Dataverse didn't return a record id");
         if (!quiet) touched(rid);
@@ -3387,7 +3532,7 @@ export default function ProductionScheduleApp({ dataApi }) {
     const patchRun = async (id, patch, what, meta) => {
         const opt = {};
         if (patch.areaId !== undefined) opt[F_AREA_ID] = patch.areaId || null;
-        else if (patch.area !== undefined) { const g = areaIdFor(patch.area); if (g) opt[F_AREA_ID] = g; }
+        else if (patch.area !== undefined) opt[F_AREA_ID] = areaIdFor(patch.area) || null;   // an area that is not an MSS area must not keep the old area's id
         return deliver('update', id, patchFields(patch), opt, { ...(meta || {}), what: what || 'change' });
     };
     const deleteRun = async (id, meta) => {
@@ -3395,6 +3540,7 @@ export default function ProductionScheduleApp({ dataApi }) {
         if (!w) throw new Error("No Dataverse write connection in this environment. Nothing was deleted.");
         try { await w.remove(TABLE_PROD, id); }
         catch (e) { logPayload({ op: 'delete', table: TABLE_PROD, id, what: (meta && meta.what) || 'delete', fields: {}, sent: [], dropped: [], ok: false, error: errText(e), preview: !apiReady }); throw e; }
+        forgetSide(id);
         logPayload({ op: 'delete', table: TABLE_PROD, id, what: (meta && meta.what) || 'delete', fields: {}, sent: [], dropped: [], ok: true, error: '', preview: !apiReady });
         if (!(meta && meta.quiet)) { touched(id); setRuns(prev => prev.filter(r => r.id !== id)); }
     };
@@ -3527,6 +3673,7 @@ export default function ProductionScheduleApp({ dataApi }) {
         columnReport: () => ({ refused: { ...colStateRef.current.refused }, sent: { ...colStateRef.current.sent } }),
         markRefused: (col, why) => { colStateRef.current.refused[col] = why; bumpPayloads(); },
         keepSide: (id, extras, dropped) => rememberSide(id, extras, dropped),
+        sideReport: () => ({ skipped: sideSkipRef.current }),
     };
     // The Import view is kept in the page while another tab shows; it gets one fixed object (always reaching the latest functions)
     // and fixed callbacks, so a click or drag on the Gantt does not redraw a big loaded plan behind the scenes.
@@ -3539,6 +3686,7 @@ export default function ProductionScheduleApp({ dataApi }) {
         columnReport: () => importLatest.current.columnReport(),
         markRefused: (c, w) => importLatest.current.markRefused(c, w),
         keepSide: (id, x, d) => importLatest.current.keepSide(id, x, d),
+        sideReport: () => importLatest.current.sideReport(),
     }), []);
     const importDone = useMemo(() => () => { loadedRef.current = []; setReloadTick(n => n + 1); }, []);
     const importShow = useMemo(() => (ms) => { setTab('schedule'); setView(v => ({ days: 7, from: addDaysLocal(midnightOf(ms), -new Date(ms).getDay()).getTime() })); }, []);
@@ -3586,7 +3734,7 @@ export default function ProductionScheduleApp({ dataApi }) {
     const resetRefused = () => { colStateRef.current.refused = {}; colStateRef.current.probed = {}; bumpPayloads(); probeColumns(); };
     const clearPayloads = () => { payloadsRef.current = []; bumpPayloads(); };
 
-    const auditRef = useRef({ status: 'idle', runs: [], result: null, progress: null, error: '', capped: false, fixing: null, fixed: null, undo: null, scopeText: '' });
+    const auditRef = useRef({ status: 'idle', runs: [], result: null, progress: null, error: '', capped: false, stopped: false, cut: [], matchFor: null, matchCache: null, fixing: null, fixed: null, undo: null, scopeText: '' });
     const auditSubs = useRef([]), auditTimer = useRef(null), auditCancel = useRef(false);
     const auditEmit = (now) => {
         const fire = () => { auditTimer.current = null; auditSubs.current.forEach(f => f()); };
@@ -3595,17 +3743,22 @@ export default function ProductionScheduleApp({ dataApi }) {
     };
     const auditSubscribe = useMemo(() => (fn) => { auditSubs.current = auditSubs.current.concat([fn]); return () => { auditSubs.current = auditSubs.current.filter(f => f !== fn); }; }, []);
     useEffect(() => () => clearTimeout(auditTimer.current), []);
-    const judge = (A) => { A.result = checkRuns(A.runs, mssIdxRef.current, Date.now(), { areaIdColumn: apiReady && colStatus('runs', { name: F_AREA_ID }).s === 'found' }); };
+    // the area match depends only on the saved text and line, so it is kept between judgings (every fix and undo judges again)
+    const judge = (A) => {
+        if (A.matchFor !== mssIdxRef.current) { A.matchFor = mssIdxRef.current; A.matchCache = {}; }
+        A.result = checkRuns(A.runs, mssIdxRef.current, Date.now(), { areaIdColumn: apiReady && colStatus('runs', { name: F_AREA_ID }).s === 'found', matchCache: A.matchCache });
+    };
     const startAudit = async (scope) => {
         const A = auditRef.current;
         if (A.status === 'running' || A.fixing) return;
         auditCancel.current = false;
         const now = Date.now();
-        Object.assign(A, { status: 'running', runs: [], result: null, error: '', capped: false, fixed: null, undo: null, progress: { done: 0, total: 0, what: 'Starting' }, scopeText: '' });
+        Object.assign(A, { status: 'running', runs: [], result: null, error: '', capped: false, stopped: false, cut: [], fixed: null, undo: null, progress: { done: 0, total: 0, what: 'Starting' }, scopeText: '' });
         auditEmit(true);
         try {
             const seen = {};
-            const add = (rows) => { rows.forEach(r => { const id = runIdOf(r); if (!id || seen[id]) return; seen[id] = true; A.runs.push(normRun(r, sideRef.current)); }); };
+            // the cap applies to the period's runs; the blank-date and far-date reads (the runs that most need fixing) are always kept
+            const add = (rows, special) => { rows.forEach(r => { const id = runIdOf(r); if (!id || seen[id]) return; if (!special && A.runs.length >= AUDIT_MAX_RUNS) { A.capped = true; return; } seen[id] = true; A.runs.push(normRun(r, sideRef.current)); }); };
             if (!apiReady) {
                 runsRef.current.forEach(r => { seen[r.id] = true; A.runs.push(r); });
                 A.scopeText = 'the sample runs';
@@ -3626,23 +3779,23 @@ export default function ProductionScheduleApp({ dataApi }) {
                     from = Math.max(first, now - FAR_DAYS * DAY); to = Math.min(last + DAY, now + FAR_DAYS * DAY); A.scopeText = 'every run in the table';
                 }
                 const steps = [];
-                for (let a = from; a < to; a += 21 * DAY) { const b = Math.min(to, a + 21 * DAY); steps.push({ what: `Reading ${fmtDay(a)} to ${fmtDay(b - 1)}`, slice: [a, b] }); }
+                // the blank-date and far-date reads go first, so they are never what a cap or a Stop cuts off
                 const far = (cond) => `statecode eq 0 and craa5_datestarttime ${cond}`;
-                steps.push({ what: 'Reading runs with a blank start', filter: far('eq null') });
-                steps.push({ what: 'Reading runs with a blank stop', filter: 'statecode eq 0 and craa5_dateendtime eq null' });
-                steps.push({ what: 'Reading runs years in the past', filter: far(`lt ${isoZ(now - FAR_DAYS * DAY)}`) });
-                steps.push({ what: 'Reading runs years ahead', filter: far(`gt ${isoZ(now + FAR_DAYS * DAY)}`) });
+                steps.push({ what: 'Reading runs with a blank start', filter: far('eq null'), special: 'blank start' });
+                steps.push({ what: 'Reading runs with a blank stop', filter: 'statecode eq 0 and craa5_dateendtime eq null', special: 'blank stop' });
+                steps.push({ what: 'Reading runs years in the past', filter: far(`lt ${isoZ(now - FAR_DAYS * DAY)}`), special: 'years in the past' });
+                steps.push({ what: 'Reading runs years ahead', filter: far(`gt ${isoZ(now + FAR_DAYS * DAY)}`), special: 'years ahead' });
+                for (let a = from; a < to; a += 21 * DAY) { const b = Math.min(to, a + 21 * DAY); steps.push({ what: `Reading ${fmtDay(a)} to ${fmtDay(b - 1)}`, slice: [a, b] }); }
                 A.progress = { done: 0, total: steps.length, what: 'Reading' };
                 let done = 0, failedReads = 0;
                 await poolRun(steps, 3, async (st) => {
-                    if (auditCancel.current || A.capped) return;
-                    const rows = st.slice ? await readRunRange(api, st.slice[0], st.slice[1], 'start', 0) : await queryRecords(TABLE_PROD, api, { filter: st.filter, top: 1000 });
-                    if (rows === null) failedReads++; else { noteKeys('runs', rows); add(rows); }
-                    if (A.runs.length >= AUDIT_MAX_RUNS) { A.capped = true; A.runs = A.runs.slice(0, AUDIT_MAX_RUNS); }
+                    if (auditCancel.current || (A.capped && st.slice)) return;
+                    const rows = st.slice ? await readRunRange(api, st.slice[0], st.slice[1], 'start', 0) : await queryRecords(TABLE_PROD, api, { filter: st.filter, top: SPECIAL_READ });
+                    if (rows === null) failedReads++; else { noteKeys('runs', rows); add(rows, !!st.special); if (st.special && rows.length >= SPECIAL_READ) A.cut.push(st.special); }
                     done++; A.progress = { done, total: steps.length, what: st.what }; auditEmit();
                 });
                 if (failedReads) A.error = `${failedReads} of ${steps.length} reads failed, so this check may be incomplete. Press Check again.`;
-                if (auditCancel.current) A.scopeText += ' (stopped early)';
+                if (auditCancel.current) { A.stopped = true; A.scopeText += ' (stopped early)'; }
             }
             A.progress = { done: 1, total: 1, what: 'Judging the runs' }; auditEmit(true);
             await new Promise(r => setTimeout(r, 20));
@@ -3658,6 +3811,8 @@ export default function ProductionScheduleApp({ dataApi }) {
         if (patch.areaId !== undefined && !colStateRef.current.refused[F_AREA_ID]) r.areaId = patch.areaId || '';
     };
     const syncRunsState = (ids, byId) => { const m = {}; ids.forEach(id => { if (byId[id]) m[id] = { area: byId[id].area, line: byId[id].line }; }); setRuns(prev => prev.map(r => m[r.id] ? { ...r, ...m[r.id] } : r).sort(byStart)); };
+    // Stop (the button in the progress bar) ends a fix, a delete or an undo after the saves already under way; what was done stays done
+    // and can be undone, and an undo that stops or fails keeps the part still to do.
     const fixRuns = async (items, label) => {
         const A = auditRef.current;
         if (A.fixing || A.status === 'running' || !items.length) return;
@@ -3669,62 +3824,78 @@ export default function ProductionScheduleApp({ dataApi }) {
         await poolRun(items, APPLY_CONC, async (it) => {
             const r = byId[it.id];
             if (failure || auditCancel.current || !r) return;
-            const prev = { id: r.id, area: r.area, line: r.line, areaId: r.areaId };
+            // `now` is what the run holds after this fix, so an undo can tell if it was changed again since
+            const prev = { id: r.id, area: r.area, line: r.line, areaId: r.areaId, now: { area: it.patch.area !== undefined ? it.patch.area : r.area, line: it.patch.line !== undefined ? it.patch.line : r.line } };
             try { await patchRun(it.id, it.patch, label, { quiet: true }); } catch (e) { if (!failure) failure = e; return; }
             before.push(prev); patchLocal(r, it.patch);
             done++; A.fixing.done = done; auditEmit();
         });
+        const stopped = auditCancel.current && !failure && done < items.length;
         syncRunsState(before.map(b => b.id), byId);
         A.fixing = null; judge(A);
         A.undo = before.length ? { kind: 'patch', before, label } : null;
-        A.fixed = failure ? { error: true, message: `Stopped after ${done} of ${items.length}: ${errText(failure)}`, undo: !!A.undo } : { message: `${label}: ${done} run${done === 1 ? '' : 's'} saved.`, undo: !!A.undo };
+        A.fixed = failure || stopped ? { error: !!failure, message: `${stopped ? 'Stopped' : 'Failed'} after ${done} of ${items.length}${failure ? `: ${errText(failure)}` : ''}. ${done} saved${done ? ', and Undo puts them back' : ''}.`, undo: !!A.undo } : { message: `${label}: ${done} run${done === 1 ? '' : 's'} saved.`, undo: !!A.undo };
         auditEmit(true);
     };
     const deleteRuns = async (ids, label) => {
         const A = auditRef.current;
         if (A.fixing || A.status === 'running' || !ids.length) return;
+        auditCancel.current = false;
         A.fixed = null; A.undo = null; A.fixing = { done: 0, total: ids.length, label };
         auditEmit(true);
         const byId = {}; A.runs.forEach(r => { byId[r.id] = r; });
         const gone = []; let failure = null, done = 0;
         await poolRun(ids, APPLY_CONC, async (id) => {
-            if (failure || !byId[id]) return;
+            if (failure || auditCancel.current || !byId[id]) return;
             try { await deleteRun(id, { quiet: true, what: label }); } catch (e) { if (!failure) failure = e; return; }
             gone.push(byId[id]); done++; A.fixing.done = done; auditEmit();
         });
+        const stopped = auditCancel.current && !failure && done < ids.length;
         const goneIds = {}; gone.forEach(r => { goneIds[r.id] = true; });
         A.runs = A.runs.filter(r => !goneIds[r.id]);
         setRuns(prev => prev.filter(r => !goneIds[r.id]));
         A.fixing = null; judge(A);
         A.undo = gone.length ? { kind: 'delete', runs: gone, label } : null;
-        A.fixed = failure ? { error: true, message: `Stopped after ${done} of ${ids.length}: ${errText(failure)}`, undo: !!A.undo } : { message: `${label}: ${done} run${done === 1 ? '' : 's'} deleted.`, undo: !!A.undo };
+        A.fixed = failure || stopped ? { error: !!failure, message: `${stopped ? 'Stopped' : 'Failed'} after ${done} of ${ids.length}${failure ? `: ${errText(failure)}` : ''}. ${done} deleted${done ? ', and Undo puts them back' : ''}.`, undo: !!A.undo } : { message: `${label}: ${done} run${done === 1 ? '' : 's'} deleted.`, undo: !!A.undo };
         auditEmit(true);
     };
     const undoFix = async () => {
         const A = auditRef.current, u = A.undo;
         if (!u || A.fixing) return;
-        A.fixed = null; A.undo = null; A.fixing = { done: 0, total: u.kind === 'patch' ? u.before.length : u.runs.length, label: `Undoing: ${u.label}` };
+        auditCancel.current = false;
+        const total = u.kind === 'patch' ? u.before.length : u.runs.length;
+        A.fixed = null; A.undo = null; A.fixing = { done: 0, total, label: `Undoing: ${u.label}` };
         auditEmit(true);
-        let failure = null, done = 0;
+        let failure = null, done = 0, skipped = 0;
+        const finished = {};
         if (u.kind === 'patch') {
             const byId = {}; A.runs.forEach(r => { byId[r.id] = r; });
             await poolRun(u.before, APPLY_CONC, async (b) => {
-                if (failure) return;
+                if (failure || auditCancel.current) return;
+                const cur = byId[b.id];
+                // a run that was changed again since the fix (in the Run dialog, say) is left as it is now
+                if (cur && b.now && (cur.area !== b.now.area || cur.line !== b.now.line)) { skipped++; finished[b.id] = true; return; }
                 try { await patchRun(b.id, { area: b.area, line: b.line, areaId: b.areaId || '' }, `undo ${u.label}`, { quiet: true }); } catch (e) { if (!failure) failure = e; return; }
-                if (byId[b.id]) { byId[b.id].area = b.area; byId[b.id].line = b.line; byId[b.id].areaId = b.areaId || ''; }
-                done++; A.fixing.done = done; auditEmit();
+                if (cur) { cur.area = b.area; cur.line = b.line; cur.areaId = b.areaId || ''; }
+                finished[b.id] = true; done++; A.fixing.done = done + skipped; auditEmit();
             });
             syncRunsState(u.before.map(b => b.id), byId);
+            u.left = u.before.filter(b => !finished[b.id]);
         } else {
             await poolRun(u.runs, APPLY_CONC, async (r) => {
-                if (failure) return;
+                if (failure || auditCancel.current) return;
                 try { const id = await saveRun('create', null, r, { order: r.order, cases: r.cases, notes: r.notes, batch: r.batch }, { quiet: true, what: `undo ${u.label}` }); A.runs.push({ ...r, id }); } catch (e) { if (!failure) failure = e; return; }
-                done++; A.fixing.done = done; auditEmit();
+                finished[r.id] = true; done++; A.fixing.done = done; auditEmit();
             });
             importDone();
+            u.left = u.runs.filter(r => !finished[r.id]);
         }
+        const stopped = auditCancel.current && !failure && u.left.length > 0;
         A.fixing = null; judge(A);
-        A.fixed = failure ? { error: true, message: `Undid ${done}, then failed: ${errText(failure)}` } : { message: `Undone: ${done} run${done === 1 ? '' : 's'} put back.` };
+        // what is still to undo stays on offer, so a Stop or a lost connection is not the end of it
+        A.undo = u.left.length ? (u.kind === 'patch' ? { ...u, before: u.left } : { ...u, runs: u.left }) : null;
+        const tail = `${skipped ? ` ${skipped} left as they are now (changed again since).` : ''}`;
+        A.fixed = failure || stopped ? { error: !!failure, message: `${stopped ? 'Stopped' : 'Failed'} after putting back ${done}${failure ? `: ${errText(failure)}` : ''}.${tail}`, undo: !!A.undo, undoLeft: u.left.length } : { message: `Undone: ${done} run${done === 1 ? '' : 's'} put back.${tail}` };
         auditEmit(true);
     };
     // after the Run dialog saved or deleted a run that is in the checked list: read it again (or drop it) and judge once more
@@ -3775,17 +3946,20 @@ export default function ProductionScheduleApp({ dataApi }) {
         const s = draftStart(d), e = draftEnd(d);
         return { area: d.area.trim(), line: Math.max(1, parseInt(d.line, 10) || 1), code: d.code === '' ? null : Number(d.code), product: d.product.trim(), start: s, end: e, allergen: d.allergen, allergenType: d.allergen ? d.allergenType : '', crumb: d.crumb };
     };
-    const draftExtras = (d) => ({ order: d.order.trim(), cases: d.cases === '' || isNaN(Number(d.cases)) ? null : Number(d.cases), notes: (d.notes || '').trim(), clear: true });   // clear: an emptied box empties the column
+    const draftExtras = (d) => ({ order: d.order.trim(), cases: d.cases === '' || isNaN(Number(d.cases)) ? null : Math.round(Number(d.cases)), notes: (d.notes || '').trim(), clear: true });   // clear: an emptied box empties the column
     const saveDialog = async (d) => {
         if (dialogBusy) return;
         setDialogBusy(true);
         try {
             const base = draftToRun(d), extras = draftExtras(d);
+            lastDropRef.current = [];
+            const savedMsg = (text) => { const dr = lastDropRef.current; return dr.length ? { m: `${text} But ${dr.map(colLabel).join(', ')} could not be stored in Dataverse (the column is missing) and ${lsOk ? 'is kept in this browser only' : 'is held only until this page is closed'}. See Data Check > Columns.`, t: 'warn' } : { m: text, t: 'success' }; };
             if (d.id) {
                 const before = runsRef.current.find(r => r.id === d.id);
                 await saveRun('update', d.id, base, extras);
                 if (before) pushUndo(`edit ${runTitle(before)}`, [{ type: 'patch', id: d.id, before: { start: before.start, end: before.end, area: before.area, line: before.line } }]);
-                setDialog(null); notify('Run saved.', 'success'); auditRefreshRuns([d.id]);
+                const sm = savedMsg('Run saved.');
+                setDialog(null); notify(sm.m, sm.t); auditRefreshRuns([d.id]);
             } else {
                 const dur = base.end - base.start, hours = dur / HOUR;
                 const count = d.repeat === 'once' ? 1 : clamp(parseInt(d.repeatDays, 10) || 1, 1, 60);
@@ -3805,7 +3979,7 @@ export default function ProductionScheduleApp({ dataApi }) {
                 for (let i = 0; i < okRuns.length && !failure; i++) { try { ids.push(await saveRun('create', null, okRuns[i], extras)); } catch (e) { failure = e; } }
                 if (ids.length) pushUndo(`add ${ids.length} run${ids.length === 1 ? '' : 's'}`, ids.map(id => ({ type: 'create', id })));
                 if (failure) notify(`Added ${ids.length} of ${planned.length}, then failed: ${failure.message || failure}`, 'error');
-                else { setDialog(null); notify(`Added ${ids.length} run${ids.length === 1 ? '' : 's'}${skipped ? `. ${skipped} day${skipped === 1 ? '' : 's'} skipped because another run is already there` : ''}.`, ids.length ? 'success' : 'error'); }
+                else { const sm = savedMsg(`Added ${ids.length} run${ids.length === 1 ? '' : 's'}${skipped ? `. ${skipped} day${skipped === 1 ? '' : 's'} skipped because another run is already there` : ''}.`); setDialog(null); notify(sm.m, ids.length ? sm.t : 'error'); }
                 if (ids.length) { const f = okRuns[0]; if (f.start < view.from || f.start > rangeTo) jumpTo(f.start); }
             }
         } catch (e) { notify(`Could not save: ${e && e.message ? e.message : e}`, 'error'); }
@@ -3886,7 +4060,7 @@ export default function ProductionScheduleApp({ dataApi }) {
                     <div className="px-4 pt-3 space-y-1.5">
                         {refusedCols.length > 0 && (
                             <div className="px-3 py-1.5 rounded-lg bg-[#FFF6E0] border border-[#FFB81C]/60 text-xs font-bold text-slate-800 flex flex-wrap items-center gap-2" data-testid="columns-banner">
-                                <span>Dataverse does not have {refusedCols.map(colLabel).join(', ')} on the runs table yet.{(() => { const kept = refusedCols.filter(c => c === F_ORDER || c === F_CASES || c === F_NOTES), lost = refusedCols.filter(c => kept.indexOf(c) < 0); return `${kept.length ? ` ${kept.map(colLabel).join(', ')} ${kept.length === 1 ? 'is' : 'are'} kept in this browser only.` : ''}${lost.length ? ` ${lost.map(colLabel).join(', ')} ${lost.length === 1 ? 'is' : 'are'} not saved.` : ''}`; })()}</span>
+                                <span>Dataverse does not have {refusedCols.map(colLabel).join(', ')} on the runs table yet.{(() => { const kept = refusedCols.filter(c => c === F_ORDER || c === F_CASES || c === F_NOTES), lost = refusedCols.filter(c => kept.indexOf(c) < 0); return `${kept.length ? ` ${kept.map(colLabel).join(', ')} ${kept.length === 1 ? 'is' : 'are'} ${lsOk ? 'kept in this browser only' : 'held only until this page is closed'}.` : ''}${lost.length ? ` ${lost.map(colLabel).join(', ')} ${lost.length === 1 ? 'is' : 'are'} not saved.` : ''}`; })()}</span>
                                 <button type="button" className="underline text-[#00468B]" onClick={() => openCheck('columns')}>See what to create</button>
                                 <button type="button" className="underline text-[#00468B]" onClick={resetRefused}>I added them, check again</button>
                             </div>
@@ -3896,7 +4070,7 @@ export default function ProductionScheduleApp({ dataApi }) {
                 )}
                 {notice && (
                     <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-[120] max-w-[90vw]" role="status">
-                        <div className={`px-4 py-2.5 rounded-xl border shadow-lg text-sm font-semibold flex items-start gap-3 ${notice.type === 'error' ? 'bg-[#FDE8EC] border-[#E4002B]/50 text-[#B00020]' : notice.type === 'success' ? 'bg-[#DCFCE7] border-[#16A34A]/50 text-[#166534]' : 'bg-white border-[#B3D4F2] text-[#00468B]'}`}>
+                        <div className={`px-4 py-2.5 rounded-xl border shadow-lg text-sm font-semibold flex items-start gap-3 ${notice.type === 'error' ? 'bg-[#FDE8EC] border-[#E4002B]/50 text-[#B00020]' : notice.type === 'warn' ? 'bg-[#FFF6E0] border-[#FFB81C] text-slate-800' : notice.type === 'success' ? 'bg-[#DCFCE7] border-[#16A34A]/50 text-[#166534]' : 'bg-white border-[#B3D4F2] text-[#00468B]'}`}>
                             <span>{notice.message}</span>
                             <button type="button" onClick={() => setNotice(null)} className="opacity-60 hover:opacity-100"><XIcon className="w-4 h-4" /></button>
                         </div>
@@ -3974,7 +4148,7 @@ export default function ProductionScheduleApp({ dataApi }) {
                         </div>
                     )}
                     <div style={{ display: tab === 'import' ? 'block' : 'none' }}>
-                        <ImportViewMemo areaOptions={areaOptions} lineChoices={lineChoices} settings={settings} updateSettings={updateSettings} api={importApi} gapCtx={gapCtx} apiReady={apiReady}
+                        <ImportViewMemo areaOptions={areaOptions} lineChoices={lineChoices} settings={settings} updateSettings={updateSettings} api={importApi} gapCtx={gapCtx} apiReady={apiReady} reloadTick={reloadTick}
                             onDone={importDone} onView={importShow} onOpenCheck={openCheck} />
                     </div>
                     {tab === 'check' && <DataCheckView sub={checkSub} setSub={setCheckSub} auditRef={auditRef} subscribe={auditSubscribe} startAudit={startAudit} cancelAudit={cancelAudit} fixRuns={fixRuns} deleteRuns={deleteRuns}
