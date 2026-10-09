@@ -574,6 +574,222 @@ async function readProductionRuns(props: any, fromMs: number, toMs: number): Pro
 }
 
 // ============================================================================
+// HISTORY (craa5_taskassignment): this crew's own boards over the last 42 days
+// Every save writes the whole board (a row per person: employee, lead, area, team, time). Reading the team's rows back tells three things: the board the
+// team ended each shift with (so the same shift can start from it), how many shifts each person has worked each room (the strength bar and the member
+// suggestions), and how many people a room usually takes. Only the supervisors of the crew are read (their team name), in 14 day pieces, each capped at
+// 5000 rows and never the whole table; what is kept is the small summary, in this browser for six hours. A shift is the crew's slot in the work schedule;
+// the prep hour before it counts for it.
+// ============================================================================
+const HIST_DAYS = 42;
+const HIST_PIECE_DAYS = 14;
+const HIST_CAP = 5000;
+const HIST_TTL_MS = 6 * 3600000;
+const HIST_TIMEOUT_MS = 30000;
+const HIST_RETRY_MS = 2 * 60000;   // a read that failed or came back partial is tried again after this long (not kept for six hours)
+const HIST_LS_KEY = "ss_hist_v1";
+const HIST_FULL_DAYS = 6;        // this many shifts in a room = a full strength bar
+const HIST_KEEP_BOARDS = 20;     // the newest boards kept (about six weeks of a crew that works three shifts a week)
+const HIST_GAP_MS = 60000;       // the rows of one Save are written within a second or two; rows this close to the newest one are the final board
+const HIST_COLUMNS = ['craa5_taskassignmentid', 'craa5_id', 'craa5__aaemp_guid', 'craa5_lead', 'craa5_team', 'craa5_area', 'craa5_datetimeofassignment', 'createdon'];
+const HIST_COLUMN_WHY: Record<string, string> = { craa5_taskassignmentid: 'the row id', craa5_id: 'text: the employee name', craa5__aaemp_guid: 'text: the employee id', craa5_lead: 'text: the lead of the room', craa5_team: 'text: the supervisor name the board was saved under', craa5_area: 'text: the room', craa5_datetimeofassignment: 'date and time: when the board was saved', createdon: 'date and time: the row was created' };
+type HistPerson = { id: string; emp: string; lead: string; area: string };   // emp "" = a room with its lead and nobody under them
+type HistBoard = { team: string; startMs: number; savedAt: number; people: HistPerson[] };
+type History = { v: number; key: string; crew: string; names: string[]; at: number; from: number; to: number; boards: HistBoard[]; strength: Record<string, Record<string, number>>; rows: number; pieces: number; failedPieces: number; capped: number; source: string; query: string; columns: string[]; error: string };
+type HistStatus = { state: 'idle' | 'reading' | 'ok' | 'error'; error: string; fromCache: boolean; key: string };
+const HIST_IDLE: HistStatus = { state: 'idle', error: "", fromCache: false, key: "" };
+// What the app decided about starting the board from the remembered team, for the Data check panel.
+type RememberedLog = { at: number; applied: boolean; text: string; team: string; startMs: number; how: string; people: number; rooms: number; skipped: string[]; sameTime: number; matching: number };
+
+// The crew's shift (slot) a moment belongs to: the one it falls inside (the prep hour before it counts).
+function slotInstanceFor(slots: Slot[], crew: string, t: number): { startMs: number; endMs: number } | null {
+    let bestStart = 0, bestEnd = 0;
+    for (let i = 0; i < slots.length; i++) {
+        const s = slots[i]; if (crewLetterOf(s.crew) !== crew) continue;
+        for (let back = -1; back <= 1; back++) {
+            const d = new Date(t); d.setDate(d.getDate() + back);
+            if (d.getDay() !== s.day) continue;
+            const start = new Date(d); start.setHours(s.startHour, 0, 0, 0);
+            const st = start.getTime(), en = slotEndMs(start, s.lengthHours);
+            if (t >= st - SHIFT_PREP_MS && t < en && (!bestStart || st < bestStart)) { bestStart = st; bestEnd = en; }
+        }
+    }
+    return bestStart ? { startMs: bestStart, endMs: bestEnd } : null;
+}
+
+// The summary kept from a crew's rows: its final board of each shift, and how many shifts each person (employee or lead) worked each room.
+function aggregateHistory(rows: any[], slots: Slot[], crew: string): { boards: HistBoard[]; strength: Record<string, Record<string, number>> } {
+    type Item = { t: number; id: string; emp: string; lead: string; area: string };
+    const groups: Record<string, { team: string; startMs: number; items: Item[] }> = {};   // one per team and shift
+    (rows || []).forEach(r => {
+        const emp = String(getField(r, 'craa5_id') || "").trim(), area = String(getField(r, 'craa5_area') || "").trim(), team = String(getField(r, 'craa5_team') || "").trim();
+        if (!area || !team || emp.toLowerCase().indexOf('unassigned') >= 0 || isStatusArea(area)) return;   // time and attendance (PTO, sick...) is a day's matter, not a team's
+        const t = taskTime(r), inst = t ? slotInstanceFor(slots, crew, t) : null; if (!inst) return;
+        const k = normText(team) + '|' + inst.startMs, g = groups[k] = groups[k] || { team, startMs: inst.startMs, items: [] };
+        g.items.push({ t, id: String(getField(r, 'craa5__aaemp_guid') || "").toLowerCase(), emp, lead: String(getField(r, 'craa5_lead') || "").trim(), area });
+    });
+    const credit: Record<string, Record<string, Record<string, boolean>>> = {}, boards: HistBoard[] = [];
+    const give = (who: string, area: string, inst: number) => { if (!who) return; const w = credit[who] = credit[who] || {}, a = w[area] = w[area] || {}; a[String(inst)] = true; };
+    Object.keys(groups).forEach(k => {
+        const g = groups[k];
+        // The employee hubs write progress rows under the same team name with no employee id; Shift Start always saves it, so when any row of the shift has one the rest are not board rows.
+        const hasIds = g.items.some(it => !!it.id);
+        g.items = g.items.filter(it => !hasIds || !it.emp || !!it.id);
+        if (!g.items.length) return;
+        g.items.sort((a, b) => a.t - b.t);
+        // A person is credited by employee id (by name only when the row has none), a lead by name.
+        g.items.forEach(it => { const ak = normText(it.area); give(it.emp ? (it.id || normText(it.emp)) : "", ak, g.startMs); give(normText(it.lead), ak, g.startMs); });
+        // the final board = the rows of the last save (within a minute of the newest row); where a person appears twice the newest row wins
+        const lastT = g.items[g.items.length - 1].t, seen: Record<string, boolean> = {}, people: HistPerson[] = [];
+        g.items.filter(it => lastT - it.t <= HIST_GAP_MS).reverse().forEach(it => { const pk = it.id || normText(it.emp) || ('room:' + normText(it.area) + '|' + normText(it.lead)); if (seen[pk]) return; seen[pk] = true; people.push({ id: it.id, emp: it.emp, lead: it.lead, area: it.area }); });
+        boards.push({ team: g.team, startMs: g.startMs, savedAt: lastT, people });
+    });
+    boards.sort((a, b) => b.startMs - a.startMs || b.savedAt - a.savedAt);
+    const strength: Record<string, Record<string, number>> = {};
+    Object.keys(credit).forEach(who => { strength[who] = {}; Object.keys(credit[who]).forEach(a => { strength[who][a] = Object.keys(credit[who][a]).length; }); });
+    return { boards: boards.slice(0, HIST_KEEP_BOARDS), strength };
+}
+
+// How many shifts a person has worked a room (looked up by employee id, then by name).
+function shiftsInArea(h: History | null, empId: string, empName: string, areaName: string): number {
+    if (!h) return 0;
+    const a = normText(areaName), byId = empId ? h.strength[String(empId).toLowerCase()] : undefined, byName = h.strength[normText(empName)];   // the name entry holds a lead's rooms and the rows saved without an id
+    return Math.max(byId && byId[a] ? byId[a] : 0, byName && byName[a] ? byName[a] : 0);
+}
+function strengthTier(days: number): { label: string; pct: number; color: string } {
+    const pct = Math.min(1, days / HIST_FULL_DAYS);
+    return days >= HIST_FULL_DAYS ? { label: 'Strong', pct, color: BRAND.blueDark } : days >= 2 ? { label: 'Familiar', pct, color: BRAND.blue } : days === 1 ? { label: 'New', pct, color: BRAND.yellow } : { label: 'No history', pct: 0, color: '#CBD5E1' };
+}
+// The rooms a person has worked most (names are the normalised room names).
+function strongestAreas(h: History | null, empId: string, empName: string, limit: number): { area: string; days: number }[] {
+    if (!h) return [];
+    const merged: Record<string, number> = {}, srcs = [empId ? h.strength[String(empId).toLowerCase()] : undefined, h.strength[normText(empName)]];
+    srcs.forEach(src => { if (src) Object.keys(src).forEach(a => { merged[a] = Math.max(merged[a] || 0, src[a]); }); });
+    return Object.keys(merged).map(a => ({ area: a, days: merged[a] })).sort((x, y) => y.days - x.days || (x.area < y.area ? -1 : x.area > y.area ? 1 : 0)).slice(0, limit);
+}
+const minutesOfDay = (ms: number) => { const d = new Date(ms); return d.getHours() * 60 + d.getMinutes(); };
+// How many people a room usually takes (the middle of its headcount across the boards kept; at the same start time of day when atMin is given); 0 when there is no history for it.
+function typicalHeadcount(h: History | null, areaName: string, atMin: number = -1): number {
+    if (!h) return 0;
+    const a = normText(areaName), counts: number[] = [];
+    h.boards.forEach(b => { if (atMin >= 0 && minutesOfDay(b.startMs) !== atMin) return; const n = b.people.filter(p => !!p.emp && normText(p.area) === a).length; if (n > 0) counts.push(n); });
+    if (!counts.length) return 0;
+    counts.sort((x, y) => x - y); return counts[Math.floor((counts.length - 1) / 2)];
+}
+// Who could fill the rooms that are short of their usual headcount: the people who have worked the room, strongest first, each person used once.
+type Suggest = { id: string; name: string; days: number };
+function suggestMembers(h: History | null, rooms: { id: string; name: string; have: number }[], staff: { id: string; name: string }[], atMin: number): Record<string, Suggest[]> {
+    const out: Record<string, Suggest[]> = {};
+    if (!h || !rooms.length || !staff.length) return out;
+    const once: Record<string, boolean> = {}; staff = staff.filter(s => { if (once[s.id]) return false; once[s.id] = true; return true; });
+    const need: Record<string, number> = {}, pairs: { room: string; who: number; days: number }[] = [];
+    rooms.forEach(r => {
+        const usual = typicalHeadcount(h, r.name, atMin) || typicalHeadcount(h, r.name), n = usual - r.have; if (n <= 0) return;
+        need[r.id] = n;
+        staff.forEach((s, i) => { const days = shiftsInArea(h, s.id, s.name, r.name); if (days > 0) pairs.push({ room: r.id, who: i, days }); });
+    });
+    pairs.sort((a, b) => b.days - a.days || (a.room < b.room ? -1 : a.room > b.room ? 1 : 0) || a.who - b.who);
+    const used: Record<number, boolean> = {};
+    pairs.forEach(p => {
+        const list = out[p.room] = out[p.room] || [];
+        if (used[p.who] || list.length >= need[p.room]) return;
+        used[p.who] = true; list.push({ id: staff[p.who].id, name: staff[p.who].name, days: p.days });
+    });
+    Object.keys(out).forEach(k => { if (!out[k].length) delete out[k]; });
+    return out;
+}
+
+// The boards this shift could start from: the earlier boards of the same crew at the same start time of day, and of those the ones whose rooms match today's.
+// matched = the rooms (normalised names) that have a line in the production schedule, down = the ones with a line down. Boards are compared only on matched
+// rooms, so Everyday and support rooms don't matter. With the schedule unknown the newest board of that start time is used and the answer says so.
+type RememberCtx = { known: boolean; matched: string[]; down: string[]; supName: string };
+function rememberedCandidates(h: History | null, slotStartMs: number, ctx: RememberCtx): { sameTime: HistBoard[]; pool: HistBoard[]; useful: boolean } {
+    if (!h || !slotStartMs) return { sameTime: [], pool: [], useful: false };
+    const want = ctx.down.slice().sort().join('|'), at = minutesOfDay(slotStartMs), matchedSet: Record<string, boolean> = {};
+    ctx.matched.forEach(m => { matchedSet[m] = true; });
+    const sameTime = h.boards.filter(b => b.startMs < slotStartMs && minutesOfDay(b.startMs) === at && b.people.some(p => !!p.emp));
+    const useful = ctx.known && ctx.matched.length > 0;
+    const pool = useful ? sameTime.filter(b => { const rooms: Record<string, boolean> = {}; b.people.forEach(p => { const n = normText(p.area); if (matchedSet[n]) rooms[n] = true; }); return Object.keys(rooms).sort().join('|') === want; }) : sameTime;
+    return { sameTime, pool, useful };
+}
+function pickRemembered(h: History | null, slotStartMs: number, ctx: RememberCtx): { board: HistBoard; how: 'matches' | 'newest' } | null {
+    const c = rememberedCandidates(h, slotStartMs, ctx); if (!c.pool.length) return null;
+    // newest shift first; on the same shift the supervisor's own board, then the one with more people
+    const best = c.pool.slice().sort((a, b) => b.startMs - a.startMs || (sameText(b.team, ctx.supName) ? 1 : 0) - (sameText(a.team, ctx.supName) ? 1 : 0) || b.people.length - a.people.length)[0];
+    return { board: best, how: c.useful ? 'matches' : 'newest' };
+}
+// A remembered board as the rows a save would have written: people who are not available today are left out, and a lead who is not one of the crew's leads is
+// replaced by the supervisor. A room whose people are all away stays with its lead; a room that no longer exists is dropped.
+function rowsOfRemembered(b: HistBoard, supName: string, leadNames: string[], staff: any[], roomNames: string[]): { rows: any[]; skipped: string[]; droppedRooms: string[] } {
+    const now = new Date().toISOString(), byId: Record<string, any> = {}, byName: Record<string, any> = {}, leadSet: Record<string, boolean> = {}, roomSet: Record<string, boolean> = {}, skipped: string[] = [], droppedRooms: string[] = [], rows: any[] = [], roomHas: Record<string, boolean> = {};
+    roomNames.forEach(n => { roomSet[normText(n)] = true; });
+    staff.forEach(e => { const id = String(empIdOf(e) || "").toLowerCase(); if (id) byId[id] = e; byName[normText(getField(e, 'craa5_name'))] = e; });
+    leadNames.forEach(n => { leadSet[normText(n)] = true; });
+    const mk = (area: string, lead: string, name: string, guid: string) => ({ craa5_taskassignmentid: "", craa5_id: name, craa5__aaemp_guid: guid, craa5_lead: lead, craa5_area: area, craa5_team: supName, craa5_whatisbeingdone: "", craa5_whatislefttodo: "", craa5_starttime: now, craa5_datetimeofassignment: now, createdon: now, craa5_percentagecomplete: 0, craa5_complete: false, statecode: 0 });
+    const leadOf = (p: HistPerson) => p.lead && (sameText(p.lead, supName) || leadSet[normText(p.lead)]) ? p.lead : supName;
+    b.people.forEach(p => {
+        if (!roomSet[normText(p.area)]) { if (droppedRooms.indexOf(p.area) < 0) droppedRooms.push(p.area); return; }
+        if (!p.emp) return;
+        const e = (p.id && byId[p.id]) || byName[normText(p.emp)];
+        if (!e) { skipped.push(p.emp); return; }
+        roomHas[normText(p.area)] = true;
+        rows.push(mk(p.area, leadOf(p), renderSafe(getField(e, 'craa5_name')), String(empIdOf(e) || "")));
+    });
+    b.people.forEach(p => { const k = normText(p.area); if (roomHas[k] || !roomSet[k]) return; roomHas[k] = true; rows.push(mk(p.area, leadOf(p), "", "")); });   // a room with nobody available (or no one under its lead) still has its lead
+    return { rows, skipped, droppedRooms };
+}
+
+const roomsIn = (rows: any[]) => { const s: Record<string, boolean> = {}; rows.forEach(r => { s[normText(r.craa5_area)] = true; }); return Object.keys(s).length; };
+const boardLabel = (ms: number) => new Date(ms).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+function lsDropHist(key: string) { try { const raw = window.localStorage.getItem(HIST_LS_KEY), o = raw ? JSON.parse(raw) : null; if (o && typeof o === 'object' && o[key]) { delete o[key]; window.localStorage.setItem(HIST_LS_KEY, JSON.stringify(o)); } } catch (e) { /* nothing kept */ } }
+const histCacheKey = (crew: string, names: string[]) => crew + '|' + names.map(normText).sort().join('|');
+function lsReadHist(key: string): History | null {
+    try {
+        const raw = window.localStorage.getItem(HIST_LS_KEY), o = raw ? JSON.parse(raw) : {}, h = o && typeof o === 'object' ? o[key] : null;
+        if (!h || typeof h !== 'object' || h.v !== 1 || !Array.isArray(h.boards) || !h.strength || typeof h.at !== 'number' || Date.now() - h.at > HIST_TTL_MS) return null;
+        return h as History;
+    } catch (e) { return null; }
+}
+function lsWriteHist(h: History): boolean {
+    try {
+        const raw = window.localStorage.getItem(HIST_LS_KEY); let o: any = raw ? JSON.parse(raw) : {}; if (!o || typeof o !== 'object') o = {};
+        o[h.key] = h;
+        Object.keys(o).filter(k => !o[k] || typeof o[k].at !== 'number' || Date.now() - o[k].at > HIST_TTL_MS).forEach(k => { delete o[k]; });
+        Object.keys(o).sort((a, b) => o[b].at - o[a].at).slice(6).forEach(k => { delete o[k]; });   // a handful of crews is all there is
+        window.localStorage.setItem(HIST_LS_KEY, JSON.stringify(o)); return true;
+    } catch (e) { return false; }
+}
+
+// One 14 day piece of the team's rows, newest first. Each way of reading only falls through when it fails.
+async function readHistoryPiece(props: any, names: string[], fromMs: number, toMs: number): Promise<{ rows: any[]; source: string; query: string }> {
+    const webApi = getWebApi(props), dataApi = props?.dataApi, problems: string[] = [], quote = (n: string) => n.replace(/'/g, "''");
+    const win = `createdon ge ${odataDate(fromMs)} and createdon lt ${odataDate(toMs)}`;
+    const fApi = '(' + names.map(n => `craa5_team eq '${quote(n)}'`).join(' or ') + ')', fWeb = '(' + names.map(n => `craa5_team eq '${encodeURIComponent(quote(n))}'`).join(' or ') + ')';
+    const query = `${TASK_TABLE}: ${fApi} and ${win}, newest first, up to ${HIST_CAP}, columns ${HIST_COLUMNS.join(', ')}`;
+    if (webApi?.retrieveMultipleRecords) {
+        try { const res: any = await asyncRace(webApi.retrieveMultipleRecords(TASK_TABLE, `?$select=${HIST_COLUMNS.join(',')}&$filter=${fWeb} and ${win}&$orderby=createdon desc&$top=${HIST_CAP}`), HIST_TIMEOUT_MS, "history"); if (Array.isArray(res?.entities)) return { rows: res.entities, source: 'Xrm.WebApi', query }; problems.push("no rows came back"); } catch (e: any) { problems.push(String(e?.message || e || "failed")); }
+    }
+    if (dataApi?.queryTable) {
+        try { return { rows: await queryDataApi(dataApi, TASK_TABLE, `${fApi} and ${win}`, { select: HIST_COLUMNS, orderBy: 'createdon desc', top: HIST_CAP }), source: 'data API', query }; } catch (e: any) { problems.push(String(e?.message || e || "failed")); }
+    }
+    throw new Error(problems.join("; ") || "no Dataverse connection");
+}
+// The crew's last six weeks, read in pieces side by side; a piece that cannot be read is counted and left out, and only when none can is the whole read an error.
+async function readHistory(props: any, slots: Slot[], crew: string, names: string[], key: string): Promise<History> {
+    const to = Date.now(), from = to - HIST_DAYS * 86400000, step = HIST_PIECE_DAYS * 86400000, spans: { from: number; to: number }[] = [];
+    for (let t = to; t > from; t -= step) spans.push({ from: Math.max(from, t - step), to: t });
+    const got = await Promise.all(spans.map(s => readHistoryPiece(props, names, s.from, s.to).then(r => ({ ok: true, rows: r.rows, source: r.source, query: r.query, error: "" }), (e: any) => ({ ok: false, rows: [] as any[], source: "", query: "", error: String(e?.message || e || "failed") }))));
+    const okPieces = got.filter(g => g.ok);
+    if (!okPieces.length) throw new Error(got[0] ? got[0].error : "nothing was read");
+    let all: any[] = []; okPieces.forEach(g => { all = all.concat(g.rows); });
+    const agg = aggregateHistory(all, slots, crew), first = okPieces.filter(g => g.rows.length)[0];
+    return {
+        v: 1, key, crew, names, at: Date.now(), from, to, boards: agg.boards, strength: agg.strength, rows: all.length, pieces: okPieces.length, failedPieces: got.length - okPieces.length,
+        capped: okPieces.filter(g => g.rows.length >= HIST_CAP).length, source: okPieces[0].source, query: okPieces[0].query, columns: first ? Object.keys(first.rows[0]).filter(k => k.charAt(0) !== '@' && k.indexOf('@') < 0) : [], error: got.filter(g => !g.ok).map(g => g.error)[0] || "",
+    };
+}
+
+// ============================================================================
 // SCREENS
 // ============================================================================
 const BucketColumn = ({ lead, isSupervisor, isCollapsed, onToggle, onRemoveLead, children, onDrop, onSetStatus }: any) => {
@@ -625,7 +841,7 @@ const AuthBox = ({ users, onLogin }: any) => (
 
 // What the app read and how it used it, so a wrong crew can be traced without a console: who is signed in, the shift on the clock,
 // each team's lead and crew size, and which columns were found.
-function DataCheckPanel({ onClose, msUser, currentUser, slotCount, currentShift, shiftStartMs, upNextShift, teams, teamsRead, employees, supervisors, taskStatus, areaCount, boardCrew, ownerName, presets, presetStore, presetLog, prd, prdWindow }: any) {
+function DataCheckPanel({ onClose, msUser, currentUser, slotCount, currentShift, shiftStartMs, upNextShift, teams, teamsRead, employees, supervisors, taskStatus, areaCount, boardCrew, ownerName, presets, presetStore, presetLog, prd, prdWindow, hist, histStatus, histNames, remembered, onReread }: any) {
     const nameOf = (id: string) => { const e = employees.find((x: any) => empIdOf(x) === id); return e ? formatFullName(getField(e, 'craa5_name')) : ""; };
     const withLookup = employees.filter((e: any) => !!teamIdOfEmp(e)).length;
     const sample = employees[0] || {}, hasKey = (k: string) => Object.keys(sample).some(x => x.toLowerCase() === k.toLowerCase());
@@ -674,6 +890,16 @@ function DataCheckPanel({ onClose, msUser, currentUser, slotCount, currentShift,
                     {prd && (prd.status === 'ok' || prd.status === 'empty') && prd.unmatched.length > 0 && <Text size={200} block className="mt-1" style={{ color: '#8A5A00' }}>Production rooms with no line of that name in the schedule (rename the room or the schedule line to match, for example IBL5 = area IBL line 5): {prd.unmatched.join(', ')}</Text>}
                     {prd && prd.query && <Text size={200} color="neutralSecondary" block className="mt-1" style={{ wordBreak: 'break-all' }}>Query sent: {prd.query}</Text>}
                     {PROD_FIELDS.slice(1).map(c => col(`${PROD_TABLE}.${c}`, prd && prd.read > 0 ? prd.hasColumns.some((k: string) => k.toLowerCase() === c) : null, c === 'craa5_area' ? 'text: the production area, e.g. IBL, Breading' : c === 'craa5_line' ? 'whole number: the line number inside that area' : c === 'craa5_product' ? 'text: the product (a Maintenance run keeps the line busy)' : 'date and time: when the run starts / ends'))}
+                    <div className="mt-4 mb-1"><Text size={300} weight="bold" style={{ color: BRAND.blueDark }}>This crew's earlier boards (table {TASK_TABLE}, last {HIST_DAYS} days)</Text></div>
+                    <Text size={200} block style={{ color: histStatus.state === 'error' || (hist && (hist.failedPieces > 0 || hist.capped > 0)) ? BRAND.red : undefined }}>
+                        {!histNames.length ? 'No supervisor name to read for (no board is open).' : !slotCount ? 'Not read: the work schedule has no shifts, so boards cannot be grouped by shift.' : histStatus.state === 'idle' ? 'Not read yet (it is read a moment after a board opens).' : histStatus.state === 'reading' ? 'Reading...' : histStatus.state === 'error' ? `Could not be read: ${String(histStatus.error).slice(0, 220)}` : hist ? `${histStatus.fromCache ? `Kept on this computer since ${clockTime(hist.at)}` : `Read through ${hist.source}`}: ${hist.rows} row${hist.rows === 1 ? '' : 's'} in ${hist.pieces} piece${hist.pieces === 1 ? '' : 's'} of up to ${HIST_PIECE_DAYS} days, ${hist.boards.length} shift board${hist.boards.length === 1 ? '' : 's'} kept (the newest ${HIST_KEEP_BOARDS} are kept), ${Object.keys(hist.strength).length} names with room history.${hist.capped ? ` ${hist.capped} piece${hist.capped === 1 ? '' : 's'} hit the ${HIST_CAP} row limit, so the oldest rows of ${hist.capped === 1 ? 'it' : 'them'} are missing.` : ''}${hist.failedPieces ? ` ${hist.failedPieces} piece${hist.failedPieces === 1 ? '' : 's'} could not be read (${String(hist.error).slice(0, 120)}).` : ''}` : 'Nothing kept.'}
+                    </Text>
+                    {histNames.length > 0 && <Text size={200} color="neutralSecondary" block className="mt-1">Teams read (the supervisor name each board was saved under): {histNames.join(' · ')}</Text>}
+                    {hist && hist.query && <Text size={200} color="neutralSecondary" block className="mt-1" style={{ wordBreak: 'break-all' }}>Query sent: {hist.query}</Text>}
+                    {HIST_COLUMNS.map(c => col(`${TASK_TABLE}.${c}`, hist && hist.rows > 0 ? hist.columns.some((k: string) => k.toLowerCase() === c) : null, HIST_COLUMN_WHY[c] || ''))}
+                    {hist && hist.boards.length > 0 && <Text size={200} color="neutralSecondary" block className="mt-1">Boards kept: {hist.boards.slice(0, 8).map((b: HistBoard) => `${formatFullName(b.team)} ${boardLabel(b.startMs)} (${b.people.filter(p => !!p.emp).length} people)`).join(' · ')}</Text>}
+                    <Text size={200} block className="mt-1" style={{ color: remembered && !remembered.applied ? '#8A5A00' : undefined }}>{remembered ? `Remembered team: ${remembered.text}${remembered.applied ? ` ${remembered.people} ${remembered.people === 1 ? 'person' : 'people'} in ${remembered.rooms} ${remembered.rooms === 1 ? 'room' : 'rooms'}${remembered.skipped.length ? `; left out because they are away or busy: ${remembered.skipped.join(', ')}` : ''}.` : ''} (${remembered.sameTime} earlier board${remembered.sameTime === 1 ? '' : 's'} at this start time${remembered.matching >= 0 ? `, ${remembered.matching} with the same lines down` : ', lines down not compared'}.)` : 'Remembered team: not looked for on this board yet (it needs the history, the production schedule and an untouched board).'}</Text>
+                    <div className="mt-1"><Button size="small" appearance="secondary" onClick={onReread}>Read history again</Button></div>
                     <div className="mt-4 mb-1"><Text size={300} weight="bold" style={{ color: BRAND.blueDark }}>Next-shift setups (table {PRESET_TABLE})</Text></div>
                     <Text size={200} block style={{ color: presetStore.remote === 'ok' ? undefined : presetStore.remote === 'unknown' ? undefined : BRAND.red }}>
                         {presetStore.remote === 'ok' ? `The table was read: ${presets.filter((b: any) => b.where === 'dataverse').length} setup${presets.filter((b: any) => b.where === 'dataverse').length === 1 ? '' : 's'} in it.` : presetStore.remote === 'missing' ? `The table ${PRESET_TABLE} was not found, so setups are kept on this computer (${presetStore.localCount} here). Create it with the columns below and save again to share setups through Dataverse.` : presetStore.remote === 'error' ? `The table could not be read (${String(presetStore.error).slice(0, 160)}); setups are kept on this computer (${presetStore.localCount} here).` : 'Not read yet.'}
@@ -822,6 +1048,13 @@ export function MainComponent(props: any) {
     const [prd, setPrd] = useState<PrdState>(PRD_IDLE);                  // what the production schedule says about this shift's window
     const [prdApplied, setPrdApplied] = useState(false);                 // the prd rooms were added (or decided against) for this board
     const prdSeq = useRef(0), prdInFlight = useRef("");
+    const [histByKey, setHistByKey] = useState<Record<string, History>>({});   // each crew's last six weeks of saved boards, summarised (a few crews at most)
+    const [histStatus, setHistStatus] = useState<HistStatus>(HIST_IDLE);
+    const [histReload, setHistReload] = useState(0);                     // the Data check button asks for a fresh read
+    const histSeq = useRef(0), histInFlight = useRef(""), histForce = useRef(false), histDone = useRef<Record<string, number>>({});   // histDone: read token -> when it is read again
+    const [rememberedTried, setRememberedTried] = useState(false);       // the remembered team was looked for (and used, or decided against) for this board
+    const [rememberedLog, setRememberedLog] = useState<RememberedLog | null>(null);
+    const [boardFresh, setBoardFresh] = useState(false);                  // the board is empty because nothing was saved or set up for this shift (not because what was saved came out empty)
     const [collapsedBuckets, setCollapsedBuckets] = useState<Set<string>>(new Set());
     const [currentStep, setCurrentStep] = useState(0);
     const [currentShift, setCurrentShift] = useState("");          // from craa5_workshift
@@ -920,7 +1153,7 @@ export function MainComponent(props: any) {
 
     // Empties the board (and the rows it was built from) so the next supervisor's saved rows can be rebuilt into it.
     const resetBoard = useCallback(() => {
-        setPresetsApplied(false); setHasAutoAssignedEveryday(false); setPrdApplied(false); setPrd(PRD_IDLE); prdInFlight.current = ""; prdSeq.current++; setPresetRecords([]); setBoardNote(null); setPresetsReady(false); setSaveSuccess(false); setSaveWarning(""); setSubmissionError(null);
+        setPresetsApplied(false); setHasAutoAssignedEveryday(false); setPrdApplied(false); setPrd(PRD_IDLE); prdInFlight.current = ""; prdSeq.current++; setRememberedTried(false); setRememberedLog(null); setBoardFresh(false); setPresetRecords([]); setBoardNote(null); setPresetsReady(false); setSaveSuccess(false); setSaveWarning(""); setSubmissionError(null);
         setSelectedLeadIds(new Set()); setSelectedAreaIds(new Set()); setAreaAssignments({}); setAssignments({}); setAreaDetails({}); setEmployeeStartTimes({}); setCustomLeads([]); setCustomAreas([]); setCustomEmployees([]); setCurrentStep(0);
     }, []);
 
@@ -1137,7 +1370,7 @@ export function MainComponent(props: any) {
 
     // Puts rows on the board: the supervisor's saved rows, or a setup turned into rows. Employees are matched by the id on the row, then by name;
     // a lead who isn't one of the crew's leads (overtime, another crew) joins as a custom lead so their column shows.
-    const applyRows = (tr: any[], sup: any, noteOf: (areas: number, people: number) => string, emptyNote: string) => {
+    const applyRows = (tr: any[], sup: any, noteOf: (areas: number, people: number) => string, emptyNote: string, landStep?: number) => {
         const supName = String(getField(sup, 'craa5_name') || "");
         const shiftLeads = crewOf(sup, allEmployees, effClock, effUp).leads;
         const idOf = (e: any) => getField(e, 'craa5__aa_employeeid') || getField(e, 'craa5_aa_employeeid');
@@ -1198,7 +1431,7 @@ export function MainComponent(props: any) {
         if (ce.length) setCustomEmployees(p => [...p, ...ce]);
         setSelectedLeadIds(nl); setSelectedAreaIds(na); setAreaAssignments(aa); setAssignments(as); setAreaDetails(ad); setEmployeeStartTimes(est); setPresetsApplied(true);
         const areaCount = Object.keys(aa).length, people = Object.keys(as).reduce((n, k) => n + as[k].length, 0);
-        if (areaCount > 0) { setBoardNote({ tone: 'ok', text: noteOf(areaCount, people) }); setCurrentStep(4); }
+        if (areaCount > 0) { setBoardNote({ tone: 'ok', text: noteOf(areaCount, people) }); if (landStep === undefined) setCurrentStep(4); else setCurrentStep(cs => cs === 0 ? landStep : cs); }   // a board opened from memory only moves someone who has not left the first step
         else setBoardNote({ tone: 'none', text: emptyNote });
     };
 
@@ -1219,7 +1452,7 @@ export function MainComponent(props: any) {
         if (tr.length === 0) {
             if (!presetsReady) return;
             const pb = liveSetupFor(); if (pb) { applyRows(rowsOfSetup(pb, sup), sup, (areaCount, people) => liveSetupNote(pb, areaCount, people), `The setup for this shift has no areas yet`); return; }
-            setBoardNote({ tone: 'none', text: noSavedNote(otherTeams, shiftStartMs, ofTeam.length > 0) }); setPresetsApplied(true); return;
+            setBoardNote({ tone: 'none', text: noSavedNote(otherTeams, shiftStartMs, ofTeam.length > 0) }); setPresetsApplied(true); setBoardFresh(true); return;
         }
         applyRows(tr, sup, (areaCount, people) => `Restored ${people} ${people === 1 ? 'person' : 'people'} in ${areaCount} ${areaCount === 1 ? 'area' : 'areas'} from the last save`, `Everything this supervisor saved ${shiftStartMs ? 'this shift' : 'in the last 16 h'} is already finished`);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1237,7 +1470,7 @@ export function MainComponent(props: any) {
         if (boardMode !== 'next' || !nextSlot || isLoading || !presetsReady || presetsApplied || areas.length === 0 || allEmployees.length === 0 || !selectedSupervisorId) return;
         const sup = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId); if (!sup) return;
         const pb = presetFor(viewCrew, nextSlot.startMs);
-        if (!pb) { setBoardNote({ tone: 'none', text: `Nothing set up yet for shift ${viewCrew} ${slotLabel(nextSlot.startMs)}` }); setPresetsApplied(true); return; }
+        if (!pb) { setBoardNote({ tone: 'none', text: `Nothing set up yet for shift ${viewCrew} ${slotLabel(nextSlot.startMs)}` }); setPresetsApplied(true); setBoardFresh(true); return; }
         applyRows(rowsOfSetup(pb, sup), sup, (areaCount, people) => `${setupNote(pb)}: ${people} ${people === 1 ? 'person' : 'people'} in ${areaCount} ${areaCount === 1 ? 'area' : 'areas'} for ${slotLabel(nextSlot.startMs)}`, `The setup for ${slotLabel(nextSlot.startMs)} has no areas yet`);
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [boardMode, nextSlot, isLoading, presetsReady, presetsApplied, areas, allEmployees, supervisors, selectedSupervisorId, presets, viewCrew]);
@@ -1325,6 +1558,97 @@ export function MainComponent(props: any) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [prd, prdKey, prdFresh, prdApplied, selectedSupervisorId, hasAutoAssignedEveryday]);
     const prdReasons = useMemo(() => { const m: Record<string, string> = {}; if (prd.status === 'ok' && prd.keyOf === prdKey) prd.down.forEach(d => { m[d.areaId] = `line down ${clockTime(d.from)} to ${clockTime(d.to)}`; }); return m; }, [prd, prdKey]);
+
+
+    // ============================================================================
+    // HISTORY: the crew's own boards of the last six weeks (the remembered team, the strength bars, the member suggestions)
+    // ============================================================================
+    // The supervisors whose boards make up this crew's history: the crew's own, and whoever runs the board now (a manager acting).
+    const histNames = useMemo(() => {
+        const out: string[] = [], seen: Record<string, boolean> = {};
+        if (!boardCrew) return out;
+        const add = (s: any) => { const n = renderSafe(getField(s, 'craa5_name')).trim(), k = normText(n); if (n && !seen[k]) { seen[k] = true; out.push(n); } };
+        supervisors.forEach(s => { if (isSupervisorLike(s) && crewOfPerson(s) === boardCrew) add(s); });
+        if (activeSupervisorObj) add(activeSupervisorObj);
+        return out;
+    }, [supervisors, boardCrew, activeSupervisorObj]);
+    const histKey = boardCrew && histNames.length ? histCacheKey(boardCrew, histNames) : "";
+    const histNow = histKey && histByKey[histKey] ? histByKey[histKey] : null;   // never another crew's history
+
+    // Read the crew's rows once (the summary is kept on this computer for six hours); the read waits a moment so the board opening settles first.
+    useEffect(() => {
+        if (!histKey || !selectedSupervisorId || isLoading) return;
+        const slots: Slot[] = GLOBAL_DATA_CACHE?.slots || []; if (!slots.length) return;
+        const token = `${histKey}#${histReload}`;
+        if (Date.now() < (histDone.current[token] || 0) || histInFlight.current === token) return;
+        const key = histKey, crew = boardCrew, names = histNames.slice(), force = histForce.current;
+        const timer = setTimeout(() => {
+            if (histInFlight.current === token) return;
+            const seq = ++histSeq.current; histInFlight.current = token; histForce.current = false;
+            setHistStatus({ state: 'reading', error: "", fromCache: false, key });
+            (async () => {
+                try {
+                    const cached = force ? null : lsReadHist(key), h = cached || await readHistory(propsRef.current, slots, crew, names, key);
+                    if (seq !== histSeq.current) return;
+                    histInFlight.current = ""; histDone.current[token] = h.failedPieces ? Date.now() + HIST_RETRY_MS : h.at + HIST_TTL_MS;
+                    if (!cached && !h.failedPieces) lsWriteHist(h);   // a partial read is used now but not kept
+                    setHistByKey(p => { const n = { ...p }; n[h.key] = h; const ks = Object.keys(n); if (ks.length > 4) delete n[ks[0] === h.key ? ks[1] : ks[0]]; return n; });
+                    setHistStatus({ state: 'ok', error: h.failedPieces ? h.error : "", fromCache: !!cached, key });
+                } catch (e: any) {
+                    if (seq !== histSeq.current) return;
+                    histInFlight.current = ""; histDone.current[token] = Date.now() + HIST_RETRY_MS;
+                    logError('History failed', e?.message || e);
+                    setHistByKey(p => { const n = { ...p }; delete n[key]; return n; });
+                    setHistStatus({ state: 'error', error: String(e?.message || e || "failed"), fromCache: false, key });
+                }
+            })();
+        }, 600);
+        return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [histKey, selectedSupervisorId, isLoading, histReload]);
+
+    // A board that is still just the Everyday rooms (plus the rooms the schedule picked) starts from the team this crew ran at this time of day before: the newest earlier
+    // board of the same start time whose rooms with a line down are today's. Anything already touched, restored or set up is left exactly as it is.
+    const rememberedFresh = presetsReady && !isLoading && (boardFresh || (!presetsApplied && boardMode === 'live' && presetRecords.length === 0 && !liveSetupFor() && taskStatus?.ok !== false));
+    const prdSettled = prd.keyOf === prdKey && (prd.status === 'ok' || prd.status === 'empty' || prd.status === 'missing' || prd.status === 'error');
+    useEffect(() => {
+        if (rememberedTried || !histNow || histStatus.state !== 'ok' || !prdWindow || !prdSettled || !rememberedFresh || !selectedSupervisorId || !hasAutoAssignedEveryday || employees.length === 0 || (prd.status === 'ok' && !prdApplied)) return;
+        const sup = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId); if (!sup) return;
+        setRememberedTried(true);
+        const supName = renderSafe(getField(sup, 'craa5_name')), known = prd.status === 'ok';
+        const ctx: RememberCtx = { known, matched: known ? prd.matched : [], down: known ? prd.down.map(d => normText(d.name)).filter((n, i, all) => all.indexOf(n) === i) : [], supName };
+        const cand = rememberedCandidates(histNow, prdWindow.from, ctx), log = (applied: boolean, text: string, extra: Partial<RememberedLog> = {}) => setRememberedLog({ at: Date.now(), applied, text, team: "", startMs: 0, how: "", people: 0, rooms: 0, skipped: [], sameTime: cand.sameTime.length, matching: cand.useful ? cand.pool.length : -1, ...extra });
+        const autoIds: Record<string, boolean> = {}; areas.filter(isEverydayArea).forEach(a => { autoIds[String(getField(a, 'craa5_aa_mss_areaid'))] = true; }); if (known) prd.down.forEach(d => { autoIds[d.areaId] = true; });
+        const untouched = Object.keys(areaAssignments).length === 0 && Object.keys(assignments).length === 0 && selectedLeadIds.size === 0 && Array.from(selectedAreaIds).every(id => autoIds[id]);
+        if (!untouched) { log(false, 'Not used: the board was already being worked on when the history arrived.'); return; }
+        const pick = pickRemembered(histNow, prdWindow.from, ctx);
+        if (!pick) { log(false, cand.sameTime.length ? `No earlier board at this start time had the same rooms down (${cand.sameTime.length} earlier board${cand.sameTime.length === 1 ? '' : 's'} at this start time).` : 'No earlier board of this crew at this start time was found in the last six weeks.'); return; }
+        const crewLeadNames = crewOf(sup, allEmployees, effClock, effUp).leads.map(l => renderSafe(getField(l, 'craa5_name')));
+        const built = rowsOfRemembered(pick.board, supName, crewLeadNames, availableStaff, roomAreas.map(a => renderSafe(getField(a, 'craa5_area'))));
+        const info = { team: pick.board.team, startMs: pick.board.startMs, how: pick.how, skipped: built.skipped };
+        if (!built.rows.length) { log(false, 'The remembered board had nobody who is available today and no rooms that still exist.', info); return; }
+        const note = (areaCount: number, people: number) => `Started from ${formatFullName(pick.board.team)}'s board of ${boardLabel(pick.board.startMs)} (${pick.how === 'matches' ? 'same lines down' : 'newest at this start time'}): ${people} ${people === 1 ? 'person' : 'people'} in ${areaCount} ${areaCount === 1 ? 'room' : 'rooms'}${built.skipped.length ? `, ${built.skipped.length} left out (away or busy)` : ''}. Change anything you like`;
+        applyRows(built.rows, sup, note, 'The remembered board has no rooms', 3);
+        const why = prd.status === 'empty' ? 'the production plan is not entered for this shift yet' : prd.status === 'missing' ? 'the production schedule table was not found' : prd.status === 'error' ? 'the production schedule could not be read' : 'no room name matches a line in the schedule';
+        log(true, `Started from ${formatFullName(pick.board.team)}'s board of ${boardLabel(pick.board.startMs)}: ${pick.how === 'matches' ? 'the rooms with a line down were the same' : `${why}, so the lines down were not compared and the newest board at this start time was used`}.${built.droppedRooms.length ? ` Rooms that no longer exist were left out: ${built.droppedRooms.join(', ')}.` : ''}`, { ...info, people: built.rows.filter(r => !!r.craa5_id).length, rooms: roomsIn(built.rows) });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [rememberedTried, histNow, histStatus.state, prd, prdKey, prdSettled, rememberedFresh, prdApplied, prdWindow, selectedSupervisorId, hasAutoAssignedEveryday, employees, supervisors]);
+
+    // Rooms that are short of their usual headcount, and who could fill them (the people who have worked the room, strongest first, each used once).
+    const roomNameByNorm = useMemo(() => { const m: Record<string, string> = {}; roomAreas.forEach(a => { const n = renderSafe(getField(a, 'craa5_area')); if (n) m[normText(n)] = n; }); return m; }, [roomAreas]);
+    const suggestions = useMemo((): Record<string, Suggest[]> => {
+        if (!histNow || currentStep < 3) return {};
+        const rooms = Object.keys(areaAssignments).filter(id => !isStatusArea(getField(areaMap.get(id), 'craa5_area'))).map(id => ({ id, name: renderSafe(getField(areaMap.get(id), 'craa5_area')), have: (assignments[id] || []).length }));
+        const staff = availableStaff.map(e => ({ id: String(getField(e, 'craa5__aa_employeeid') || ""), name: renderSafe(getField(e, 'craa5_name')) })).filter(s => !!s.id);
+        return suggestMembers(histNow, rooms, staff, prdWindow ? minutesOfDay(prdWindow.from) : -1);
+    }, [histNow, currentStep, areaAssignments, assignments, availableStaff, areaMap, prdWindow]);
+    const suggestionCount = Object.keys(suggestions).reduce((n, k) => n + suggestions[k].length, 0);
+    const addMembers = (picks: { areaId: string; id: string }[]) => {
+        if (!picks.length) return;
+        const now = new Date().toISOString(), moving: Record<string, boolean> = {}; picks.forEach(pk => { moving[pk.id] = true; });
+        setAssignments(p => { const x: Record<string, string[]> = {}; Object.keys(p).forEach(k => { x[k] = p[k].filter(i => !moving[i]); }); picks.forEach(pk => { x[pk.areaId] = (x[pk.areaId] || []).concat([pk.id]); }); return x; });
+        setEmployeeStartTimes(s => { const n = { ...s }; picks.forEach(pk => { n[pk.id] = now; }); return n; });
+    };
 
     // ============================================================================
     // INTERACTION HANDLERS
@@ -1560,6 +1884,7 @@ export function MainComponent(props: any) {
                 });
                 if (!res.ok) throw new Error("Plugin execution failed.");
             }
+            histDone.current = {}; histForce.current = true; lsDropHist(histKey);   // the board just saved belongs in the history: the next read is a fresh one
             setSaveSuccess(true); setCurrentStep(4);
             setBoardNote({ tone: 'ok', text: `Saved ${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` });
             if (!readStatus.ok) setSaveWarning(`The earlier assignments could not be read, so they were not closed (${String(readStatus.error).slice(0, 140)}).`);
@@ -1605,6 +1930,8 @@ export function MainComponent(props: any) {
                 <div className="w-[280px] shrink-0 bg-white rounded-xl border border-slate-200 p-4 flex flex-col h-full max-h-[calc(100vh-250px)] shadow-sm">
                     <div className="shrink-0 flex flex-col gap-3 mb-3">
                         <Text weight="bold" className="uppercase tracking-wider" style={{ color: BRAND.blueDark }}>{currentStep === 2 ? "Select Areas" : "Available Staff"}</Text>
+                        {currentStep > 2 && suggestionCount > 0 && <Button size="small" appearance="primary" title="Fills the rooms that are short of their usual headcount with the people who have worked them most" onClick={() => addMembers(Object.keys(suggestions).reduce((acc: { areaId: string; id: string }[], k) => acc.concat(suggestions[k].map(s => ({ areaId: k, id: s.id }))), []))}>Add all {suggestionCount} suggested</Button>}
+                        {currentStep > 2 && histStatus.key === histKey && histStatus.state === 'reading' && <Text size={100} color="neutralSecondary">Reading the last six weeks of this crew's boards...</Text>}
                         {currentStep > 2 && (
                             <div className="relative">
                                 <div className="flex gap-2">
@@ -1629,6 +1956,7 @@ export function MainComponent(props: any) {
                                 <div key={getField(e, 'craa5__aa_employeeid')} draggable={true} onDragStart={ev => { ev.dataTransfer.setData("empId", getField(e, 'craa5__aa_employeeid')); ev.stopPropagation(); }} className="p-3 bg-white border border-slate-200 rounded-lg mb-2 cursor-grab shadow-sm hover:border-[#0072CE]">
                                     <Text size={200} weight="semibold" block>{formatFullName(getField(e, 'craa5_name'))}</Text>
                                     {getField(e, 'craa5_email') && <Badge size="small" appearance="outline" color="brand">AAD Linked</Badge>}
+                                    {histNow && (() => { const sa = strongestAreas(histNow, String(getField(e, 'craa5__aa_employeeid') || ""), renderSafe(getField(e, 'craa5_name')), 2); return sa.length ? <div className="text-[10px] text-slate-500 mt-0.5" title="Shifts worked in the last six weeks">Strongest: {sa.map(x => `${roomNameByNorm[x.area] || x.area} (${x.days})`).join(', ')}</div> : null; })()}
                                     <div className="flex flex-wrap gap-1 mt-2">{["PTO", "Sick", "Late", "Left Early"].map(s => <Button key={s} size="small" appearance="subtle" className="px-1 text-[9px] h-5" onClick={() => handleSetEmployeeStatus(getField(e, 'craa5__aa_employeeid'), s)}>{s}</Button>)}</div>
                                 </div>
                             ))}
@@ -1647,13 +1975,30 @@ export function MainComponent(props: any) {
                                         <div key={aid} draggable={true} onDragStart={ev => { GLOBAL_DRAG_PAYLOAD = aid; if (ev.dataTransfer) ev.dataTransfer.setData("areaId", aid); }} className={`p-2 bg-white rounded-lg border border-slate-200 border-l-4 relative shadow-sm cursor-grab flex flex-col ${isProductionArea(a) ? 'border-l-[#FFB81C]' : 'border-l-[#0072CE]'}`}>
                                             <div className="flex justify-between mb-2"><div><Text weight="bold" size={200}>{renderSafe(getField(a, 'craa5_area'))}{getAreaEmoji(a)}</Text>{prdReasons[aid] && <div className="text-[10px] font-bold" style={{ color: BRAND.blue }} title="From the production schedule">🔻 {prdReasons[aid]}</div>}</div><Button appearance="subtle" size="small" className="min-w-0 px-1" onClick={() => setAreaAssignments(p => { const n = { ...p }; delete n[aid]; return n; })}>✖</Button></div>
                                             <div onDragOver={e => e.preventDefault()} onDrop={e => { const eid = e.dataTransfer.getData("empId"); if (!eid) return; e.stopPropagation(); setAssignments(p => { const x = { ...p }; Object.keys(x).forEach(k => x[k] = x[k].filter(i => i !== eid)); if (!x[aid]) x[aid] = []; if (!x[aid].includes(eid)) x[aid] = [...x[aid], eid]; return x; }); setEmployeeStartTimes(s => ({ ...s, [eid]: new Date().toISOString() })); }} className="min-h-[40px] bg-slate-50 border border-dashed border-slate-300 rounded p-1 w-full">
-                                                {(assignments[aid] || []).map(eid => (
-                                                    <div key={eid} draggable={true} onDragStart={ev => { ev.dataTransfer.setData("empId", eid); ev.stopPropagation(); }} className="text-xs bg-white px-2 py-1 rounded mt-1 cursor-grab border border-slate-300 flex justify-between items-center shadow-sm">
-                                                        <div className="flex items-center gap-1 overflow-hidden"><Text truncate>{formatFullName(getField(employeeMap.get(eid), 'craa5_name'))}</Text>{boardMode === 'live' && <Badge color="brand" appearance="tint" size="small" className="text-[10px]">{formatDuration(employeeStartTimes[eid])}</Badge>}</div>
-                                                        <Button appearance="transparent" size="small" className="min-w-0 px-1" style={{ color: BRAND.red }} onClick={(e) => { e.stopPropagation(); setAssignments(p => ({ ...p, [aid]: p[aid].filter(i => i !== eid) })); }}>✖</Button>
-                                                    </div>
-                                                ))}
+                                                {(assignments[aid] || []).map(eid => {
+                                                    const en = renderSafe(getField(employeeMap.get(eid), 'craa5_name')), an = renderSafe(getField(a, 'craa5_area')), days = histNow && !isStatusArea(an) ? shiftsInArea(histNow, eid, en, an) : -1, tier = strengthTier(days);
+                                                    return (
+                                                        <div key={eid} draggable={true} onDragStart={ev => { ev.dataTransfer.setData("empId", eid); ev.stopPropagation(); }} className="text-xs bg-white px-2 py-1 rounded mt-1 cursor-grab border border-slate-300 flex flex-col shadow-sm">
+                                                            <div className="flex justify-between items-center">
+                                                                <div className="flex items-center gap-1 overflow-hidden"><Text truncate>{formatFullName(getField(employeeMap.get(eid), 'craa5_name'))}</Text>{boardMode === 'live' && <Badge color="brand" appearance="tint" size="small" className="text-[10px]">{formatDuration(employeeStartTimes[eid])}</Badge>}</div>
+                                                                <Button appearance="transparent" size="small" className="min-w-0 px-1" style={{ color: BRAND.red }} onClick={(e) => { e.stopPropagation(); setAssignments(p => ({ ...p, [aid]: p[aid].filter(i => i !== eid) })); }}>✖</Button>
+                                                            </div>
+                                                            {days >= 0 && (
+                                                                <div className="flex items-center gap-1.5 pb-0.5" data-strength={tier.label} title={`${formatFullName(en)} has worked ${an} on ${days} ${days === 1 ? 'shift' : 'shifts'} in the last six weeks (${HIST_FULL_DAYS} or more is a full bar)`}>
+                                                                    <div className="flex-1 h-1.5 rounded-full bg-slate-200 overflow-hidden"><div style={{ width: `${Math.round(tier.pct * 100)}%`, height: '100%', background: tier.color }} /></div>
+                                                                    <span className="text-[9px] font-bold whitespace-nowrap" style={{ color: days === 0 ? '#64748B' : tier.color === BRAND.yellow ? '#8A5A00' : tier.color }}>{tier.label}{days > 0 ? ` · ${days}` : ''}</span>
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    );
+                                                })}
                                             </div>
+                                            {suggestions[aid] && suggestions[aid].length > 0 && (
+                                                <div className="flex flex-wrap items-center gap-1 mt-1.5" data-suggest={aid}>
+                                                    <span className="text-[10px] font-bold" style={{ color: BRAND.blue }}>Suggested:</span>
+                                                    {suggestions[aid].map(s => <button key={s.id} className="text-[10px] px-1.5 py-0.5 rounded-full border border-[#0072CE] text-[#00468B] bg-[#E6F1FB] hover:bg-[#cfe3f7]" title={`${formatFullName(s.name)} has worked ${renderSafe(getField(a, 'craa5_area'))} on ${s.days} ${s.days === 1 ? 'shift' : 'shifts'} in the last six weeks`} onClick={() => addMembers([{ areaId: aid, id: s.id }])}>+ {formatFullName(s.name)} ({s.days})</button>)}
+                                                </div>
+                                            )}
                                         </div>
                                     );
                                 })}
@@ -1790,7 +2135,7 @@ export function MainComponent(props: any) {
                     </nav>
                 )}
 
-                {showData && <DataCheckPanel onClose={() => setShowData(false)} msUser={msUser} currentUser={currentUser} slotCount={(GLOBAL_DATA_CACHE?.slots || []).length} currentShift={currentShift} shiftStartMs={shiftStartMs} upNextShift={upNextShift} teams={GLOBAL_DATA_CACHE?.teams || []} teamsRead={GLOBAL_DATA_CACHE?.teamsRead || 0} employees={allEmployees} supervisors={supervisors} taskStatus={taskStatus} areaCount={areas.length} boardCrew={boardCrew} ownerName={ownerLabel} presets={presets} presetStore={presetStore} presetLog={presetLog} prd={prd.keyOf === prdKey ? prd : PRD_IDLE} prdWindow={prdWindow} />}
+                {showData && <DataCheckPanel onClose={() => setShowData(false)} msUser={msUser} currentUser={currentUser} slotCount={(GLOBAL_DATA_CACHE?.slots || []).length} currentShift={currentShift} shiftStartMs={shiftStartMs} upNextShift={upNextShift} teams={GLOBAL_DATA_CACHE?.teams || []} teamsRead={GLOBAL_DATA_CACHE?.teamsRead || 0} employees={allEmployees} supervisors={supervisors} taskStatus={taskStatus} areaCount={areas.length} boardCrew={boardCrew} ownerName={ownerLabel} presets={presets} presetStore={presetStore} presetLog={presetLog} prd={prd.keyOf === prdKey ? prd : PRD_IDLE} prdWindow={prdWindow} hist={histNow} histStatus={histStatus.key === histKey ? histStatus : HIST_IDLE} histNames={histNames} remembered={rememberedLog} onReread={() => { histForce.current = true; setHistReload(n => n + 1); }} />}
                 <main style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", position: 'relative' }}>{SC}</main>
             </div>
         </FluentProvider>
