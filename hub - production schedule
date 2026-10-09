@@ -48,12 +48,14 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
  *                      4,950; hours can be typed), a date change moves it, a product TAKEN OFF removes it, a product ADDED takes its
  *                      line, start time and hours per case from its last runs. Later runs are pushed when the change overlaps them.
  *                      Nothing is saved until Apply; a line that is not certain (several runs fit, the cases disagree, the run has
- *                      started, the form puts a change in the fixed zone with no approval) is not ticked and says why. Every changed
- *                      run gets a note and a batch tag, the schedule is read back after the save and Undo puts it all back. The same
- *                      form read twice changes nothing twice. "Applies by itself when sure" (off until switched on) applies a request
- *                      without a click when every line is certain. An email flow (Power Automate) can drop forms in the optional table
- *                      craa5_schedulechange; the tab reads the waiting ones every 2 minutes while the page is open and writes
- *                      applied / review / failed back to the row.
+ *                      started or over, the form puts a change in the fixed zone with no approval) is not ticked and says why. Every
+ *                      changed run (not the ones only pushed later) gets a note and a batch tag; the schedule is read back after the
+ *                      save and Undo puts it all back, also after a reload (the last applies are kept in this browser for 14 days,
+ *                      newest first). The same form read twice changes nothing twice. "Applies by itself when sure" (off until switched
+ *                      on) applies a request without a click when every line is certain. An email flow (Power Automate) can drop forms
+ *                      in the optional table craa5_schedulechange; the tab reads the waiting ones every 2 minutes while the page is open,
+ *                      claims a row (status "applying") before it applies it by itself, and writes applied / review / failed back to
+ *                      the row. Rows left in review or failed come back on the next visit and wait for a person.
  *
  * SCROLLING: the host canvas never scrolls the page, so the app is one screen tall (h-screen) and the area under the
  * header scrolls on its own (<main>), the same shell as the Manager hub.
@@ -137,8 +139,9 @@ const API_TIMEOUT_MS = 20000;
 const QUERY_LIMIT = 1000;
 const RANGE_LIMIT = 2000;
 const TABLE_INBOX = "craa5_schedulechange";   // optional: change requests an email flow drops off (see the Change Requests tab)
+const LS_CR_UNDO = 'prodsched_changes_undo_v1';   // the last applies, so Undo survives a reload
 const LS_CR_DONE = 'prodsched_changes_done_v1';   // forms already applied here (their signature and when), so reading one again says so
-const INBOX_POLL_MS = 120000, INBOX_TOP = 25;     // the inbox is looked at every 2 minutes while the page is open
+const INBOX_POLL_MS = 120000, INBOX_TOP = 25, INBOX_HELD = 10;     // the inbox is looked at every 2 minutes while the page is open
 const CR_MAX_FORMS = 30;       // request forms held at once in the Change Requests tab
 const APPLY_CONC = 4;          // saves in flight at once when a bulk upload is applied
 const MAX_OPEN_WEEKS = 6;       // 'Open all' in step 3 opens this many weeks at most
@@ -192,7 +195,7 @@ const COLUMN_GUIDE = [
     { key: 'inbox', table: TABLE_INBOX, optionalTable: true, title: 'Change request inbox', note: 'Optional table. An email flow (Power Automate) drops each schedule change request form here; the Change Requests tab reads the waiting ones every 2 minutes while it is open, shows what each would change and, if you switch it on, applies the certain ones by itself. Without this table, upload the form by hand.', cols: [
         { name: 'craa5_name', label: 'Name', type: 'Single line of text (the table\'s primary column)', need: 'required', why: 'The email subject or file name' },
         { name: 'craa5_formjson', label: 'Form JSON', type: 'Multiple lines of text (maximum length)', need: 'required', why: 'The cells of the form as JSON (rows of cells). The flow\'s Excel script fills it' },
-        { name: 'craa5_status', label: 'Status', type: 'Single line of text (50)', need: 'required', why: 'The flow writes "new". The app sets applied, review (needs a look), failed or dismissed' },
+        { name: 'craa5_status', label: 'Status', type: 'Single line of text (50)', need: 'required', why: 'The flow writes "new". The app sets applying (while it works on it), applied, review (needs a look), failed or dismissed' },
         { name: 'craa5_result', label: 'Result', type: 'Multiple lines of text (2000)', need: 'optional', why: 'What the app did, or why it left the request for you to look at' },
         { name: 'craa5_sender', label: 'Sender', type: 'Single line of text (200)', need: 'optional', why: 'Who sent the email (shown on the request)' },
     ] },
@@ -1014,9 +1017,10 @@ async function readChangeFile(file) {
     }
     sheetsOf.forEach(sh => {
         const p = parseChangeForm(sh.grid, { name: sh.n }), label = sheetsOf.length > 1 && sh.n ? `${file.name} · ${sh.n}` : file.name;
-        if (p.error) rejects.push({ name: label, why: p.error }); else forms.push({ name: label, grid: sh.grid, parsed: p });
+        if (p.error) rejects.push({ name: label, why: p.error, form: !!p.looksLikeForm }); else forms.push({ name: label, grid: sh.grid, parsed: p });
     });
-    if (!forms.length) rejects.forEach(r => skipped.push(r));   // an empty spare sheet next to the real form is not worth a warning
+    // an empty spare sheet next to the real form is not worth a warning, but a sheet that looks like a form and could not be read is
+    rejects.forEach(r => { if (!forms.length || r.form) skipped.push({ name: r.name, why: r.why }); });
     return { forms, skipped };
 }
 
@@ -1030,6 +1034,7 @@ async function readChangeFile(file) {
 // Amounts are cases, like the Cases column of a run.
 // ============================================================================
 const CR_MAX_RUN = 31 * DAY;                                   // no request makes a run longer than this
+const CR_FAR_DAYS = 400;                                       // a date farther than this from today is a typo, not a request
 const CR_MAX_LINES = 200;                                      // lines read from one form
 const CR_ROUND = 15 * 60000;                                   // a changed run length is rounded to a quarter hour, like the plan's own times
 const crRound = (ms) => Math.max(CR_ROUND, Math.round(ms / CR_ROUND) * CR_ROUND);
@@ -1037,11 +1042,11 @@ const crText = (v) => cellStr(v).replace(/\s+/g, ' ').trim();
 const CR_WEEKDAY = /^(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)[a-z]*\.?,?\s*/i;
 // An amount: null = blank (or a dash), a number, or NaN when it is something else. "9,900" and "9,900 cs" are 9900.
 function crQty(v) {
-    if (typeof v === 'number') return isFinite(v) ? v : NaN;
+    if (typeof v === 'number') return isFinite(v) ? Math.round(v) : NaN;   // cases are whole: 4950.0000001 from an Excel formula is 4950
     const t = crText(v).replace(/,/g, '');
     if (!t || isPlaceholder(t)) return null;
     const m = /^(-?\d+(?:\.\d+)?)\s*(?:cs|cases?|ea|each|units?|pcs?)?$/i.exec(t);
-    return m ? Number(m[1]) : NaN;
+    return m ? Math.round(Number(m[1])) : NaN;
 }
 // The item (SAP) number as text without leading zeros, '' when blank, `bad` when it is not a number.
 function crCode(v) {
@@ -1096,7 +1101,7 @@ function parseChangeForm(grid, opts) {
         }
     }
     if (h < 0) return { error: 'No "original amount" and "new amount" columns found: this is not a schedule change request form.' };
-    if (cols.code < 0) return { error: 'The form has no "Code" column for the item number.' };
+    if (cols.code < 0) return { error: 'The form has no "Code" column for the item number.', looksLikeForm: true };
     // the header block above the table and the signature block below it: a label, then the first filled cell to its right
     const info = { date: null, plant: '', requestor: '', planners: '', reason: '', fixedZone: '', signature: '', approval: '' };
     const LABELS = [['plant', /^plant\b.*\bproduced\b/], ['requestor', /^change requestor\b/], ['planners', /^ddp planners?\b/], ['reason', /^requested change\b/], ['fixedZone', /^change requested in fixed zone\b/], ['signature', /^supply chain signature\b(?!.*\bmay include\b)/], ['approval', /^plant approval\b/]];
@@ -1171,7 +1176,7 @@ function crRecall(runs) {
 }
 // The reading window for one line: the runs of its days and a few either side (a line with no date looks from the form's date on).
 function crWindow(form, L, nowMs) {
-    const ds = [L.origDate, L.newDate].filter(Boolean).map(d => d.getTime());
+    const ds = [L.origDate, L.newDate].filter(Boolean).map(d => d.getTime()).filter(t => Math.abs(t - nowMs) <= CR_FAR_DAYS * DAY);
     const base = midnightOf(ds.length ? Math.min.apply(null, ds) : (form.date ? form.date.getTime() : nowMs));
     const from = addDaysLocal(base, ds.length ? -3 : -2).getTime();
     const to = ds.length ? addDaysLocal(midnightOf(Math.max.apply(null, ds)), 4).getTime() : addDaysLocal(new Date(from), 50).getTime();
@@ -1192,10 +1197,16 @@ function crNote(form, row) {
     if (!parts.length) parts.push('request received');
     return clipText(`Schedule change${md ? ` ${md}` : ''}: ${parts.join(', ')}${form.reason ? ` (${clipText(form.reason, 160)})` : ''}.${form.approval ? ` Approved: ${clipText(form.approval, 60)}.` : ''}`, 400);
 }
+// The fixed zone (the next 7 days) needs the plant approval or the supply chain signature on the form. An unanswered question counts as yes,
+// and an "n/a" or a dash is not an approval.
+const CR_NOT_A_NAME = /^(?:n\/?a|none|no|nope|nil|tbd|pending|waiting|-+|\?+|x+)$/i;
+const crSigned = (t) => { const v = crText(t); return !!v && !isPlaceholder(v) && !CR_NOT_A_NAME.test(v); };
+const crApproved = (form) => !!form && (crSigned(form.approval) || crSigned(form.signature));
+const crNeedsApproval = (form) => !!form && form.fixedZone !== 'N' && !crApproved(form);
 // Every line of a form against the runs on the schedule.
 //   existing  the runs around the form's dates (normRun shape, any line, any spelling of the area)
 //   recallMap crRecall() of the added items
-//   opts      { edits: { lineIndex: { pick, hours, include, area, line, time, asAdd } }, push, scale, nowMs, gapCtx }
+//   opts      { edits: { lineIndex: { pick, hours, include, area, line, time, asAdd } }, push, scale, nowMs, gapCtx, applied (this form was applied here) }
 // Row status: ok | already (nothing left to do) | pick (several runs fit: choose) | missing (no such run) | needs (an added run needs a line,
 // time or hours) | blocked (cannot be placed) | same | incomplete | bad.   certain = found by item and day, nothing odd about it.
 function planChanges(form, existing, recallMap, opts) {
@@ -1206,7 +1217,8 @@ function planChanges(form, existing, recallMap, opts) {
         if (r.code !== null && r.code !== undefined) (byCode[r.code] = byCode[r.code] || []).push(r);
         const k = canonLine(r.area, r.line); (byLine[k] = byLine[k] || []).push(r);
     });
-    const noApproval = form.fixedZone === 'Y' && !form.approval && !form.signature;   // the form's own rule: a change in the fixed zone needs one of them
+    const noApproval = crNeedsApproval(form);   // the form's own rule: a change in the fixed zone needs the approval or the signature (an unanswered question counts as yes)
+    const zoneEnd = addDaysLocal(midnightOf(nowMs), 8).getTime(), zoneStart = midnightOf(nowMs).getTime();
     const rows = form.lines.map((L, i) => {
         const ed = edits[i] || {};
         const row = { i, L, kind: ed.asAdd && (L.kind === 'change' || L.kind === 'move') ? 'add' : L.kind, status: 'ok', m: null, cands: [], tier: 0, certain: false, caution: false, include: false,
@@ -1214,7 +1226,10 @@ function planChanges(form, existing, recallMap, opts) {
         const warn = (t, caution) => { row.warns.push(t); if (caution) row.caution = true; };
         const finish = () => {
             const ok = row.status === 'ok';
-            if (ok && noApproval) warn('The form puts this change in the fixed zone and has no plant approval or supply chain signature: check with Supply Chain, then tick it', true);
+            const inZone = [L.origDate, L.newDate].some(d => d && d.getTime() >= zoneStart && d.getTime() < zoneEnd);
+            if (ok && noApproval && form.fixedZone === 'Y') warn('The form puts this change in the fixed zone and has no plant approval or supply chain signature: check with Supply Chain, then tick it', true);
+            else if (ok && noApproval && form.fixedZone === '') warn('The form does not say whether this is in the fixed zone and has no plant approval or supply chain signature: check with Supply Chain, then tick it', true);
+            else if (ok && !crApproved(form) && inZone) warn('This is inside the next 7 days (the fixed zone), the form says it is not, and it has no plant approval or supply chain signature: check with Supply Chain, then tick it', true);
             row.include = ed.include !== undefined ? ok && !!ed.include : ok && row.certain && !row.caution;
             if (ok || row.status === 'already') row.note = crNote(form, row);
             return row;
@@ -1225,8 +1240,10 @@ function planChanges(form, existing, recallMap, opts) {
             if (row.kind === 'bad') row.error = L.bad.join('. ');
             return finish();
         }
+        const farDate = [L.origDate, L.newDate].find(d => d && Math.abs(d.getTime() - nowMs) > CR_FAR_DAYS * DAY);
+        if (farDate) { row.status = 'bad'; row.error = `The date ${fmtDay(farDate.getTime())} is more than a year from today: check the form`; return finish(); }
         const code = Number(L.code), all = byCode[code] || [];
-        const free = (list) => list.filter(r => !claimed[r.id]);
+        const free = (list) => list.filter(r => claimed[r.id] === undefined);
         const dayEnd = (d) => addDaysLocal(d, 1).getTime();
         const poolOf = (day) => {
             const a = day.getTime(), b = dayEnd(day), starts = (r) => r.start >= a && r.start < b, carries = (r) => r.start < a && r.end > a;
@@ -1249,7 +1266,7 @@ function planChanges(form, existing, recallMap, opts) {
         const checkFound = (f) => {
             if (!f.m) return;
             row.certain = f.tier === 1 || f.hand === true;
-            if (f.tier === 2) warn(`The run started on an earlier day and carries into ${fmtDay(L.origDate.getTime())}`, true);
+            if (f.tier === 2) warn(`The run started on an earlier day and carries into ${fmtDay((L.origDate || L.newDate).getTime())}`, true);
             if (f.tier === 4) warn('The form has no original date: this is the only run of the item in the next weeks', true);
             if (!f.hand && crHas(L.origAmt) && crHas(f.m.cases) && f.m.cases !== L.origAmt) warn(`The schedule has ${fmtNum(f.m.cases)} cases for this run, the form says ${fmtNum(L.origAmt)}`, true);
         };
@@ -1280,8 +1297,17 @@ function planChanges(form, existing, recallMap, opts) {
         if (row.kind === 'remove') {
             const f = findRun(L.origDate || L.newDate);
             claim(f);
-            if (!f.m) { row.status = f.cands.length ? 'pick' : 'already'; row.what = row.status === 'already' ? `No run of item ${L.code} on ${fmtDay((L.origDate || L.newDate).getTime())}: nothing to remove` : ''; return finish(); }
+            if (!f.m) {
+                const dayText = fmtDay((L.origDate || L.newDate).getTime());
+                // a run that is not there is "already off" only when this form was applied here; otherwise the item or the day on the form may be wrong
+                if (f.cands.length && !o.applied) { row.status = 'pick'; return finish(); }
+                row.status = o.applied ? 'already' : 'missing';
+                row.what = o.applied ? `No run of item ${L.code} on ${dayText}: it is already off the schedule` : `No run of item ${L.code} on ${dayText}: nothing to take off. If it was taken off already, nothing is needed; if not, check the item and the day on the form`;
+                return finish();
+            }
             checkFound(f);
+            if (f.m.end < nowMs) warn('This run is already over', true);
+            else if (f.m.start < nowMs) warn('This run has already started', true);
             row.before = { start: f.m.start, end: f.m.end, cases: f.m.cases };
             row.what = `Remove ${runTitle(f.m)}, ${lineLabelOf(f.m.area, f.m.line)}, ${fmtDT(f.m.start)}`;
             if (f.m.notes || f.m.order) warn('This run has notes or an order number: they go with it (Undo puts them back)', false);
@@ -1292,10 +1318,11 @@ function planChanges(form, existing, recallMap, opts) {
             const f = findRun(L.origDate);
             claim(f);
             if (!f.m) {
-                if (f.cands.length) { row.status = 'pick'; return finish(); }
                 // maybe it was done already: the run is on its new day with the new amount
                 const there = L.newDate ? (poolOf(L.newDate).t1.concat(poolOf(L.newDate).t2)) : [];
                 const done = there.find(r => row.kind === 'move' || !crHas(L.newAmt) || r.cases === L.newAmt);
+                // several runs near the day: pick, unless they are all the run that is already on the new day (a one day move leaves it next to the old day)
+                if (f.cands.length && !(done && f.cands.every(r => there.indexOf(r) >= 0))) { row.status = 'pick'; return finish(); }
                 if (done) { row.status = 'already'; row.m = done; row.what = `${runTitle(done)} is already on ${fmtDay(done.start)} with ${crHas(done.cases) ? fmtNum(done.cases) : '?'} cases`; return finish(); }
                 row.status = 'missing'; row.what = `No run of item ${L.code} on ${L.origDate ? fmtDay(L.origDate.getTime()) : 'the schedule'}`; return finish();
             }
@@ -1304,15 +1331,18 @@ function planChanges(form, existing, recallMap, opts) {
             const shift = L.newDate && L.origDate ? Math.round((L.newDate.getTime() - L.origDate.getTime()) / DAY) : 0;
             let dur1 = dur0;
             if (ed.hours !== undefined && isFinite(ed.hours) && ed.hours > 0) dur1 = Math.round(ed.hours * HOUR);
-            else if (scale && crHas(L.newAmt) && crHas(base) && base > 0 && L.newAmt !== base) dur1 = crRound(dur0 * L.newAmt / base);
+            else if (row.kind !== 'move' && scale && crHas(L.newAmt) && crHas(base) && base > 0 && L.newAmt !== base) dur1 = crRound(dur0 * L.newAmt / base);   // a move changes the day, not the length
+            if (row.kind !== 'move' && !crHas(m.cases) && crHas(L.newAmt) && crHas(L.origAmt) && L.newAmt !== L.origAmt) warn('The schedule has no cases for this run, so the length was worked out from the form\'s own amounts: check the hours', true);
             if (dur1 > CR_MAX_RUN) { row.status = 'blocked'; row.error = `The run would be ${fmtHrs(dur1)} long. Type the hours it should have.`; row.what = `${runTitle(m)}: the length worked out from the cases is too long`; return finish(); }
-            const start1 = shift ? addDaysLocal(new Date(m.start), shift).getTime() : m.start, end1 = start1 + dur1, cases1 = crHas(L.newAmt) ? L.newAmt : (crHas(m.cases) ? m.cases : null);
+            const start1 = shift ? addDaysLocal(new Date(m.start), shift).getTime() : m.start, end1 = start1 + dur1, cases1 = row.kind === 'move' && crHas(m.cases) ? m.cases : crHas(L.newAmt) ? L.newAmt : (crHas(m.cases) ? m.cases : null);
             row.before = { start: m.start, end: m.end, cases: crHas(m.cases) ? m.cases : null };
             row.after = { start: start1, end: end1, cases: cases1, hours: dur1 / HOUR };
             if (start1 === m.start && end1 === m.end && (cases1 === row.before.cases || cases1 === null)) { row.status = 'already'; row.what = `${runTitle(m)} already has ${crHas(m.cases) ? fmtNum(m.cases) : 'this'} cases and these times`; return finish(); }
-            if (end1 < nowMs) warn('This run is already over', true);
-            else if (start1 < nowMs) warn('This run has already started', true);
-            if (place(m, start1, end1)) gapCheck(m, start1, end1, { start: m.start, end: m.end });
+            if (end1 < nowMs || m.end < nowMs) warn('This run is already over', true);
+            else if (start1 < nowMs || m.start < nowMs) warn('This run has already started', true);
+            // a run that only gets shorter, in the same place, needs no room (it may already sit close to its neighbour)
+            if (start1 === m.start && end1 <= m.end) gapCheck(m, start1, end1, { start: m.start, end: m.end });
+            else if (place(m, start1, end1)) gapCheck(m, start1, end1, { start: m.start, end: m.end });
             const bits = [];
             if (crHas(L.newAmt) && cases1 !== row.before.cases) bits.push(`${fmtNum(row.before.cases !== null ? row.before.cases : L.origAmt)} to ${fmtNum(cases1)} cases`);
             if (dur1 !== dur0) bits.push(`${fmtHrs(dur0)} to ${fmtHrs(dur1)} long`);
@@ -1323,6 +1353,7 @@ function planChanges(form, existing, recallMap, opts) {
 
         // add: the form names no line, so it comes from the last run of the item (or what was typed on the card)
         const day = L.newDate || L.origDate;
+        if (!day) { row.status = 'incomplete'; row.error = 'There is no date on this line to add the run on.'; return finish(); }
         const there = poolOf(day).t1.concat(poolOf(day).t2);
         const dup = there.find(r => r.cases === L.newAmt);
         if (dup) { row.status = 'already'; row.m = dup; row.what = `${runTitle(dup)} is already on ${fmtDay(dup.start)} with ${fmtNum(dup.cases)} cases`; return finish(); }
@@ -1397,12 +1428,27 @@ function crWhy(r) {
 // May a request be applied without anyone looking? Only when every line is plain and certain, or already done, and a change in the fixed zone is approved on the form.
 function crAutoVerdict(form, rows) {
     if (!form || !rows || !rows.length) return { ok: false, why: 'The form has no lines to apply.' };
-    if (form.fixedZone === 'Y' && !form.approval && !form.signature) return { ok: false, why: 'A change in the fixed zone needs the plant approval or the supply chain signature on the form, and this form has neither.' };
+    if (crNeedsApproval(form)) return { ok: false, why: form.fixedZone === 'Y' ? 'A change in the fixed zone needs the plant approval or the supply chain signature on the form, and this form has neither.' : 'The form does not say whether the change is in the fixed zone, and it has no plant approval or supply chain signature.' };
     const bad = rows.find(r => !(r.status === 'already' || r.status === 'same' || (r.status === 'ok' && r.include)));
     if (bad) return { ok: false, why: `Line ${bad.L.row}${bad.L.code ? ` (item ${bad.L.code})` : ''} needs a look: ${crWhy(bad)}.` };
     if (!rows.some(r => r.status === 'ok' && r.include)) return { ok: true, nothing: true, why: 'Everything on the form is already on the schedule.' };
     return { ok: true };
 }
+// ---- the undo history: the last applies, newest first, kept in this browser. Each entry holds what every changed run was before.
+const CR_UNDO_ENTRIES = 8, CR_UNDO_CHANGES = 600, CR_UNDO_DAYS = 14, CR_UNDO_BYTES = 800000;
+const crSlimRun = (r) => r ? { id: r.id, area: r.area, line: r.line, code: r.code, product: r.product, start: r.start, end: r.end, allergen: !!r.allergen, allergenType: r.allergenType || '', crumb: !!r.crumb, order: r.order || '', cases: r.cases === undefined ? null : r.cases, notes: r.notes || '', batch: r.batch || '', areaId: r.areaId || '' } : r;
+const crSlimChange = (c) => c.type === 'delete' ? { type: 'delete', run: crSlimRun(c.run) } : c.type === 'update' ? { type: 'update', id: c.id, before: crSlimRun(c.before) } : c;
+function crTrimUndo(list, nowMs) {
+    const out = []; let n = 0, stop = false;
+    (Array.isArray(list) ? list : []).forEach(e => {   // newest first; once one does not fit, nothing older is kept (an older apply may sit under a newer one)
+        if (stop) return;
+        if (!e || !Array.isArray(e.changes) || !e.changes.length || !(nowMs - e.at <= CR_UNDO_DAYS * DAY) || out.length >= CR_UNDO_ENTRIES || (out.length && n + e.changes.length > CR_UNDO_CHANGES)) { stop = true; return; }
+        n += e.changes.length; out.push(e);
+    });
+    while (out.length > 1 && JSON.stringify(out).length > CR_UNDO_BYTES) out.pop();
+    return out;
+}
+const crCountsText = (c) => [c.changed && `${c.changed} changed`, c.added && `${c.added} added`, c.removed && `${c.removed} taken off`, c.pushed && `${c.pushed} pushed later`].filter(Boolean).join(', ') || 'nothing changed';
 
 // ============================================================================
 // RUN CHECK (pure): is each run saved completely, and on a real MSS production area?
@@ -3203,7 +3249,7 @@ function ChangeLine({ row, ed, setEd, lineChoices, areaNames }) {
                         </select>
                     </Field>
                 )}
-                {row.status === 'missing' && L.newAmt > 0 && row.kind !== 'add' && <Btn kind="ghost" onClick={() => setEd(i, { asAdd: true })} title="There is no run to change: add the new amount as a new run instead">Add it as a new run</Btn>}
+                {row.status === 'missing' && L.newAmt > 0 && row.kind !== 'add' && (L.newDate || L.origDate) && <Btn kind="ghost" onClick={() => setEd(i, { asAdd: true })} title="There is no run to change: add the new amount as a new run instead">Add it as a new run</Btn>}
                 {(row.kind === 'add' && ed.asAdd) && <Btn kind="ghost" onClick={() => setEd(i, { asAdd: false })}>Back to a change</Btn>}
                 {row.kind === 'add' && row.add && (<>
                     <Field label="Line" plain>
@@ -3215,7 +3261,7 @@ function ChangeLine({ row, ed, setEd, lineChoices, areaNames }) {
                     <Field label="Starts"><input type="time" className={smallIn + (!row.add.time ? ' border-[#E4002B] bg-[#FDE8EC]' : '')} data-testid="cr-time" value={ed.time !== undefined ? ed.time : row.add.time} onChange={(e) => setEd(i, { time: e.target.value })} /></Field>
                     {hoursBox}
                 </>)}
-                {row.status === 'ok' && row.kind !== 'add' && row.kind !== 'remove' && (<>
+                {(row.status === 'ok' || (row.status === 'blocked' && row.m && row.after === null)) && row.kind !== 'add' && row.kind !== 'remove' && (<>
                     {hoursBox}
                     {ed.hoursText !== undefined && <Btn kind="ghost" className="mt-5" onClick={() => setEd(i, { hoursText: undefined, hours: undefined })} title="Go back to the length worked out from the cases">Use the cases</Btn>}
                 </>)}
@@ -3234,12 +3280,17 @@ function ChangeView({ api, lineChoices, settings, updateSettings, gapCtx, apiRea
     const [data, setData] = useState({});            // form id -> { runs, loading, failed }: the schedule around the form's dates
     const [recallMap, setRecallMap] = useState({});  // item -> { product, area, line, startClock, hours, perCase } from its last runs
     const [applying, setApplying] = useState(null);  // { done, total, phase }
-    const [result, setResult] = useState(null);      // { type, message, lines, changes, tick, confirmUndo, busy, sigs, inboxIds }
-    const [open, setOpen] = useState({ auto: true, s1: true, s2: true });
+    const [result, setResult] = useState(null);      // { type, message, lines, tick, entryId (its Undo entry), partialId (an unfinished apply that Apply again carries on) , viewMs }
+    const [open, setOpen] = useState({ auto: true, s1: true, s2: true, hist: false });
     const [fold, setFold] = useState({});            // form id -> true when folded away
     const [inbox, setInbox] = useState({ state: 'idle', at: 0, waiting: 0 });
     const [epoch, setEpoch] = useState(0);           // bumped when the schedule changed under the forms (an apply, an undo): every form reads its days again
     const [doneMap, setDoneMap] = useState(() => lsRead(LS_CR_DONE, {}));
+    const [history, setHistory] = useState(() => crTrimUndo(lsRead(LS_CR_UNDO, []), Date.now()));   // [{ id, at, auto, names, counts, changes, sigs, inboxIds, partial }] newest first
+    const [undoAsk, setUndoAsk] = useState('');     // the history entry waiting for its second click
+    const [undoing, setUndoing] = useState(false);
+    const historyRef = useRef(history), undoingRef = useRef(false);
+    const putHistory = (list) => { const t = crTrimUndo(list, Date.now()); historyRef.current = t; setHistory(t); lsWrite(LS_CR_UNDO, t); };
     const applyingRef = useRef(false), cancelRef = useRef(false), mountedRef = useRef(true), barRef = useRef(null);
     const seqRef = useRef(1), winCache = useRef({}), loadedRef = useRef({}), askedRef = useRef({}), autoTried = useRef({}), inboxSeen = useRef({});
     const inboxRef = useRef(inbox); inboxRef.current = inbox;
@@ -3297,10 +3348,14 @@ function ChangeView({ api, lineChoices, settings, updateSettings, gapCtx, apiRea
         inboxLast.current[id] = { status, result: res };
         api.inboxSet(id, { craa5_status: status, craa5_result: res }, what);
     };
-    const removeForm = (f) => {
+    // takes a form off this page without touching its inbox row (the row was dealt with, here or on another page)
+    const dropForm = (f) => {
         const next = formsRef.current.filter(x => x.id !== f.id); formsRef.current = next; setForms(next);
         setEdits(e => { const n = { ...e }; delete n[f.id]; return n; }); setData(d => { const n = { ...d }; delete n[f.id]; return n; });
         delete loadedRef.current[f.id]; delete autoTried.current[f.id];
+    };
+    const removeForm = (f) => {
+        dropForm(f);
         const was = f.inboxId && inboxLast.current[f.inboxId];
         if (f.source === 'inbox' && f.inboxId && !(was && was.status === 'applied')) inboxMark(f.inboxId, 'dismissed', 'Dismissed from the Change Requests tab.', 'dismiss change request');
     };
@@ -3312,19 +3367,27 @@ function ChangeView({ api, lineChoices, settings, updateSettings, gapCtx, apiRea
             const g = crInboxGrid(x.json), p = g.error ? { error: g.error } : parseChangeForm(g.grid, { name: x.name });
             inboxLast.current[x.id] = { status: x.status || 'new', result: clipText(x.result || '', 1900) };
             if (p.error) inboxMark(x.id, 'failed', p.error, 'change request could not be read');
-            // a row already marked review or failed was looked at before (or undone by hand): it waits for a person, it is never applied by itself
-            return { name: x.name || 'Change request', source: 'inbox', inboxId: x.id, sender: x.sender, at: x.at, parsed: p, hold: x.status === 'review' || x.status === 'failed', inboxStatus: x.status, inboxResult: x.result };
+            // a row already marked review or failed was looked at before (or undone by hand), and one marked applying is in the hands of another page: it waits for a person, it is never applied by itself
+            return { name: x.name || 'Change request', source: 'inbox', inboxId: x.id, sender: x.sender, at: x.at, parsed: p, hold: x.status === 'review' || x.status === 'failed' || x.status === 'applying', inboxStatus: x.status, inboxResult: x.result };
         });
         addForms(list);
     };
+    const inboxWasOk = useRef(false);
     const checkInbox = async (manual) => {
         if (!apiReady) { setInbox({ state: 'preview', at: Date.now(), waiting: 0 }); return; }
         const cur = inboxRef.current;
-        if (!manual && cur.state === 'unavailable' && Date.now() - cur.at < 10 * 60000) return;   // a table that is not there is asked about every 10 minutes, not every 2
+        if (!manual && cur.state === 'unavailable' && !inboxWasOk.current && Date.now() - cur.at < 10 * 60000) return;   // a table that was never there is asked about every 10 minutes, not every 2
         setInbox(p => ({ ...p, state: p.state === 'ok' ? 'ok' : 'loading' }));
-        const rows = await api.inboxList();
+        const got = await api.inboxList();
         if (!mountedRef.current) return;
-        if (rows === null) { setInbox({ state: 'unavailable', at: Date.now(), waiting: 0 }); return; }
+        if (got === null) { setInbox({ state: 'unavailable', at: Date.now(), waiting: 0 }); return; }
+        inboxWasOk.current = true;
+        const rows = got.rows;
+        // a request that is no longer waiting (applied or dismissed on another page, or by hand in the table) leaves this page too. Not while a list this long may be cut short.
+        if (!got.full && !applyingRef.current) {
+            const ids = {}; rows.forEach(x => { ids[x.id] = true; });
+            formsRef.current.filter(f => f.source === 'inbox' && f.inboxId && !ids[f.inboxId]).forEach(f => { delete inboxSeen.current[f.inboxId]; dropForm(f); });
+        }
         const fresh = rows.filter(x => !inboxSeen.current[x.id]).slice(0, Math.max(0, CR_MAX_FORMS - formsRef.current.length));   // what does not fit is looked at again on the next round, when there is room
         fresh.forEach(x => { inboxSeen.current[x.id] = true; });
         if (fresh.length) addInboxForms(fresh);
@@ -3364,7 +3427,7 @@ function ChangeView({ api, lineChoices, settings, updateSettings, gapCtx, apiRea
         const need = addCodes.filter(c => !askedRef.current[c]);
         if (!need.length) return;
         need.forEach(c => { askedRef.current[c] = true; });
-        (async () => { const got = await api.recallItems(need); if (mountedRef.current && got) setRecallMap(m => ({ ...m, ...got })); })();
+        (async () => { const got = await api.recallItems(need); if (!got) need.forEach(c => { delete askedRef.current[c]; }); if (mountedRef.current && got) setRecallMap(m => ({ ...m, ...got })); })();   // a failed read is asked again on the next Reload
     }, [addKey, reloadTick]);
 
     // ---- the plan: every form against the schedule
@@ -3374,11 +3437,11 @@ function ChangeView({ api, lineChoices, settings, updateSettings, gapCtx, apiRea
         const list = forms.map(f => {
             const dd = data[f.id];
             if (!f.parsed.form || !dd || dd.loading || dd.failed) return null;
-            return planChanges(f.parsed.form, dd.runs, recallMap, { edits: edits[f.id] || {}, push: settings.push !== false, scale: settings.crScale !== false, nowMs: now, gapCtx });
+            return planChanges(f.parsed.form, dd.runs, recallMap, { edits: edits[f.id] || {}, push: settings.push !== false, scale: settings.crScale !== false, nowMs: now, gapCtx, applied: !!doneMap[f.parsed.form.sig] });
         });
         crCrossForms(list);
         return list;
-    }, [forms, data, edits, recallMap, settings.push, settings.crScale, gapCtx]);
+    }, [forms, data, edits, recallMap, settings.push, settings.crScale, gapCtx, doneMap]);
     const jobs = useMemo(() => {
         const out = [];
         forms.forEach((f, fi) => { const pl = plans[fi]; if (pl) pl.forEach(r => { if (r.include && r.status === 'ok') out.push({ f, r }); }); });
@@ -3386,7 +3449,7 @@ function ChangeView({ api, lineChoices, settings, updateSettings, gapCtx, apiRea
     }, [forms, plans]);
     const loadingAny = forms.some(f => f.parsed.form && (!data[f.id] || data[f.id].loading));
     const failedAny = forms.some(f => data[f.id] && data[f.id].failed);
-    const canApply = jobs.length > 0 && !applying && !loadingAny;
+    const canApply = jobs.length > 0 && !applying && !undoing && !loadingAny;
     const jobCounts = useMemo(() => { const c = { change: 0, remove: 0, add: 0 }; jobs.forEach(j => { c[j.r.kind === 'remove' ? 'remove' : j.r.kind === 'add' ? 'add' : 'change']++; }); return c; }, [jobs]);
     // the tab's badge: forms that still have something to do or to look at
     const pendingCount = useMemo(() => forms.filter((f, fi) => !f.parsed.form || (plans[fi] && plans[fi].some(r => r.status !== 'already' && r.status !== 'same')) ).length, [forms, plans]);
@@ -3415,7 +3478,7 @@ function ChangeView({ api, lineChoices, settings, updateSettings, gapCtx, apiRea
     };
     // only: form ids to apply (null = every ticked line of every form); auto = it is applying by itself
     const apply = async (only, auto) => {
-        if (applyingRef.current) return { ok: false, reason: 'busy' };
+        if (applyingRef.current || undoingRef.current) return { ok: false, reason: 'busy' };
         const sel = jobs.filter(j => !only || only.indexOf(j.f.id) >= 0);
         if (!sel.length) return { ok: false, reason: 'nothing' };
         applyingRef.current = true; cancelRef.current = false;
@@ -3436,6 +3499,7 @@ function ChangeView({ api, lineChoices, settings, updateSettings, gapCtx, apiRea
             setResult({ type: 'warn', message: lookFailed ? 'Could not read the schedule again to check it before saving, so nothing was changed.' : 'The schedule changed since this request was checked (a run was added, moved or deleted). Nothing was changed. The request is checked again: look at it, then apply.', tick: Date.now() });
             return { ok: false, reason: lookFailed ? 'unreadable' : 'changed' };
         }
+        const resumeId = result && result.partialId ? result.partialId : '';   // carrying on after a failure or a stop: Undo covers the first part too
         setApplying({ done: 0, total, phase: 'saving' }); setResult(null);
         const changes = [], expect = [], done_ = {}, counts = { changed: 0, removed: 0, added: 0, pushed: 0 };
         let failure = null, done = 0;
@@ -3443,27 +3507,33 @@ function ChangeView({ api, lineChoices, settings, updateSettings, gapCtx, apiRea
             await poolRun(sel, APPLY_CONC, async (j) => {
                 if (failure || cancelRef.current) return;
                 const r = j.r, m = r.m, meta = { quiet: true, what: `change request ${j.f.name}` }, batch = clipText(`${stamp} · change request · ${j.f.name}`, BATCH_MAX);
+                // Later runs move first, the one that moves furthest first, so no moment has two runs on top of each other, and a failure part way
+                // leaves the changed run itself for the next Apply (which then sees the room already made).
+                const pushLater = async () => {
+                    for (let k = r.pushes.length - 1; k >= 0; k--) {
+                        const pp = r.pushes[k];
+                        await api.patchRun(pp.run.id, { start: pp.start, end: pp.end }, 'change request: push later', meta);
+                        changes.push({ type: 'patch', id: pp.run.id, before: { start: pp.run.start, end: pp.run.end } }); counts.pushed++;
+                        expect.push({ type: 'patch', id: pp.run.id, start: pp.start, end: pp.end, label: runTitle(pp.run) });
+                    }
+                };
                 try {
                     if (r.kind === 'remove') {
                         await api.deleteRun(m.id, meta); changes.push({ type: 'delete', run: m }); counts.removed++;
                         expect.push({ type: 'delete', id: m.id, label: runTitle(m) });
                     } else if (r.kind === 'add') {
                         const a = r.add, run = { area: a.area, line: a.line, code: Number(r.L.code), product: a.product, start: a.start, end: a.end, allergen: a.allergen, allergenType: a.allergenType, crumb: a.crumb };
+                        await pushLater();
                         const id = await api.saveRun('create', null, run, { cases: r.L.newAmt, notes: r.note, batch }, meta);
                         changes.push({ type: 'create', id }); counts.added++;
-                        expect.push({ type: 'create', id, run, start: a.start, end: a.end, cases: r.L.newAmt, note: r.note, label: runTitle(run) });
+                        expect.push({ type: 'create', id, run, start: a.start, end: a.end, cases: r.L.newAmt, note: r.note, notes: r.note, label: runTitle(run) });
                     } else {
                         const A = r.after, run = { area: m.area, line: m.line, code: m.code, product: m.product, start: A.start, end: A.end, allergen: m.allergen, allergenType: m.allergenType, crumb: m.crumb };
                         const cases = A.cases === null || A.cases === undefined ? m.cases : A.cases, notes = mergeNotes(m.notes, r.note);
+                        await pushLater();
                         await api.saveRun('update', m.id, run, { order: m.order, cases, notes, batch }, meta);
                         changes.push({ type: 'update', id: m.id, before: m }); counts.changed++;
-                        expect.push({ type: 'update', id: m.id, start: A.start, end: A.end, cases, note: r.note, label: runTitle(m) });
-                        for (let k = 0; k < r.pushes.length; k++) {
-                            const p = r.pushes[k];
-                            await api.patchRun(p.run.id, { start: p.start, end: p.end }, 'change request: push later', meta);
-                            changes.push({ type: 'patch', id: p.run.id, before: { start: p.run.start, end: p.run.end } }); counts.pushed++;
-                            expect.push({ type: 'patch', id: p.run.id, start: p.start, end: p.end, label: runTitle(p.run) });
-                        }
+                        expect.push({ type: 'update', id: m.id, start: A.start, end: A.end, cases, note: r.note, notes, label: runTitle(m) });
                     }
                 } catch (err) { if (!failure) failure = err; return; }
                 done_[j.f.id] = (done_[j.f.id] || 0) + 1; done++;
@@ -3480,69 +3550,90 @@ function ChangeView({ api, lineChoices, settings, updateSettings, gapCtx, apiRea
             if (verify.checked) lines.push(`Read back ${verify.found} of ${verify.checked} changes.${verify.readFailed ? ` (${verify.readFailed} read${verify.readFailed === 1 ? '' : 's'} failed)` : ''}`);
             verify.problems.slice(0, 6).forEach(t => lines.push(t));
             const rep = api.columnReport();
-            if (verify.casesExp > 0 && verify.casesOk === 0 && !rep.refused[F_CASES]) { api.markRefused(F_CASES, `Dataverse accepted the save but none of ${verify.casesExp} runs came back with their cases`); expect.forEach(x => { if (x.id && x.cases !== undefined && x.cases !== null) api.keepSide(x.id, { cases: x.cases }, [F_CASES]); }); }
-            if (verify.notesExp > 0 && verify.notesOk === 0 && !rep.refused[F_NOTES]) { api.markRefused(F_NOTES, `Dataverse accepted the save but none of ${verify.notesExp} runs came back with their notes`); expect.forEach(x => { if (x.id && x.note) api.keepSide(x.id, { notes: x.note }, [F_NOTES]); }); }
+            // one entry per run: Cases and Notes kept in this browser together (a second call for the same run would replace the first)
+            const keep = {};
+            if (verify.casesExp > 0 && verify.casesOk === 0 && !rep.refused[F_CASES]) { api.markRefused(F_CASES, `Dataverse accepted the save but none of ${verify.casesExp} runs came back with their cases`); expect.forEach(x => { if (x.id && x.cases !== undefined && x.cases !== null) { const k = keep[x.id] = keep[x.id] || { v: {}, cols: [] }; k.v.cases = x.cases; k.cols.push(F_CASES); } }); }
+            if (verify.notesExp > 0 && verify.notesOk === 0 && !rep.refused[F_NOTES]) { api.markRefused(F_NOTES, `Dataverse accepted the save but none of ${verify.notesExp} runs came back with their notes`); expect.forEach(x => { if (x.id && x.note) { const k = keep[x.id] = keep[x.id] || { v: {}, cols: [] }; k.v.notes = x.notes || x.note; k.cols.push(F_NOTES); } }); }
+            Object.keys(keep).forEach(id => api.keepSide(id, keep[id].v, keep[id].cols));
         }
         const notStored = Object.keys(api.columnReport().refused);
         if (notStored.length) lines.push(`Dataverse does not have these columns yet: ${notStored.map(colLabel).join(', ')}. See Data Check > Columns.`);
         const sd = api.sideReport().skipped - sideBase;
         if (sd > 0) lines.push(`${sd} run${sd === 1 ? '' : 's'} could not be kept in this browser, so their Cases / Notes were not saved anywhere.`);
-        const parts = []; if (counts.changed) parts.push(`${counts.changed} changed`); if (counts.added) parts.push(`${counts.added} added`); if (counts.removed) parts.push(`${counts.removed} taken off`); if (counts.pushed) parts.push(`${counts.pushed} pushed later`);
-        const summary = parts.join(', ') || 'nothing changed';
+        const summary = crCountsText(counts);
+        const verifyBad = !verify || verify.problems.length > 0 || verify.readFailed > 0;
         // which forms are now finished: every line applied, already there, or not a change
         const sigs = [], inboxIds = [];
         Object.keys(fids).forEach(id => {
             const f = fids[id], fi = forms.findIndex(x => x.id === id), pl = plans[fi] || [];
             const finished = !failure && !cancelled && pl.every(r => r.status === 'already' || r.status === 'same' || (r.status === 'ok' && r.include));
-            if (done_[id]) sigs.push(f.parsed.form.sig);
+            if (finished) sigs.push(f.parsed.form.sig);
             if (f.source === 'inbox' && f.inboxId && done_[id]) {
                 inboxIds.push(f.inboxId);
-                inboxMark(f.inboxId, finished ? 'applied' : 'review', `${auto ? 'Applied by itself' : 'Applied by hand'} ${stamp}: ${summary}.${finished ? '' : ' Some lines still need a look.'}`, 'change request result');
+                inboxMark(f.inboxId, finished && !verifyBad ? 'applied' : 'review', `${auto ? 'Applied by itself' : 'Applied by hand'} ${stamp}: ${summary}.${finished ? '' : ' Some lines still need a look.'}${finished && verifyBad ? ' Reading the schedule back found a problem: check the runs.' : ''}`, 'change request result');
             }
         });
-        if (sigs.length) { const dm = lsRead(LS_CR_DONE, {}); sigs.forEach(s => { dm[s] = Date.now(); }); const keep = {}; Object.keys(dm).sort((a, b) => dm[b] - dm[a]).slice(0, 60).forEach(k => { keep[k] = dm[k]; }); lsWrite(LS_CR_DONE, keep); setDoneMap(keep); }
-        const tick = Date.now();
+        if (sigs.length) { const dm = lsRead(LS_CR_DONE, {}); sigs.forEach(sg => { dm[sg] = Date.now(); }); const keepDone = {}; Object.keys(dm).sort((a, b) => dm[b] - dm[a]).slice(0, 60).forEach(k => { keepDone[k] = dm[k]; }); lsWrite(LS_CR_DONE, keepDone); setDoneMap(keepDone); }
+        const tick = Date.now(), partial = !!(failure || cancelled);
+        // the undo history: this apply (joined to the unfinished one it carries on)
+        let entryId = '';
+        if (changes.length) {
+            const cur = historyRef.current.slice(), slim = changes.map(crSlimChange), names = Object.keys(fids).map(id => fids[id].name);
+            if (resumeId && cur.length && cur[0].id === resumeId) {
+                const c0 = cur[0], cc = { changed: (c0.counts.changed || 0) + counts.changed, added: (c0.counts.added || 0) + counts.added, removed: (c0.counts.removed || 0) + counts.removed, pushed: (c0.counts.pushed || 0) + counts.pushed };
+                cur[0] = { ...c0, at: tick, auto: c0.auto && !!auto, counts: cc, names: c0.names.concat(names.filter(n => c0.names.indexOf(n) < 0)), changes: c0.changes.concat(slim), sigs: c0.sigs.concat(sigs), inboxIds: c0.inboxIds.concat(inboxIds), partial };
+                entryId = c0.id;
+            } else { entryId = `u${tick}`; cur.unshift({ id: entryId, at: tick, auto: !!auto, names, counts, changes: slim, sigs, inboxIds, partial }); }
+            putHistory(cur);
+        }
         winCache.current = verify ? verify.fresh : {}; setEpoch(n => n + 1);
         const bad = verify && (verify.problems.length > 0 || verify.readFailed > 0) || notStored.length > 0;
-        if (failure) setResult({ type: 'error', message: `Stopped after ${done} of ${total}: ${errText(failure)}. What was already saved (${summary}) stays; Undo puts it back. Apply again to carry on: finished lines show as ALREADY DONE.`, lines, changes, tick, sigs, inboxIds });
-        else if (cancelled) setResult({ type: 'warn', message: `Stopped by you after ${done} of ${total} (${summary}). Apply again to carry on.`, lines, changes, tick, sigs, inboxIds });
-        else setResult({ type: bad ? 'warn' : 'success', message: `${auto ? 'Applied by itself' : 'Done'}: ${summary}.`, lines, changes, tick, sigs, inboxIds, viewMs: sel[0].r.after ? sel[0].r.after.start : sel[0].r.before ? sel[0].r.before.start : 0 });
+        const partialId = partial ? entryId : '';
+        if (failure) setResult({ type: 'error', message: `Stopped after ${done} of ${total}: ${errText(failure)}. What was already saved (${summary}) stays; Undo puts it back. Apply again to carry on: finished lines show as ALREADY DONE.`, lines, tick, entryId, partialId });
+        else if (cancelled) setResult({ type: 'warn', message: `Stopped by you after ${done} of ${total} (${summary}). Apply again to carry on.`, lines, tick, entryId, partialId });
+        else setResult({ type: bad ? 'warn' : 'success', message: `${auto ? 'Applied by itself' : 'Done'}: ${summary}.`, lines, tick, entryId, partialId: '', viewMs: sel[0].r.after ? sel[0].r.after.start : sel[0].r.before ? sel[0].r.before.start : 0 });
         onDone();
         return { ok: !failure && !cancelled, reason: failure ? 'failed' : cancelled ? 'stopped' : '', done };
     };
     applyRef.current = apply;
-    const undoApplied = async () => {
-        if (!result || !result.changes || !result.changes.length || result.busy) return;
-        if (!result.confirmUndo) { setResult({ ...result, confirmUndo: true }); return; }
-        const list = result.changes.slice(), doneAt = {};
-        setResult({ ...result, busy: true });
-        let failure = null;
-        await poolRun(list.map((c, i) => ({ c, i })), APPLY_CONC, async (it) => {
-            if (failure) return;
-            const c = it.c, meta = { quiet: true, what: 'undo change request' };
-            try {
-                if (c.type === 'create') await api.deleteRun(c.id, meta);
-                else if (c.type === 'update') await api.saveRun('update', c.id, c.before, { order: c.before.order, cases: c.before.cases, notes: c.before.notes, batch: c.before.batch || '', clear: true }, meta);
-                else if (c.type === 'patch') await api.patchRun(c.id, c.before, 'undo change request', meta);
-                else await api.saveRun('create', null, c.run, { order: c.run.order, cases: c.run.cases, notes: c.run.notes, batch: c.run.batch }, meta);
-                doneAt[it.i] = true;
-            } catch (err) { if (!failure) failure = err; }
-        });
-        const n = Object.keys(doneAt).length, left = list.filter((c, i) => !doneAt[i]);
-        if (!failure) {   // the form is not "applied" any more, and its inbox row says so
-            const dm = lsRead(LS_CR_DONE, {}); (result.sigs || []).forEach(s => { delete dm[s]; }); lsWrite(LS_CR_DONE, dm); setDoneMap(dm);
-            (result.inboxIds || []).forEach(id => inboxMark(id, 'review', 'Applied, then undone by hand.', 'change request undone'));
+    // Undo takes back the newest apply (two clicks); older ones come back one at a time, newest first, because a later apply may sit on the same runs.
+    const undoTop = async () => {
+        const e = historyRef.current[0];
+        if (!e || undoingRef.current || applyingRef.current) return;
+        if (undoAsk !== e.id) { setUndoAsk(e.id); return; }
+        undoingRef.current = true; setUndoing(true); setUndoAsk('');
+        const list = e.changes.slice(), doneAt = {}; let firstErr = null;
+        try {
+            await poolRun(list.map((c, i) => ({ c, i })), APPLY_CONC, async (it) => {   // a change that cannot be put back does not stop the others
+                const c = it.c, meta = { quiet: true, what: 'undo change request' };
+                try {
+                    if (c.type === 'create') await api.deleteRun(c.id, meta);
+                    else if (c.type === 'update') await api.saveRun('update', c.id, c.before, { order: c.before.order, cases: c.before.cases, notes: c.before.notes, batch: c.before.batch || '', clear: true }, meta);
+                    else if (c.type === 'patch') await api.patchRun(c.id, c.before, 'undo change request', meta);
+                    else await api.saveRun('create', null, c.run, { order: c.run.order, cases: c.run.cases, notes: c.run.notes, batch: c.run.batch }, meta);
+                    doneAt[it.i] = true;
+                } catch (err) { if (!firstErr) firstErr = err; }
+            });
+        } finally { undoingRef.current = false; }
+        const left = list.filter((c, i) => !doneAt[i]), n = list.length - left.length;
+        const rest = historyRef.current.filter(x => x.id !== e.id);
+        if (left.length) rest.unshift({ ...e, changes: left });
+        putHistory(rest);
+        if (!left.length) {   // the form is not "applied" any more, and its inbox row says so
+            const dm = lsRead(LS_CR_DONE, {}); (e.sigs || []).forEach(sg => { delete dm[sg]; }); lsWrite(LS_CR_DONE, dm); if (mountedRef.current) setDoneMap(dm);
+            (e.inboxIds || []).forEach(id => inboxMark(id, 'review', 'Applied, then undone by hand.', 'change request undone'));
             Object.keys(autoTried.current).forEach(k => { autoTried.current[k] = true; });   // an undone request is not applied by itself again
         }
-        winCache.current = {}; setEpoch(e => e + 1); onDone();
+        winCache.current = {}; onDone();
         if (!mountedRef.current) return;
-        setResult(failure ? { type: 'error', message: `Undid ${n} of ${list.length} changes, then failed: ${errText(failure)}. ${left.length} still to undo: press Undo again to carry on.`, changes: left, tick: Date.now(), sigs: result.sigs, inboxIds: result.inboxIds } : { type: 'success', message: `Undone: ${n} change${n === 1 ? '' : 's'} put back.`, tick: Date.now() });
+        setEpoch(x => x + 1); setUndoing(false);
+        setResult(left.length ? { type: 'error', message: `Put ${n} of ${list.length} changes back; ${left.length} could not be put back (${errText(firstErr)}). Press Undo again to try those once more.`, tick: Date.now() } : { type: 'success', message: `Undone: ${n} change${n === 1 ? '' : 's'} put back.`, tick: Date.now() });
     };
 
     // ---- applying by itself: a request whose every line is plain and certain (and approved, in the fixed zone)
     const plansSig = forms.map((f, fi) => f.id + ':' + (plans[fi] ? plans[fi].map(r => r.status + (r.include ? '+' : '-')).join('') : '-')).join('|');
     useEffect(() => {
-        if (applying || applyingRef.current) return;
+        if (applying || undoing || applyingRef.current || undoingRef.current) return;
         for (let fi = 0; fi < forms.length; fi++) {
             const f = forms[fi], pl = plans[fi];
             if (!pl || autoTried.current[f.id]) continue;
@@ -3550,21 +3641,47 @@ function ChangeView({ api, lineChoices, settings, updateSettings, gapCtx, apiRea
             if (f.hold) continue;
             const v = crAutoVerdict(f.parsed.form, pl);
             if (!settings.crAuto) continue;   // switched off: nothing happens by itself (a form already on screen when it is switched on is left for the next one)
-            if (!v.ok) { if (f.source === 'inbox' && f.inboxId) inboxMark(f.inboxId, 'review', v.why, 'change request needs a look'); continue; }
+            if (!v.ok) {
+                // held back only by an earlier request of this batch on the same run: look again once that one is applied
+                if (pl.some(r => r.status === 'blocked' && /^An earlier request in this batch/.test(r.error || ''))) { delete autoTried.current[f.id]; continue; }
+                if (f.source === 'inbox' && f.inboxId) inboxMark(f.inboxId, 'review', v.why, 'change request needs a look');
+                continue;
+            }
             if (v.nothing) { if (f.source === 'inbox' && f.inboxId) inboxMark(f.inboxId, 'applied', 'Nothing to change: it is already on the schedule.', 'change request already done'); continue; }
-            applyRef.current([f.id], true).then(res => { if (res && (res.reason === 'changed' || res.reason === 'busy') && (autoRetry.current[f.id] = (autoRetry.current[f.id] || 0) + 1) <= 2) delete autoTried.current[f.id]; });   // the schedule moved under it: look again, twice at most
+            const retry = (res) => { if (res && (res.reason === 'changed' || res.reason === 'busy') && (autoRetry.current[f.id] = (autoRetry.current[f.id] || 0) + 1) <= 2) delete autoTried.current[f.id]; };   // the schedule moved under it: look again, twice at most
+            if (f.source === 'inbox' && f.inboxId) {
+                // Claim the row first: the status goes to "applying" only if it is still "new", so a second page showing the same request leaves it alone.
+                (async () => {
+                    const claimed = await api.inboxClaim(f.inboxId, stampNow());
+                    if (!mountedRef.current) return;
+                    if (!claimed) return;   // another page has it, or the row could not be read: it is left for a person
+                    inboxLast.current[f.inboxId] = { status: 'applying', result: claimed };
+                    const res = await applyRef.current([f.id], true);
+                    const last = inboxLast.current[f.inboxId];
+                    if (last && last.status === 'applying') {   // nothing was written by the apply: give the row back
+                        if (res && (res.reason === 'changed' || res.reason === 'busy' || res.reason === 'unreadable' || res.reason === 'nothing')) inboxMark(f.inboxId, 'new', '', 'change request given back');
+                        else inboxMark(f.inboxId, 'review', 'It could not be applied by itself. Open the Change Requests tab to look at it.', 'change request could not be applied');
+                    }
+                    retry(res);
+                })();
+            } else applyRef.current([f.id], true).then(retry);
             break;   // one request at a time
         }
-    }, [plansSig, settings.crAuto, !!applying]);
+    }, [plansSig, settings.crAuto, !!applying, undoing]);
 
     // ---- what is on screen
     const inboxText = inbox.state === 'ok' ? `Inbox connected: ${inbox.waiting} request${inbox.waiting === 1 ? '' : 's'} waiting. Last looked at ${fmtTime(inbox.at)}; it looks again every 2 minutes while this page is open.`
-        : inbox.state === 'unavailable' ? `The inbox table (${TABLE_INBOX}) was not found, so nothing arrives by itself yet. Data Check > Columns lists the table to create. Until then, upload the form here.`
+        : inbox.state === 'unavailable' ? `The inbox table (${TABLE_INBOX}) was not found (or your role has no access to it), so nothing arrives by itself yet. Data Check > Columns lists the table to create. Until then, upload the form here.`
         : inbox.state === 'preview' ? 'Preview mode: there is no Dataverse, so there is no inbox. Upload the form here.'
         : 'Looking at the inbox...';
     const applyHint = canApply || applying ? '' : loadingAny ? 'Reading the schedule around the dates on the form...' : failedAny ? 'Could not read the schedule: press Reload (top right) and try again.' : !forms.length ? 'Read a change request first.' : 'Nothing is ticked to apply. A line that says CHECK, THEN TICK needs a look first; WHICH RUN? and NEEDS DETAILS need an answer.';
     const pct = applying && applying.total ? Math.round((applying.done / applying.total) * 100) : 0;
     const waiting = forms.length > 0;
+    const undoBox = (e) => undoing ? <span className="text-xs font-bold text-[#B00020]">Undoing...</span>
+        : undoAsk === e.id
+            ? <span className="flex flex-wrap items-center gap-2"><span className="text-xs font-bold text-[#B00020]">{`Put the ${e.changes.length} change${e.changes.length === 1 ? '' : 's'} back as they were? Edits made since are lost.`}</span>
+                <Btn kind="dangerSolid" onClick={undoTop}>Yes, undo</Btn><Btn kind="ghost" onClick={() => setUndoAsk('')}>No</Btn></span>
+            : <Btn kind="danger" onClick={undoTop}>Undo this change</Btn>;
     // Kept mounted so the inbox poll and the waiting forms survive a tab change, but nothing is drawn while another tab is open.
     if (!active) return null;
     return (
@@ -3650,6 +3767,22 @@ function ChangeView({ api, lineChoices, settings, updateSettings, gapCtx, apiRea
                 </Section>
             )}
 
+            {history.length > 0 && (
+                <Section title="Recent changes" open={!!open.hist} onToggle={() => setOpen(o => ({ ...o, hist: !o.hist }))} summary={`${history.length} kept in this browser · last ${fmtDT(history[0].at)}`}>
+                    <p className="text-sm text-slate-500 mb-2">What the schedule looked like before each apply is kept here for 14 days, also after the page is closed. Undo takes back the newest one; the older ones come back one at a time, newest first.</p>
+                    <div className="space-y-1.5" data-testid="cr-history">
+                        {history.map((e, i) => (
+                            <div key={e.id} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 rounded-lg border border-slate-200 bg-slate-50 text-xs" data-testid="cr-hist-row">
+                                <span className="font-black text-[#00468B]">{fmtDT(e.at)}</span>
+                                <span className={`px-1.5 rounded font-bold ${e.auto ? 'bg-[#FFF6E0] text-[#7A5200]' : 'bg-[#E6F1FB] text-[#00468B]'}`}>{e.auto ? 'by itself' : 'by hand'}</span>
+                                <span className="min-w-0 flex-1 basis-56 font-semibold text-slate-700">{crCountsText(e.counts)}{e.partial ? ' (unfinished)' : ''} · {e.names.join(', ')}</span>
+                                {i === 0 ? (!applying && undoBox(e)) : <span className="text-slate-400">undo the newer ones first</span>}
+                            </div>
+                        ))}
+                    </div>
+                </Section>
+            )}
+
             {/* Outside the folding steps on purpose: Apply, its result and Undo stay reachable whichever step is folded */}
             {(waiting || result) && (
                 <div ref={barRef} className="sticky bottom-0 z-30 -mx-4 px-4 py-3 bg-white/95 border-t border-slate-200 shadow-[0_-6px_14px_rgba(15,23,42,0.08)]">
@@ -3665,10 +3798,7 @@ function ChangeView({ api, lineChoices, settings, updateSettings, gapCtx, apiRea
                         {applying && applying.phase === 'saving' && <Btn kind="danger" onClick={() => { cancelRef.current = true; }}>Stop</Btn>}
                         {waiting && applyHint && <span className="text-xs text-slate-500 font-semibold min-w-0 flex-1 basis-56">{applyHint}</span>}
                         {!apiReady && <span className="text-xs text-[#B27B00] font-bold">Preview mode: nothing is saved to Dataverse.</span>}
-                        {result && result.changes && result.changes.length > 0 && !applying && (result.confirmUndo || result.busy
-                            ? <span className="flex flex-wrap items-center gap-2"><span className="text-xs font-bold text-[#B00020]">{result.busy ? 'Undoing...' : `Put the ${result.changes.length} change${result.changes.length === 1 ? '' : 's'} back as they were? Edits made since are lost.`}</span>
-                                <Btn kind="dangerSolid" onClick={undoApplied} disabled={result.busy}>Yes, undo</Btn><Btn kind="ghost" onClick={() => setResult({ ...result, confirmUndo: false })} disabled={result.busy}>No</Btn></span>
-                            : <Btn kind="danger" onClick={undoApplied}>Undo this change</Btn>)}
+                        {result && history.length > 0 && result.entryId === history[0].id && !applying && undoBox(history[0])}
                         {result && (result.type === 'success' || result.type === 'warn') && result.viewMs > 0 && !applying && <Btn kind="ghost" onClick={() => onView(result.viewMs)}>View on the schedule</Btn>}
                     </div>
                 </div>
@@ -4676,13 +4806,27 @@ export default function ProductionScheduleApp({ dataApi }) {
             }
             return crRecall(rows2.filter(r => r.code !== null && valid.indexOf(String(r.code)) >= 0));
         },
-        // change requests an email flow dropped in the inbox table: the waiting ones (null = the table could not be read), and a status/result write-back
+        // change requests an email flow dropped in the inbox table: { rows, full } (null = the table could not be read), and a status/result write-back.
+        // The waiting ones ("new", or no status) are read first and oldest first; the ones left for a person (review, failed, applying) are read apart, so a pile of
+        // those can never hide a new request.
         inboxList: async () => {
-            const rows2 = await queryRecords(TABLE_INBOX, dataApiRef.current, { filter: "statecode eq 0 and (craa5_status eq 'new' or craa5_status eq 'review' or craa5_status eq 'failed')", orderby: 'createdon asc', top: INBOX_TOP, quiet: true });   // the table is optional: its absence is not worth a console warning
-            if (rows2 === null) return null;
-            noteKeys('inbox', rows2);
+            const toRow = (r) => ({ id: String(r.craa5_schedulechangeid || r.craa5_ScheduleChangeId || ''), name: renderSafe(rv(r, 'craa5_name')), sender: renderSafe(rv(r, 'craa5_sender')), json: rv(r, 'craa5_formjson') || '', status: String(rv(r, 'craa5_status') || 'new'), result: renderSafe(rv(r, 'craa5_result')), at: Date.parse(r.createdon) || 0 });
+            const fresh = await queryRecords(TABLE_INBOX, dataApiRef.current, { filter: "statecode eq 0 and (craa5_status eq 'new' or craa5_status eq null)", orderby: 'createdon asc', top: INBOX_TOP, quiet: true });   // the table is optional: its absence is not worth a console warning
+            if (fresh === null) return null;
+            noteKeys('inbox', fresh);
             colStateRef.current.probed['inbox|craa5_status'] = { s: 'found' };   // a filter on a column that is not there is refused, so this worked because it is
-            return rows2.map(r => ({ id: String(r.craa5_schedulechangeid || r.craa5_ScheduleChangeId || ''), name: renderSafe(rv(r, 'craa5_name')), sender: renderSafe(rv(r, 'craa5_sender')), json: rv(r, 'craa5_formjson') || '', status: String(rv(r, 'craa5_status') || 'new'), result: renderSafe(rv(r, 'craa5_result')), at: Date.parse(r.createdon) || 0 })).filter(x => x.id);
+            const held = await queryRecords(TABLE_INBOX, dataApiRef.current, { filter: "statecode eq 0 and (craa5_status eq 'review' or craa5_status eq 'failed' or craa5_status eq 'applying')", orderby: 'createdon desc', top: INBOX_HELD, quiet: true }) || [];
+            const rows2 = fresh.concat(held).map(toRow).filter(x => x.id);
+            return { rows: rows2, full: fresh.length >= INBOX_TOP || held.length >= INBOX_HELD };
+        },
+        // one page takes a request: the row must still be "new", and goes to "applying" (null/false = another page has it, or it cannot be read: leave it for a person)
+        inboxClaim: async (id, stamp) => {
+            if (!id || !apiReady) return false;
+            const got = await queryRecords(TABLE_INBOX, dataApiRef.current, { filter: `statecode eq 0 and craa5_schedulechangeid eq ${id}`, top: 1, quiet: true });
+            if (!got || !got.length) return false;
+            if (String(rv(got[0], 'craa5_status') || 'new') !== 'new') return false;
+            const text = `Being applied by a Production Schedule page (${stamp || ''}).`;
+            return (await importApiNow.inboxSet(id, { craa5_status: 'applying', craa5_result: text }, 'change request claimed')) ? text : false;
         },
         inboxSet: async (id, fields, what) => {
             const w = writer();
@@ -4719,6 +4863,7 @@ export default function ProductionScheduleApp({ dataApi }) {
         recallItems: (c) => importLatest.current.recallItems(c),
         inboxList: () => importLatest.current.inboxList(),
         inboxSet: (id, f, w) => importLatest.current.inboxSet(id, f, w),
+        inboxClaim: (id, st) => importLatest.current.inboxClaim(id, st),
     }), []);
     const importDone = useMemo(() => () => { loadedRef.current = []; setReloadTick(n => n + 1); }, []);
     const importShow = useMemo(() => (ms) => { setTab('schedule'); setView(v => ({ days: 7, from: addDaysLocal(midnightOf(ms), -new Date(ms).getDay()).getTime() })); }, []);
@@ -5069,7 +5214,7 @@ export default function ProductionScheduleApp({ dataApi }) {
     const issueColor = { overlap: BRAND.red, short: BRAND.red, tight: '#D97706', shift: '#F97316' };
     const rangeLabel = view.days === 1 ? fmtDay(view.from) : `${fmtDay(view.from)} to ${fmtDay(rangeTo - 1)}`;
     const issueValues = Object.keys(issues).map(k => issues[k]);
-    const lastPay = payloadsRef.current.length ? payloadsRef.current[payloadsRef.current.length - 1] : null;
+    const lastPay = (() => { const l = payloadsRef.current; for (let k = l.length - 1; k >= 0; k--) { if (l[k].table !== TABLE_INBOX) return l[k]; } return null; })();   // the header shows the last save of a RUN; a status write-back to the optional inbox is not one
 
     return (
         <div className="flex flex-col h-screen bg-[#F7F9FC] text-slate-800 overflow-hidden" style={{ fontFamily: BRAND_FONT }}>
