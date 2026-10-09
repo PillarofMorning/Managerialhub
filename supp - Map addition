@@ -28,7 +28,7 @@ LEARNINGS & CHAT CONTEXT LOG
   * Closed: an observation can be marked Closed (and reopened). This uses the table's built-in Status (statecode 1 = Inactive), so no new
     column is needed. Closed flags are grey with a check on the map; Open / Closed / All sits beside the category chips.
   * HOST RULE: the app host compiles to ES5 without iterable support. Never spread or for-of a Set or Map; use arrays and Array.from.
-- Entry 19 (Current): Hide closed, and the Assets tab.
+- Entry 19: Hide closed, and the Assets tab.
   * Overview map: a "Hide closed" switch (on at first, remembered on the device) replaces Open / Closed / Both there. Gallery and the
     Action Item Rail keep Open / Closed / Both.
   * Assets tab (table craa5_aa_assets): the placed assets are pins on the map; a search list (Dataverse queries, 50 rows a page, never the
@@ -46,6 +46,23 @@ LEARNINGS & CHAT CONTEXT LOG
     open / remove (their own requests). Saves send only the changed columns with the row's etag (If-Match), so someone else's newer change
     is never overwritten silently ("Save mine anyway" overrides). Unsaved edits are never dropped without asking; the Assets tab stays
     alive (hidden) when another tab is opened, so its edits are still there on the way back. Fields are locked while a save runs.
+- Entry 20 (Current): Box snap, a map you can turn and pop out, and the equipment table.
+  * Assets has two sub-tabs, Map and Equipment table (the last one used is remembered). Both stay alive once opened, so nothing
+    typed in one is lost by looking at the other; a save in one shows in the other (pins, list, card, table row).
+  * Map: drag a box around something and smart snap fits it to the black lines inside it (enclosed areas plus the lines around
+    them; no enclosed area = the lines' own extent; no lines = the box as drawn). Saved with "s":2. A click still snaps as before.
+    "Drag: move map" pans instead; the middle button and two fingers always pan, two fingers pinch to zoom.
+  * Turn left / right (remembered on the device; pins stay upright, spots are always saved in picture terms), zoom 25-800% with
+    the buttons or Ctrl + wheel around the pointer, Fit, and Pop out (the map fills the screen; Esc or Close pop-out comes back).
+  * A pin opens a short card (picture, cleaning frequencies, a few facts, Move / Remove from map, "Edit in table"). Every
+    column is edited in the Equipment table; the full editor stays on the map only for "+ New asset here".
+  * Equipment table: 50 rows a page with the total (Show more for the next 50), search, room, on / off the map, sort by a column
+    header (in Dataverse), and a Columns list (sections, remembered on the device). Every column is fetched once, so showing a
+    column needs no new query. Cells edit by type; each row saves only its changed columns with its etag (412: "Reload row" or
+    "Save mine anyway"); Save all / Discard all; a changed row that drops out of a search is kept at the top. Pictures and files
+    upload, open and remove straight from their cells (the table asks for file names and picture time stamps, never the
+    pictures). Details opens the full editor in a side panel; + New asset creates one there and keeps it open for uploads.
+    If Dataverse refuses the column list, the table asks again for every column instead.
 =======================================================================
 */
 
@@ -2832,7 +2849,11 @@ const metaLabel = (l) => {
 
 const getJson = async (path, headers) => {
   const res = await fetch(apiUrl(path), { headers: { ...ODATA_HEADERS, ...NO_CACHE, ...(headers || {}) } });
-  if (!res.ok) throw new Error(await readApiError(res));
+  if (!res.ok) {
+    const err = new Error(await readApiError(res));
+    err.status = res.status;
+    throw err;
+  }
   return res.json();
 };
 
@@ -2912,6 +2933,10 @@ async function loadAssetMetadata(logEvent) {
 
   const fields = [];
   const byName = {};
+  const companions = {};
+  attributes.forEach(a => {
+    if (a && a.AttributeOf && a.IsValidForRead !== false && a.IsValidODataAttribute !== false) companions[a.LogicalName] = true;
+  });
   attributes.forEach(a => {
     // Companion columns (file names, lookup names) and columns the Web API does not expose are left out
     if (!a || !a.LogicalName || a.AttributeOf || a.IsValidForRead === false || a.IsValidODataAttribute === false) return;
@@ -2933,6 +2958,9 @@ async function loadAssetMetadata(logEvent) {
       info: ASSET_INFO_COLUMNS.indexOf(a.LogicalName) !== -1
     };
     if (field.kind === 'bool') { field.trueLabel = 'Yes'; field.falseLabel = 'No'; }
+    // The table asks for these instead of the file itself: the file's name, the picture's time stamp
+    if (field.kind === 'file' && companions[`${field.name}_name`]) field.nameColumn = `${field.name}_name`;
+    if (field.kind === 'image' && companions[`${field.name}_timestamp`]) field.stampColumn = `${field.name}_timestamp`;
     fields.push(field);
     byName[field.name] = field;
   });
@@ -2997,20 +3025,26 @@ const toAssetSummary = (row, mapColumn) => ({
 
 const assetWordFilter = (words) => words.map(w => `(contains(craa5_equipmentidentifier,'${escLike(w)}') or contains(craa5_roomname,'${escLike(w)}') or contains(craa5_areaname,'${escLike(w)}'))`);
 
+// The filter and order of an asset list (the map's list and the equipment table). `sort` = { name, desc } from a column header.
+function assetListQuery({ words, room, placement, mapColumn, orderById, sort }) {
+  const parts = assetWordFilter(words || []);
+  if (room) parts.push(`craa5_roomname eq '${escOData(room)}'`);
+  if (mapColumn && placement === 'placed') parts.push(`${mapColumn} ne null`);
+  if (mapColumn && placement === 'unplaced') parts.push(`${mapColumn} eq null`);
+  // Nothing searched yet: the latest changed first. The id last, so paging never repeats or skips a row.
+  let first = '';
+  if (sort) first = `${sort.name} ${sort.desc ? 'desc' : 'asc'}`;
+  else if (!orderById) first = (words || []).length === 0 && !room ? 'modifiedon desc' : `${ASSET_NAME_COLUMN} asc`;
+  return { filter: parts.join(' and '), order: first ? `${first},${ASSET_ID_COLUMN}` : ASSET_ID_COLUMN };
+}
+
 // One page of assets. `next` is the previous page's @odata.nextLink (an absolute URL), else a new query.
 // Never the whole table: Dataverse sends `pageSize` rows at a time.
 async function fetchAssetPage({ set, words, room, placement, mapColumn, next, pageSize, orderById }) {
   let url = next;
   if (!url) {
-    const parts = assetWordFilter(words || []);
-    if (room) parts.push(`craa5_roomname eq '${escOData(room)}'`);
-    if (mapColumn && placement === 'placed') parts.push(`${mapColumn} ne null`);
-    if (mapColumn && placement === 'unplaced') parts.push(`${mapColumn} eq null`);
-    // Nothing searched yet: the latest changed first
-    // Nothing searched yet: the latest changed first. The id last, so paging never repeats or skips a row.
-    const first = orderById ? '' : ((words || []).length === 0 && !room ? 'modifiedon desc' : `${ASSET_NAME_COLUMN} asc`);
-    const order = first ? `${first},${ASSET_ID_COLUMN}` : ASSET_ID_COLUMN;
-    url = apiUrl(`${set}?$select=${assetListSelect(mapColumn)}${parts.length ? `&$filter=${encodeURIComponent(parts.join(' and '))}` : ''}&$orderby=${encodeURIComponent(order)}`);
+    const q = assetListQuery({ words, room, placement, mapColumn, orderById });
+    url = apiUrl(`${set}?$select=${assetListSelect(mapColumn)}${q.filter ? `&$filter=${encodeURIComponent(q.filter)}` : ''}&$orderby=${encodeURIComponent(q.order)}`);
   }
   // The same page size on every page (a nextLink is fetched exactly as Dataverse gave it)
   const res = await fetch(url, { headers: { ...ODATA_HEADERS, ...NO_CACHE, Prefer: `odata.maxpagesize=${pageSize || ASSET_LIST_PAGE}` } });
@@ -3150,7 +3184,8 @@ async function openAssetFile(set, id, column, fileName, isImage) {
 
 // --- MAP SPOTS ---
 // Saved as a little JSON text: {"v":1,"m":"MAIN","x":12.34,"y":56.78,"b":[left,top,width,height],"s":1}, in percent of the map picture.
-// "s":1 = smart snap found an outline there. "12.3;45.6" typed by hand also counts as a spot.
+// "s":1 = smart snap found an outline around a click, "s":2 = a dragged box was fitted to the lines in it. "12.3;45.6" typed by
+// hand also counts as a spot.
 const clampPct = (n) => Math.max(0, Math.min(100, n));
 const round2 = (n) => Math.round(n * 100) / 100;
 
@@ -3164,17 +3199,17 @@ function parseMapLocation(text) {
       const y = num(o.y);
       if (x === null || y === null) return null;
       const box = Array.isArray(o.b) && o.b.length === 4 && o.b.every(v => typeof v === 'number' && isFinite(v)) ? o.b : null;
-      return { x, y, box, snapped: o.s === 1, map: typeof o.m === 'string' ? o.m.toUpperCase() : '' };
+      return { x, y, box, snapped: o.s === 1 || o.s === 2, how: o.s === 2 ? 'box' : 'click', map: typeof o.m === 'string' ? o.m.toUpperCase() : '' };
     }
   } catch (e) { /* not JSON */ }
   const m = String(text).match(/^\s*(\d+(?:\.\d+)?)\s*[;,]\s*(\d+(?:\.\d+)?)\s*$/);
-  return m ? { x: clampPct(parseFloat(m[1])), y: clampPct(parseFloat(m[2])), box: null, snapped: false, map: '' } : null;
+  return m ? { x: clampPct(parseFloat(m[1])), y: clampPct(parseFloat(m[2])), box: null, snapped: false, how: 'click', map: '' } : null;
 }
 
 function mapLocationText(spot, mapKey, maxLength) {
   const o = { v: 1, m: mapKey || 'MAIN', x: round2(spot.x), y: round2(spot.y) };
   if (spot.box) o.b = spot.box.map(round2);
-  if (spot.snapped) o.s = 1;
+  if (spot.snapped) o.s = spot.how === 'box' ? 2 : 1;
   let text = JSON.stringify(o);
   if (maxLength && text.length > maxLength) { delete o.b; text = JSON.stringify(o); }
   if (maxLength && text.length > maxLength) text = `${o.x};${o.y}`;
@@ -3519,6 +3554,113 @@ const boxesAgree = (a, b) => {
   return union > 0 && inter / union > 0.6;
 };
 
+// A dragged box (percent of the picture: [x0, y0, x1, y1]): the outline the black lines inside it draw. Areas those lines
+// close off inside the box are filled, with the lines around them; lines that only run on past them are cut. When the lines
+// close nothing off, the box shrinks to the lines themselves. No lines in the box: null (the box is used as drawn).
+function snapBox(grid, rect) {
+  const { w, h, dark, closed, gap } = grid;
+  const x0 = Math.max(0, Math.floor((Math.min(rect[0], rect[2]) / 100) * w));
+  const x1 = Math.min(w - 1, Math.ceil((Math.max(rect[0], rect[2]) / 100) * w) - 1);
+  const y0 = Math.max(0, Math.floor((Math.min(rect[1], rect[3]) / 100) * h));
+  const y1 = Math.min(h - 1, Math.ceil((Math.max(rect[1], rect[3]) / 100) * h) - 1);
+  const bw = x1 - x0 + 1;
+  const bh = y1 - y0 + 1;
+  if (bw < 3 || bh < 3) return null;
+  const n = bw * bh;
+  const at = (k) => { const lx = k % bw; return (y0 + (k - lx) / bw) * w + x0 + lx; };
+  // Light floor that can be reached from the box's edge (with door gaps closed) is outside what the lines draw
+  const outside = new Uint8Array(n);
+  const stack = new Int32Array(n);
+  let top = 0;
+  const reach = (k) => { if (!outside[k] && !closed[at(k)]) { outside[k] = 1; stack[top++] = k; } };
+  for (let lx = 0; lx < bw; lx += 1) { reach(lx); reach((bh - 1) * bw + lx); }
+  for (let ly = 0; ly < bh; ly += 1) { reach(ly * bw); reach(ly * bw + bw - 1); }
+  while (top > 0) {
+    const k = stack[--top];
+    const lx = k % bw;
+    if (lx > 0) reach(k - 1);
+    if (lx < bw - 1) reach(k + 1);
+    if (k >= bw) reach(k - bw);
+    if (k + bw < n) reach(k + bw);
+  }
+  // ...and the strip the gap closing took from it, back up to the real lines
+  for (let step = 0; step < gap; step += 1) {
+    const grow = [];
+    for (let k = 0; k < n; k += 1) {
+      if (outside[k] || dark[at(k)]) continue;
+      const lx = k % bw;
+      if ((lx > 0 && outside[k - 1]) || (lx < bw - 1 && outside[k + 1]) || (k >= bw && outside[k - bw]) || (k + bw < n && outside[k + bw])) grow.push(k);
+    }
+    grow.forEach(k => { outside[k] = 1; });
+  }
+  const isDark = new Uint8Array(n);
+  const light = new Uint8Array(n); // closed off by lines, not yet sorted
+  let darkCount = 0;
+  let minX = bw; let minY = bh; let maxX = -1; let maxY = -1;
+  for (let k = 0; k < n; k += 1) {
+    if (dark[at(k)]) {
+      isDark[k] = 1;
+      darkCount += 1;
+      const lx = k % bw;
+      const ly = (k - lx) / bw;
+      if (lx < minX) minX = lx;
+      if (lx > maxX) maxX = lx;
+      if (ly < minY) minY = ly;
+      if (ly > maxY) maxY = ly;
+    } else if (!outside[k]) {
+      light[k] = 1;
+    }
+  }
+  if (darkCount === 0) return null;
+  // Closed-off areas big enough to be a room or an outlined machine (the holes in letters are not)
+  const minArea = Math.max(SNAP_MIN_PX, Math.floor(w * h * 0.00004));
+  const enclosed = new Uint8Array(n);
+  let enclosedCount = 0;
+  for (let start = 0; start < n; start += 1) {
+    if (!light[start]) continue;
+    const part = [start];
+    light[start] = 0;
+    for (let j = 0; j < part.length; j += 1) {
+      const k = part[j];
+      const lx = k % bw;
+      if (lx > 0 && light[k - 1]) { light[k - 1] = 0; part.push(k - 1); }
+      if (lx < bw - 1 && light[k + 1]) { light[k + 1] = 0; part.push(k + 1); }
+      if (k >= bw && light[k - bw]) { light[k - bw] = 0; part.push(k - bw); }
+      if (k + bw < n && light[k + bw]) { light[k + bw] = 0; part.push(k + bw); }
+    }
+    if (part.length >= minArea) {
+      part.forEach(k => { enclosed[k] = 1; });
+      enclosedCount += part.length;
+    }
+  }
+  // Closed-off areas that fill a fair part of the box are what was boxed; a few small pockets (between letters) are not
+  if (enclosedCount >= n * 0.1) {
+    // The closed-off areas, and the lines around them (lines that run on are cut about one line width past the area)
+    const near = dilate(enclosed, bw, bh, gap + 2);
+    const pixels = [];
+    for (let k = 0; k < n; k += 1) if (enclosed[k] || (isDark[k] && near[k])) pixels.push(at(k));
+    const region = describeRegion(grid, pixels, 'box', at(Math.floor(bh / 2) * bw + Math.floor(bw / 2)));
+    region.inside = false;
+    return region;
+  }
+  // Nothing closed off: the box pulled in to the lines in it
+  const rw = maxX - minX + 1;
+  const rh = maxY - minY + 1;
+  const mask = new Uint8Array(rw * rh);
+  mask.fill(1);
+  return {
+    kind: 'box',
+    x: ((x0 + minX + rw / 2) / w) * 100,
+    y: ((y0 + minY + rh / 2) / h) * 100,
+    box: [((x0 + minX) / w) * 100, ((y0 + minY) / h) * 100, (rw / w) * 100, (rh / h) * 100],
+    mask: { w: rw, h: rh, data: mask },
+    origin: [x0 + minX, y0 + minY],
+    area: rw * rh,
+    gridW: w,
+    inside: false
+  };
+}
+
 // --- EDITOR VALUES ---
 // What a column holds while it is edited: text for text and numbers, true / false / null for yes-no, an array for
 // multi-select choices, "YYYY-MM-DD" (or "YYYY-MM-DDTHH:mm") for dates, { id, name, set } for lookups.
@@ -3749,44 +3891,29 @@ function RegionOverlay({ region, fill, edge, testId }) {
 }
 
 // ==========================================
-// TAB: ASSETS (the equipment table on the map, and its editor)
+// TAB: ASSETS. Two views of the equipment table (craa5_aa_assets): the map (smart snap, pins) and the equipment table
+// (every column, uploads). Both stay alive once opened, so nothing typed in one is lost by looking at the other.
 // ==========================================
+const ASSET_VIEW_PREF = 'stillwell.assets.view';
+const ASSET_ROTATION_PREF = 'stillwell.assets.rotation';
+const ASSET_DRAG_PREF = 'stillwell.assets.drag';
+const ASSET_ZOOM_STEPS = [25, 33, 50, 67, 75, 100, 125, 150, 200, 250, 300, 400, 500, 600, 800];
+const ASSET_ZOOM_MIN = 25;
+const ASSET_ZOOM_MAX = 800;
+
+const RotateRight = createIcon(<><polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" /></>);
+const RotateLeft = createIcon(<><polyline points="1 4 1 10 7 10" /><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" /></>);
+const PopOutIcon = createIcon(<><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></>);
+const PopInIcon = createIcon(<><polyline points="4 14 10 14 10 20" /><polyline points="20 10 14 10 14 4" /><line x1="14" y1="10" x2="21" y2="3" /><line x1="3" y1="21" x2="10" y2="14" /></>);
+
 function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta, assetPins, setAssetPins, logEvent }) {
   const meta = assetMeta;
   const set = meta.entitySet || ASSET_SET;
   const mapColumn = meta.mapColumn ? meta.mapColumn.name : null;
-  const containerRef = useRef(null);
-  const mapRef = useRef(null);
-  const [zoomLevel, setZoomLevel] = useState(100);
-  const [snapOn, setSnapOn] = useState(() => readPref(SNAP_PREF, true) !== false);
-  useEffect(() => { writePref(SNAP_PREF, snapOn); }, [snapOn]);
-
-  const [selectedId, setSelectedId] = useState(null);   // asset open in the editor
-  const [creating, setCreating] = useState(null);       // { location } while a new asset is filled in
-  const [placingFor, setPlacingFor] = useState(null);   // { id, name } of the asset being placed, { id: 'new' } for the new-asset form
-  const [spot, setSpot] = useState(null);               // the clicked spot: { x, y, box, snapped, region, note }
-  const [snapBusy, setSnapBusy] = useState(false);
-  const [dirty, setDirty] = useState(false);            // the editor has unsaved changes
-  const [pendingNav, setPendingNav] = useState(null);   // { run } waiting for "Discard changes?"
-  const [refreshToken, setRefreshToken] = useState(0);  // bump: the editor re-reads its row (keeping unsaved edits)
-  const [selectedRegion, setSelectedRegion] = useState(null);
-  const [actionError, setActionError] = useState('');
-  const [savingSpot, setSavingSpot] = useState(false);
-  const clickSeq = useRef(0);
-
-  // Search (one box for the list and the pins)
-  const [query, setQuery] = useState('');
-  const [debounced, setDebounced] = useState('');
-  useEffect(() => {
-    const t = setTimeout(() => setDebounced(query), 300);
-    return () => clearTimeout(t);
-  }, [query]);
-  const words = useMemo(() => debounced.trim().split(/\s+/).filter(Boolean).slice(0, 4), [debounced]);
-  const [placement, setPlacement] = useState('all');
-  const [room, setRoom] = useState('');
-  const [rooms, setRooms] = useState([]);
-  const [list, setList] = useState({ rows: [], next: null, loading: true, error: '' });
-  const listReq = useRef(0);
+  const [view, setView] = useState(() => (readPref(ASSET_VIEW_PREF, 'map') === 'table' ? 'table' : 'map'));
+  useEffect(() => { writePref(ASSET_VIEW_PREF, view); }, [view]);
+  const [tableOpened, setTableOpened] = useState(view === 'table');
+  useEffect(() => { if (view === 'table') setTableOpened(true); }, [view]);
 
   // 1. The table's columns (once per session)
   useEffect(() => {
@@ -3816,15 +3943,159 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
     if (metaDone && mapColumn && assetPins.status === 'idle') loadPins();
   }, [metaDone, mapColumn, assetPins.status, loadPins]);
 
-  // 3. Room names for the filter
+  // 3. Room names for the filters
+  const [rooms, setRooms] = useState([]);
   useEffect(() => {
-    if (!metaDone) return;
+    if (!metaDone) return undefined;
     let alive = true;
     loadAssetRooms(set).then(r => { if (alive) setRooms(r); }).catch(error => logEvent(`Room list for the asset filter could not be loaded: ${error.message}`, 'warn'));
     return () => { alive = false; };
   }, [metaDone, set, logEvent]);
 
-  // 4. The list: the first page whenever the search or filters change
+  // 4. A saved asset reaches the pins and the other view
+  const [rowEvent, setRowEvent] = useState(null); // { row, summary, from, isNew, n }
+  const rowSeq = useRef(0);
+  const onAssetSaved = useCallback((row, from, isNew) => {
+    const summary = toAssetSummary(row, mapColumn);
+    if (pinSaves.current) pinSaves.current[summary.id] = summary;
+    setAssetPins(p => {
+      const rows = p.rows.filter(r => r.id !== summary.id);
+      return { ...p, rows: summary.location ? rows.concat([summary]) : rows };
+    });
+    rowSeq.current += 1;
+    setRowEvent({ row, summary, from, isNew: !!isNew, n: rowSeq.current });
+  }, [mapColumn, setAssetPins]);
+
+  // 5. One view asks the other to show an asset
+  const focusSeq = useRef(0);
+  const [mapFocus, setMapFocus] = useState(null);     // { id, n }
+  const [tableFocus, setTableFocus] = useState(null); // { id, n }
+  const showOnMap = useCallback((id) => { focusSeq.current += 1; setMapFocus({ id, n: focusSeq.current }); setView('map'); }, []);
+  const editInTable = useCallback((id) => { focusSeq.current += 1; setTableFocus({ id, n: focusSeq.current }); setView('table'); }, []);
+
+  const subTab = (key, label) => (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={view === key}
+      onClick={() => setView(key)}
+      className={`px-3.5 py-1.5 rounded-t-lg text-sm font-bold border-b-2 transition-colors ${view === key ? 'border-[#0072CE] text-[#00468B] bg-white' : 'border-transparent text-slate-500 hover:text-[#00468B] hover:bg-white/60'}`}
+    >
+      {label}
+    </button>
+  );
+
+  return (
+    <div className="h-full flex flex-col bg-slate-100">
+      <div className="shrink-0 px-4 md:px-6 pt-2 flex items-end gap-1 border-b border-slate-200" role="tablist" aria-label="Asset views">
+        {subTab('map', 'Map')}
+        {subTab('table', 'Equipment table')}
+      </div>
+      <div className="flex-1 min-h-0">
+        <div className={view === 'map' ? 'h-full' : 'hidden'}>
+          <AssetsMap
+            active={view === 'map'}
+            mapImage={mapImage}
+            setMainMapImage={setMainMapImage}
+            mapKey={mapKey}
+            meta={meta}
+            set={set}
+            mapColumn={mapColumn}
+            metaDone={metaDone}
+            loadAssetMeta={loadAssetMeta}
+            assetPins={assetPins}
+            loadPins={loadPins}
+            rooms={rooms}
+            rowEvent={rowEvent}
+            focus={mapFocus}
+            onAssetSaved={onAssetSaved}
+            onEditInTable={editInTable}
+            logEvent={logEvent}
+          />
+        </div>
+        {tableOpened && (
+          <div className={view === 'table' ? 'h-full' : 'hidden'}>
+            <AssetsTable
+              meta={meta}
+              set={set}
+              mapColumn={mapColumn}
+              mapKey={mapKey}
+              metaDone={metaDone}
+              loadAssetMeta={loadAssetMeta}
+              rooms={rooms}
+              rowEvent={rowEvent}
+              focus={tableFocus}
+              onAssetSaved={onAssetSaved}
+              onShowOnMap={showOnMap}
+              logEvent={logEvent}
+            />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Where a point of the picture lands on the turned map, and back (fractions 0..1; turns are clockwise)
+const turnPoint = (rotation, x, y) => {
+  if (rotation === 90) return [1 - y, x];
+  if (rotation === 180) return [1 - x, 1 - y];
+  if (rotation === 270) return [y, 1 - x];
+  return [x, y];
+};
+const unturnPoint = (rotation, u, v) => {
+  if (rotation === 90) return [v, 1 - u];
+  if (rotation === 180) return [1 - u, 1 - v];
+  if (rotation === 270) return [1 - v, u];
+  return [u, v];
+};
+const clamp01 = (n) => Math.max(0, Math.min(1, n));
+
+// ==========================================
+// ASSETS: THE MAP
+// ==========================================
+function AssetsMap({ active, mapImage, setMainMapImage, mapKey, meta, set, mapColumn, metaDone, loadAssetMeta, assetPins, loadPins, rooms, rowEvent, focus, onAssetSaved, onEditInTable, logEvent }) {
+  const rootRef = useRef(null);
+  const containerRef = useRef(null);
+  const stageRef = useRef(null);
+  const [zoomLevel, setZoomLevel] = useState(100);
+  const [rotation, setRotation] = useState(() => { const r = readPref(ASSET_ROTATION_PREF, 0); return [0, 90, 180, 270].indexOf(r) !== -1 ? r : 0; });
+  useEffect(() => { writePref(ASSET_ROTATION_PREF, rotation); }, [rotation]);
+  const [dragMode, setDragMode] = useState(() => (readPref(ASSET_DRAG_PREF, 'box') === 'move' ? 'move' : 'box'));
+  useEffect(() => { writePref(ASSET_DRAG_PREF, dragMode); }, [dragMode]);
+  const [popped, setPopped] = useState(false);
+  const [natural, setNatural] = useState(null); // { w, h } of the map picture
+  const [snapOn, setSnapOn] = useState(() => readPref(SNAP_PREF, true) !== false);
+  useEffect(() => { writePref(SNAP_PREF, snapOn); }, [snapOn]);
+
+  const [selectedId, setSelectedId] = useState(null);   // asset open in the side panel
+  const [creating, setCreating] = useState(null);       // { location } while a new asset is filled in
+  const [placingFor, setPlacingFor] = useState(null);   // { id, name } of the asset being placed, { id: 'new' } for the new-asset form
+  const [spot, setSpot] = useState(null);               // the picked spot: { x, y, box, snapped, how, region, note }
+  const [snapBusy, setSnapBusy] = useState(false);
+  const [dirty, setDirty] = useState(false);            // the new-asset form has unsaved changes
+  const [pendingNav, setPendingNav] = useState(null);   // { run } waiting for "Discard changes?"
+  const [refreshToken, setRefreshToken] = useState(0);  // bump: the open asset is read again
+  const [selectedRegion, setSelectedRegion] = useState(null);
+  const [actionError, setActionError] = useState('');
+  const [savingSpot, setSavingSpot] = useState(false);
+  const [dragRect, setDragRect] = useState(null);       // [u0, v0, u1, v1] on the turned map while a box is drawn
+  const clickSeq = useRef(0);
+
+  // Search (one box for the list and the pins)
+  const [query, setQuery] = useState('');
+  const [debounced, setDebounced] = useState('');
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(query), 300);
+    return () => clearTimeout(t);
+  }, [query]);
+  const words = useMemo(() => debounced.trim().split(/\s+/).filter(Boolean).slice(0, 4), [debounced]);
+  const [placement, setPlacement] = useState('all');
+  const [room, setRoom] = useState('');
+  const [list, setList] = useState({ rows: [], next: null, loading: true, error: '' });
+  const listReq = useRef(0);
+
+  // The list: the first page whenever the search or filters change
   const listKey = [words.join(' '), room, placement, mapColumn || '', metaDone ? '1' : '0'].join('#');
   useEffect(() => {
     if (!metaDone) return;
@@ -3857,18 +4128,23 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
       .catch(error => { if (req === listReq.current) setList(l => ({ ...l, loading: false, error: error.message })); });
   };
 
-  // Keep the pins and the list in step with a saved asset
-  const applySummary = useCallback((summary, isNewRow) => {
-    if (pinSaves.current) pinSaves.current[summary.id] = summary;
-    setAssetPins(p => {
-      const rows = p.rows.filter(r => r.id !== summary.id);
-      return { ...p, rows: summary.location ? rows.concat([summary]) : rows };
-    });
+  // Keep the list in step with a saved asset (the pins follow in the parent)
+  const applyToList = useCallback((summary, isNewRow) => {
     setList(l => ({
       ...l,
       rows: isNewRow ? [summary].concat(l.rows.filter(r => r.id !== summary.id)) : l.rows.map(r => (r.id === summary.id ? summary : r))
     }));
-  }, [setAssetPins]);
+  }, []);
+  const saved = useCallback((row, isNewRow) => {
+    applyToList(toAssetSummary(row, mapColumn), isNewRow);
+    onAssetSaved(row, 'map', isNewRow);
+  }, [applyToList, onAssetSaved, mapColumn]);
+  // Saved in the table: the list and the open card follow
+  useEffect(() => {
+    if (!rowEvent || rowEvent.from === 'map') return;
+    applyToList(rowEvent.summary, rowEvent.isNew);
+    if (rowEvent.summary.id === selectedId) setRefreshToken(t => t + 1);
+  }, [rowEvent && rowEvent.n]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Pins on this map that match the search
   const pinWords = useMemo(() => query.trim().toLowerCase().split(/\s+/).filter(Boolean), [query]);
@@ -3909,12 +4185,18 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
     getSnapGrid(mapImage)
       .then(grid => {
         if (!alive) return;
-        const r = snapAt(grid, loc.x, loc.y);
+        let r = null;
+        if (loc.how === 'box' && loc.box) {
+          const b = loc.box;
+          r = snapBox(grid, [b[0] - 0.2, b[1] - 0.2, b[0] + b[2] + 0.2, b[1] + b[3] + 0.2]);
+        } else {
+          r = snapAt(grid, loc.x, loc.y);
+        }
         setSelectedRegion(r && (!loc.box || boxesAgree(r.box, loc.box)) ? r : null);
       })
       .catch(() => { /* the saved box is drawn instead */ });
     return () => { alive = false; };
-  }, [selectedId, selectedLocation ? selectedLocation.x : null, selectedLocation ? selectedLocation.y : null, mapImage]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selectedId, selectedLocation ? `${selectedLocation.x}:${selectedLocation.y}:${selectedLocation.how}` : '', mapImage]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Unsaved edits are never dropped silently
   const guard = (run) => {
@@ -3922,47 +4204,179 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
     else run();
   };
 
+  // --- The turned, zoomed map ---
+  const quarter = rotation === 90 || rotation === 270;
+  const nat = natural || { w: 1, h: 1 };
+  // The stage is the map as it is seen (turned); the picture sits in its middle, turned by CSS
+  const stageStyle = {
+    width: `${zoomLevel}%`,
+    aspectRatio: quarter ? `${nat.h} / ${nat.w}` : `${nat.w} / ${nat.h}`,
+    touchAction: 'none'
+  };
+  const pictureStyle = {
+    width: quarter ? `${(nat.w / nat.h) * 100}%` : '100%',
+    height: quarter ? `${(nat.h / nat.w) * 100}%` : '100%',
+    left: '50%',
+    top: '50%',
+    transform: `translate(-50%, -50%) rotate(${rotation}deg)`
+  };
+
+  // Zooming keeps the point under the pointer (or the middle of the view) where it is
+  const zoomAnchor = useRef(null);
+  const zoomRef = useRef({ level: 100, zoomTo: null });
+  const zoomTo = useCallback((target, clientX, clientY) => {
+    const next = Math.max(ASSET_ZOOM_MIN, Math.min(ASSET_ZOOM_MAX, Math.round(target)));
+    const c = containerRef.current;
+    const s = stageRef.current;
+    if (c && s && next !== zoomRef.current.level) {
+      const cr = c.getBoundingClientRect();
+      const sr = s.getBoundingClientRect();
+      const px = clientX === undefined ? cr.left + cr.width / 2 : clientX;
+      const py = clientY === undefined ? cr.top + cr.height / 2 : clientY;
+      if (sr.width > 0 && sr.height > 0 && cr.width > 0 && cr.height > 0) {
+        zoomAnchor.current = { fx: (px - sr.left) / sr.width, fy: (py - sr.top) / sr.height, vx: (px - cr.left) / cr.width, vy: (py - cr.top) / cr.height };
+      }
+    }
+    zoomRef.current.level = next;
+    setZoomLevel(next);
+  }, []);
+  zoomRef.current.zoomTo = zoomTo;
+  React.useLayoutEffect(() => {
+    zoomRef.current.level = zoomLevel;
+    const a = zoomAnchor.current;
+    zoomAnchor.current = null;
+    const c = containerRef.current;
+    const s = stageRef.current;
+    if (!a || !c || !s) return;
+    c.scrollLeft = s.offsetLeft + a.fx * s.offsetWidth - a.vx * c.clientWidth;
+    c.scrollTop = s.offsetTop + a.fy * s.offsetHeight - a.vy * c.clientHeight;
+  }, [zoomLevel]);
+  const zoomStep = (dir) => {
+    const cur = zoomRef.current.level;
+    const next = dir > 0 ? ASSET_ZOOM_STEPS.find(z => z > cur) : ASSET_ZOOM_STEPS.slice().reverse().find(z => z < cur);
+    zoomTo(next || (dir > 0 ? ASSET_ZOOM_MAX : ASSET_ZOOM_MIN));
+  };
+  // The whole map in view
+  const fit = () => {
+    const c = containerRef.current;
+    if (!c) return;
+    const heightPerWidth = quarter ? nat.w / nat.h : nat.h / nat.w;
+    const byHeight = c.clientWidth > 0 ? (c.clientHeight / (c.clientWidth * heightPerWidth)) * 100 : 100;
+    zoomAnchor.current = null;
+    const next = Math.max(ASSET_ZOOM_MIN, Math.min(100, Math.floor(byHeight)));
+    zoomRef.current.level = next;
+    setZoomLevel(next);
+    c.scrollTo({ left: 0, top: 0 });
+  };
+  // Ctrl + wheel (and a trackpad pinch) zooms; the wheel alone scrolls as usual
+  useEffect(() => {
+    const c = containerRef.current;
+    if (!c) return undefined;
+    const onWheel = (e) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      zoomRef.current.zoomTo(zoomRef.current.level * Math.exp(-e.deltaY * 0.0015), e.clientX, e.clientY);
+    };
+    c.addEventListener('wheel', onWheel, { passive: false });
+    return () => c.removeEventListener('wheel', onWheel);
+  }, []);
+
+  // Scroll so a point of the picture (percent) is in the middle of the view
+  const pendingCenter = useRef(null);
+  const centerNow = (loc) => {
+    const c = containerRef.current;
+    const s = stageRef.current;
+    if (!c || !s) return;
+    const f = turnPoint(rotation, loc.x / 100, loc.y / 100);
+    c.scrollTo({ left: s.offsetLeft + f[0] * s.offsetWidth - c.clientWidth / 2, top: s.offsetTop + f[1] * s.offsetHeight - c.clientHeight / 2, behavior: 'smooth' });
+  };
   const centerOn = (loc) => {
     if (!loc) return;
-    setTimeout(() => centerMapOn(containerRef.current, loc.x, loc.y), 60);
+    if (mapImage && !natural) { pendingCenter.current = loc; return; }
+    setTimeout(() => centerNow(loc), 60);
+  };
+  useEffect(() => {
+    if (natural && pendingCenter.current) {
+      const loc = pendingCenter.current;
+      pendingCenter.current = null;
+      setTimeout(() => centerNow(loc), 60);
+    }
+  }, [natural]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Turning keeps the middle of the view in the middle
+  const rotate = (delta) => {
+    const c = containerRef.current;
+    const s = stageRef.current;
+    let middle = null;
+    if (c && s && s.offsetWidth > 0 && s.offsetHeight > 0) {
+      const u = clamp01((c.scrollLeft + c.clientWidth / 2 - s.offsetLeft) / s.offsetWidth);
+      const v = clamp01((c.scrollTop + c.clientHeight / 2 - s.offsetTop) / s.offsetHeight);
+      const p = unturnPoint(rotation, u, v);
+      middle = { x: p[0] * 100, y: p[1] * 100 };
+    }
+    setRotation(r => (r + delta + 360) % 360);
+    if (middle) pendingCenter.current = middle;
+  };
+  useEffect(() => {
+    if (!pendingCenter.current || (mapImage && !natural)) return;
+    const loc = pendingCenter.current;
+    pendingCenter.current = null;
+    const c = containerRef.current;
+    const s = stageRef.current;
+    if (!c || !s) return;
+    const f = turnPoint(rotation, loc.x / 100, loc.y / 100);
+    c.scrollLeft = s.offsetLeft + f[0] * s.offsetWidth - c.clientWidth / 2;
+    c.scrollTop = s.offsetTop + f[1] * s.offsetHeight - c.clientHeight / 2;
+  }, [rotation]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Pop out: the map fills the whole app (and the screen, where the browser allows it). Escape comes back.
+  const fullScreenUsed = useRef(false);
+  const setPop = (next) => {
+    setPopped(next);
+    try {
+      if (next && rootRef.current && document.fullscreenEnabled && rootRef.current.requestFullscreen) {
+        fullScreenUsed.current = true;
+        const p = rootRef.current.requestFullscreen();
+        if (p && p.catch) p.catch(() => { fullScreenUsed.current = false; });
+      } else if (!next && document.fullscreenElement && document.exitFullscreen) {
+        const p = document.exitFullscreen();
+        if (p && p.catch) p.catch(() => {});
+      }
+    } catch (e) { fullScreenUsed.current = false; /* the in-app pop-out still works */ }
+  };
+  useEffect(() => {
+    if (!popped) return undefined;
+    const onKey = (e) => { if (e.key === 'Escape' && !pendingNav) setPop(false); };
+    const onFull = () => { if (!document.fullscreenElement && fullScreenUsed.current) { fullScreenUsed.current = false; setPopped(false); } };
+    window.addEventListener('keydown', onKey);
+    document.addEventListener('fullscreenchange', onFull);
+    return () => { window.removeEventListener('keydown', onKey); document.removeEventListener('fullscreenchange', onFull); };
+  }, [popped, pendingNav]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Leaving the map view ends the pop-out
+  useEffect(() => { if (!active && popped) setPop(false); }, [active]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // --- Picking a spot: a click (smart snap around it) or a dragged box (fitted to the lines in it) ---
+  const stageFraction = (clientX, clientY) => {
+    const r = stageRef.current.getBoundingClientRect();
+    return [clamp01((clientX - r.left) / r.width), clamp01((clientY - r.top) / r.height)];
+  };
+  const toPicture = (u, v) => {
+    const p = unturnPoint(rotation, u, v);
+    return [clampPct(p[0] * 100), clampPct(p[1] * 100)];
   };
 
-  const openAsset = (asset, center) => {
-    const go = () => {
+  // What to do with a picked spot: the asset being placed gets it, otherwise "which asset is here?"
+  const usePicked = (next) => {
+    if (placingFor) { setSpot(next); return; }
+    guard(() => {
+      setSelectedId(null);
       setCreating(null);
-      setSpot(null);
-      setPlacingFor(null);
-      setActionError('');
-      setSelectedId(asset.id);
-      if (center && asset.location && pinOnMap(asset.location, mapKey)) centerOn(asset.location);
-    };
-    // The asset already open: nothing to lose, its form stays as it is
-    if (asset.id === selectedId && !creating) go();
-    else guard(go);
+      setSpot(next);
+    });
   };
 
-  const closePanel = () => guard(() => {
-    setSelectedId(null);
-    setCreating(null);
-    setPlacingFor(null);
-    setSpot(null);
-    setActionError('');
-  });
-
-  const startNew = (location) => guard(() => {
-    setSelectedId(null);
-    setPlacingFor(null);
-    setSpot(null);
-    setActionError('');
-    setCreating({ location: location || null });
-  });
-
-  // A click on the map: the spot (snapped to the outlined area when smart snap is on)
-  const onMapClick = async (e) => {
-    if (!mapRef.current || savingSpot) return;
-    const rect = mapRef.current.getBoundingClientRect();
-    const x = clampPct(((e.clientX - rect.left) / rect.width) * 100);
-    const y = clampPct(((e.clientY - rect.top) / rect.height) * 100);
+  const pickPoint = async (x, y) => {
+    if (savingSpot) return;
     const seq = clickSeq.current + 1;
     clickSeq.current = seq;
     setActionError('');
@@ -3981,28 +4395,181 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
       }
       if (seq === clickSeq.current) setSnapBusy(false);
     } else if (snapOn && !mapImage) note = 'nomap';
-    if (seq !== clickSeq.current) return; // a later click won
+    if (seq !== clickSeq.current) return; // a later pick won
     // Inside the area the pin stays where it was clicked (so several assets in one room don't sit on one point);
     // a click on a line, a label or a solid shape puts it in the middle
     const next = region
-      ? { x: region.inside ? x : region.x, y: region.inside ? y : region.y, box: region.box, snapped: true, region, note: '' }
-      : { x, y, box: null, snapped: false, region: null, note };
+      ? { x: region.inside ? x : region.x, y: region.inside ? y : region.y, box: region.box, snapped: true, how: 'click', region, note: '' }
+      : { x, y, box: null, snapped: false, how: 'click', region: null, note };
     logEvent(region ? `Smart snap found an outlined area around ${round2(next.x)}%, ${round2(next.y)}%.` : `Map spot picked at ${round2(x)}%, ${round2(y)}% (${note || 'smart snap off'}).`, 'debug');
-    if (placingFor) { setSpot(next); return; }
-    // Nothing being placed: this starts "assign this spot" (unsaved edits are kept unless the user lets them go)
-    guard(() => {
-      setSelectedId(null);
-      setCreating(null);
-      setSpot(next);
-    });
+    usePicked(next);
   };
+
+  const pickBox = async (rect) => {
+    if (savingSpot) return;
+    const seq = clickSeq.current + 1;
+    clickSeq.current = seq;
+    setActionError('');
+    const box = [rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]];
+    const middle = [rect[0] + box[2] / 2, rect[1] + box[3] / 2];
+    let region = null;
+    let note = '';
+    if (!mapColumn) note = 'nocolumn';
+    else if (snapOn && mapImage) {
+      setSnapBusy(true);
+      try {
+        const grid = await getSnapGrid(mapImage);
+        region = snapBox(grid, rect);
+        if (!region) note = 'nolines';
+      } catch (error) {
+        note = `error:${error.message}`;
+        logEvent(`Smart snap is not available: ${error.message}`, 'warn');
+      }
+      if (seq === clickSeq.current) setSnapBusy(false);
+    } else if (snapOn && !mapImage) note = 'nomap';
+    if (seq !== clickSeq.current) return;
+    const next = region
+      ? { x: region.x, y: region.y, box: region.box, snapped: true, how: 'box', region, note: '' }
+      : { x: middle[0], y: middle[1], box, snapped: false, how: 'box', region: null, note };
+    logEvent(region ? `Smart snap fitted the box to the lines at ${region.box.map(round2).join(', ')}.` : `Map box drawn at ${box.map(round2).join(', ')} (${note || 'smart snap off'}).`, 'debug');
+    usePicked(next);
+  };
+
+  // Pointer gestures on the map: a click picks a point; a drag draws a box (or moves the map); two fingers zoom and move
+  const gesture = useRef({ pointers: {}, mode: '', start: null, pinch: null });
+  const onPointerDown = (e) => {
+    if (e.pointerType === 'mouse' && e.button !== 0 && e.button !== 1) return;
+    const pinEl = e.target && e.target.closest ? e.target.closest('[data-asset-pin]') : null;
+    if (pinEl && !placingFor) return; // the pin's own click opens it
+    const g = gesture.current;
+    g.pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch (err) { /* not needed for a plain click */ }
+    const ids = Object.keys(g.pointers);
+    if (ids.length === 2) {
+      const a = g.pointers[ids[0]];
+      const b = g.pointers[ids[1]];
+      g.mode = 'pinch';
+      g.start = null;
+      g.pinch = { dist: Math.hypot(a.x - b.x, a.y - b.y), zoom: zoomRef.current.level, mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 } };
+      setDragRect(null);
+      return;
+    }
+    if (ids.length > 2) return;
+    const c = containerRef.current;
+    if (e.button === 1) e.preventDefault();
+    g.mode = 'press';
+    g.start = { id: e.pointerId, x: e.clientX, y: e.clientY, left: c ? c.scrollLeft : 0, top: c ? c.scrollTop : 0, pan: e.button === 1 || dragMode === 'move', frac: stageFraction(e.clientX, e.clientY) };
+  };
+  const onPointerMove = (e) => {
+    const g = gesture.current;
+    if (!g.pointers[e.pointerId]) return;
+    g.pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+    const c = containerRef.current;
+    if (g.mode === 'pinch') {
+      const ids = Object.keys(g.pointers);
+      if (ids.length < 2 || !c) return;
+      const a = g.pointers[ids[0]];
+      const b = g.pointers[ids[1]];
+      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      c.scrollLeft -= mid.x - g.pinch.mid.x;
+      c.scrollTop -= mid.y - g.pinch.mid.y;
+      g.pinch.mid = mid;
+      const dist = Math.hypot(a.x - b.x, a.y - b.y);
+      if (g.pinch.dist > 0) {
+        const z = g.pinch.zoom * (dist / g.pinch.dist);
+        if (Math.abs(z - zoomRef.current.level) >= 2) zoomTo(z, mid.x, mid.y);
+      }
+      return;
+    }
+    const s = g.start;
+    if (!s || s.id !== e.pointerId) return;
+    const dx = e.clientX - s.x;
+    const dy = e.clientY - s.y;
+    if (g.mode === 'press') {
+      if (Math.hypot(dx, dy) < 6) return;
+      g.mode = s.pan ? 'pan' : 'box';
+    }
+    if (g.mode === 'pan') {
+      if (c) { c.scrollLeft = s.left - dx; c.scrollTop = s.top - dy; }
+      return;
+    }
+    if (g.mode === 'box') {
+      const f = stageFraction(e.clientX, e.clientY);
+      setDragRect([s.frac[0], s.frac[1], f[0], f[1]]);
+    }
+  };
+  const onPointerEnd = (e) => {
+    const g = gesture.current;
+    if (!g.pointers[e.pointerId]) return;
+    delete g.pointers[e.pointerId];
+    if (g.mode === 'pinch') {
+      if (Object.keys(g.pointers).length === 0) { g.mode = ''; g.pinch = null; }
+      return;
+    }
+    const s = g.start;
+    const mode = g.mode;
+    g.mode = '';
+    g.start = null;
+    if (!s || s.id !== e.pointerId) return;
+    if (e.type === 'pointercancel') { setDragRect(null); return; }
+    if (mode === 'press') {
+      const p = toPicture(s.frac[0], s.frac[1]);
+      pickPoint(p[0], p[1]);
+    } else if (mode === 'box') {
+      setDragRect(null);
+      const f = stageFraction(e.clientX, e.clientY);
+      const a = toPicture(s.frac[0], s.frac[1]);
+      const b = toPicture(f[0], f[1]);
+      const rect = [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[0], b[0]), Math.max(a[1], b[1])];
+      // A box too small to mean anything is a click
+      if (rect[2] - rect[0] < 0.4 && rect[3] - rect[1] < 0.4) pickPoint((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2);
+      else pickBox(rect);
+    }
+  };
+
+  const openAsset = (asset, center) => {
+    const go = () => {
+      setCreating(null);
+      setSpot(null);
+      setPlacingFor(null);
+      setActionError('');
+      setSelectedId(asset.id);
+      if (center && asset.location && pinOnMap(asset.location, mapKey)) centerOn(asset.location);
+    };
+    // The asset already open: nothing to lose
+    if (asset.id === selectedId && !creating) go();
+    else guard(go);
+  };
+
+  // Asked from the table: open this asset here
+  useEffect(() => {
+    if (!focus) return;
+    const pin = assetPins.rows.find(p => p.id === focus.id);
+    openAsset(pin || { id: focus.id, location: null }, true);
+  }, [focus && focus.n]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const closePanel = () => guard(() => {
+    setSelectedId(null);
+    setCreating(null);
+    setPlacingFor(null);
+    setSpot(null);
+    setActionError('');
+  });
+
+  const startNew = (location) => guard(() => {
+    setSelectedId(null);
+    setPlacingFor(null);
+    setSpot(null);
+    setActionError('');
+    setCreating({ location: location || null });
+  });
 
   // Save (or clear) one asset's spot. Resolves to the saved summary.
   const saveSpot = async (asset, s) => {
     const text = s ? mapLocationText(s, mapKey, meta.mapColumn.maxLength) : null;
     const row = await patchAsset(set, asset.id, { [mapColumn]: text }, '*', logEvent);
     const summary = toAssetSummary(row, mapColumn);
-    applySummary(summary, false);
+    saved(row, false);
     setRefreshToken(t => t + 1);
     logEvent(s ? `Saved the map spot of ${summary.name}.` : `Removed ${summary.name} from the map.`, 'success');
     return summary;
@@ -4041,7 +4608,7 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
     await saveSpot(asset, null);
   };
 
-  const panel = (selectedId || creating) ? 'editor' : (spot && !placingFor ? 'spot' : 'list');
+  const panel = creating ? 'editor' : (selectedId ? 'card' : (spot && !placingFor ? 'spot' : 'list'));
   const placingName = placingFor ? (placingFor.id === 'new' ? 'the new asset' : placingFor.name) : '';
 
   let pinsLine = '';
@@ -4056,24 +4623,54 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
     if (assetPins.capped) pinsLine += ` - only the first ${ASSET_PIN_MAX} are drawn`;
   }
 
+  const toolButton = 'inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs font-bold border border-[#B3D4F2] bg-white text-[#00468B] hover:bg-[#E6F1FB] disabled:opacity-50';
+  // Where a pin's name shows: below it when the pin is near the top of the view
+  const labelBelow = (loc) => turnPoint(rotation, loc.x / 100, loc.y / 100)[1] < 0.15;
+  const pinTransform = `translate(-50%, -50%) rotate(${-rotation}deg)`;
+
   return (
-    <div className="h-full flex flex-col md:flex-row bg-slate-100 p-4 md:p-6 overflow-y-auto md:overflow-hidden gap-4">
+    <div
+      ref={rootRef}
+      className={`${popped ? 'fixed inset-0 z-[300]' : 'h-full'} flex flex-col md:flex-row bg-slate-100 p-4 md:p-6 pt-3 md:pt-4 overflow-y-auto md:overflow-hidden gap-4`}
+      data-testid="assets-map-view"
+      data-popped={popped ? 'true' : 'false'}
+    >
       {/* Map */}
       <div className="flex-1 flex flex-col md:min-h-0 md:overflow-hidden">
-        <div className="mb-3 shrink-0 flex flex-wrap items-end justify-between gap-3">
+        <div className="mb-2 shrink-0 flex flex-wrap items-end justify-between gap-3">
           <div>
             <h2 className="text-2xl font-black text-[#00468B]">Assets</h2>
-            <p className="text-sm text-slate-500">Click an outlined area on the map to put an asset there. Click a pin to open its asset.</p>
+            <p className="text-sm text-slate-500">Click a room, or drag a box around something, to put an asset there. Click a pin to open its asset.</p>
           </div>
           <SearchBox query={query} onQuery={setQuery} placeholder="Search assets: name, room, area..." ariaLabel="Search assets" className="w-full sm:w-80" />
         </div>
-        <div className="mb-3 shrink-0 flex flex-wrap items-center gap-x-3 gap-y-2">
+        <div className="mb-2 shrink-0 flex flex-wrap items-center gap-x-2 gap-y-2">
           <Switch
             on={snapOn}
             onChange={setSnapOn}
             label="Smart snap"
-            title={snapOn ? 'A click finds the outlined area around it. A click on a wall or a label puts the pin in the middle of the area.' : 'A click puts the pin exactly where you click.'}
+            title={snapOn ? 'A click finds the outlined area around it; a dragged box is fitted to the black lines inside it.' : 'A click puts the pin exactly where you click; a dragged box is used as drawn.'}
           />
+          <div className="inline-flex shrink-0 rounded-full border border-[#B3D4F2] bg-white p-0.5" role="group" aria-label="What dragging on the map does">
+            {[['box', 'Drag: box'], ['move', 'Drag: move map']].map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setDragMode(key)}
+                aria-pressed={dragMode === key}
+                className={`px-2.5 py-0.5 rounded-full text-xs font-bold whitespace-nowrap transition-colors ${dragMode === key ? 'bg-[#00468B] text-white' : 'text-[#00468B] hover:bg-[#E6F1FB]'}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <button type="button" onClick={() => rotate(-90)} className={toolButton} title="Turn the map a quarter turn to the left" aria-label="Turn the map left"><RotateLeft className="w-4 h-4" /></button>
+          <button type="button" onClick={() => rotate(90)} className={toolButton} title="Turn the map a quarter turn to the right" aria-label="Turn the map right"><RotateRight className="w-4 h-4" /></button>
+          <button type="button" onClick={fit} className={toolButton} title="Show the whole map">Fit</button>
+          <button type="button" onClick={() => setPop(!popped)} className={toolButton} title={popped ? 'Back to the normal view (Esc)' : 'Make the map fill the screen'} aria-pressed={popped}>
+            {popped ? <PopInIcon className="w-4 h-4" /> : <PopOutIcon className="w-4 h-4" />}
+            {popped ? 'Close pop-out' : 'Pop out'}
+          </button>
           <span className="text-xs text-slate-600" role="status">{pinsLine}</span>
           {assetPins.status === 'error' && <button type="button" onClick={loadPins} className="text-xs text-[#0072CE] underline hover:text-[#00468B]">Try again</button>}
           {!mapColumn && metaDone && (
@@ -4084,73 +4681,102 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
         <div className="flex-1 relative min-h-[50vh] md:min-h-0">
           <div className="absolute inset-0 rounded-xl shadow-inner border border-slate-400/50 bg-slate-300 overflow-auto" ref={containerRef}>
             <div
-              ref={mapRef}
-              className={`relative mx-auto select-none transition-all origin-top-left ${snapBusy ? 'cursor-wait' : 'cursor-crosshair'}`}
-              style={{ width: `${zoomLevel}%`, minWidth: '100%' }}
-              onClick={onMapClick}
+              ref={stageRef}
+              className={`relative mx-auto select-none ${snapBusy ? 'cursor-wait' : (dragMode === 'move' ? 'cursor-grab' : 'cursor-crosshair')}`}
+              style={stageStyle}
+              onPointerDown={onPointerDown}
+              onPointerMove={onPointerMove}
+              onPointerUp={onPointerEnd}
+              onPointerCancel={onPointerEnd}
+              onContextMenu={e => { if (gesture.current.mode) e.preventDefault(); }}
               data-testid="asset-map"
+              data-rotation={rotation}
             >
-              {mapImage ? (
-                <img src={mapImage} onError={() => setMainMapImage(null)} alt="Facility map with assets" className="w-full h-auto block pointer-events-none select-none" draggable="false" />
-              ) : (
-                <div className="w-full aspect-square"><FacilityMapSvg /></div>
-              )}
+              <div className="absolute" style={pictureStyle} data-testid="asset-picture">
+                {mapImage ? (
+                  <img
+                    src={mapImage}
+                    onLoad={e => { const im = e.currentTarget; if (im.naturalWidth && im.naturalHeight) setNatural({ w: im.naturalWidth, h: im.naturalHeight }); }}
+                    onError={() => setMainMapImage(null)}
+                    alt="Facility map with assets"
+                    className="w-full h-full block pointer-events-none select-none"
+                    draggable="false"
+                  />
+                ) : (
+                  <div className="w-full h-full"><FacilityMapSvg /></div>
+                )}
 
-              {/* The open asset's area */}
-              {selectedRegion && <RegionOverlay region={selectedRegion} fill="#0072CE" edge="#00468B" testId="selected-region" />}
-              {!selectedRegion && selectedLocation && selectedLocation.box && (
-                <div className="absolute border-2 border-[#00468B] bg-[#0072CE]/15 rounded-sm pointer-events-none" style={{ left: `${selectedLocation.box[0]}%`, top: `${selectedLocation.box[1]}%`, width: `${selectedLocation.box[2]}%`, height: `${selectedLocation.box[3]}%` }} />
-              )}
-              {/* The clicked spot, or the spot a new asset will get */}
-              {spot && spot.region && <RegionOverlay region={spot.region} fill="#FFB81C" edge="#00468B" testId="spot-region" />}
-              {!spot && creating && creating.location && creating.location.region && <RegionOverlay region={creating.location.region} fill="#FFB81C" edge="#00468B" testId="new-spot-region" />}
+                {/* The open asset's area */}
+                {selectedRegion && <RegionOverlay region={selectedRegion} fill="#0072CE" edge="#00468B" testId="selected-region" />}
+                {!selectedRegion && selectedLocation && selectedLocation.box && (
+                  <div className="absolute border-2 border-[#00468B] bg-[#0072CE]/15 rounded-sm pointer-events-none" style={{ left: `${selectedLocation.box[0]}%`, top: `${selectedLocation.box[1]}%`, width: `${selectedLocation.box[2]}%`, height: `${selectedLocation.box[3]}%` }} />
+                )}
+                {/* The picked spot, or the spot a new asset will get */}
+                {spot && spot.region && <RegionOverlay region={spot.region} fill="#FFB81C" edge="#00468B" testId="spot-region" />}
+                {spot && !spot.region && spot.box && (
+                  <div data-testid="spot-box" className="absolute border-2 border-dashed border-[#00468B] bg-[#FFB81C]/25 pointer-events-none" style={{ left: `${spot.box[0]}%`, top: `${spot.box[1]}%`, width: `${spot.box[2]}%`, height: `${spot.box[3]}%` }} />
+                )}
+                {!spot && creating && creating.location && creating.location.region && <RegionOverlay region={creating.location.region} fill="#FFB81C" edge="#00468B" testId="new-spot-region" />}
 
-              {visiblePins.map(pin => {
-                const selected = pin.id === selectedId;
-                const moving = placingFor && placingFor.id === pin.id;
-                const off = pinOffsets[pin.id];
-                return (
-                  <button
-                    type="button"
-                    key={pin.id}
-                    data-asset-pin={pin.id}
-                    aria-label={`Asset ${pin.name}`}
-                    onClick={(e) => { e.stopPropagation(); logEvent(`Asset pin clicked: ${pin.name}`, 'info'); openAsset(pin, false); }}
-                    className={`absolute transform -translate-x-1/2 -translate-y-1/2 group p-1 ${selected ? 'z-20' : 'z-10'} ${moving ? 'opacity-40' : ''} ${placingFor ? 'pointer-events-none' : ''}`}
-                    style={{ left: `${pin.location.x}%`, top: `${pin.location.y}%`, marginLeft: off ? off[0] : 0, marginTop: off ? off[1] : 0 }}
-                  >
-                    <span className={`block rounded-full border-2 shadow transition-transform ${selected ? 'w-5 h-5 bg-[#FFB81C] border-[#00468B]' : 'w-3.5 h-3.5 bg-[#0072CE] border-white group-hover:scale-125'}`} />
-                    <span className={`absolute ${pin.location.y < 15 ? 'top-full mt-1' : 'bottom-full mb-1'} left-1/2 transform -translate-x-1/2 bg-slate-900/90 text-white text-xs text-left px-2 py-1 rounded w-max max-w-[16rem] break-words pointer-events-none shadow-lg ${selected ? 'block' : 'hidden group-hover:block'}`}>
-                      <span className="font-bold block">{pin.name}</span>
-                      {(pin.room || pin.area) && <span className="text-slate-300">{[pin.room, pin.area].filter(Boolean).join(' · ')}</span>}
-                    </span>
-                  </button>
-                );
-              })}
+                {visiblePins.map(pin => {
+                  const selected = pin.id === selectedId;
+                  const moving = placingFor && placingFor.id === pin.id;
+                  const off = pinOffsets[pin.id];
+                  return (
+                    <button
+                      type="button"
+                      key={pin.id}
+                      data-asset-pin={pin.id}
+                      aria-label={`Asset ${pin.name}`}
+                      onClick={(e) => { e.stopPropagation(); logEvent(`Asset pin clicked: ${pin.name}`, 'info'); openAsset(pin, false); }}
+                      className={`absolute group p-1 ${selected ? 'z-20' : 'z-10'} ${moving ? 'opacity-40' : ''} ${placingFor ? 'pointer-events-none' : ''}`}
+                      style={{ left: `${pin.location.x}%`, top: `${pin.location.y}%`, marginLeft: off ? off[0] : 0, marginTop: off ? off[1] : 0, transform: pinTransform }}
+                    >
+                      <span className={`block rounded-full border-2 shadow transition-transform ${selected ? 'w-5 h-5 bg-[#FFB81C] border-[#00468B]' : 'w-3.5 h-3.5 bg-[#0072CE] border-white group-hover:scale-125'}`} />
+                      <span className={`absolute ${labelBelow(pin.location) ? 'top-full mt-1' : 'bottom-full mb-1'} left-1/2 transform -translate-x-1/2 bg-slate-900/90 text-white text-xs text-left px-2 py-1 rounded w-max max-w-[16rem] break-words pointer-events-none shadow-lg ${selected ? 'block' : 'hidden group-hover:block'}`}>
+                        <span className="font-bold block">{pin.name}</span>
+                        {(pin.room || pin.area) && <span className="text-slate-300">{[pin.room, pin.area].filter(Boolean).join(' · ')}</span>}
+                      </span>
+                    </button>
+                  );
+                })}
 
-              {!spot && creating && creating.location && (
-                <span
-                  data-testid="new-spot-pin"
-                  className="absolute transform -translate-x-1/2 -translate-y-1/2 w-5 h-5 rounded-full bg-[#FFB81C] border-2 border-[#00468B] shadow-lg pointer-events-none z-30"
-                  style={{ left: `${creating.location.x}%`, top: `${creating.location.y}%` }}
-                />
-              )}
-              {spot && (
-                <span
-                  data-testid="spot-pin"
-                  className="absolute transform -translate-x-1/2 -translate-y-1/2 w-5 h-5 rounded-full bg-[#FFB81C] border-2 border-[#00468B] shadow-lg pointer-events-none z-30"
-                  style={{ left: `${spot.x}%`, top: `${spot.y}%` }}
+                {!spot && creating && creating.location && (
+                  <span
+                    data-testid="new-spot-pin"
+                    className="absolute w-5 h-5 rounded-full bg-[#FFB81C] border-2 border-[#00468B] shadow-lg pointer-events-none z-30"
+                    style={{ left: `${creating.location.x}%`, top: `${creating.location.y}%`, transform: 'translate(-50%, -50%)' }}
+                  />
+                )}
+                {spot && (
+                  <span
+                    data-testid="spot-pin"
+                    className="absolute w-5 h-5 rounded-full bg-[#FFB81C] border-2 border-[#00468B] shadow-lg pointer-events-none z-30"
+                    style={{ left: `${spot.x}%`, top: `${spot.y}%`, transform: 'translate(-50%, -50%)' }}
+                  />
+                )}
+              </div>
+              {/* The box being drawn (on the map as seen) */}
+              {dragRect && (
+                <div
+                  data-testid="drag-box"
+                  className="absolute border-2 border-dashed border-[#E4002B] bg-[#E4002B]/10 pointer-events-none z-40"
+                  style={{ left: `${Math.min(dragRect[0], dragRect[2]) * 100}%`, top: `${Math.min(dragRect[1], dragRect[3]) * 100}%`, width: `${Math.abs(dragRect[2] - dragRect[0]) * 100}%`, height: `${Math.abs(dragRect[3] - dragRect[1]) * 100}%` }}
                 />
               )}
             </div>
           </div>
-          <ZoomControls zoomLevel={zoomLevel} setZoomLevel={setZoomLevel} />
+          <div className="absolute bottom-4 right-4 bg-white rounded-lg shadow-lg flex items-center border border-slate-200 z-10">
+            <button type="button" onClick={() => zoomStep(-1)} className="p-2 hover:bg-slate-100 text-slate-700 rounded-l-lg transition-colors" title="Zoom Out" aria-label="Zoom out"><ZoomOut className="w-5 h-5" /></button>
+            <span className="px-3 text-sm font-bold text-slate-700 border-x border-slate-200 min-w-[3.5rem] text-center" data-testid="asset-zoom">{zoomLevel}%</span>
+            <button type="button" onClick={() => zoomStep(1)} className="p-2 hover:bg-slate-100 text-slate-700 rounded-r-lg transition-colors" title="Zoom In" aria-label="Zoom in"><ZoomIn className="w-5 h-5" /></button>
+          </div>
 
           {/* Placing an asset: what to do, then save */}
           {placingFor && (
             <div className="absolute left-3 right-3 sm:right-auto bottom-3 z-30 bg-white rounded-xl shadow-xl border-2 border-[#FFB81C] p-3 max-w-md" role="status">
               {!spot ? (
-                <p className="text-sm text-slate-700"><span className="font-bold text-[#00468B]">Click the map where {placingName} is.</span> {snapOn ? 'Smart snap finds the outlined area you click in.' : 'The pin goes exactly where you click.'}</p>
+                <p className="text-sm text-slate-700"><span className="font-bold text-[#00468B]">Click the map where {placingName} is, or drag a box around it.</span> {snapOn ? 'Smart snap fits it to the lines.' : 'The pin goes exactly where you click.'}</p>
               ) : (
                 <SpotNote spot={spot} />
               )}
@@ -4168,8 +4794,8 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
         </div>
       </div>
 
-      {/* Side panel: list, "assign this spot", or the editor */}
-      <aside className="w-full md:w-[24rem] lg:w-[28rem] bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col overflow-hidden shrink-0 h-[80vh] md:h-full" aria-label="Assets panel">
+      {/* Side panel: list, "assign this spot", the open asset, or the new-asset form */}
+      <aside className="w-full md:w-[22rem] lg:w-[26rem] bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col overflow-hidden shrink-0 h-[80vh] md:h-full" aria-label="Assets panel">
         {pendingNav && (
           <div className="p-3 bg-[#FFF6E0] border-b-2 border-[#FFB81C] text-sm shrink-0" role="alert">
             <p className="font-semibold text-slate-800">This asset has unsaved changes.</p>
@@ -4182,22 +4808,21 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
 
         {panel === 'editor' && (
           <AssetEditor
-            key={selectedId || 'new'}
+            key="new"
             meta={meta}
             set={set}
-            assetId={selectedId}
+            assetId={null}
             createLocation={creating ? creating.location : null}
             mapKey={mapKey}
-            pinLocation={selectedPin ? selectedPin.location : undefined}
             placing={!!placingFor}
-            refreshToken={refreshToken}
+            refreshToken={0}
             onRetryMeta={loadAssetMeta}
             onDirtyChange={setDirty}
             onClose={closePanel}
-            onSaved={(row) => applySummary(toAssetSummary(row, mapColumn), false)}
+            onSaved={(row) => saved(row, false)}
             onCreated={(row) => {
               const summary = toAssetSummary(row, mapColumn);
-              applySummary(summary, true);
+              saved(row, true);
               setDirty(false);
               setCreating(null);
               setPlacingFor(null);
@@ -4207,8 +4832,26 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
             }}
             onPlace={(asset) => { setSpot(null); setActionError(''); setPlacingFor(asset); }}
             onClearNewSpot={() => setCreating(c => ({ ...(c || {}), location: null }))}
+            logEvent={logEvent}
+          />
+        )}
+
+        {panel === 'card' && (
+          <AssetCard
+            key={selectedId}
+            meta={meta}
+            set={set}
+            assetId={selectedId}
+            mapKey={mapKey}
+            pinLocation={selectedPin ? selectedPin.location : undefined}
+            placing={!!placingFor}
+            refreshToken={refreshToken}
+            onRetryMeta={loadAssetMeta}
+            onClose={closePanel}
+            onPlace={(asset) => { setSpot(null); setActionError(''); setPlacingFor(asset); }}
             onRemoveFromMap={removeFromMap}
             onLocate={(loc) => centerOn(loc)}
+            onEditInTable={onEditInTable}
             logEvent={logEvent}
           />
         )}
@@ -4250,13 +4893,1094 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
   );
 }
 
-// What smart snap made of a click
+// ==========================================
+// THE OPEN ASSET ON THE MAP: a short card; everything else is edited in the equipment table
+// ==========================================
+function AssetCard({ meta, set, assetId, mapKey, pinLocation, placing, refreshToken, onRetryMeta, onClose, onPlace, onRemoveFromMap, onLocate, onEditInTable, logEvent }) {
+  const mapColumn = meta.mapColumn ? meta.mapColumn.name : null;
+  const imageField = useMemo(() => meta.fields.find(f => f.kind === 'image') || null, [meta.fields]);
+  const [load, setLoad] = useState({ status: 'loading', row: null, error: '' });
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const [removing, setRemoving] = useState(false);
+  const [error, setError] = useState('');
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+
+  const read = useCallback(async (quiet) => {
+    if (!quiet) setLoad(l => ({ ...l, status: 'loading', error: '' }));
+    try {
+      const row = await loadAssetRow(set, assetId, imageField ? [imageField.name] : []);
+      if (mounted.current) setLoad({ status: 'ready', row, error: '' });
+    } catch (e) {
+      logEvent(`Asset ${assetId} could not be read: ${e.message}`, 'error');
+      if (mounted.current && !quiet) setLoad({ status: 'error', row: null, error: e.message });
+    }
+  }, [set, assetId, imageField, logEvent]);
+  useEffect(() => { read(false); }, [read]);
+  useEffect(() => { if (refreshToken) read(true); }, [refreshToken]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const row = load.row;
+  const title = row ? (row[ASSET_NAME_COLUMN] || '(no name)') : 'Asset';
+  const place = row ? [row.craa5_roomname, row.craa5_areaname].filter(v => v && String(v).trim()).join(' · ') : '';
+  const location = pinLocation !== undefined ? pinLocation : (row && mapColumn ? parseMapLocation(row[mapColumn]) : null);
+  const onThisMap = pinOnMap(location, mapKey);
+
+  // A short summary: the cleaning frequencies that are on, and a few filled-in columns
+  const summary = useMemo(() => {
+    if (!row) return { freq: [], facts: [] };
+    const { groups } = groupAssetFields(meta.fields.filter(f => f.name !== mapColumn));
+    const freq = groups.find(g => g.key === 'freq');
+    const main = groups.find(g => g.key === 'main');
+    const skip = [ASSET_NAME_COLUMN, 'craa5_roomname', 'craa5_areaname'];
+    const factFields = (freq ? freq.items.filter(f => f.kind !== 'bool') : []).concat(main ? main.items.filter(f => skip.indexOf(f.name) === -1) : []);
+    return {
+      freq: freq ? freq.items.filter(f => f.kind === 'bool' && row[f.name] === true).map(f => f.label) : [],
+      facts: factFields.map(f => [f.label, displayValue(f, row)]).filter(x => x[1] !== '' && x[1] !== null && x[1] !== undefined).slice(0, 6)
+    };
+  }, [row, meta.fields, mapColumn]);
+
+  const stamp = row && imageField ? (row[`${imageField.name}_timestamp`] || '') : '';
+  const hasPicture = !!(row && imageField && (row[imageField.name] || row[`${imageField.name}_timestamp`] || row[`${imageField.name}_url`]));
+  const pictureSources = hasPicture
+    ? (imageField.fullImage === false ? [] : [apiUrl(`${set}(${assetId})/${imageField.name}/$value?size=full&t=${encodeURIComponent(String(stamp))}`)]).concat([apiUrl(`${set}(${assetId})/${imageField.name}/$value?t=${encodeURIComponent(String(stamp))}`)])
+    : [];
+
+  return (
+    <div className="flex flex-col flex-1 min-h-0" data-testid="asset-card">
+      <div className="p-4 border-b-2 border-[#E6F1FB] shrink-0 space-y-2">
+        <EditorHeader title={title} subtitle={place} onClose={onClose} isNew={false} />
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          {!mapColumn ? (
+            <span className="text-[#9A6700]">Map spot: {meta.mapReason}</span>
+          ) : placing ? (
+            <span className="font-semibold text-[#00468B]">Click the map where this asset is, or drag a box around it...</span>
+          ) : load.status !== 'ready' ? null : (
+            <>
+              <span className={`inline-flex items-center gap-1 font-semibold ${onThisMap ? 'text-[#00468B]' : 'text-slate-500'}`}>
+                <MapPin className="w-3.5 h-3.5" />
+                {onThisMap ? 'On the map' : (location ? `On another map (${location.map})` : 'Not on the map')}
+              </span>
+              {onThisMap && <button type="button" onClick={() => onLocate(location)} className="px-2 py-1 rounded-md font-bold border border-[#B3D4F2] text-[#0072CE] hover:bg-[#E6F1FB]">Show</button>}
+              <button type="button" onClick={() => onPlace({ id: assetId, name: title })} className="px-2 py-1 rounded-md font-bold bg-[#0072CE] text-white hover:bg-[#00468B]">{location ? 'Move' : 'Place on map'}</button>
+              {location && !confirmRemove && <button type="button" onClick={() => setConfirmRemove(true)} className="px-2 py-1 rounded-md font-bold border border-slate-300 text-slate-600 hover:bg-slate-100">Remove from map</button>}
+              {confirmRemove && (
+                <span className="inline-flex items-center gap-1.5 bg-[#FFF6E0] border border-[#FFB81C] rounded-md px-2 py-1">
+                  Remove the pin?
+                  <button
+                    type="button"
+                    disabled={removing}
+                    onClick={async () => {
+                      setRemoving(true);
+                      setError('');
+                      try { await onRemoveFromMap({ id: assetId, name: title }); if (mounted.current) setConfirmRemove(false); }
+                      catch (e) { logEvent(`Could not remove ${title} from the map: ${e.message}`, 'error'); if (mounted.current) setError(`The pin was not removed: ${e.message}`); }
+                      finally { if (mounted.current) setRemoving(false); }
+                    }}
+                    className="font-bold text-[#C4001F] underline"
+                  >
+                    {removing ? 'Removing...' : 'Remove'}
+                  </button>
+                  <button type="button" onClick={() => setConfirmRemove(false)} className="font-bold text-slate-600 underline">Keep</button>
+                </span>
+              )}
+            </>
+          )}
+        </div>
+        {error && <p className="text-xs text-[#C4001F]" role="alert">{error}</p>}
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-4 space-y-3">
+        {meta.fields.length === 0 && meta.status === 'error' && (
+          <div className="text-sm text-[#C4001F]" role="alert">
+            The Assets table's columns could not be read: {meta.error}
+            <div><button type="button" onClick={onRetryMeta} className="mt-2 text-[#0072CE] underline">Try again</button></div>
+          </div>
+        )}
+        {load.status === 'loading' && <p className="text-sm text-slate-500">Loading the asset...</p>}
+        {load.status === 'error' && (
+          <div className="text-sm text-[#C4001F]" role="alert">
+            This asset could not be loaded: {load.error}
+            <div><button type="button" onClick={() => read(false)} className="mt-2 text-[#0072CE] underline">Try again</button></div>
+          </div>
+        )}
+        {load.status === 'ready' && (
+          <>
+            {hasPicture && (
+              <div className="rounded-md border border-slate-200 bg-slate-50 overflow-hidden">
+                <StoredImage key={pictureSources.join('|')} sources={pictureSources} alt={imageField.label} className="w-full h-auto max-h-48 object-contain" fallback={<p className="text-xs text-slate-500 p-2">The picture could not be shown.</p>} />
+              </div>
+            )}
+            {summary.freq.length > 0 && (
+              <div className="flex flex-wrap gap-1.5" aria-label="Cleaning frequency">
+                {summary.freq.map(label => <span key={label} className="px-2 py-0.5 rounded-full text-[11px] font-bold bg-[#E6F1FB] text-[#00468B] border border-[#B3D4F2]">{label}</span>)}
+              </div>
+            )}
+            {summary.facts.length > 0 && (
+              <dl className="grid grid-cols-2 gap-x-3 gap-y-2 text-xs">
+                {summary.facts.map(([label, value]) => (
+                  <div key={label} className="min-w-0">
+                    <dt className="text-slate-400">{label}</dt>
+                    <dd className="text-slate-700 font-medium [overflow-wrap:anywhere]">{value}</dd>
+                  </div>
+                ))}
+              </dl>
+            )}
+            {!hasPicture && summary.freq.length === 0 && summary.facts.length === 0 && <p className="text-sm text-slate-500">Nothing else is filled in for this asset yet.</p>}
+          </>
+        )}
+      </div>
+
+      <div className="p-3 border-t border-slate-200 bg-white shrink-0 flex items-center justify-between gap-2">
+        <span className="text-xs text-slate-500">Edit every column, pictures and files in the table.</span>
+        <button type="button" onClick={() => onEditInTable(assetId)} className="px-4 py-1.5 rounded-md text-sm font-bold bg-[#0072CE] text-white hover:bg-[#00468B] shadow-sm shrink-0">Edit in table</button>
+      </div>
+    </div>
+  );
+}
+
+// ==========================================
+// ASSETS: THE EQUIPMENT TABLE. Every column, 50 rows a page (never the whole table). Changes are saved row by row with the
+// row's etag; pictures and files upload straight from their cells.
+// ==========================================
+const ASSET_TABLE_COLUMNS_PREF = 'stillwell.assets.tableColumns';
+const ASSET_TABLE_PAGE = 50;
+// Column headers that sort: only types Dataverse can sort by
+const ASSET_SORTABLE_KINDS = ['text', 'int', 'number', 'date', 'bool', 'choice', 'status'];
+// Starting width of each kind of column
+const ASSET_CELL_WIDTH = {
+  text: 'min-w-[11rem]', memo: 'min-w-[15rem]', int: 'min-w-[6.5rem]', number: 'min-w-[6.5rem]', bool: 'min-w-[5.5rem]', choice: 'min-w-[9rem]',
+  choices: 'min-w-[12rem]', date: 'min-w-[10rem]', lookup: 'min-w-[12rem]', fixedlookup: 'min-w-[10rem]', file: 'min-w-[13rem]', image: 'min-w-[12rem]',
+  status: 'min-w-[7rem]', id: 'min-w-[10rem]'
+};
+const ASSET_CELL_INPUT = 'w-full bg-transparent px-1.5 py-1 text-sm rounded border border-transparent hover:border-slate-300 focus:border-[#0072CE] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#0072CE]/30 disabled:text-slate-500 disabled:hover:border-transparent';
+
+// What the table asks for to show a column: lookups by their id (the name comes as an annotation), files by their name,
+// pictures by their time stamp (never the picture itself)
+function tableSelectOf(f) {
+  if (f.kind === 'lookup' || f.kind === 'fixedlookup') return [`_${f.name}_value`];
+  if (f.kind === 'file') return f.nameColumn ? [f.name, f.nameColumn] : [f.name];
+  if (f.kind === 'image') return [f.stampColumn || f.name];
+  return [f.name];
+}
+function assetTableSelect(fields, mapColumn) {
+  const seen = {};
+  const out = [];
+  const add = (c) => { if (c && !seen[c]) { seen[c] = true; out.push(c); } };
+  [ASSET_ID_COLUMN, ASSET_NAME_COLUMN, 'craa5_roomname', 'craa5_areaname', 'modifiedon'].concat(mapColumn ? [mapColumn] : []).forEach(add);
+  fields.forEach(f => tableSelectOf(f).forEach(add));
+  return out.join(',');
+}
+
+// One page of whole rows for the table, with the total on the first page (Dataverse counts up to 5000)
+async function fetchAssetRows({ set, select, words, room, placement, mapColumn, sort, next }) {
+  let url = next;
+  if (!url) {
+    const q = assetListQuery({ words, room, placement, mapColumn, sort });
+    url = apiUrl(`${set}?${select ? `$select=${select}&` : ''}${q.filter ? `$filter=${encodeURIComponent(q.filter)}&` : ''}$orderby=${encodeURIComponent(q.order)}&$count=true`);
+  }
+  const res = await fetch(url, { headers: { ...ODATA_HEADERS, ...NO_CACHE, Prefer: `odata.maxpagesize=${ASSET_TABLE_PAGE},odata.include-annotations="*"` } });
+  if (!res.ok) {
+    const err = new Error(await readApiError(res));
+    err.status = res.status;
+    throw err;
+  }
+  const data = await res.json();
+  const count = typeof data['@odata.count'] === 'number' ? data['@odata.count'] : null;
+  return {
+    rows: (data.value || []).filter(r => GUID_PATTERN.test(cleanGuid(r[ASSET_ID_COLUMN]))),
+    next: data['@odata.nextLink'] || null,
+    count,
+    countCapped: data['@Microsoft.Dynamics.CRM.totalrecordcountlimitexceeded'] === true || (count !== null && count >= 5000)
+  };
+}
+
+// A row of the table: the row as Dataverse last sent it, the etag a save sends, and what the user has typed
+// (edits[name] = { value, from }: `from` is the server value the edit started from)
+const blankAssetEntry = (row) => ({ row: row || {}, etag: (row && row['@odata.etag']) || '', edits: {}, errors: {}, status: '', message: '', clash: false });
+
+// The columns of a row the user has changed (and not changed back)
+function changedAssetFields(entry, byName) {
+  const out = [];
+  if (!entry) return out;
+  Object.keys(entry.edits).forEach(name => {
+    const f = byName[name];
+    if (f && editKey(f, entry.edits[name].value) !== editKey(f, toEditValue(f, entry.row))) out.push(f);
+  });
+  return out;
+}
+
+// A newer copy of a row from Dataverse. The edits stay. If someone else changed a column the user is changing, the etag
+// the edit started from is kept, so Save reports the clash instead of quietly writing over their change.
+function mergeAssetEntry(entry, fresh, byName) {
+  if (!entry) return blankAssetEntry(fresh);
+  const row = { ...entry.row, ...fresh };
+  const names = Object.keys(entry.edits);
+  if (names.length === 0) return { ...entry, row, etag: fresh['@odata.etag'] || entry.etag, clash: false };
+  let clash = entry.clash;
+  names.forEach(name => {
+    const f = byName[name];
+    const e = entry.edits[name];
+    if (!f || editKey(f, e.value) === e.from) return;
+    const now = editKey(f, toEditValue(f, row));
+    if (now !== e.from && now !== editKey(f, e.value)) clash = true;
+  });
+  return { ...entry, row, clash, etag: clash ? entry.etag : (fresh['@odata.etag'] || entry.etag) };
+}
+
+// A row that must not drop out of view: unsaved, saving, or waiting on a decision
+const entryNeedsKeeping = (e) => !!e && (Object.keys(e.edits).length > 0 || e.status === 'saving' || e.status === 'stale' || e.status === 'error');
+
+function AssetsTable({ meta, set, mapColumn, mapKey, metaDone, loadAssetMeta, rooms, rowEvent, focus, onAssetSaved, onShowOnMap, logEvent }) {
+  const ready = meta.status === 'ready' && meta.fields.length > 0;
+  // Every column but the id and the map spot (the pin button shows that); the name is always the first column
+  const allFields = useMemo(() => meta.fields.filter(f => !f.isPrimaryId && f.name !== mapColumn), [meta.fields, mapColumn]);
+  const byName = useMemo(() => { const o = {}; allFields.forEach(f => { o[f.name] = f; }); return o; }, [allFields]);
+  const nameField = useMemo(() => allFields.find(f => f.isPrimaryName) || null, [allFields]);
+  const grouped = useMemo(() => groupAssetFields(allFields.filter(f => !f.isPrimaryName)), [allFields]);
+  const orderedFields = useMemo(() => {
+    const out = [];
+    grouped.groups.forEach(g => g.items.forEach(f => out.push(f)));
+    grouped.info.forEach(f => out.push(f));
+    return out;
+  }, [grouped]);
+  // At first: the equipment, cleaning and pictures / documents columns. The choice is remembered on this device.
+  const defaultColumns = useMemo(() => {
+    const out = [];
+    grouped.groups.forEach(g => { if (g.key !== 'other') g.items.forEach(f => out.push(f.name)); });
+    return out;
+  }, [grouped]);
+  const [columnPref, setColumnPref] = useState(() => { const v = readPref(ASSET_TABLE_COLUMNS_PREF, null); return Array.isArray(v) ? v : null; });
+  useEffect(() => { writePref(ASSET_TABLE_COLUMNS_PREF, columnPref); }, [columnPref]);
+  const shownNames = columnPref || defaultColumns;
+  const columns = useMemo(() => orderedFields.filter(f => shownNames.indexOf(f.name) !== -1), [orderedFields, shownNames]);
+  // Every column is asked for (not only the shown ones), so showing another column needs no new query
+  const select = useMemo(() => (ready ? assetTableSelect(allFields, mapColumn) : ''), [ready, allFields, mapColumn]);
+  const useSelect = useRef(true);
+
+  // Search and filters
+  const [query, setQuery] = useState('');
+  const [debounced, setDebounced] = useState('');
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(query), 300);
+    return () => clearTimeout(t);
+  }, [query]);
+  const words = useMemo(() => debounced.trim().split(/\s+/).filter(Boolean).slice(0, 4), [debounced]);
+  const [room, setRoom] = useState('');
+  const [placement, setPlacement] = useState('all');
+  const [sort, setSort] = useState(null); // { name, desc }
+
+  // Rows
+  const [rows, setRows] = useState({});
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+  const [page, setPage] = useState({ ids: [], next: null, loading: true, error: '', count: null, countCapped: false });
+  const pageRef = useRef(page);
+  pageRef.current = page;
+  // Rows kept at the top: changed rows outside this search, new assets, the asset asked for from the map
+  const [pinned, setPinned] = useState([]);
+  const pinnedRef = useRef(pinned);
+  pinnedRef.current = pinned;
+  const focusKeep = useRef(null); // the asset asked for from the map stays until the search changes
+  const req = useRef(0);
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+
+  const [drawer, setDrawer] = useState(null); // { id } = details of a row, { id: null } = a new asset
+  const drawerRef = useRef(drawer);
+  drawerRef.current = drawer;
+  const [drawerDirty, setDrawerDirty] = useState(false);
+  const drawerDirtyRef = useRef(false);
+  drawerDirtyRef.current = drawerDirty;
+  const [confirmClose, setConfirmClose] = useState(null); // { run }
+  const [drawerRefresh, setDrawerRefresh] = useState(0);
+  const [highlight, setHighlight] = useState(null); // { id, n }
+  const focusSeqLocal = useRef(0);
+  const [chooserOpen, setChooserOpen] = useState(false);
+  const chooserRef = useRef(null);
+  const [savingAll, setSavingAll] = useState(false);
+  const [bulkNote, setBulkNote] = useState('');
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const [notice, setNotice] = useState('');
+  const scrollRef = useRef(null);
+
+  // The user changed the search: the asset asked for from the map need not stay
+  const userChanged = (fn) => (v) => { focusKeep.current = null; fn(v); };
+  const onQuery = userChanged(setQuery);
+  const onRoom = userChanged(setRoom);
+  const onPlacement = userChanged(setPlacement);
+
+  // A query, with every column by name; if Dataverse refuses a name, once more without the list
+  const runQuery = async (args) => {
+    try {
+      return await fetchAssetRows({ ...args, select: useSelect.current ? select : '' });
+    } catch (error) {
+      if (error.status === 400 && useSelect.current && select && !args.next) {
+        useSelect.current = false;
+        logEvent(`The equipment table's column list was refused (${error.message}). Asking for every column instead.`, 'warn');
+        return fetchAssetRows({ ...args, select: '' });
+      }
+      throw error;
+    }
+  };
+  const fetchRow = async (id) => {
+    const path = (withSelect) => `${set}(${id})${withSelect && select ? `?$select=${select}` : ''}`;
+    try {
+      return await getJson(path(useSelect.current), ANNOTATIONS);
+    } catch (error) {
+      if (error.status !== 400 || !useSelect.current || !select) throw error;
+      useSelect.current = false;
+      logEvent(`The equipment table's column list was refused (${error.message}). Asking for every column instead.`, 'warn');
+      return getJson(path(false), ANNOTATIONS);
+    }
+  };
+
+  // The first page, whenever the search, filters or sort change (or Try again)
+  const [reloadSeq, setReloadSeq] = useState(0);
+  const listKey = [words.join(' '), room, placement, sort ? `${sort.name}:${sort.desc ? 1 : 0}` : '', mapColumn || '', select].join('#');
+  useEffect(() => {
+    if (!ready) return;
+    const r = req.current + 1;
+    req.current = r;
+    setPage(p => ({ ...p, loading: true, error: '' }));
+    runQuery({ set, words, room, placement, mapColumn, sort, next: null })
+      .then(res => {
+        if (r !== req.current || !mounted.current) return;
+        const cur = rowsRef.current;
+        const ids = res.rows.map(x => cleanGuid(x[ASSET_ID_COLUMN]));
+        const inPage = {};
+        ids.forEach(id => { inPage[id] = true; });
+        const open = drawerRef.current && drawerRef.current.id;
+        const before = pinnedRef.current.concat(pageRef.current.ids);
+        const keep = before.filter((id, i) => before.indexOf(id) === i && !inPage[id] && (entryNeedsKeeping(cur[id]) || id === open || id === focusKeep.current));
+        setRows(prev => {
+          const next = {};
+          keep.forEach(id => { if (prev[id]) next[id] = prev[id]; });
+          res.rows.forEach(x => { const id = cleanGuid(x[ASSET_ID_COLUMN]); next[id] = mergeAssetEntry(prev[id], x, byName); });
+          return next;
+        });
+        setPinned(keep);
+        setPage({ ids, next: res.next, loading: false, error: '', count: res.count, countCapped: res.countCapped });
+      })
+      .catch(error => {
+        if (r !== req.current || !mounted.current) return;
+        logEvent(`Equipment table query failed: ${error.message}`, 'error');
+        setPage(p => ({ ...p, next: null, loading: false, error: error.message }));
+      });
+  }, [listKey, ready, reloadSeq]); // eslint-disable-line react-hooks/exhaustive-deps
+  const retry = () => setReloadSeq(n => n + 1);
+
+  const showMore = () => {
+    if (!page.next || page.loading) return;
+    const r = req.current + 1;
+    req.current = r;
+    setPage(p => ({ ...p, loading: true, error: '' }));
+    runQuery({ set, next: page.next })
+      .then(res => {
+        if (r !== req.current || !mounted.current) return;
+        setRows(prev => {
+          const next = { ...prev };
+          res.rows.forEach(x => { const id = cleanGuid(x[ASSET_ID_COLUMN]); next[id] = mergeAssetEntry(prev[id], x, byName); });
+          return next;
+        });
+        setPage(p => {
+          const have = {};
+          p.ids.forEach(id => { have[id] = true; });
+          const add = res.rows.map(x => cleanGuid(x[ASSET_ID_COLUMN])).filter(id => !have[id] && (have[id] = true));
+          return { ...p, ids: p.ids.concat(add), next: res.next, loading: false, error: '' };
+        });
+      })
+      .catch(error => { if (r === req.current && mounted.current) setPage(p => ({ ...p, loading: false, error: error.message })); });
+  };
+
+  // --- Row actions ---
+  const patchEntry = (id, changes) => setRows(prev => (prev[id] ? { ...prev, [id]: { ...prev[id], ...changes } } : prev));
+
+  const setCell = (id, name, value) => {
+    setRows(prev => {
+      const e = prev[id];
+      const f = byName[name];
+      if (!e || !f || e.status === 'saving') return prev;
+      const old = e.edits[name];
+      const edits = { ...e.edits, [name]: { value, from: old ? old.from : editKey(f, toEditValue(f, e.row)) } };
+      const errors = e.errors[name] ? { ...e.errors, [name]: '' } : e.errors;
+      const settled = e.status === 'saved' || e.status === 'error' || (e.status === '' && e.message);
+      return { ...prev, [id]: { ...e, edits, errors, status: settled ? '' : e.status, message: settled ? '' : e.message } };
+    });
+  };
+
+  const undoRow = (id) => setRows(prev => (prev[id] && prev[id].status !== 'saving' ? { ...prev, [id]: blankAssetEntry(prev[id].row) } : prev));
+
+  // Saves one row: only the changed columns, with the etag. Resolves to 'saved', 'error' or 'skip'.
+  const saveRow = async (id, force) => {
+    const e = rowsRef.current[id];
+    if (!e || e.status === 'saving') return 'skip';
+    const changed = changedAssetFields(e, byName);
+    if (changed.length === 0) { patchEntry(id, { edits: {}, errors: {}, status: '', message: '' }); return 'skip'; }
+    const errs = {};
+    changed.forEach(f => { const msg = validateField(f, e.edits[f.name].value); if (msg) errs[f.name] = msg; });
+    if (Object.keys(errs).length > 0) {
+      patchEntry(id, { errors: errs, status: 'error', message: 'Fix the marked cells first.' });
+      return 'error';
+    }
+    const payload = {};
+    changed.forEach(f => { const kv = toPayloadEntry(f, e.edits[f.name].value); payload[kv[0]] = kv[1]; });
+    patchEntry(id, { status: 'saving', message: '', errors: {} });
+    try {
+      const fresh = await patchAsset(set, id, payload, force ? '*' : e.etag, logEvent);
+      const base = rowsRef.current[id];
+      const row = { ...(base ? base.row : e.row), ...fresh };
+      setRows(prev => (prev[id] ? { ...prev, [id]: { ...blankAssetEntry(row), status: 'saved', message: 'Saved.' } } : prev));
+      logEvent(`Saved asset ${id} from the table (${changed.length} column${changed.length === 1 ? '' : 's'}).`, 'success');
+      onAssetSaved(row, 'table', false);
+      return 'saved';
+    } catch (error) {
+      logEvent(`Asset ${id} not saved from the table: ${error.message}`, 'error', payload);
+      if (error.stale) patchEntry(id, { status: 'stale', message: 'Someone else changed this asset after it was loaded here.' });
+      else patchEntry(id, { status: 'error', message: `Not saved: ${error.message}` });
+      return 'error';
+    }
+  };
+
+  // Reads one row again. `discard` drops its edits (Reload after a clash); otherwise they stay (after an upload).
+  const refreshRow = async (id, discard) => {
+    try {
+      const fresh = await fetchRow(id);
+      if (!mounted.current) return null;
+      setRows(prev => {
+        if (!prev[id]) return prev;
+        return { ...prev, [id]: discard ? blankAssetEntry({ ...prev[id].row, ...fresh }) : mergeAssetEntry(prev[id], fresh, byName) };
+      });
+      return fresh;
+    } catch (error) {
+      logEvent(`Asset ${id} could not be read again: ${error.message}`, 'error');
+      if (mounted.current) patchEntry(id, { message: `Could not read this asset again: ${error.message}` });
+      return null;
+    }
+  };
+
+  // A picture or file changed (in a cell or in Details): the row, the map card and the pins follow
+  const fileChanged = async (id) => {
+    const fresh = await refreshRow(id, false);
+    if (fresh) {
+      const e = rowsRef.current[id];
+      onAssetSaved({ ...(e ? e.row : {}), ...fresh }, 'table', false);
+    }
+  };
+
+  // The drawer: one asset's every column (as in the map's editor), or a new asset. Unsaved changes are never dropped silently.
+  const requestDrawer = (next) => {
+    if (drawerDirtyRef.current) setConfirmClose({ run: () => { setDrawerDirty(false); setDrawer(next); } });
+    else setDrawer(next);
+  };
+  const closeDrawer = () => requestDrawer(null);
+
+  const openDetails = (id) => {
+    if (changedAssetFields(rowsRef.current[id], byName).length > 0) {
+      patchEntry(id, { message: 'Save or undo the changes in this row first, then open Details.' });
+      return;
+    }
+    if (drawerRef.current && drawerRef.current.id === id) return;
+    requestDrawer({ id });
+  };
+
+  const onDrawerSaved = (row) => {
+    const id = cleanGuid(row[ASSET_ID_COLUMN]);
+    setRows(prev => (prev[id] ? { ...prev, [id]: mergeAssetEntry(prev[id], row, byName) } : prev));
+    onAssetSaved(row, 'table', false);
+  };
+  const onDrawerCreated = (row) => {
+    const id = cleanGuid(row[ASSET_ID_COLUMN]);
+    setRows(prev => ({ ...prev, [id]: blankAssetEntry(row) }));
+    setPinned(p => [id].concat(p.filter(x => x !== id)));
+    onAssetSaved(row, 'table', true);
+    logEvent(`Created asset ${(row[ASSET_NAME_COLUMN] || '').trim() || id} from the table.`, 'success');
+    setDrawerDirty(false);
+    // Stays open on the new asset, so pictures and files can be added straight away
+    setDrawer({ id });
+    focusSeqLocal.current += 1;
+    setHighlight({ id, n: focusSeqLocal.current });
+  };
+
+  // Stable handlers for the rows (a row only draws again when its own data changes)
+  const act = useRef({});
+  act.current = { setCell, saveRow, undoRow, openDetails, onShowOnMap, refreshRow, fileChanged };
+  const actions = useMemo(() => ({
+    setCell: (id, name, v) => act.current.setCell(id, name, v),
+    save: (id, force) => act.current.saveRow(id, force),
+    undo: (id) => act.current.undoRow(id),
+    details: (id) => act.current.openDetails(id),
+    showOnMap: (id) => act.current.onShowOnMap(id),
+    reload: (id) => act.current.refreshRow(id, true),
+    fileChanged: (id) => act.current.fileChanged(id)
+  }), []);
+
+  // Saved on the map: the row here follows; a new asset made there is added at the top
+  useEffect(() => {
+    if (!rowEvent || rowEvent.from === 'table') return;
+    const id = rowEvent.summary.id;
+    if (rowsRef.current[id]) setRows(prev => (prev[id] ? { ...prev, [id]: mergeAssetEntry(prev[id], rowEvent.row, byName) } : prev));
+    else if (rowEvent.isNew) {
+      setRows(prev => ({ ...prev, [id]: blankAssetEntry(rowEvent.row) }));
+      setPinned(p => [id].concat(p.filter(x => x !== id)));
+    }
+    if (drawerRef.current && drawerRef.current.id === id) setDrawerRefresh(t => t + 1);
+  }, [rowEvent && rowEvent.n]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Asked from the map ("Edit in table"): show that row at the top and point at it
+  const focusDone = useRef(0);
+  useEffect(() => {
+    const f = focus;
+    if (!f || !ready || focusDone.current >= f.n) return;
+    focusDone.current = f.n;
+    const id = f.id;
+    focusKeep.current = id;
+    const show = () => {
+      setPinned(p => (pageRef.current.ids.indexOf(id) !== -1 || p.indexOf(id) !== -1 ? p : [id].concat(p)));
+      focusSeqLocal.current += 1;
+      setHighlight({ id, n: focusSeqLocal.current });
+    };
+    if (rowsRef.current[id]) { show(); return; }
+    fetchRow(id)
+      .then(fresh => {
+        if (!mounted.current) return;
+        setRows(prev => (prev[id] ? prev : { ...prev, [id]: blankAssetEntry(fresh) }));
+        show();
+      })
+      .catch(error => {
+        logEvent(`Asset ${id} could not be shown in the table: ${error.message}`, 'error');
+        if (mounted.current) setNotice(`That asset could not be loaded: ${error.message}`);
+      });
+  }, [focus && focus.n, ready]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Scroll to the row being pointed at, and let the colour fade
+  useEffect(() => {
+    if (!highlight) return undefined;
+    const n = highlight.n;
+    const t1 = setTimeout(() => {
+      const c = scrollRef.current;
+      const tr = c ? c.querySelector(`tr[data-row-id="${highlight.id}"]`) : null;
+      if (c && tr) {
+        // Rows kept at the top: show the top (with its label); other rows: only scroll if the row is out of view
+        const head = c.querySelector('thead');
+        const top = tr.offsetTop - (head ? head.offsetHeight : 0);
+        if (pinnedRef.current.indexOf(highlight.id) !== -1) c.scrollTop = 0;
+        else if (top < c.scrollTop || tr.offsetTop + tr.offsetHeight > c.scrollTop + c.clientHeight) c.scrollTop = Math.max(0, top - 8);
+        c.scrollLeft = 0;
+      }
+    }, 60);
+    const t2 = setTimeout(() => setHighlight(h => (h && h.n === n ? null : h)), 2600);
+    return () => { clearTimeout(t1); clearTimeout(t2); };
+  }, [highlight && highlight.n]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The column list closes on a click outside it, or Escape
+  useEffect(() => {
+    if (!chooserOpen) return undefined;
+    const onDown = (e) => { if (chooserRef.current && !chooserRef.current.contains(e.target)) setChooserOpen(false); };
+    const onKey = (e) => { if (e.key === 'Escape') setChooserOpen(false); };
+    document.addEventListener('pointerdown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => { document.removeEventListener('pointerdown', onDown); document.removeEventListener('keydown', onKey); };
+  }, [chooserOpen]);
+
+  const dirtyIds = Object.keys(rows).filter(id => rows[id].status !== 'saving' && changedAssetFields(rows[id], byName).length > 0);
+
+  const saveAll = async () => {
+    if (savingAll) return;
+    const ids = dirtyIds.slice();
+    setSavingAll(true);
+    setBulkNote('');
+    let ok = 0;
+    let bad = 0;
+    for (let i = 0; i < ids.length; i += 1) {
+      const r = await saveRow(ids[i], false);
+      if (r === 'saved') ok += 1;
+      else if (r === 'error') bad += 1;
+    }
+    if (!mounted.current) return;
+    setSavingAll(false);
+    setBulkNote(bad ? `${ok} saved, ${bad} not saved (see the marked rows).` : `${ok} row${ok === 1 ? '' : 's'} saved.`);
+  };
+
+  const discardAll = () => {
+    setRows(prev => {
+      const next = { ...prev };
+      Object.keys(next).forEach(id => {
+        const e = next[id];
+        if (e.status !== 'saving' && (Object.keys(e.edits).length > 0 || e.status === 'stale' || e.status === 'error')) next[id] = blankAssetEntry(e.row);
+      });
+      return next;
+    });
+    setConfirmDiscard(false);
+    setBulkNote('');
+  };
+
+  const toggleSort = (name) => {
+    focusKeep.current = null;
+    setSort(s => (!s || s.name !== name ? { name, desc: false } : (s.desc ? null : { name, desc: true })));
+  };
+
+  // What is drawn: the kept rows first, then the page
+  const pinnedShown = pinned.filter(id => rows[id]);
+  const pinnedIndex = {};
+  pinnedShown.forEach(id => { pinnedIndex[id] = true; });
+  const pageShown = page.ids.filter(id => rows[id] && !pinnedIndex[id]);
+  const drawerId = drawer ? drawer.id : null;
+  const colCount = columns.length + 1;
+
+  let countLine = '';
+  if (!metaDone) countLine = 'Reading the Assets table...';
+  else if (!ready) countLine = '';
+  else if (page.loading && page.ids.length === 0) countLine = 'Loading...';
+  else if (page.count !== null) countLine = `${page.ids.length} of ${page.count}${page.countCapped ? '+' : ''} asset${page.count === 1 ? '' : 's'} shown`;
+  else countLine = `${page.ids.length} asset${page.ids.length === 1 ? '' : 's'} shown`;
+
+  const headerCell = 'sticky top-0 bg-[#00468B] text-white text-left text-[11px] font-bold uppercase tracking-wide px-2 py-2 border-b border-[#003366] align-bottom';
+  const renderRow = (id) => (
+    <AssetTableRow
+      key={id}
+      id={id}
+      entry={rows[id]}
+      columns={columns}
+      nameField={nameField}
+      byName={byName}
+      mapColumn={mapColumn}
+      mapKey={mapKey}
+      set={set}
+      highlight={!!highlight && highlight.id === id}
+      locked={drawerId === id}
+      actions={actions}
+      logEvent={logEvent}
+    />
+  );
+
+  return (
+    <div className="h-full flex flex-col bg-slate-100 p-3 md:p-6 pt-3 md:pt-4 gap-2 overflow-hidden relative" data-testid="assets-table-view">
+      <div className="shrink-0 flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 className="text-2xl font-black text-[#00468B]">Equipment table</h2>
+          <p className="hidden sm:block text-sm text-slate-500">Change any cell, then Save the row. Pictures and files upload straight from their cells.</p>
+        </div>
+        <SearchBox query={query} onQuery={onQuery} placeholder="Search name, room, area..." ariaLabel="Search the equipment table" className="w-full sm:w-80" />
+      </div>
+
+      <div className="shrink-0 flex flex-wrap items-center gap-2">
+        {mapColumn && (
+          <div className="inline-flex shrink-0 rounded-full border border-[#B3D4F2] bg-white p-0.5" role="group" aria-label="Filter the table by map spot">
+            {[['all', 'All'], ['placed', 'On the map'], ['unplaced', 'Not on the map']].map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => onPlacement(key)}
+                aria-pressed={placement === key}
+                className={`px-2.5 py-0.5 rounded-full text-xs font-bold whitespace-nowrap transition-colors ${placement === key ? 'bg-[#00468B] text-white' : 'text-[#00468B] hover:bg-[#E6F1FB]'}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
+        {rooms.length > 0 && (
+          <label className="flex items-center gap-1 text-xs text-slate-600">
+            <span className="sr-only">Room</span>
+            <select value={room} onChange={e => onRoom(e.target.value)} aria-label="Filter the table by room" className="border border-slate-300 rounded-md px-2 py-1 text-xs bg-white max-w-[11rem]">
+              <option value="">Every room</option>
+              {rooms.map(r => <option key={r} value={r}>{r}</option>)}
+            </select>
+          </label>
+        )}
+        <div className="relative" ref={chooserRef}>
+          <button
+            type="button"
+            onClick={() => setChooserOpen(o => !o)}
+            aria-expanded={chooserOpen}
+            disabled={!ready}
+            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-bold border border-[#B3D4F2] bg-white text-[#00468B] hover:bg-[#E6F1FB] disabled:opacity-50"
+          >
+            <TableIcon className="w-3.5 h-3.5" /> Columns ({columns.length})
+          </button>
+          {chooserOpen && (
+            <AssetColumnChooser
+              grouped={grouped}
+              shown={shownNames}
+              onChange={names => setColumnPref(names)}
+              onDefault={() => setColumnPref(null)}
+              onAll={() => setColumnPref(orderedFields.map(f => f.name))}
+              onClose={() => setChooserOpen(false)}
+            />
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={() => requestDrawer({ id: null })}
+          disabled={!ready}
+          title={ready ? 'Create an asset (it can be placed on the map afterwards)' : 'Waiting for the Assets table columns'}
+          className="bg-[#0072CE] text-white px-3 py-1 rounded-md text-xs font-bold hover:bg-[#00468B] disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+        >
+          + New asset
+        </button>
+        <span className="text-xs text-slate-600" role="status">{countLine}</span>
+        {(dirtyIds.length > 0 || savingAll) && (
+          <span className="sm:ml-auto inline-flex flex-wrap items-center gap-2 bg-[#FFF6E0] border border-[#FFB81C] rounded-md px-2 py-1 text-xs" data-testid="table-unsaved">
+            <span className="font-bold text-slate-800">{savingAll ? 'Saving...' : `${dirtyIds.length} row${dirtyIds.length === 1 ? '' : 's'} with unsaved changes`}</span>
+            {!confirmDiscard ? (
+              <>
+                <button type="button" onClick={saveAll} disabled={savingAll} className="px-2 py-0.5 rounded font-bold bg-[#0072CE] text-white hover:bg-[#00468B] disabled:opacity-50">Save all ({dirtyIds.length})</button>
+                <button type="button" onClick={() => setConfirmDiscard(true)} disabled={savingAll} className="px-2 py-0.5 rounded font-bold border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-50">Discard all</button>
+              </>
+            ) : (
+              <>
+                <span>Drop every unsaved change?</span>
+                <button type="button" onClick={discardAll} className="px-2 py-0.5 rounded font-bold bg-[#E4002B] text-white hover:bg-[#C4001F]">Discard</button>
+                <button type="button" onClick={() => setConfirmDiscard(false)} className="px-2 py-0.5 rounded font-bold border border-slate-300 bg-white text-slate-700 hover:bg-slate-100">Keep</button>
+              </>
+            )}
+          </span>
+        )}
+        {bulkNote && !savingAll && <span className="text-xs text-slate-700" role="status">{bulkNote}</span>}
+      </div>
+
+      {metaDone && !ready && (
+        <div className="shrink-0 text-sm text-[#C4001F] bg-white rounded-lg border border-slate-200 p-3" role="alert">
+          The Assets table's columns could not be read{meta.error ? `: ${meta.error}` : '.'}
+          <button type="button" onClick={loadAssetMeta} className="ml-2 text-[#0072CE] underline">Try again</button>
+        </div>
+      )}
+      {page.error && (
+        <div className="shrink-0 text-xs text-[#C4001F]" role="alert">
+          The assets could not be loaded: {page.error}
+          <button type="button" onClick={retry} className="ml-2 text-[#0072CE] underline">Try again</button>
+        </div>
+      )}
+      {notice && (
+        <div className="shrink-0 text-xs text-[#9A6700]" role="status">
+          {notice}
+          <button type="button" onClick={() => setNotice('')} className="ml-2 text-[#0072CE] underline">OK</button>
+        </div>
+      )}
+
+      <div ref={scrollRef} className="flex-1 min-h-[10rem] overflow-auto bg-white rounded-xl border border-slate-200 shadow-sm relative" aria-busy={page.loading}>
+        {ready && (
+          <table className="border-separate border-spacing-0 text-sm min-w-full" data-testid="asset-table">
+            <thead>
+              <tr>
+                <th scope="col" className={`${headerCell} left-0 z-30 w-[10.5rem] min-w-[10.5rem] max-w-[10.5rem] sm:w-[16rem] sm:min-w-[16rem] sm:max-w-[16rem] border-r`}>
+                  {nameField ? <SortHeader f={nameField} sort={sort} onSort={toggleSort} /> : 'Equipment'}
+                </th>
+                {columns.map(f => (
+                  <th key={f.name} scope="col" className={`${headerCell} z-20 ${ASSET_CELL_WIDTH[f.kind] || 'min-w-[9rem]'}`} title={f.description ? `${f.description} (${f.name})` : f.name}>
+                    {ASSET_SORTABLE_KINDS.indexOf(f.kind) !== -1 ? <SortHeader f={f} sort={sort} onSort={toggleSort} /> : f.label}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {pinnedShown.length > 0 && (
+                <tr>
+                  <td colSpan={colCount} className="bg-[#FFF6E0] border-b border-[#FFB81C] px-2 py-1">
+                    <span className="sticky left-2 text-[11px] font-bold uppercase tracking-wider text-[#9A6700]">Kept at the top: new, changed or opened from the map</span>
+                  </td>
+                </tr>
+              )}
+              {pinnedShown.map(renderRow)}
+              {pinnedShown.length > 0 && pageShown.length > 0 && (
+                <tr><td colSpan={colCount} className="h-2 bg-slate-100 border-b border-slate-200" /></tr>
+              )}
+              {pageShown.map(renderRow)}
+              {!page.loading && !page.error && pinnedShown.length === 0 && pageShown.length === 0 && (
+                <tr>
+                  <td colSpan={colCount} className="p-6">
+                    <span className="sticky left-6 text-sm text-slate-500">{words.length || room || placement !== 'all' ? 'No assets match.' : 'No assets yet.'}</span>
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        )}
+        {(page.loading || page.next) && ready && (
+          <div className="sticky left-0 p-3 flex justify-center">
+            {page.loading ? <span className="text-xs text-slate-500">Loading...</span> : (
+              <button type="button" onClick={showMore} className="px-4 py-1.5 text-xs font-bold text-[#0072CE] hover:bg-[#E6F1FB] rounded-lg border border-[#B3D4F2]">Show more</button>
+            )}
+          </div>
+        )}
+        {!metaDone && <p className="p-4 text-sm text-slate-500">Reading the Assets table...</p>}
+      </div>
+
+      {drawer && (
+        <>
+          <div className="absolute inset-0 bg-slate-900/25 z-40" onClick={closeDrawer} aria-hidden="true" />
+          <aside className="absolute inset-y-0 right-0 z-50 w-full sm:w-[28rem] lg:w-[32rem] bg-white shadow-2xl border-l border-slate-200 flex flex-col" aria-label={drawer.id ? 'Asset details' : 'New asset'} data-testid="asset-drawer">
+            {confirmClose && (
+              <div className="p-3 bg-[#FFF6E0] border-b-2 border-[#FFB81C] text-sm shrink-0" role="alert">
+                <p className="font-semibold text-slate-800">This asset has unsaved changes.</p>
+                <div className="flex gap-2 mt-2">
+                  <button type="button" onClick={() => { const run = confirmClose.run; setConfirmClose(null); run(); }} className="px-3 py-1 rounded-md text-xs font-bold bg-[#E4002B] text-white hover:bg-[#C4001F]">Discard changes</button>
+                  <button type="button" onClick={() => setConfirmClose(null)} className="px-3 py-1 rounded-md text-xs font-bold border border-slate-300 text-slate-700 hover:bg-slate-100">Keep editing</button>
+                </div>
+              </div>
+            )}
+            <AssetEditor
+              key={drawer.id || 'new'}
+              meta={meta}
+              set={set}
+              assetId={drawer.id}
+              createLocation={null}
+              mapKey={mapKey}
+              placing={false}
+              refreshToken={drawerRefresh}
+              onRetryMeta={loadAssetMeta}
+              onDirtyChange={setDrawerDirty}
+              onClose={closeDrawer}
+              onSaved={onDrawerSaved}
+              onCreated={onDrawerCreated}
+              onShowOnMap={onShowOnMap}
+              onFilesChanged={() => { if (drawer.id) fileChanged(drawer.id); }}
+              logEvent={logEvent}
+            />
+          </aside>
+        </>
+      )}
+    </div>
+  );
+}
+
+function SortHeader({ f, sort, onSort }) {
+  const on = sort && sort.name === f.name;
+  return (
+    <button
+      type="button"
+      onClick={() => onSort(f.name)}
+      className="inline-flex items-end gap-1 text-left uppercase font-bold hover:text-[#FFB81C]"
+      aria-label={`Sort by ${f.label}${on ? (sort.desc ? ' (now Z to A)' : ' (now A to Z)') : ''}`}
+    >
+      <span>{f.label}</span>
+      <span aria-hidden="true" className={on ? 'text-[#FFB81C]' : 'text-white/40'}>{on ? (sort.desc ? '▼' : '▲') : '↕'}</span>
+    </button>
+  );
+}
+
+// The Columns list: tick what the table shows, by section
+function AssetColumnChooser({ grouped, shown, onChange, onDefault, onAll, onClose }) {
+  const sections = grouped.groups.map(g => ({ key: g.key, title: g.title, items: g.items }))
+    .concat(grouped.info.length ? [{ key: 'info', title: 'Record info', items: grouped.info }] : []);
+  const toggle = (name) => onChange(shown.indexOf(name) !== -1 ? shown.filter(n => n !== name) : shown.concat([name]));
+  const setSection = (items, on) => {
+    const names = items.map(f => f.name);
+    onChange(on ? shown.concat(names.filter(n => shown.indexOf(n) === -1)) : shown.filter(n => names.indexOf(n) === -1));
+  };
+  return (
+    <div className="absolute left-0 top-full mt-1 z-[60] w-[min(22rem,calc(100vw-2rem))] max-h-[60vh] overflow-y-auto bg-white rounded-xl shadow-xl border border-slate-200 p-3 space-y-3" role="dialog" aria-label="Columns to show" data-testid="column-chooser">
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-black text-[11px] uppercase tracking-widest text-[#00468B]">Columns</span>
+        <span className="flex items-center gap-3 text-xs font-bold">
+          <button type="button" onClick={onDefault} className="text-[#0072CE] underline">Default</button>
+          <button type="button" onClick={onAll} className="text-[#0072CE] underline">All</button>
+          <button type="button" onClick={onClose} className="text-slate-400 hover:text-[#E4002B]" aria-label="Close the column list"><X className="w-4 h-4" /></button>
+        </span>
+      </div>
+      {sections.map(s => {
+        const on = s.items.filter(f => shown.indexOf(f.name) !== -1).length;
+        return (
+          <div key={s.key} role="group" aria-label={s.title}>
+            <div className="flex items-center justify-between gap-2 text-xs font-bold text-slate-700">
+              <span>{s.title} <span className="text-slate-400 font-semibold">({on}/{s.items.length})</span></span>
+              <button type="button" onClick={() => setSection(s.items, on < s.items.length)} className="text-[#0072CE] underline">{on < s.items.length ? 'Show all' : 'Hide all'}</button>
+            </div>
+            <div className="mt-1 grid grid-cols-2 gap-x-2 gap-y-1">
+              {s.items.map(f => (
+                <label key={f.name} className="flex items-center gap-1.5 text-xs text-slate-700 min-w-0 cursor-pointer" title={f.name}>
+                  <input type="checkbox" checked={shown.indexOf(f.name) !== -1} onChange={() => toggle(f.name)} className="accent-[#0072CE] shrink-0" />
+                  <span className="truncate">{f.label}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// One row of the table. Drawn again only when its own data changes.
+const AssetTableRow = React.memo(function AssetTableRow({ id, entry, columns, nameField, byName, mapColumn, mapKey, set, highlight, locked, actions, logEvent }) {
+  const row = entry.row;
+  const saving = entry.status === 'saving';
+  const disabled = saving || locked;
+  const changed = changedAssetFields(entry, byName);
+  const changedNames = {};
+  changed.forEach(f => { changedNames[f.name] = true; });
+  const dirty = changed.length > 0;
+  const valueOf = (f) => (entry.edits[f.name] ? entry.edits[f.name].value : toEditValue(f, row));
+  const name = nameField ? String(valueOf(nameField) || '') : '';
+  const label = (row[ASSET_NAME_COLUMN] || '').trim() || name.trim() || '(no name)';
+  const location = mapColumn ? parseMapLocation(row[mapColumn]) : null;
+  const onMap = pinOnMap(location, mapKey);
+  const bg = highlight ? 'bg-[#FFF6E0]' : (dirty ? 'bg-[#FFFBEB]' : 'bg-white');
+  const nameEditable = !!nameField && isEditableField(nameField, false);
+  const iconButton = 'p-1 rounded hover:bg-[#E6F1FB] shrink-0 disabled:opacity-40';
+  let statusLine = null;
+  if (saving) statusLine = <span className="text-slate-600">Saving...</span>;
+  else if (locked) statusLine = <span className="text-slate-500">Open in Details.</span>;
+  else if (entry.status === 'stale') {
+    statusLine = (
+      <>
+        <span className="text-[#C4001F]">{entry.message}</span>
+        <button type="button" onClick={() => actions.reload(id)} className="font-bold text-[#0072CE] underline">Reload row</button>
+        <button type="button" onClick={() => actions.save(id, true)} className="font-bold text-[#C4001F] underline">Save mine anyway</button>
+      </>
+    );
+  } else if (dirty || entry.message) {
+    statusLine = (
+      <>
+        {entry.message && <span className={entry.status === 'error' ? 'text-[#C4001F]' : (entry.status === 'saved' ? 'text-green-700' : 'text-[#9A6700]')}>{entry.message}</span>}
+        {dirty && <span className="text-slate-600">{changed.length} change{changed.length === 1 ? '' : 's'}</span>}
+        {dirty && <button type="button" onClick={() => actions.save(id, false)} aria-label={`Save ${label}`} className="px-2 py-0.5 rounded font-bold bg-[#0072CE] text-white hover:bg-[#00468B]">Save</button>}
+        {dirty && <button type="button" onClick={() => actions.undo(id)} aria-label={`Undo the changes to ${label}`} className="px-2 py-0.5 rounded font-bold border border-slate-300 bg-white text-slate-700 hover:bg-slate-100">Undo</button>}
+      </>
+    );
+  }
+  return (
+    <tr data-row-id={id} className={`${bg} ${highlight ? 'outline outline-2 outline-[#FFB81C]' : ''}`} aria-busy={saving}>
+      <td className={`sticky left-0 z-10 ${bg} border-b border-r border-slate-200 p-1 align-top w-[10.5rem] min-w-[10.5rem] max-w-[10.5rem] sm:w-[16rem] sm:min-w-[16rem] sm:max-w-[16rem]`}>
+        <div className="flex items-start gap-0.5">
+          {nameEditable ? (
+            <input
+              value={name}
+              onChange={e => actions.setCell(id, nameField.name, e.target.value)}
+              disabled={disabled}
+              aria-label={`${nameField.label}, ${label}`}
+              className={`${ASSET_CELL_INPUT} font-semibold text-[#00468B] min-w-0 ${entry.errors[nameField.name] ? 'border-[#E4002B] bg-white' : ''} ${changedNames[nameField.name] ? 'bg-[#FFF6E0]' : ''}`}
+            />
+          ) : (
+            <span className="flex-1 min-w-0 px-1.5 py-1 font-semibold text-[#00468B] truncate" title={label}>{label}</span>
+          )}
+          <button type="button" onClick={() => actions.details(id)} className={`${iconButton} text-[#0072CE]`} title="Details: every column of this asset" aria-label={`Details of ${label}`}><PencilIcon className="w-4 h-4" /></button>
+          <button
+            type="button"
+            onClick={() => actions.showOnMap(id)}
+            className={`${iconButton} ${onMap ? 'text-[#0072CE]' : 'text-slate-400'}`}
+            title={onMap ? 'Show on the map' : (location ? `On another map (${location.map})` : 'Not on the map yet: open it on the map to place it')}
+            aria-label={`Show ${label} on the map`}
+            data-on-map={onMap ? 'true' : 'false'}
+          >
+            <MapPin className="w-4 h-4" fill={onMap ? 'currentColor' : 'none'} />
+          </button>
+        </div>
+        {nameField && entry.errors[nameField.name] && <p className="text-[11px] text-[#C4001F] px-1.5" role="alert">{entry.errors[nameField.name]}</p>}
+        {statusLine && <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-1.5 pt-0.5 text-[11px]" data-row-status>{statusLine}</div>}
+      </td>
+      {columns.map(f => (
+        <td key={f.name} data-cell={`${id}:${f.name}`} className={`border-b border-slate-200 p-1 align-top ${ASSET_CELL_WIDTH[f.kind] || 'min-w-[9rem]'} ${changedNames[f.name] ? 'bg-[#FFF6E0]' : ''}`}>
+          {(f.kind === 'file' || f.kind === 'image') ? (
+            <AssetFileField variant="cell" f={f} row={row} set={set} assetId={id} isNew={false} canWrite={f.canUpdate && !disabled} onChanged={() => actions.fileChanged(id)} logEvent={logEvent} />
+          ) : (
+            <AssetCell
+              f={f}
+              value={valueOf(f)}
+              row={row}
+              error={entry.errors[f.name]}
+              readOnly={!isEditableField(f, false)}
+              disabled={disabled}
+              label={`${f.label}, ${label}`}
+              onChange={v => actions.setCell(id, f.name, v)}
+            />
+          )}
+        </td>
+      ))}
+    </tr>
+  );
+});
+
+// One cell, by the column's type
+function AssetCell({ f, value, row, error, readOnly, disabled, label, onChange }) {
+  const cls = `${ASSET_CELL_INPUT} ${error ? 'border-[#E4002B] bg-white' : ''}`;
+  const err = error ? <p className="text-[11px] text-[#C4001F] px-1.5" role="alert">{error}</p> : null;
+  if (readOnly || (f.kind === 'lookup' && disabled)) {
+    const shown = f.kind === 'lookup' && value && value.id ? (value.name || value.id) : displayValue(f, row);
+    return <div className="px-1.5 py-1 text-sm text-slate-600 truncate max-w-[18rem]" title={shown || undefined}>{shown || <span className="text-slate-300">-</span>}</div>;
+  }
+  let control;
+  switch (f.kind) {
+    case 'bool':
+      control = (
+        <label className="flex justify-center py-1 cursor-pointer" title={value === true ? (f.trueLabel || 'Yes') : (value === false ? (f.falseLabel || 'No') : 'Not set')}>
+          <input type="checkbox" checked={value === true} disabled={disabled} onChange={e => onChange(e.target.checked)} aria-label={label} className="w-4 h-4 accent-[#0072CE] cursor-pointer" />
+        </label>
+      );
+      break;
+    case 'memo':
+      control = <textarea rows={1} value={value} onChange={e => onChange(e.target.value)} disabled={disabled} aria-label={label} className={`${cls} resize-y min-h-[2rem] block`} />;
+      break;
+    case 'int':
+    case 'number':
+      control = <input type="text" inputMode={f.kind === 'int' ? 'numeric' : 'decimal'} value={value} onChange={e => onChange(e.target.value)} disabled={disabled} aria-label={label} className={`${cls} text-right tabular-nums`} />;
+      break;
+    case 'choice':
+      control = (
+        <select value={value} onChange={e => onChange(e.target.value)} disabled={disabled} aria-label={label} className={cls}>
+          <option value="">-</option>
+          {f.options.map(o => <option key={o.value} value={String(o.value)}>{o.label}</option>)}
+        </select>
+      );
+      break;
+    case 'choices':
+      control = <ChoicesCell f={f} value={value} disabled={disabled} label={label} onChange={onChange} />;
+      break;
+    case 'date':
+      control = <input type={f.dateOnly ? 'date' : 'datetime-local'} value={value} onChange={e => onChange(e.target.value)} disabled={disabled} aria-label={label} className={cls} />;
+      break;
+    case 'lookup':
+      control = <div className="px-1.5 py-1 text-sm"><LookupField id={undefined} f={f} value={value} onChange={onChange} /></div>;
+      break;
+    default: {
+      const type = f.format === 'Email' ? 'email' : (f.format === 'Url' ? 'url' : (f.format === 'Phone' ? 'tel' : 'text'));
+      const over = f.maxLength && String(value || '').length > f.maxLength;
+      control = <input type={type} value={value} onChange={e => onChange(e.target.value)} disabled={disabled} aria-label={label} className={`${cls} ${over ? 'border-[#E4002B]' : ''}`} title={over ? `At most ${f.maxLength} characters` : undefined} />;
+    }
+  }
+  return <div>{control}{err}</div>;
+}
+
+// Multi-select choices in a cell: the picked ones, and a list to tick when opened
+function ChoicesCell({ f, value, disabled, label, onChange }) {
+  const [open, setOpen] = useState(false);
+  const list = value || [];
+  const picked = f.options.filter(o => list.indexOf(String(o.value)) !== -1).map(o => o.label);
+  return (
+    <div>
+      <button type="button" disabled={disabled} onClick={() => setOpen(o => !o)} aria-expanded={open} aria-label={label} className={`${ASSET_CELL_INPUT} text-left truncate`}>
+        {picked.length ? picked.join(', ') : <span className="text-slate-300">-</span>}
+      </button>
+      {open && !disabled && (
+        <div className="mt-1 flex flex-wrap gap-1 px-1">
+          {f.options.map(o => {
+            const key = String(o.value);
+            const on = list.indexOf(key) !== -1;
+            return (
+              <button key={key} type="button" aria-pressed={on} onClick={() => onChange(on ? list.filter(v => v !== key) : list.concat([key]))} className={`px-2 py-0.5 rounded-full text-[11px] font-semibold border ${on ? 'bg-[#00468B] text-white border-[#00468B]' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-100'}`}>{o.label}</button>
+            );
+          })}
+          <button type="button" onClick={() => setOpen(false)} className="text-[11px] font-bold text-[#0072CE] underline">Done</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// What smart snap made of a click or a dragged box
 function SpotNote({ spot }) {
   let text;
-  if (spot.snapped) text = spot.region && spot.region.kind === 'shape' ? 'Smart snap picked the solid shape you clicked (highlighted).' : (spot.region && spot.region.inside ? 'Smart snap found the outlined area you clicked in (highlighted).' : 'Smart snap found the outlined area next to your click (highlighted). The pin goes in its middle.');
-  else if (spot.note === 'none') text = 'No closed outline here, so the pin goes exactly where you clicked.';
+  const failed = spot.note && spot.note.indexOf('error:') === 0 ? spot.note.slice(6) : '';
+  if (spot.how === 'box') {
+    if (spot.snapped) text = 'Smart snap fitted the box to the black lines inside it (highlighted).';
+    else if (spot.note === 'nolines') text = 'No black lines in the box, so the box you drew is used.';
+    else if (spot.note === 'nomap') text = 'There is no map picture to snap to, so the box you drew is used.';
+    else if (failed) text = `Smart snap is not available (${failed}), so the box you drew is used.`;
+    else text = 'The box you drew is used.';
+  } else if (spot.snapped) text = spot.region && spot.region.kind === 'shape' ? 'Smart snap picked the solid shape you clicked (highlighted).' : (spot.region && spot.region.inside ? 'Smart snap found the outlined area you clicked in (highlighted).' : 'Smart snap found the outlined area next to your click (highlighted). The pin goes in its middle.');
+  else if (spot.note === 'none') text = 'No closed outline here, so the pin goes exactly where you clicked. Drag a box around it to fit it to the lines instead.';
   else if (spot.note === 'nomap') text = 'There is no map picture to snap to, so the pin goes where you clicked.';
-  else if (spot.note && spot.note.indexOf('error:') === 0) text = `Smart snap is not available (${spot.note.slice(6)}), so the pin goes where you clicked.`;
+  else if (failed) text = `Smart snap is not available (${failed}), so the pin goes where you clicked.`;
   else text = 'The pin goes exactly where you clicked.';
   return <p className="text-sm text-slate-700" data-testid="spot-note">{text}</p>;
 }
@@ -4440,7 +6164,8 @@ function AssignSpot({ spot, set, mapColumn, mapReason, canCreate, onAssign, onCr
 // ==========================================
 // ASSET EDITOR: every column of one asset, by type. New assets too.
 // ==========================================
-function AssetEditor({ meta, set, assetId, createLocation, mapKey, pinLocation, placing, refreshToken, onRetryMeta, onDirtyChange, onClose, onSaved, onCreated, onPlace, onClearNewSpot, onRemoveFromMap, onLocate, logEvent }) {
+// On the map (new assets only) it gets onPlace / onClearNewSpot; in the equipment table it gets onShowOnMap and onFilesChanged.
+function AssetEditor({ meta, set, assetId, createLocation, mapKey, placing, refreshToken, onRetryMeta, onDirtyChange, onClose, onSaved, onCreated, onPlace, onClearNewSpot, onShowOnMap, onFilesChanged, logEvent }) {
   const isNew = !assetId;
   const mapColumn = meta.mapColumn ? meta.mapColumn.name : null;
   // The map column has its own buttons; the id is shown under Record info
@@ -4463,8 +6188,6 @@ function AssetEditor({ meta, set, assetId, createLocation, mapKey, pinLocation, 
   const [saveError, setSaveError] = useState('');
   const [stale, setStale] = useState(false);
   const [notice, setNotice] = useState('');
-  const [confirmRemove, setConfirmRemove] = useState(false);
-  const [removing, setRemoving] = useState(false);
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
 
@@ -4596,7 +6319,7 @@ function AssetEditor({ meta, set, assetId, createLocation, mapKey, pinLocation, 
   const liveName = nameField ? String(form.values[nameField.name] || '').trim() : '';
   const title = liveName || (isNew ? 'New asset' : '(no name)');
   const placeText = [form.values.craa5_roomname, form.values.craa5_areaname].filter(v => v && String(v).trim()).join(' · ');
-  const location = isNew ? createLocation : (pinLocation !== undefined ? pinLocation : (row && mapColumn ? parseMapLocation(row[mapColumn]) : null));
+  const location = isNew ? createLocation : (row && mapColumn ? parseMapLocation(row[mapColumn]) : null);
   const onThisMap = pinOnMap(location, mapKey);
 
   if (meta.fields.length === 0) {
@@ -4614,7 +6337,6 @@ function AssetEditor({ meta, set, assetId, createLocation, mapKey, pinLocation, 
   }
 
   const { groups, info } = groupAssetFields(fields);
-  const asset = { id: assetId, name: title };
 
   return (
     <div className="flex flex-col flex-1 min-h-0" data-testid="asset-editor">
@@ -4627,39 +6349,23 @@ function AssetEditor({ meta, set, assetId, createLocation, mapKey, pinLocation, 
           ) : placing ? (
             <span className="font-semibold text-[#00468B]">Click the map where this asset is...</span>
           ) : isNew ? (
-            <>
-              <span className={`font-semibold ${createLocation ? 'text-[#00468B]' : 'text-slate-500'}`}>{createLocation ? 'Goes on the map at the highlighted spot.' : 'Not on the map.'}</span>
-              <button type="button" onClick={() => onPlace({ id: 'new', name: title })} className="px-2 py-1 rounded-md font-bold border border-[#B3D4F2] text-[#0072CE] hover:bg-[#E6F1FB]">{createLocation ? 'Pick another spot' : 'Pick a spot on the map'}</button>
-              {createLocation && <button type="button" onClick={onClearNewSpot} className="px-2 py-1 rounded-md font-bold border border-slate-300 text-slate-600 hover:bg-slate-100">No spot</button>}
-            </>
+            onPlace ? (
+              <>
+                <span className={`font-semibold ${createLocation ? 'text-[#00468B]' : 'text-slate-500'}`}>{createLocation ? 'Goes on the map at the highlighted spot.' : 'Not on the map.'}</span>
+                <button type="button" onClick={() => onPlace({ id: 'new', name: title })} className="px-2 py-1 rounded-md font-bold border border-[#B3D4F2] text-[#0072CE] hover:bg-[#E6F1FB]">{createLocation ? 'Pick another spot' : 'Pick a spot on the map'}</button>
+                {createLocation && <button type="button" onClick={onClearNewSpot} className="px-2 py-1 rounded-md font-bold border border-slate-300 text-slate-600 hover:bg-slate-100">No spot</button>}
+              </>
+            ) : (
+              <span className="text-slate-500">Not on the map. Once it is created, "Show on map" places it.</span>
+            )
           ) : load.status !== 'ready' ? null : (
             <>
               <span className={`inline-flex items-center gap-1 font-semibold ${onThisMap ? 'text-[#00468B]' : 'text-slate-500'}`}>
                 <MapPin className="w-3.5 h-3.5" />
                 {onThisMap ? 'On the map' : (location ? `On another map (${location.map})` : 'Not on the map')}
               </span>
-              {onThisMap && <button type="button" onClick={() => onLocate(location)} className="px-2 py-1 rounded-md font-bold border border-[#B3D4F2] text-[#0072CE] hover:bg-[#E6F1FB]">Show</button>}
-              <button type="button" onClick={() => onPlace({ id: assetId, name: title })} className="px-2 py-1 rounded-md font-bold bg-[#0072CE] text-white hover:bg-[#00468B]">{location ? 'Move' : 'Place on map'}</button>
-              {location && !confirmRemove && <button type="button" onClick={() => setConfirmRemove(true)} className="px-2 py-1 rounded-md font-bold border border-slate-300 text-slate-600 hover:bg-slate-100">Remove from map</button>}
-              {confirmRemove && (
-                <span className="inline-flex items-center gap-1.5 bg-[#FFF6E0] border border-[#FFB81C] rounded-md px-2 py-1">
-                  Remove the pin?
-                  <button
-                    type="button"
-                    disabled={removing}
-                    onClick={async () => {
-                      setRemoving(true);
-                      setSaveError('');
-                      try { await onRemoveFromMap(asset); if (mounted.current) setConfirmRemove(false); }
-                      catch (e) { logEvent(`Could not remove ${title} from the map: ${e.message}`, 'error'); if (mounted.current) setSaveError(`The pin was not removed: ${e.message}`); }
-                      finally { if (mounted.current) setRemoving(false); }
-                    }}
-                    className="font-bold text-[#C4001F] underline"
-                  >
-                    {removing ? 'Removing...' : 'Remove'}
-                  </button>
-                  <button type="button" onClick={() => setConfirmRemove(false)} className="font-bold text-slate-600 underline">Keep</button>
-                </span>
+              {onShowOnMap && (
+                <button type="button" onClick={() => onShowOnMap(assetId)} className="px-2 py-1 rounded-md font-bold bg-[#0072CE] text-white hover:bg-[#00468B]">{onThisMap ? 'Show on map' : 'Place on map'}</button>
               )}
             </>
           )}
@@ -4691,7 +6397,7 @@ function AssetEditor({ meta, set, assetId, createLocation, mapKey, pinLocation, 
                 )}
                 {rest.map(f => (
                   (f.kind === 'file' || f.kind === 'image') ? (
-                    <AssetFileField key={f.name} f={f} row={row} set={set} assetId={assetId} isNew={isNew} canWrite={f.canUpdate} onChanged={() => reload(true)} logEvent={logEvent} />
+                    <AssetFileField key={f.name} f={f} row={row} set={set} assetId={assetId} isNew={isNew} canWrite={f.canUpdate} onChanged={() => { reload(true); if (onFilesChanged) onFilesChanged(); }} logEvent={logEvent} />
                   ) : (
                     <AssetField key={f.name} f={f} value={form.values[f.name]} onChange={v => setValue(f.name, v)} error={errors[f.name]} readOnly={!isEditableField(f, isNew)} row={row} />
                   )
@@ -4925,8 +6631,9 @@ function LookupField({ id, f, value, onChange }) {
   );
 }
 
-// A File or Image column: upload, open and remove act straight away (they are their own requests in Dataverse)
-function AssetFileField({ f, row, set, assetId, isNew, canWrite, onChanged, logEvent }) {
+// A File or Image column: upload, open and remove act straight away (they are their own requests in Dataverse).
+// variant "cell" is the compact form used in the equipment table.
+function AssetFileField({ f, row, set, assetId, isNew, canWrite, onChanged, logEvent, variant = 'field' }) {
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -4977,6 +6684,53 @@ function AssetFileField({ f, row, set, assetId, isNew, canWrite, onChanged, logE
     });
   };
 
+  const picker = canWrite && !isNew
+    ? <input ref={inputRef} type="file" accept={isImage ? 'image/*' : undefined} onChange={onPick} className="hidden" aria-label={`Upload ${f.label}`} data-upload={f.name} />
+    : null;
+  const openIt = () => run('open', () => openAssetFile(set, assetId, f.name, fileName, isImage));
+  const removeConfirm = confirmDelete && (
+    <span className="inline-flex items-center gap-1.5 text-xs bg-[#FFF6E0] border border-[#FFB81C] rounded-md px-2 py-1">
+      Remove {isImage ? 'the picture' : 'the file'}?
+      <button type="button" disabled={!!busy} onClick={() => run('remove', () => deleteAssetFile(set, assetId, f.name, logEvent))} className="font-bold text-[#C4001F] underline">{busy === 'remove' ? 'Removing...' : 'Remove'}</button>
+      <button type="button" onClick={() => setConfirmDelete(false)} className="font-bold text-slate-600 underline">Keep</button>
+    </span>
+  );
+
+  if (variant === 'cell') {
+    // The small thumbnail Dataverse keeps (144 px), not the full picture
+    const thumb = has && isImage && assetId ? [apiUrl(`${set}(${assetId})/${f.name}/$value?t=${encodeURIComponent(String(stamp))}`)] : [];
+    return (
+      <div data-file-field={f.name} className="min-w-0 px-1 py-0.5">
+        <div className="flex items-center gap-1.5">
+          {isImage && has && (
+            <button type="button" onClick={openIt} disabled={!!busy} title={`Open the ${f.label.toLowerCase()}`} aria-label={`Open the ${f.label.toLowerCase()}`} className="w-9 h-9 rounded border border-slate-200 bg-slate-50 overflow-hidden shrink-0 flex items-center justify-center">
+              <StoredImage key={thumb.join('|')} sources={thumb} alt={f.label} className="w-full h-full object-cover" fallback={<ImageIcon className="w-4 h-4 text-slate-400" />} />
+            </button>
+          )}
+          {!isImage && has && (
+            <button type="button" onClick={openIt} disabled={!!busy} className="text-xs font-semibold text-[#0072CE] underline truncate max-w-[8rem] disabled:opacity-50" title={`Open ${fileName || 'the file'}`}>
+              {busy === 'open' ? 'Opening...' : (fileName || 'Open file')}
+            </button>
+          )}
+          {!has && <span className="text-xs text-slate-400">{isImage ? 'No picture' : 'No file'}</span>}
+          {picker}
+          {picker && (
+            <button type="button" disabled={!!busy} onClick={() => inputRef.current && inputRef.current.click()} title={`${has ? 'Replace' : 'Upload'} the ${f.label}`} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-bold bg-[#0072CE] text-white hover:bg-[#00468B] disabled:opacity-50 shrink-0">
+              <Download className="w-3 h-3 rotate-180" />{busy === 'upload' ? 'Uploading...' : (has ? 'Replace' : 'Upload')}
+            </button>
+          )}
+          {has && canWrite && !confirmDelete && (
+            <button type="button" disabled={!!busy} onClick={() => setConfirmDelete(true)} title={`Remove the ${f.label}`} aria-label={`Remove the ${f.label}`} className="p-0.5 rounded text-slate-400 hover:text-[#E4002B] hover:bg-slate-100 disabled:opacity-50 shrink-0">
+              <X className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
+        {removeConfirm && <div className="mt-1">{removeConfirm}</div>}
+        {error && <p className="text-[11px] text-[#C4001F] mt-0.5" role="alert">Not done: {error}</p>}
+      </div>
+    );
+  }
+
   return (
     <div data-file-field={f.name}>
       <span className="flex items-baseline justify-between gap-2">
@@ -4993,29 +6747,23 @@ function AssetFileField({ f, row, set, assetId, isNew, canWrite, onChanged, logE
       </p>
       {isNew ? null : (
         <div className="flex flex-wrap items-center gap-2 mt-1">
-          {canWrite && (
+          {picker && (
             <>
-              <input ref={inputRef} type="file" accept={isImage ? 'image/*' : undefined} onChange={onPick} className="hidden" aria-label={`Upload ${f.label}`} data-upload={f.name} />
+              {picker}
               <button type="button" disabled={!!busy} onClick={() => inputRef.current && inputRef.current.click()} className="px-2.5 py-1 rounded-md text-xs font-bold bg-[#0072CE] text-white hover:bg-[#00468B] disabled:opacity-50">
                 {busy === 'upload' ? 'Uploading...' : (has ? 'Replace' : (isImage ? 'Upload picture' : 'Upload file'))}
               </button>
             </>
           )}
           {has && (
-            <button type="button" disabled={!!busy} onClick={() => run('open', () => openAssetFile(set, assetId, f.name, fileName, isImage))} className="px-2.5 py-1 rounded-md text-xs font-bold border border-[#B3D4F2] text-[#0072CE] hover:bg-[#E6F1FB] disabled:opacity-50">
+            <button type="button" disabled={!!busy} onClick={openIt} className="px-2.5 py-1 rounded-md text-xs font-bold border border-[#B3D4F2] text-[#0072CE] hover:bg-[#E6F1FB] disabled:opacity-50">
               {busy === 'open' ? 'Opening...' : 'Open'}
             </button>
           )}
           {has && canWrite && !confirmDelete && (
             <button type="button" disabled={!!busy} onClick={() => setConfirmDelete(true)} className="px-2.5 py-1 rounded-md text-xs font-bold border border-slate-300 text-slate-600 hover:bg-slate-100 disabled:opacity-50">Remove</button>
           )}
-          {confirmDelete && (
-            <span className="inline-flex items-center gap-1.5 text-xs bg-[#FFF6E0] border border-[#FFB81C] rounded-md px-2 py-1">
-              Remove {isImage ? 'the picture' : 'the file'}?
-              <button type="button" disabled={!!busy} onClick={() => run('remove', () => deleteAssetFile(set, assetId, f.name, logEvent))} className="font-bold text-[#C4001F] underline">{busy === 'remove' ? 'Removing...' : 'Remove'}</button>
-              <button type="button" onClick={() => setConfirmDelete(false)} className="font-bold text-slate-600 underline">Keep</button>
-            </span>
-          )}
+          {removeConfirm}
         </div>
       )}
       {error && <p className="text-xs text-[#C4001F] mt-0.5" role="alert">Not done: {error}</p>}
