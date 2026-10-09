@@ -1596,16 +1596,17 @@ function odLogDay(v) {
 // -> { state: 'none' | 'ok' | 'overdue', letters: ['W', ...], worst: days late (9999 = never logged) }
 function overdueOf(flags, lt, rDay) {
     const fs = odFreqsOf(flags);
-    if (!fs.length) return { state: 'none', letters: [], worst: 0, never: false };
+    if (!fs.length) return { state: 'none', letters: [], worst: 0, never: false, any: false, needRank: 0 };
     const letters = [];
-    let worst = 0, never = false;
+    let worst = 0, never = false, needRank = 0;
     fs.forEach(function(f) {
         const last = lt ? lt[f.rank - 1] : 0;
         if (last && last >= rDay - f.days) return;
         letters.push(f.code);
-        if (!last) { never = true; worst = 9999; } else worst = Math.max(worst, rDay - last - f.days);
+        if (!last) { never = true; worst = 9999; needRank = Math.max(needRank, f.rank); } else worst = Math.max(worst, rDay - last - f.days);
     });
-    return { state: letters.length ? 'overdue' : 'ok', letters: letters, worst: worst, never: never };
+    // any = some clean is on file (just not one of the level this frequency needs); needRank = the highest level missing (2 weekly, 3 monthly)
+    return { state: letters.length ? 'overdue' : 'ok', letters: letters, worst: worst, never: never, any: !!(lt && lt[0]), needRank: needRank };
 }
 let odDateStyle = 0;   // how a date is written in the log filter: 0 quoted ISO datetime, 1 plain date, 2 unquoted datetime (the first one Dataverse takes is kept)
 let odKindCols = OD_KIND_COLS;
@@ -1650,7 +1651,7 @@ async function fetchOverdueChunk(dataApi, ids, floorYMD) {
 // { id: [d1, d2, d3] } for the ids asked about: the newest log day (0 = none) that counts for each rank. Rows dated after
 // `todayNo` are ignored. Reads { cands: [{ id, days }] } in chunks of OD_CHUNK ids per window (days = the longest frequency the
 // piece has), OD_PARALLEL requests at a time. `failed` lists the ids whose request failed (left out of `logs`).
-async function fetchOverdue(dataApi, cands, todayNo, onProgress) {
+async function fetchOverdue(dataApi, cands, todayNo, onProgress, isStale) {
     const tiers = {};
     cands.forEach(function(c) {
         const t = odTierOf(c.days);
@@ -1663,8 +1664,8 @@ async function fetchOverdue(dataApi, cands, todayNo, onProgress) {
     });
     const logs = {}, failed = [];
     let next = 0, done = 0;
-    const run = async function() {
-        while (next < jobs.length) {
+    const step = async function() {
+        {
             const job = jobs[next++];
             const rows = await fetchOverdueChunk(dataApi, job.ids, job.floor);
             if (rows === null) failed.push.apply(failed, job.ids);
@@ -1688,6 +1689,12 @@ async function fetchOverdue(dataApi, cands, todayNo, onProgress) {
             if (onProgress) onProgress(done, jobs.length);
         }
     };
+    const run = async function() {
+        while (next < jobs.length && !(isStale && isStale())) await step();   // a read the planner has moved past stops asking for more
+    };
+    // The first request goes out alone: if the log table needs the other date style or has no kind columns, that is settled (it is kept
+    // in module variables) before the others go out beside it.
+    if (jobs.length) await step();
     const workers = [];
     for (let w = 0; w < Math.min(OD_PARALLEL, jobs.length); w++) workers.push(run());
     await Promise.all(workers);
@@ -1985,6 +1992,7 @@ export default function App(props) {
     const [odMap, setOdMap] = useState(odBootRef.current.logs);
     const [odState, setOdState] = useState({ status: 'idle', done: 0, total: 0, readAt: odBootRef.current.builtAt, failed: 0 });
     const odReqRef = useRef(0);
+    const odAttemptRef = useRef(0);   // when the last read started (a tab click doesn't start another within 5 minutes)
     const odMapRef = useRef(odMap);
     odMapRef.current = odMap;
     const odStateRef = useRef(odState);
@@ -2025,12 +2033,16 @@ export default function App(props) {
     const prodSigRef = useRef('');
     const prodReqRef = useRef(0);
     const loadProdRunsRef = useRef(null);   // set once the plan window is known (below)
+    const ssBusyRef = useRef(false);
+    const ssAttemptRef = useRef(0);   // when the last re-read started; a tab click doesn't start another within a minute (a failed read otherwise retried on every click)
     const reloadShiftStart = async function() {
+        if (ssBusyRef.current) return;
+        ssBusyRef.current = true; ssAttemptRef.current = Date.now();
         setShiftStartLoading(true);
         try {
             const res = await Promise.all([fetchBoardRows(props.dataApi), fetchAllActiveRecords("craa5_aa_mss_area", props.dataApi), loadTaskRowsRef.current ? loadTaskRowsRef.current() : null, loadProdRunsRef.current ? loadProdRunsRef.current() : null]);
             applyShiftStartRows(res[0], res[1]);
-        } finally { setShiftStartLoading(false); }
+        } finally { ssBusyRef.current = false; setShiftStartLoading(false); }
     };
     const reloadShiftStartRef = useRef(reloadShiftStart);
     reloadShiftStartRef.current = reloadShiftStart;
@@ -2390,7 +2402,7 @@ export default function App(props) {
     // The types a room plans: its own pick, else the plan's ([] = every piece of equipment, or the overdue modes' own rule).
     const roomCleanTypes = function(area) {
         const own = roomCleanType[String(area)];
-        if (own === 'all' || own === 'overdue' || own === 'overdueweekly') return [];
+        if (own === 'all' || (odUsable && (own === 'overdue' || own === 'overdueweekly'))) return [];
         if (own && cleanTypeCols.indexOf(own) > -1) return [own];
         return roomMode(area) === 'type' ? planCleanTypes : [];
     };
@@ -2525,9 +2537,10 @@ export default function App(props) {
     const odWanted = odUsable && (planMode !== 'type' || Object.keys(roomCleanType).some(function(k) { return roomCleanType[k] === 'overdue' || roomCleanType[k] === 'overdueweekly'; }));
     const loadOverdue = async function(force) {
         const req = ++odReqRef.current;
+        odAttemptRef.current = Date.now();
         const seen = {}, cands = [];
         assets.forEach(function(a) {
-            if (!Array.isArray(a.flags) || a.removed || hiddenRooms[String(a.area)]) return;
+            if (!Array.isArray(a.flags) || hiddenRooms[String(a.area)] || roomMode(String(a.area)) === 'type') return;   // pieces taken out of cleaning are read too, so putting one back needs no new read
             const id = normGuid(a.id);
             if (!isGuidStr(id) || seen[id]) return;
             const fs = odFreqsOf(a.flags);
@@ -2546,7 +2559,7 @@ export default function App(props) {
                 if (req !== odReqRef.current || (d < t && d - shown < Math.max(1, Math.ceil(t / 10)))) return;
                 shown = d;
                 setOdState({ status: 'loading', done: d, total: t, readAt: prev.readAt, failed: 0 });
-            });
+            }, function() { return req !== odReqRef.current; });
             if (req !== odReqRef.current) return;
             const dead = res.chunks > 0 && res.failed.length >= need.length;
             const merged = Object.assign({}, have, res.logs);
@@ -2561,7 +2574,7 @@ export default function App(props) {
     useEffect(function() {
         if (!odWanted || isLoading) return;
         loadOverdue(false);
-    }, [odWanted, isLoading, hiddenRooms, assets.length]);
+    }, [odWanted, isLoading, hiddenRooms, assets.length, planMode, roomCleanType]);
     const expMap = useMemo(function() { return autoCrews ? buildExperienceMap(expAgg, rosterInfo.who, lineIndex) : {}; }, [autoCrews, expAgg, rosterInfo, lineIndex]);
     // Each shift's crews, in time order: leaders, rooms, teams. Work a shift can't get to is carried to the next one.
     const autoPlan = useMemo(function() {
@@ -3421,6 +3434,7 @@ export default function App(props) {
                     tasks: [],
                     limit: Infinity,
                     startOffset: Infinity,
+                    areaFloor: {},   // each room's own earliest start: a combined clean orders by the earliest, but a room's tasks never start before its own handoff
                     priority: Infinity,
                     areas: {}
                 };
@@ -3437,6 +3451,7 @@ export default function App(props) {
             const handMs = handoffMs[area];   // a typed Handover or the production schedule's handoff (see PRODUCTION SCHEDULE HANDOFFS)
             if (handMs !== undefined && handMs !== null) rStartMins = Math.max(0, Math.round((handMs - startMs) / 60000));
             if (rStartMins < vRoom.startOffset) vRoom.startOffset = rStartMins;
+            vRoom.areaFloor[area] = rStartMins;
 
             const rPri = roomPriority[area] || 2;
             if (rPri < vRoom.priority) vRoom.priority = rPri;
@@ -3758,7 +3773,7 @@ export default function App(props) {
         const tailMin = Math.min(240, Math.max(5, Number(tailFillMins) || 30));
         const byStart = function(a, b) { return a.start - b.start; };
         const uniq = function(l, i, a) { return a.indexOf(l) === i; };
-        const fromOf = function(task) { return Math.max(virtualRoomsMap[task.vRoomKey].startOffset, task.earliestStart || 0, reforecastFrom); };
+        const fromOf = function(task) { const vr = virtualRoomsMap[task.vRoomKey]; return Math.max(vr.startOffset, vr.areaFloor[task.originalArea] || 0, task.earliestStart || 0, reforecastFrom); };
         // A worker's free stretches on shift, worked out again only after they get a new booking (bookings are only added here).
         const allRuns = function(w) {
             if (w.runsAt === w.schedule.length && w.runs) return w.runs;
@@ -5242,7 +5257,8 @@ export default function App(props) {
         if (!LAZY_ENGINE) return;
         setLiveTime(new Date());
         if (id === 'setup' || id === 'equipment') return;
-        if (!shiftStartCheckedAt || Date.now() - shiftStartCheckedAt.getTime() > 5 * 60000) reloadShiftStart();
+        if ((!shiftStartCheckedAt || Date.now() - shiftStartCheckedAt.getTime() > 5 * 60000) && !ssBusyRef.current && Date.now() - ssAttemptRef.current > 60000) reloadShiftStart();
+        if (odWanted && odState.status !== 'loading' && odState.readAt && Date.now() - odState.readAt > OD_CACHE_MS && Date.now() - odAttemptRef.current > 5 * 60000) loadOverdue(true);   // an open tab reads the cleaning log again once it is 6 hours old
     };
     const tabBtn = function(id, label, Icon) {
         const on = activeTab === id;
@@ -5360,7 +5376,7 @@ export default function App(props) {
                                         <span>
                                             {odState.status === 'idle' ? 'Reading the cleaning log to find what is overdue…'
                                                 : odState.status === 'loading' ? (odState.total > 0 ? `Reading the cleaning log to find what is overdue: ${odState.done} of ${odState.total} requests…` : 'Reading the cleaning log to find what is overdue…')
-                                                : odState.status === 'error' ? 'Couldn\'t read the cleaning log, so every piece of equipment is planned until it can be.'
+                                                : odState.status === 'error' ? (Object.keys(odMap).length > 0 ? 'Couldn\'t read the cleaning log again, so what was read earlier is kept and anything not read yet is planned until it can be.' : 'Couldn\'t read the cleaning log, so every piece of equipment is planned until it can be.')
                                                 : odState.status === 'partial' ? `${odState.failed} piece${odState.failed === 1 ? '' : 's'} of equipment couldn't be read from the cleaning log, so ${odState.failed === 1 ? 'it is' : 'they are'} planned anyway.`
                                                 : 'Overdue as of ' + new Date(odRDay * 86400000).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' }) + ' by the cleaning log (Daily 1 day, Weekly and Midweek 7, Monthly 31, Quarterly 92, Annual 366)' + (odState.readAt ? ', read ' + new Date(odState.readAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '') + '.'}
                                         </span>
@@ -5394,12 +5410,12 @@ export default function App(props) {
                                         {handoffSource === 'schedule' ? (
                                             <div data-handoff-status={prodState.status} className={`flex flex-wrap items-center gap-2 mt-2 text-[11px] font-bold ${prodState.status === 'failed' || prodState.truncated || (prodState.status === 'ready' && prodRows.length === 0) ? 'text-amber-700' : 'text-slate-500'}`}>
                                                 <span>
-                                                    {prodState.status === 'failed' ? 'Couldn\'t read the production schedule, so each room starts at the plan start unless a Handover is typed in.'
+                                                    {prodState.status === 'failed' ? (prodRows.length > 0 ? 'Couldn\'t read the production schedule again, so the runs read earlier are still used.' : 'Couldn\'t read the production schedule, so each room starts at the plan start unless a Handover is typed in.')
                                                         : prodState.status === 'ready' && prodRows.length === 0 ? 'No production runs are scheduled for this window, so each room starts at the plan start.'
                                                         : prodState.status === 'idle' || (prodState.status === 'loading' && !prodState.readAt) ? 'Reading the production schedule…'
                                                         : `Production schedule read ${readTime}: ${prodRows.length} run${prodRows.length === 1 ? '' : 's'} on ${lineCount} line${lineCount === 1 ? '' : 's'} · ${inPlanRooms.length - unmatched.length} of ${inPlanRooms.length} rooms matched to a line · ${waiting} wait${waiting === 1 ? 's' : ''} for production to hand over.`}
                                                     {prodState.truncated ? ' Only the first ' + PROD_TOP + ' runs were read.' : ''}
-                                                    {prodState.status !== 'failed' && prodState.status !== 'idle' && unmatched.length > 0 ? ' No production line found for: ' + unmatched.slice(0, 6).join(', ') + (unmatched.length > 6 ? ' and ' + (unmatched.length - 6) + ' more' : '') + ' (pick one on the room below).' : ''}
+                                                    {prodState.status !== 'failed' && prodState.status !== 'idle' && unmatched.length > 0 ? ' No run found on a matching line in this window for: ' + unmatched.slice(0, 6).join(', ') + (unmatched.length > 6 ? ' and ' + (unmatched.length - 6) + ' more' : '') + ' (a line with nothing scheduled starts at the plan start; or pick the line on the room below).' : ''}
                                                 </span>
                                                 <button data-handoff-reload disabled={prodState.status === 'loading'} onClick={function() { loadProdRuns(); }} className="text-[#0072CE] hover:text-[#00468B] underline disabled:opacity-40 disabled:no-underline">Read the schedule again</button>
                                             </div>
@@ -5466,7 +5482,7 @@ export default function App(props) {
                                                 <div className="flex flex-wrap items-center gap-3 mt-2">
                                                     {(function() {
                                                         const hi = handoffInfo[room] || { ms: null, src: 'hand-none' };
-                                                        const shown = hi.ms !== null && hi.ms !== undefined ? msToLocalInput(hi.ms) : (hi.src === 'hand-none' && roomHandovers[room]) || getDatetimeLocalString(0, ganttStartDate, ganttStartHour);
+                                                        const shown = roomHandovers[room] ? roomHandovers[room] : hi.ms !== null && hi.ms !== undefined ? msToLocalInput(hi.ms) : getDatetimeLocalString(0, ganttStartDate, ganttStartHour);
                                                         const fromSchedule = handoffSource === 'schedule';
                                                         const chip = !fromSchedule ? null
                                                             : hi.src === 'hand' ? 'typed in'
@@ -5474,7 +5490,7 @@ export default function App(props) {
                                                             : hi.src === 'free' ? 'production stopped · ' + (hi.lines || []).slice(0, 2).join(', ')
                                                             : hi.src === 'norun' ? 'no run scheduled · ' + (hi.lines || []).slice(0, 2).join(', ')
                                                             : hi.src === 'nolines' ? 'doesn\'t wait for production'
-                                                            : 'no production line found';
+                                                            : 'no run found on a matching line in this window';
                                                         const autoLines = fromSchedule ? linesForRoom([room, (lineForArea(lineIndex, room) || { name: '' }).name], prodLines, undefined).lines : [];
                                                         const pick = roomProdLines[room] || '';
                                                         const lineKeys = Object.keys(prodLines).sort(function(a, b) { return prodLineLabel(prodLines[a]).localeCompare(prodLineLabel(prodLines[b]), undefined, { numeric: true }); });
@@ -5482,7 +5498,7 @@ export default function App(props) {
                                                             <div data-handoff-room={room} data-handoff-src={hi.src} className="flex flex-wrap items-center gap-2 bg-white px-2 py-1.5 rounded border border-[#B3D4F2] shadow-sm">
                                                                 <span className="text-[10px] font-black text-slate-500 uppercase">Handover:</span>
                                                                 <input type="datetime-local" value={shown} onChange={function(e) { handleRoomHandoverChange(room, e.target.value); }} className="w-36 md:w-40 text-center font-bold text-xs md:text-sm outline-none border-b border-slate-200 no-pan bg-transparent" />
-                                                                {chip && <span className={`text-[10px] font-bold ${hi.src === 'nomatch' ? 'text-amber-700' : 'text-slate-400'}`} title={hi.how ? 'Matched by: ' + hi.how : ''}>{chip}{hi.stale ? ' · the Handover typed earlier is outside this plan and ignored' : ''}</span>}
+                                                                {chip && <span className={`text-[10px] font-bold ${hi.src === 'nomatch' ? 'text-amber-700' : 'text-slate-400'}`} title={hi.how ? 'Matched by: ' + hi.how : ''}>{chip}{hi.stale ? ' · the Handover typed here is outside this plan and ignored' : ''}</span>}
                                                                 {fromSchedule && roomHandovers[room] && <button data-handoff-clear={room} onClick={function() { handleRoomHandoverClear(room); }} className="text-[10px] font-bold text-[#0072CE] hover:text-[#00468B] underline" title="Remove the typed Handover and follow the production schedule again">use the schedule</button>}
                                                                 {fromSchedule && (
                                                                     <select data-handoff-line={room} value={pick} onChange={function(e) { handleRoomProdLineChange(room, e.target.value); }} className="text-[10px] font-bold outline-none bg-white cursor-pointer no-pan border border-slate-200 rounded px-1 py-0.5" title="Which production line this room waits for">
@@ -5570,7 +5586,7 @@ export default function App(props) {
                                     const mode = roomMode(a.area);
                                     const st = odStatus[a.id];
                                     if (mode === 'type' || !st) return null;
-                                    if (st.state === 'overdue') return <span data-od-chip="overdue" className="block text-[10px] font-bold text-rose-700">{st.never ? 'Overdue · no clean logged in the last ' + (odTierOf(odFreqsOf(a.flags).reduce(function(m, f) { return Math.max(m, f.days); }, 0)) + 1) + ' days' : 'Overdue ' + st.worst + ' day' + (st.worst === 1 ? '' : 's')} · {st.letters.join(' + ')}</span>;
+                                    if (st.state === 'overdue') return <span data-od-chip="overdue" className="block text-[10px] font-bold text-rose-700">{st.never ? 'Overdue · no ' + (st.any && st.needRank > 1 ? (st.needRank === 2 ? 'weekly-level ' : 'monthly-level ') : '') + 'clean logged in the last ' + (odTierOf(odFreqsOf(a.flags).reduce(function(m, f) { return Math.max(m, f.days); }, 0)) + 1) + ' days' : 'Overdue ' + st.worst + ' day' + (st.worst === 1 ? '' : 's')} · {st.letters.join(' + ')}</span>;
                                     if (mode === 'overdueweekly' && isWeeklyEq(a)) return <span data-od-chip="weekly" className="block text-[10px] font-bold text-amber-700">Weekly</span>;
                                     return null;
                                 };
@@ -5711,13 +5727,18 @@ export default function App(props) {
                                             })}
                                         </select>
                                         <span className="text-sm font-bold text-slate-600">{peopleN} people{leadsN ? ' · ' + leadsN + ' lead' + (leadsN === 1 ? '' : 's') : ''}</span>
-                                        <Button variant="primary" size="sm" onClick={function() { if (LAZY_ENGINE) setPrinting(true); else window.print(); }} className="ml-auto"><Printer className="w-3.5 h-3.5 mr-1" /> Print</Button>
+                                        <Button variant="primary" size="sm" onClick={function() { if (LAZY_ENGINE) { setLiveTime(new Date()); setPrinting(true); } else window.print(); }} className="ml-auto"><Printer className="w-3.5 h-3.5 mr-1" /> Print</Button>
                                     </div>
                                 ) : (
                                     <span className="text-sm font-bold text-slate-400">{IS_CURRENT ? 'No shifts fall inside the window.' : 'No shifts fall inside the plan window. Check the Setup tab.'}</span>
                                 )}
                             </div>
 
+                            {LAZY_ENGINE && !printing && (
+                                <div className="print-only" data-print-hint>
+                                    <div className="text-sm font-bold text-slate-600">The crew schedules print from the Print button at the top of the Crew tab (they are only built when it is pressed).</div>
+                                </div>
+                            )}
                             {win && (printing || !LAZY_ENGINE) && (
                                 <div className="print-only">
                                     <div className="mb-3">
@@ -6394,9 +6415,9 @@ export default function App(props) {
                     {!IS_CURRENT && ((odWanted && (odState.status === 'error' || odState.status === 'partial')) || (handoffSource === 'schedule' && prodState.status === 'failed')) && (
                         <div data-plan-warning className="bg-[#FFF6E0] border-b border-[#FFB81C]/60 px-5 py-1.5 text-[11px] font-bold text-[#8A5A00] flex flex-wrap items-center gap-x-4 gap-y-1 flex-shrink-0">
                             <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
-                            {odWanted && odState.status === 'error' && <span>Couldn't read the cleaning log, so every piece of equipment is planned.</span>}
+                            {odWanted && odState.status === 'error' && <span>{Object.keys(odMap).length > 0 ? 'Couldn\'t read the cleaning log again, so what was read earlier is kept and anything not read yet is planned.' : 'Couldn\'t read the cleaning log, so every piece of equipment is planned.'}</span>}
                             {odWanted && odState.status === 'partial' && <span>{odState.failed} piece{odState.failed === 1 ? '' : 's'} of equipment couldn't be read from the cleaning log and {odState.failed === 1 ? 'is' : 'are'} planned anyway.</span>}
-                            {handoffSource === 'schedule' && prodState.status === 'failed' && <span>Couldn't read the production schedule, so rooms start at the plan start unless a Handover is typed in.</span>}
+                            {handoffSource === 'schedule' && prodState.status === 'failed' && <span>{prodRows.length > 0 ? 'Couldn\'t read the production schedule again, so the runs read earlier are still used.' : 'Couldn\'t read the production schedule, so rooms start at the plan start unless a Handover is typed in.'}</span>}
                         </div>
                     )}
                     {activeTab === 'gantt' && visibleIdle.mins > 0 && (
