@@ -78,7 +78,7 @@ import {
     craa5_sap               = SAP order entered (upper case)
     craa5_lastcleaned       = completion date, midnight UTC
     craa5_lastcleanedby     = initials, upper case, "/" separated
-    craa5_hoursworked       = number (the order's hours split across equipment)
+    craa5_hoursworked       = number (the order's hours split across equipment, in whole hours)
 
   FIX MISSING IDS
   Repair IDs: scans the log page by page for entries whose craa5_equipmentguid
@@ -90,7 +90,7 @@ import {
   them, or the equipment has since been split into records named after it) can
   be broken up. The entry keeps the first piece and a new entry is saved for each
   other piece with the same date, SAP order and initials; the hours are shared
-  out evenly and a piece already logged for that order and date is not saved
+  out in whole hours and a piece already logged for that order and date is not saved
   again. The pieces are suggested, never ticked, and can be searched by hand.
   Unify duplicates: for one room (and optionally one area), finds equipment
   records that are the same equipment (same name; with the option ticked, also
@@ -218,14 +218,23 @@ const normalizeInitials = (s) =>
   safeString(s).toUpperCase().replace(/[\s,&+]+/g, '/').replace(/\/+/g, '/').replace(/^\/|\/$/g, '');
 const INITIALS_RE = /^[A-Z]{1,4}(\/[A-Z]{1,4})*$/;
 // Submit problems that are about the equipment lines (the list is opened so they can be seen)
-const LINE_PROBLEM = /highlighted line|equipment line|Two lines|needs hours greater|Line hours add up/;
+const LINE_PROBLEM = /highlighted line|equipment line|Two lines|needs hours|Line hours add up/;
 
+// Hours shared out in whole hours (Gerald, Oct 9): every share is a whole number, and the decimals carry from one share to the next;
+// once they make a whole hour, the share they reach gets it (8 over 3 shares: 2, 3, 3; 3 over 7 shares: 0, 0, 1, 0, 1, 0, 1). The
+// decimals a total has itself (8.5) cannot be carried anywhere, so the last share keeps them and the shares always add up to the total.
 const splitHours = (total, n) => {
   if (!n || !(total > 0)) return [];
   const cents = Math.round(total * 100);
-  const each = Math.floor(cents / n);
-  const out = Array(n).fill(each / 100);
-  out[n - 1] = (cents - each * (n - 1)) / 100;
+  const whole = Math.floor(cents / 100);
+  const out = [];
+  let given = 0;
+  for (let i = 1; i <= n; i++) {
+    const upto = Math.floor((whole * i) / n);
+    out.push(upto - given);
+    given = upto;
+  }
+  out[n - 1] = (out[n - 1] * 100 + (cents - whole * 100)) / 100;
   return out;
 };
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
@@ -1430,7 +1439,7 @@ const repointRows = async (api, rows, from, target) => {
 // --- BREAKING AN ENTRY UP INTO PIECES ---
 // An old entry can cover several things ("Floor Cleaning, shadow board + tools") that are separate equipment records now.
 // Breaking it up keeps the existing entry for the first piece and saves one new entry for every other piece, with the same
-// date, SAP order and initials. The hours are shared out evenly, so their total stays the same. A piece that already has an
+// date, SAP order and initials. The hours are shared out in whole hours, so their total stays the same. A piece that already has an
 // entry for that order and date is not saved again.
 const LISTING = /\s*(?:[,;+&\/]|\band\b|\bplus\b)\s*/i;
 // The things a text lists ("Mixers 1, 2 & 3" -> Mixers 1, mixers 2, mixers 3); [] unless it lists two or more
@@ -1651,6 +1660,8 @@ const splitStats = (items) => {
     rows: live.length,
     creates: live.reduce((n, it) => n + it.todo.length - 1, 0),
     pieceSkips: live.reduce((n, it) => n + it.pieces.length - it.todo.length, 0),
+    // the hours that belong to pieces which are not saved again (whole-hour shares can make that all of a small entry's hours)
+    skippedHours: Math.round(live.reduce((n, it) => n + it.pieces.reduce((sum, x, i) => (it.todo.indexOf(x) >= 0 ? sum : sum + (Number(hoursFor(it.row, it.pieces.length, i)) || 0)), 0), 0) * 100) / 100,
     leftAlone: items.filter(it => !it.gone && !it.undated && !it.todo.length).length,
     gone: items.filter(it => it.gone).length,
     undated: items.filter(it => it.undated).length,
@@ -1667,31 +1678,149 @@ const fetchDupes = async (api, code, dateStr) => {
   return new Set(rows.map(r => cleanGuid(r.craa5_equipmentguid)).filter(Boolean));
 };
 
-// Paperwork must stay readable: up to 1600 px on the long side as a JPEG (a few hundred KB), returned as base64
-const compressImage = (file) => new Promise((resolve) => {
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    const img = new Image();
-    img.onload = () => {
-      try {
-        const scale = Math.min(1, 1600 / Math.max(img.width, img.height));
-        const c = document.createElement('canvas');
-        c.width = Math.round(img.width * scale);
-        c.height = Math.round(img.height * scale);
-        const g = c.getContext('2d');
-        // JPEG has no transparency: see-through parts would turn black without a white page under them
-        g.fillStyle = '#FFFFFF';
-        g.fillRect(0, 0, c.width, c.height);
-        g.drawImage(img, 0, 0, c.width, c.height);
-        resolve(c.toDataURL('image/jpeg', 0.8).split(',')[1]);
-      } catch (_) { resolve(null); }
+// ===== PICTURE TO JPG (every picture upload goes through this; the same block is in each app that uploads pictures) =====
+// Whatever picture is picked (PNG, WebP, GIF, BMP, TIFF, an iPhone HEIC photo ...) goes up as a JPG, as large as maxSide px on
+// its long side (default 1600). Chrome and Edge cannot open HEIC (Safari can), so a HEIC photo is turned into a JPG by a small
+// converter that is loaded from a CDN the first time one is picked. A photo that fails says why, in plain words.
+const PICTURE_MAX_SIDE = 1600;
+const HEIC_CONVERTER_URLS = [
+  'https://cdnjs.cloudflare.com/ajax/libs/heic2any/0.0.4/heic2any.min.js',
+  'https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js',
+  'https://unpkg.com/heic2any@0.0.4/dist/heic2any.min.js'
+];
+const HEIC_FILE_NAME = /\.(heic|heif)$/i;
+const looksLikeHeic = (file) => /hei[cf]/i.test((file && file.type) || '') || HEIC_FILE_NAME.test((file && file.name) || '');
+const isJpegFile = (file) => /^image\/(p?jpe?g)$/i.test((file && file.type) || '') || /\.(jpe?g|jfif)$/i.test((file && file.name) || '');
+const HEIC_HELP = 'this is an iPhone HEIC photo and the converter that turns it into a JPG could not be loaded (is the network blocked?). It can be tried again, or save or share the photo as a JPG first (for new photos, set the iPhone to Settings > Camera > Formats > Most Compatible)';
+
+// heic2any 0.0.4 leaves one "message" listener on its worker for every photo it converts, and each one keeps that photo's bytes in
+// memory until the page is reloaded. Each listener answers a single request, so it is taken off again once its answer has come.
+function tidyHeicWorker() {
+  try {
+    const w = window.__heic2any__worker;
+    if (!w || w.__tidy) return;
+    w.__tidy = true;
+    let lastId = null;
+    const post = w.postMessage.bind(w);
+    const add = w.addEventListener.bind(w);
+    w.postMessage = function (msg) { lastId = msg && msg.id; return post.apply(null, arguments); };
+    w.addEventListener = function (type, fn, opts) {
+      if (type !== 'message' || typeof fn !== 'function' || lastId === null) return add(type, fn, opts);
+      const id = lastId;
+      lastId = null;
+      const wrapped = function (ev) {
+        fn.call(this, ev);
+        if (ev && ev.data && ev.data.id === id) w.removeEventListener('message', wrapped);
+      };
+      return add(type, wrapped, opts);
     };
-    img.onerror = () => resolve(null);
-    img.src = e.target.result;
-  };
-  reader.onerror = () => resolve(null);
-  reader.readAsDataURL(file);
+  } catch (e) { /* only a tidy-up: the conversion works without it */ }
+}
+
+let heicConverterLoading = null;
+function loadHeicConverter() {
+  if (typeof window !== 'undefined' && typeof window.heic2any === 'function') return Promise.resolve(window.heic2any);
+  if (heicConverterLoading) return heicConverterLoading;
+  const tryUrl = (url) => new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = url;
+    s.onload = () => { if (typeof window.heic2any === 'function') { tidyHeicWorker(); resolve(window.heic2any); } else reject(new Error('empty')); };
+    s.onerror = () => { if (s.parentNode) s.parentNode.removeChild(s); reject(new Error('blocked')); };
+    document.head.appendChild(s);
+  });
+  heicConverterLoading = (async () => {
+    for (let i = 0; i < HEIC_CONVERTER_URLS.length; i += 1) {
+      try { return await tryUrl(HEIC_CONVERTER_URLS[i]); } catch (e) { /* try the next address */ }
+    }
+    heicConverterLoading = null; // a later try may work
+    const err = new Error(HEIC_HELP);
+    err.retry = true; // not the photo's fault: it can be tried again
+    throw err;
+  })();
+  return heicConverterLoading;
+}
+
+// The first bytes of a HEIC / HEIF file: a "ftyp" box that names one of its brands (a photo renamed to .jpg still counts)
+function sniffHeic(file) {
+  return new Promise((resolve) => {
+    if (!file || typeof FileReader === 'undefined' || !file.slice) { resolve(false); return; }
+    const reader = new FileReader();
+    reader.onerror = () => resolve(false);
+    reader.onload = () => {
+      try {
+        const b = new Uint8Array(reader.result);
+        const tag = (o) => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
+        if (b.length < 12 || tag(4) !== 'ftyp') { resolve(false); return; }
+        const brands = [tag(8)];
+        for (let o = 16; o + 4 <= b.length; o += 4) brands.push(tag(o));
+        resolve(brands.some(x => /^(heic|heix|hevc|hevx|heim|heis|hevm|hevs|mif1|msf1|heif)$/.test(x)));
+      } catch (e) { resolve(false); }
+    };
+    try { reader.readAsArrayBuffer(file.slice(0, 64)); } catch (e) { resolve(false); }
+  });
+}
+
+// A HEIC photo as a JPEG blob; one picked file is converted once, however many parts of the app ask
+const heicJpegs = typeof WeakMap === 'function' ? new WeakMap() : null;
+function heicToJpegBlob(file) {
+  if (heicJpegs && heicJpegs.has(file)) return heicJpegs.get(file);
+  const p = loadHeicConverter().then(heic2any => heic2any({ blob: file, toType: 'image/jpeg', quality: 0.92 }).then(
+    out => (Array.isArray(out) ? out[0] : out),
+    err => { throw new Error(`this HEIC photo could not be converted (${(err && (err.message || err.code)) || 'unknown reason'}). Save or share it as a JPG first, then add it again`); }
+  ));
+  if (heicJpegs) {
+    heicJpegs.set(file, p);
+    p.catch(() => { heicJpegs.delete(file); });
+  }
+  return p;
+}
+
+const decodePicture = (blob) => new Promise((resolve, reject) => {
+  const url = URL.createObjectURL(blob);
+  const img = new Image();
+  img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+  img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('not a picture this browser can open')); };
+  img.src = url;
 });
+
+// Resolves the picture as a JPEG data URL. opts.maxSide: long side in px (default 1600; 0 keeps the size, up to 4096);
+// opts.quality: 0 to 1 (default 0.8). Rejects with a plain sentence.
+async function pictureToJpegDataUrl(file, opts) {
+  const o = opts || {};
+  const maxSide = o.maxSide === undefined ? PICTURE_MAX_SIDE : (o.maxSide || 4096);
+  const quality = o.quality || 0.8;
+  let img;
+  try {
+    img = await decodePicture(file);
+  } catch (e) {
+    if (!(looksLikeHeic(file) || await sniffHeic(file))) throw new Error('That file is not a picture this browser can open. Try a JPG or PNG.');
+    const jpeg = await heicToJpegBlob(file); // throws a plain sentence of its own
+    try { img = await decodePicture(jpeg); } catch (e2) { throw new Error('this HEIC photo could not be converted. Save or share it as a JPG first, then add it again'); }
+  }
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  if (!w || !h) throw new Error('That picture has no size this browser can read.');
+  try {
+    const scale = Math.min(1, maxSide / Math.max(w, h));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(w * scale));
+    canvas.height = Math.max(1, Math.round(h * scale));
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#FFFFFF'; // JPEG has no transparency: see-through parts would turn black
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/jpeg', quality);
+  } catch (err) {
+    throw new Error('The picture could not be prepared for upload.');
+  }
+}
+// ===== END PICTURE TO JPG =====
+
+// Paperwork must stay readable: up to 1600 px on the long side as a JPEG (a few hundred KB). Resolves { data: base64 } or { error: sentence }
+const compressImage = (file) => pictureToJpegDataUrl(file).then(
+  (url) => ({ data: url.split(',')[1] }),
+  (err) => ({ error: (err && err.message) || 'That picture could not be read.' })
+);
 
 // --- STYLES ---
 const DISABLED = { backgroundColor: '#F0F0F0', color: '#A0A0A0', border: '1px solid #E0E0E0' };
@@ -1902,6 +2031,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   const [totalHours, setTotalHours] = useState('');
   const [photo, setPhoto] = useState(null);
   const [photoName, setPhotoName] = useState('');
+  const [photoNote, setPhotoNote] = useState(''); // why the last picture could not be used (gone as soon as another is picked)
   const [photoBusy, setPhotoBusy] = useState(false);
   const [excluded, setExcluded] = useState({});
   const [chosen, setChosen] = useState({});          // lineKey -> equipment picked instead of the automatic one
@@ -2125,7 +2255,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     return l && key && l.key === key ? 'on this line now' : 'on another line of this order';
   };
   const included = lines.filter(l => !excluded[l.key] && l.asset);
-  // The order's hours are shared evenly by SAP row: a row broken up shares its part among its pieces, so breaking one up never
+  // The order's hours are shared out in whole hours by SAP row: a row broken up shares its part among its pieces, so breaking one up never
   // changes the hours of the other rows. Hours typed by hand come off the part they were typed for: a line's (or a broken-up row's,
   // if typed before it was broken up) off the order total, a piece's off the part of its own row.
   const evenHours = useMemo(() => {
@@ -2388,6 +2518,8 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     const e = matches.find(x => x.key === (l.parent || l.key));
     if (!e) return;
     setPieces(p => (p[e.key] ? p : { ...p, [e.key]: [] }));
+    // The row has no hours box once it is broken up: a blank or negative number left in it would make its pieces get 0 hours unseen
+    setHoursOverride(p => { if (p[e.key] === undefined || parseFloat(p[e.key]) >= 0) return p; const x = { ...p }; delete x[e.key]; return x; });
     setSplitOpen(p => ({ ...p, [e.key]: true }));
     closePanel(l);
     setNote('');
@@ -2461,18 +2593,23 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     if (Object.keys(add).length) setEdits(p => ({ ...add, ...p }));
   }, [lines, editMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // A picture is compressed once; one that cannot be read is reported, not dropped silently
+  // A picture (PNG, WebP, an iPhone HEIC ...) is turned into a JPG once; one that cannot be read is reported, not dropped silently
   const onPhoto = async (file) => {
     const n = ++photoSeq.current;
     setPhoto(null);
+    setPhotoNote('');
     if (!file) { setPhotoName(''); setPhotoBusy(false); return; }
     setPhotoName(file.name);
     setPhotoBusy(true);
-    const data = await compressImage(file);
+    const res = await compressImage(file);
     if (n !== photoSeq.current) return;
     setPhotoBusy(false);
-    setPhoto(data);
-    if (!data) { setPhotoName(''); setNote(`Could not read ${file.name} (use a JPG or PNG picture); it will not be attached.`); }
+    setPhoto(res.data || null);
+    if (!res.data) {
+      const why = String(res.error || 'that picture could not be read').replace(/\.$/, '');
+      setPhotoName('');
+      setPhotoNote(`Could not use ${file.name}: ${why.charAt(0).toLowerCase()}${why.slice(1)}. It will not be attached.`);
+    }
   };
 
   const validate = () => {
@@ -2489,7 +2626,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     if (!dateStr || dateStr > today || dateStr < yearBefore(today)) return 'Date must be within the last year and not in the future.';
     if (!INITIALS_RE.test(normalizeInitials(initials))) return 'Initials: letters only, up to 4 per person, separate people with "/" (e.g. EL/LH).';
     const total = parseFloat(totalHours);
-    if (!(total > 0) || total > 200) return 'Enter the hours it took (greater than 0).';
+    if (!(Math.round(total * 100) >= 1) || total > 200) return 'Enter the hours it took (0.01 or more).';
     if (lines.length === 0) return 'This SAP order is not in the list. Add the equipment it covers.';
     if (lines.some(l => !excluded[l.key] && l.splitting)) return 'Add at least two pieces for the highlighted line, or choose One piece only.';
     if (lines.some(l => !excluded[l.key] && !l.asset)) return 'Choose the equipment for the highlighted line(s), or untick them.';
@@ -2498,7 +2635,8 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     const sigs = included.map(l => (l.asset.isNew ? `new|${normName(l.name)}|${normName(l.room)}|${normName(l.area)}` : l.asset.id));
     if (sigs.some((x, i) => sigs.indexOf(x) !== i)) return 'Two lines use the same equipment. Change one of them.';
     if (included.every(isDupe)) return 'Every selected equipment already has this order logged for that date.';
-    if (included.some(l => !isDupe(l) && !(lineHours(l) > 0))) return 'Every selected equipment needs hours greater than 0.';
+    // A line can get 0 hours from the whole-hour split (more lines than hours); only an hours box that is blank or not a number is a problem
+    if (included.some(l => hoursOverride[l.key] !== undefined && !(parseFloat(hoursOverride[l.key]) >= 0))) return 'Every selected equipment needs hours (0 or more).';
     if (Math.abs(hoursSum - total) > 0.01) return `Line hours add up to ${hoursSum} but the order total is ${total}.`;
     if (lines.some(l => !l.splitting && retro[l.key] && retro[l.key].status === 'scanning')) return 'Still checking earlier entries for a changed line. Try again in a moment.';
     if (photoBusy) return 'Still preparing the paperwork picture. Try again in a moment.';
@@ -2894,8 +3032,9 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
         </div>
         <div className={styles.field}>
           <Text className={styles.label}>Paperwork Picture</Text>
-          <input type="file" accept="image/*" aria-label="Paperwork picture" disabled={saving} onChange={(e) => onPhoto(e.target.files && e.target.files[0])} style={{ minWidth: '150px', padding: '4px' }} />
-          {photoName && <span className={styles.hint}>{photoName}{photoBusy ? ' (preparing…)' : ''}</span>}
+          <input type="file" accept="image/*,.heic,.heif" aria-label="Paperwork picture" disabled={saving} onChange={(e) => { const f = e.target.files && e.target.files[0]; e.target.value = ''; onPhoto(f); }} style={{ minWidth: '150px', padding: '4px' }} />
+          {photoName && <span className={styles.hint}>{photoName}{photoBusy ? ' (converting to a JPG…)' : ''}</span>}
+          {photoNote && <Text className={styles.warnText} block role="status" style={{ marginTop: 2 }}>{photoNote}</Text>}
         </div>
         <Button appearance="subtle" style={{ alignSelf: 'flex-start', marginTop: '16px' }} aria-label={`Remove row ${index + 1}`} disabled={!canRemove || saving} onClick={onRemove}>Remove</Button>
       </div>
@@ -2999,7 +3138,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
       )}
       {lines.length > 0 && linesOpen && (
         <Text className={styles.hint} block style={{ marginTop: 6 }}>
-          Equipment is picked automatically (linked, or the best fit in the same room and area); use Change to pick another. Use Break up when one line covers several pieces of equipment: each piece gets its own entry and the pieces share the line's hours. Total hours are split evenly across the lines; edit a line to override it. Lines sum to {hoursSum}.
+          Equipment is picked automatically (linked, or the best fit in the same room and area); use Change to pick another. Use Break up when one line covers several pieces of equipment: each piece gets its own entry and the pieces share the line's hours. Total hours are shared out in whole hours across the lines: the decimals carry from one line to the next and a line gets the extra hour once they make a whole one, so a line can get 0 when there are more lines than hours. Edit a line to override it. Lines sum to {hoursSum}.
           {dupeShare > 0 ? ` ${dupeShare} h is on equipment already logged for this date and will not be saved again.` : ''}
         </Text>
       )}
@@ -3519,7 +3658,7 @@ const RepairIds = ({ ctx, onCount }) => {
   return (
     <div>
       <Text className={styles.hint} block style={{ marginBottom: 10 }}>
-        Log entries need the equipment’s ID (craa5_equipmentguid) so the calendar can match them. This scans the log page by page, groups identical entries, and suggests the closest equipment using the SAP order first, then the equipment name in the same room and area (equipment numbers must agree). Each suggestion is double-checked against the log: other entries with the same name in the same room and area that already have an ID. Type in Map to to search all equipment for a match of your own. Only the equipment it needs is looked up. An entry that covers several pieces of equipment, because the equipment has since been broken up, can be broken up as well: choose Break up under Map to and pick the pieces. The entry keeps the first piece and every other piece gets a new entry with the same date, SAP order and initials (the hours are shared out evenly). Nothing is saved until you apply.
+        Log entries need the equipment’s ID (craa5_equipmentguid) so the calendar can match them. This scans the log page by page, groups identical entries, and suggests the closest equipment using the SAP order first, then the equipment name in the same room and area (equipment numbers must agree). Each suggestion is double-checked against the log: other entries with the same name in the same room and area that already have an ID. Type in Map to to search all equipment for a match of your own. Only the equipment it needs is looked up. An entry that covers several pieces of equipment, because the equipment has since been broken up, can be broken up as well: choose Break up under Map to and pick the pieces. The entry keeps the first piece and every other piece gets a new entry with the same date, SAP order and initials (the hours are shared out in whole hours). Nothing is saved until you apply.
       </Text>
       <div className={styles.filterBar}>
         <Select aria-label="Entries to look for" value={mode} disabled={!!busy} onChange={(e, d) => setMode(d.value)}>
@@ -3548,9 +3687,9 @@ const RepairIds = ({ ctx, onCount }) => {
           {planned && (
             <div style={{ marginBottom: pending.more.length > 0 && !idle ? 8 : 0 }}>
               <Text block weight="semibold">{planned.ticked.rows > 0 ? `Break up ${plural(planned.ticked.rows, 'entry', 'entries')} into pieces?` : idle ? 'Nothing can be broken up here.' : 'Nothing to break up in the ticked rows.'}</Text>
-              {planned.ticked.rows > 0 && <Text className={styles.hint} block>The first piece stays on the existing entry and {plural(planned.ticked.creates, 'new entry', 'new entries')} {planned.ticked.creates === 1 ? 'is' : 'are'} saved for the other pieces, each with the entry’s date, SAP order and initials. The hours are shared out evenly.</Text>}
+              {planned.ticked.rows > 0 && <Text className={styles.hint} block>The first piece stays on the existing entry and {plural(planned.ticked.creates, 'new entry', 'new entries')} {planned.ticked.creates === 1 ? 'is' : 'are'} saved for the other pieces, each with the entry’s date, SAP order and initials. The hours are shared out in whole hours.</Text>}
               {planned.others > 0 && <Text className={styles.hint} block>The other {plural(planned.others, 'ticked entry', 'ticked entries')} {planned.others === 1 ? 'is' : 'are'} updated with the equipment chosen for {planned.others === 1 ? 'it' : 'them'}.</Text>}
-              {planned.ticked.pieceSkips > 0 && <Text className={styles.hint} block>{plural(planned.ticked.pieceSkips, 'piece already has', 'pieces already have')} an entry for that order and date and {planned.ticked.pieceSkips === 1 ? 'is' : 'are'} not saved again.</Text>}
+              {planned.ticked.pieceSkips > 0 && <Text className={styles.hint} block>{plural(planned.ticked.pieceSkips, 'piece already has', 'pieces already have')} an entry for that order and date and {planned.ticked.pieceSkips === 1 ? 'is' : 'are'} not saved again.{planned.ticked.skippedHours > 0 ? ` The hours for ${planned.ticked.pieceSkips === 1 ? 'that piece' : 'those pieces'} (${planned.ticked.skippedHours} h) are not saved either.` : ''}</Text>}
               {planned.ticked.leftAlone > 0 && <Text className={styles.hint} block>{plural(planned.ticked.leftAlone, 'entry stays', 'entries stay')} as {planned.ticked.leftAlone === 1 ? 'it is' : 'they are'}, because every piece is already logged for that order and date.</Text>}
               {planned.ticked.gone > 0 && <Text className={styles.hint} block>{plural(planned.ticked.gone, 'entry was', 'entries were')} not found (removed since the scan).</Text>}
               {planned.ticked.undated > 0 && <Text className={styles.hint} block>{plural(planned.ticked.undated, 'entry has', 'entries have')} no date and will not be broken up: there is no date to check the pieces against.</Text>}
@@ -4126,7 +4265,7 @@ const LogTableTab = ({ ctx }) => {
       }
       if (c.hours !== undefined) {
         const h = parseFloat(c.hours);
-        if (!(h > 0) || h > 200) { setMessage({ kind: 'error', text: 'Hours must be greater than 0.' }); return; }
+        if (!(h >= 0) || h > 200) { setMessage({ kind: 'error', text: 'Hours must be 0 or more.' }); return; }
         payload.craa5_hoursworked = h;
       }
       if (c.by !== undefined) {
