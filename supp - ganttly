@@ -13,6 +13,12 @@ const IS_CURRENT = APP_MODE === 'current';
 // and the Shift Start / production schedule re-reads also happen on a tab click, not on a timer, in PBED.
 const LAZY_ENGINE = !IS_CURRENT;
 const ENGINE_TABS = ['gantt', 'focus', 'metrics'];
+// FOCUS ROOMS (PBED): rooms each shift is asked to finish first (the engine's focusCandidates / focusFit and the claim in its group loop).
+const FOCUS_MAX = 2;          // most rooms a shift is asked to finish
+const FOCUS_OPEN_BY = 0.5;    // a room only counts when production has handed it over in the first half of the shift
+const FOCUS_MIN_MINS = 180;   // a shorter shift (a plan window cut short) has none
+const FOCUS_EFF = 1.0;        // share of the free time counted on for a room (stubs, walking)
+const CLAIM_LEVELS = ['crewPro', 'leadC', 'crew'];
 // 🚨 ARCHITECTURE NOTE: Production first, support below. An MSS area is production when craa5_production or craa5_runsproduct is ticked;
 // production rooms are listed first everywhere and support rooms sit in a folded "Support" section at the bottom (PBED folded, Ganttly
 // open). It is display only (the engine just breaks ties with it): preset room priorities always decide what is cleaned first. Room order,
@@ -358,6 +364,7 @@ function defaultWorkKind(roleKey) {
     if (/chem\w*\s*clerk/.test(k)) return 'chemical';
     if (/admin/.test(k)) return 'admin';
     if (/janitor/.test(k)) return 'janitorial';
+    if (!IS_CURRENT && /\b(trash|garbage|refuse|waste)\b/.test(k)) return 'trash';   // PBED only
     if (/inspect/.test(k)) return 'inspector';
     const m = k.match(/tech\w*\s*([0-9]+)/);
     if (m) return m[1] === '1' || m[1] === '2' ? 'general' : (m[1] === '3' ? 'pic' : 'none');
@@ -2038,6 +2045,109 @@ function autoCrewBoard(inp) {
 }
 
 // ============================================================================
+// SUPPORT DUTY (PBED)
+// 🚨 ARCHITECTURE NOTE (Gerald, Oct 9: "only set up roles like janitor, chemical, trash support roles who take those roles for their whole
+// shift. If there is not an available room, assign extra heads to support roles, and if no equipment exists, create a time block of
+// 'trash'"): a person in a support role (Chemical Clerk, Janitorial, Admin, Trash) holds that role for the whole shift. Whatever part of
+// their shift has no equipment task is drawn as the role's duty (a time block named for the role, like a lead's Leadership), never as blank
+// space; a Trash role has no equipment at all, so its whole shift is the Trash block. When a Tech 1 / 2 has nothing available for a stretch
+// (every room that still has work is waiting for production, at its Max Workers or taken), they are an extra head on a support role for that
+// shift, within the head limits on the Crew tab. Duty is worked out AFTER the engine from each person's free stretches, so it never moves a
+// clean and never takes equipment; it only decides what a free stretch is called. Off, or in Ganttly, nothing is drawn or counted.
+// ============================================================================
+const DUTY_ROLES = [
+    { id: 'janitorial', label: 'Janitorial', color: '#0d9488' },
+    { id: 'chemical', label: 'Chemical', color: '#a21caf' },
+    { id: 'trash', label: 'Trash', color: '#4d7c0f' },
+    { id: 'admin', label: 'Admin', color: '#be185d' },
+    { id: 'tugger', label: 'Tugger', color: '#65A30D' },
+    { id: 'baler', label: 'Baler', color: '#C2410C' }
+];
+const DUTY_NATIVE = ['chemical', 'janitorial', 'trash', 'admin', 'tugger', 'baler'];   // work kinds that hold their role for the whole shift (an extra head can only go to DUTY_EXTRA)
+const DUTY_EXTRA = ['janitorial', 'trash', 'chemical'];             // roles an extra head can be put on, in the order they are filled
+const DUTY_DEFAULT_HEADS = { janitorial: 2, chemical: 1, trash: 2 };
+const DUTY_MIN_GAP = IDLE_SHOW_MINS;   // a free stretch shorter than this is not drawn as blank space either, so it stays as it is
+const DUTY_MIN_IDLE = 60;    // an extra head is only put on duty when they would otherwise be free this long in the shift
+function dutyRoleOf(id) { return DUTY_ROLES.filter(function(r) { return r.id === id; })[0] || DUTY_ROLES[0]; }
+// { janitorial: n, chemical: n, trash: n } as saved: whole numbers 0-12, anything else is the default.
+function normDutyHeads(v) {
+    const out = {};
+    DUTY_EXTRA.forEach(function(k) {
+        const n = v && typeof v === 'object' ? Math.round(Number(v[k])) : NaN;
+        out[k] = isNaN(n) ? DUTY_DEFAULT_HEADS[k] : Math.max(0, Math.min(12, n));
+    });
+    return out;
+}
+// The parts of free stretches `gaps` that lie inside [lo, hi), as [{ start, end }].
+function gapsWithin(gaps, lo, hi) {
+    const out = [];
+    (gaps || []).forEach(function(g) { const a = Math.max(g.start, lo), b = Math.min(g.end, hi); if (b - a >= 1) out.push({ start: a, end: b }); });
+    return out;
+}
+// What is left of free stretches `gaps` once the blocks of `taken` are laid over them.
+function gapsMinus(gaps, taken) {
+    let out = (gaps || []).map(function(g) { return { start: g.start, end: g.end }; });
+    (taken || []).forEach(function(t) {
+        const next = [];
+        out.forEach(function(g) {
+            if (t.end <= g.start || t.start >= g.end) { next.push(g); return; }
+            if (t.start > g.start) next.push({ start: g.start, end: t.start });
+            if (t.end < g.end) next.push({ start: t.end, end: g.end });
+        });
+        out = next;
+    });
+    return out;
+}
+// Who holds which support role in which stretch. inp = {
+//   workers: [{ lane, crew, kind, isLead, windows: [{ start, end }], gaps: [{ start, end }] (free stretches, minutes from the plan start) }],
+//   shifts: [{ key, crew, start, end }], heads: { janitorial, chemical, trash } (extra heads each role may take per shift, on top of the people who already hold it),
+//   pref: optional function(lane, role) -> number (more = a better fit, e.g. history on that room) }
+// Returns { blocks: [{ lane, start, end, role, src: 'role' | 'extra', shiftKey }], extras: { shiftKey: [{ lane, role }] },
+//           slots: { shiftKey: { role: { natives, limit, free } } } }.
+function planSupportDuty(inp) {
+    const blocks = [], extras = {}, slots = {};
+    const heads = normDutyHeads(inp.heads);
+    const pref = typeof inp.pref === 'function' ? inp.pref : function() { return 0; };
+    const shifts = (inp.shifts || []).slice().sort(function(a, b) { return a.start - b.start || String(a.crew).localeCompare(String(b.crew)); });
+    shifts.forEach(function(W) {
+        const here = (inp.workers || []).filter(function(w) {
+            return w.crew === W.crew && !w.isLead && (w.windows || []).some(function(x) { return x.start < W.end - 0.01 && x.end > W.start + 0.01; });
+        });
+        const own = {};
+        here.forEach(function(w) {
+            if (DUTY_NATIVE.indexOf(w.kind) === -1) return;
+            own[w.kind] = (own[w.kind] || 0) + 1;
+            gapsWithin(w.gaps, W.start, W.end).forEach(function(g) {
+                if (g.end - g.start >= DUTY_MIN_GAP) blocks.push({ lane: w.lane, start: g.start, end: g.end, role: w.kind, src: 'role', shiftKey: W.key });
+            });
+        });
+        // Extra heads: Tech 1 / 2 with the most free time in this shift, one support role each for the whole shift.
+        const left = {};
+        slots[W.key] = {};
+        DUTY_EXTRA.forEach(function(r) { left[r] = heads[r]; slots[W.key][r] = { natives: own[r] || 0, limit: heads[r], free: left[r] }; });
+        const cands = here.filter(function(w) { return w.kind === 'general'; }).map(function(w) {
+            const g = gapsWithin(w.gaps, W.start, W.end).filter(function(x) { return x.end - x.start >= DUTY_MIN_GAP; });
+            return { w: w, gaps: g, mins: g.reduce(function(a, x) { return a + (x.end - x.start); }, 0) };
+        }).filter(function(c) { return c.mins >= DUTY_MIN_IDLE; })
+            .sort(function(a, b) { return b.mins - a.mins || a.w.lane - b.w.lane; });
+        extras[W.key] = [];
+        cands.forEach(function(c) {
+            let best = null;
+            DUTY_EXTRA.forEach(function(r) { if (left[r] > 0 && (!best || left[r] > left[best])) best = r; });
+            if (!best) return;
+            // among the roles with as many free places as the best one, the one this person fits best (history), else the fixed order
+            const tied = DUTY_EXTRA.filter(function(r) { return left[r] === left[best]; });
+            tied.forEach(function(r) { if (pref(c.w.lane, r) > pref(c.w.lane, best)) best = r; });
+            left[best]--;
+            extras[W.key].push({ lane: c.w.lane, role: best });
+            c.gaps.forEach(function(g) { blocks.push({ lane: c.w.lane, start: g.start, end: g.end, role: best, src: 'extra', shiftKey: W.key }); });
+        });
+        DUTY_EXTRA.forEach(function(r) { slots[W.key][r].left = left[r]; });   // places still open after the extra heads were put on
+    });
+    return { blocks: blocks, extras: extras, slots: slots };
+}
+
+// ============================================================================
 // TYPE OF CLEAN
 // ============================================================================
 // The equipment table's yes/no columns (craa5_dailyclean, craa5_weeklyclean, craa5_monthlyclean, craa5_quarterly, ...) say how
@@ -2539,6 +2649,14 @@ export default function App(props) {
     // saved teams only (a shift with nothing saved falls back to the employee table).
     const [crewMode, setCrewMode] = useState(!IS_CURRENT && (initialSettings.crewMode === 'shiftstart' || initialSettings.crewMode === 'autoall') ? initialSettings.crewMode : 'auto');
     const autoCrews = !IS_CURRENT && crewMode !== 'shiftstart';
+    // PBED shift rules (see ROOMS PER SHIFT and SUPPORT DUTY): how many rooms each shift is made to finish first (1 or 2, 0 = off: every room
+    // is dealt work as before), and whether support roles hold their role for the whole shift, with how many extra heads each may take.
+    // Ganttly never reads these: its own values stay off.
+    const [roomsPerShift, setRoomsPerShift] = useState(!IS_CURRENT && (initialSettings.roomsPerShift === 0 || initialSettings.roomsPerShift === 1) ? initialSettings.roomsPerShift : 2);
+    const [dutyOn, setDutyOn] = useState(IS_CURRENT || initialSettings.dutyOn !== false);
+    const [dutyHeads, setDutyHeads] = useState(function() { return normDutyHeads(initialSettings.dutyHeads); });
+    const focusK = IS_CURRENT || !autoCrews ? 0 : roomsPerShift;
+    const dutyActive = !IS_CURRENT && dutyOn;
     const rosterSource = IS_CURRENT || autoCrews ? 'shiftstart' : savedRosterSource;   // the current-shift app always follows Shift Start
     const roomSource = IS_CURRENT || autoCrews ? 'shiftstart' : savedRoomSource;
     // Who-does-what history for the auto crews: the counts (kept in this browser for a few hours) and how the read is going.
@@ -2671,7 +2789,7 @@ export default function App(props) {
     // PBED: the box that says why a stretch of blank space is blank (hover, or tap to keep it open); the reasons are worked out on hover and kept per plan.
     const [idleTip, setIdleTip] = useState(null);
     const idleTipRef = useRef(null);
-    const idleCacheRef = useRef({ sd: null, map: {} });
+    const idleCacheRef = useRef({ sd: null, duty: '', map: {} });
     const [focusRoom, setFocusRoom] = useState('');
     const [ganttShift, setGanttShift] = useState('');
     // Ganttly's one-line view: which shift's names the left column shows (it follows the scroll; see `stack`).
@@ -2736,6 +2854,9 @@ export default function App(props) {
             rosterSource: savedRosterSource,
             roomSource: savedRoomSource,
             crewMode: crewMode,
+            roomsPerShift: IS_CURRENT ? undefined : roomsPerShift,   // PBED only: Ganttly's saved settings stay as they were
+            dutyOn: IS_CURRENT ? undefined : dutyOn,
+            dutyHeads: IS_CURRENT ? undefined : dutyHeads,
             ganttView: ganttView,
             deptSteps: deptSteps,
             roomRestarts: roomRestarts,
@@ -2750,7 +2871,7 @@ export default function App(props) {
             liveReforecast: savedLiveReforecast
         };
         try { localStorage.setItem('itp_settings_v10', JSON.stringify(s)); } catch(e) {}
-    }, [roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, cleanTypes, roomCleanType, planMode, handoffSource, handoffGapMins, roomProdLines, roomGroups, roomOrder, roomColors, functionColors, equipColors, roomConfigured, hiddenRooms, hideConfiguredRooms, hourlyRate, savedStartDate, savedStartHour, savedPlanHours, shiftRotation, rotationSource, crewHeadcountOverrides, absentEmployees, extraPeople, jobRoleChoices, handoverMins, tailFillMins, includeBreaks, includeTransit, includeInspection, pbMode, savedLiveReforecast, savedRosterSource, savedRoomSource, crewMode, ganttView, deptSteps, roomRestarts, deptShow]);
+    }, [roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, cleanTypes, roomCleanType, planMode, handoffSource, handoffGapMins, roomProdLines, roomGroups, roomOrder, roomColors, functionColors, equipColors, roomConfigured, hiddenRooms, hideConfiguredRooms, hourlyRate, savedStartDate, savedStartHour, savedPlanHours, shiftRotation, rotationSource, crewHeadcountOverrides, absentEmployees, extraPeople, jobRoleChoices, handoverMins, tailFillMins, includeBreaks, includeTransit, includeInspection, pbMode, savedLiveReforecast, savedRosterSource, savedRoomSource, crewMode, roomsPerShift, dutyOn, dutyHeads, ganttView, deptSteps, roomRestarts, deptShow]);
     // The current-shift app's own crew marks and Live Reforecast switch.
     useEffect(function() {
         if (!IS_CURRENT) return;
@@ -3326,7 +3447,7 @@ export default function App(props) {
             const bs = windowBoards[w.key] || [];
             if (bs.length === 0) return;
             const norm = bs.map(function(bd) { return Object.assign(normalizeBoard(bd.board, lineById, lineByName), { supervisor: bd.supervisor }); });
-            out[w.key] = { boards: norm, merged: mergeBoards(norm) };
+            out[w.key] = { boards: norm, merged: mergeBoards(norm), fromAuto: bs.every(function(b) { return !!b.fromAuto; }) };
         });
         return out;
     }, [shiftWindows, windowBoards, lineById, lineByName]);
@@ -3383,7 +3504,7 @@ export default function App(props) {
             const mb = sb.merged;
             const lineOf = function(lid) { return lineById[lid] || (mb.manualNames[lid] ? { id: lid, name: mb.manualNames[lid] } : null); };
             const ownerOf = function(id) { return mb.leads.indexOf(id) > -1 ? id : (mb.members[id] || ''); };
-            const plan = { assign: {}, lineWorkers: {}, lineTeam: {}, lineUnassigned: {}, personRoom: {}, manualLine: {}, views: [] };
+            const plan = { assign: {}, lineWorkers: {}, lineTeam: {}, lineUnassigned: {}, personRoom: {}, manualLine: {}, views: [], fromAuto: !!sb.fromAuto };
             const lineIds = {};
             Object.keys(mb.workerLine).forEach(function(id) { if (lineOf(mb.workerLine[id])) lineIds[mb.workerLine[id]] = true; });
             Object.keys(mb.teamLines).forEach(function(l) { mb.teamLines[l].forEach(function(lid) { if (lineOf(lid)) lineIds[lid] = true; }); });
@@ -4211,9 +4332,12 @@ export default function App(props) {
     // PBED keeps the plan's inputs still on every tab that doesn't show the plan: React is handed the array it had last time, so the memo
     // below returns its last result, and the first click on Gantt, Focus or Metrics (or Print) plans once with whatever changed.
     const engineOn = !LAZY_ENGINE || printing || ENGINE_TABS.indexOf(activeTab) > -1;
-    const engineDepsNow = [assets, supportRooms, cleanTypes, roomCleanType, cleanTypeCols, planMode, odStatus, roomLimits, handoffMs, roomPriority, roomCleanTogether, roomAllergen, overrides, taskStatus, targetDowntimes, planBlocks, allInterrupts, includeTransit, includeInspection, pbMode, hiddenRooms, roomSource, shiftStartLines, areaLine, customOnlyAreas, windowPlans, laneByEmpCrew, shiftWindows, laneRoster, maxCrewSize, planHorizonMins, handoverMins, tailFillMins, reforecastFrom, ganttStartDate, ganttStartHour, shiftRotation];
+    const engineDepsNow = [assets, supportRooms, cleanTypes, roomCleanType, cleanTypeCols, planMode, odStatus, roomLimits, handoffMs, roomPriority, roomCleanTogether, roomAllergen, overrides, taskStatus, targetDowntimes, planBlocks, allInterrupts, includeTransit, includeInspection, pbMode, hiddenRooms, roomSource, shiftStartLines, areaLine, customOnlyAreas, windowPlans, laneByEmpCrew, shiftWindows, laneRoster, maxCrewSize, planHorizonMins, handoverMins, tailFillMins, reforecastFrom, ganttStartDate, ganttStartHour, shiftRotation, focusK];
     const engineDepsRef = useRef(null);
     if (engineOn || engineDepsRef.current === null) engineDepsRef.current = engineDepsNow;
+    // PBED: false while the plan on hand was made with other inputs than the ones on screen now (an input changed on a tab that does not
+    // plan). What is read from the plan only for display on those tabs (the "finishes first" tags, the extra heads) waits until it is made again.
+    const planFresh = !LAZY_ENGINE || engineOn || engineDepsNow.every(function(d, i) { return d === engineDepsRef.current[i]; });
     const scheduleData = useMemo(function() {
         const workers = laneRoster.map(function(l) { const w = new Worker(l.lane, l.crew, l.name, l.windows); w.kind = l.kind || 'general'; w.isLead = !!l.isLead; return w; });
         const laneIndex = {};
@@ -4799,6 +4923,10 @@ export default function App(props) {
             return null;
         };
 
+        // PBED focus rooms: the cleans a focus room claimed (the lead swap leaves them where they are) and what each shift was asked to finish.
+        const claimedIds = {};
+        const focusLog = [];
+        const FOCUS_N = IS_CURRENT ? 0 : Math.min(FOCUS_MAX, Math.max(0, Math.round(Number(focusK) || 0)));
         const ROOM_LEVELS = ['must', 'roomPro', 'room'];
         const TEAM_LEVELS = ['teamPro', 'mustLate', 'team'];
         const CREW_LEVELS = ['crewPro', 'crew'];
@@ -4819,6 +4947,7 @@ export default function App(props) {
             const leadFirst = picLeadLanes.length > 0;
             const isLeadLevel = function(level) { return level === 'leadR' || level === 'leadT' || level === 'leadC'; };
             let inFirst = false;   // the clock-in pass (long cleans start at clock-in before anything else is placed)
+            let claimSet = null;   // PBED focus rooms: while set, only these rooms' cleans are placed (see focusCandidates)
             // Who this shift's board puts on a clean's room. skip = the room isn't on this board but a later board has it, so
             // it waits for that shift (work carried over from an earlier shift, and custom tasks, go to whoever is on).
             // late = PIC / admin dealt to a Tech 1 / 2 only because the room has no Tech 3 / Inspector / Admin.
@@ -5035,6 +5164,7 @@ export default function App(props) {
             const wholePass = function(level, mode) {
                 let placed = 0;
                 pending = pending.filter(function(task) {
+                    if (claimSet && !claimSet[task.vRoomKey]) return true;
                     if (mode === 'release' && task.kind !== 'pic' && task.kind !== 'admin') return true;
                     if ((mode === 'leadPic' || mode === 'deferPic') && task.kind !== 'pic') return true;
                     const lanes = lanesAt(task, level, mode === 'defer' || mode === 'deferPic');
@@ -5090,6 +5220,7 @@ export default function App(props) {
                 for (let i = 0; i < pending.length; i++) {
                     const task = pending[i];
                     if (task.splitIndex >= 40) continue;
+                    if (claimSet && !claimSet[task.vRoomKey]) continue;
                     if (mode === 'release' && task.kind !== 'pic' && task.kind !== 'admin') continue;
                     if ((mode === 'leadPic' || mode === 'deferPic') && task.kind !== 'pic') continue;
                     const vRoom = virtualRoomsMap[task.vRoomKey];
@@ -5138,7 +5269,7 @@ export default function App(props) {
                 pending.forEach(function(u) { if (u.kind === 'general' && fromOf(u) < W.end) waiting += u.rawWorkloadMins; });
                 if (waiting <= 0) return out;
                 const cands = allTasks.filter(function(t) {
-                    if (t.kind !== 'pic' || skip[t.id] || t.isPinned || t.isFrozen || t.isSplitPart1 || t.isSplitPart2 || !t.assignedLanes || t.assignedLanes.length !== 1) return false;
+                    if (t.kind !== 'pic' || skip[t.id] || claimedIds[t.id] || t.isPinned || t.isFrozen || t.isSplitPart1 || t.isSplitPart2 || !t.assignedLanes || t.assignedLanes.length !== 1) return false;
                     const x = t.assignedLanes[0];
                     return crewLanes.indexOf(x) > -1 && workers[x].kind === 'general' && t.startMin >= W.start && t.startMin < W.end && pending.indexOf(t) === -1;
                 }).sort(function(a, b) { return a.startMin - b.startMin; });
@@ -5198,7 +5329,9 @@ export default function App(props) {
                 });
                 return moved;
             };
-            return { wholePass: wholePass, partPass: partPass, swapPic: swapPic, relieve: relieve, hasPlan: !!plan, hasLeads: leadLanes.length > 0, leadFirst: leadFirst, setFirst: function(v) { inFirst = !!v; } };
+            return { wholePass: wholePass, partPass: partPass, swapPic: swapPic, relieve: relieve, hasPlan: !!plan, hasLeads: leadLanes.length > 0, leadFirst: leadFirst, setFirst: function(v) { inFirst = !!v; },
+                setClaim: function(set) { claimSet = set; }, W: W, crewLanes: crewLanes, auto: !plan || !!plan.fromAuto,
+                claimLanes: function(task) { return crewFor(whoFor(task)).filter(function(l) { return workers[l].canDo(task.kind, true); }); } };
         };
         // The rest of a clean picked up on a later shift (or left over) carries the handover minutes, once, per head; picked up
         // on the shift it was cut on, none.
@@ -5224,15 +5357,16 @@ export default function App(props) {
         const groups = [];
         winList.forEach(function(W) { const g = groups[groups.length - 1]; if (g && g[0].start === W.start) g.push(W); else groups.push([W]); });
         // One group's crews, filled level by level in rounds. first: long jobs start at clock-in before anything else.
-        const fillGroup = function(ctxs, first) {
-            const whole = function(levels, mode) { let n = 0; levels.forEach(function(lv) { ctxs.forEach(function(c) { n += c.wholePass(lv, mode); }); }); return n; };
-            const part = function(levels, onlyLong, mode, guard) { let n = 0; levels.forEach(function(lv) { ctxs.forEach(function(c) { n += c.partPass(lv, onlyLong, mode, guard); }); }); return n; };
+        const fillGroup = function(ctxs, first, claim) {
+            // claim (PBED focus rooms): only the whole-shift levels run, so the claimed rooms get every head that can work them
+            const whole = function(levels, mode) { let n = 0; levels.forEach(function(lv) { if (claim && CLAIM_LEVELS.indexOf(lv) === -1) return; ctxs.forEach(function(c) { n += c.wholePass(lv, mode); }); }); return n; };
+            const part = function(levels, onlyLong, mode, guard) { let n = 0; levels.forEach(function(lv) { if (claim && CLAIM_LEVELS.indexOf(lv) === -1) return; ctxs.forEach(function(c) { n += c.partPass(lv, onlyLong, mode, guard); }); }); return n; };
             if (first) {
                 ctxs.forEach(function(c) { c.setFirst(true); });
                 part(ROOM_LEVELS, true, 'defer');
                 part(['leadR'], true, 'leadPic');   // a PIC clean too long for one shift: a PIC-first lead starts it at clock-in (the room's Tech 3s first)
                 // no board: the shift is one room (with PIC-first leads, the Tech 3s / Inspectors start the long PIC cleans before the leads)
-                ctxs.forEach(function(c) { if (!c.hasPlan) { if (c.leadFirst) c.partPass('crewPro', true, 'defer'); c.partPass('crew', true, 'defer'); } });
+                ctxs.forEach(function(c) { if (!c.hasPlan || claim) { if (c.leadFirst) c.partPass('crewPro', true, 'defer'); c.partPass('crew', true, 'defer'); } });
                 part(['leadC'], true, 'leadPic');
                 ctxs.forEach(function(c) { c.setFirst(false); });
             }
@@ -5262,13 +5396,96 @@ export default function App(props) {
                 if (parts === 0) break;
             }
         };
+        // PBED focus rooms. For one clock-in group: the rooms with work waiting that it could be asked to finish, best first. Never
+        // when a shift of the group runs a saved Shift Start board, or the shift is too short (a plan window cut it). A room counts when
+        // production has handed it over in the first half of the shift, a later saved board doesn't hold it, it has regular or PIC work,
+        // and people on shift with free time can do that work. Order: priority, rooms already started, earliest handover, production
+        // before support, least work first (it finishes soonest), name.
+        const focusCandidates = function(ctxs, gStart) {
+            if (!FOCUS_N || ctxs.some(function(c) { return !c.auto; })) return [];
+            const W0 = Math.max(gStart, reforecastFrom);
+            const end = Math.max.apply(null, ctxs.map(function(c) { return c.W.end; }));
+            if (end - gStart < FOCUS_MIN_MINS) return [];
+            const by = {};
+            pending.forEach(function(t) {
+                if (t.kind !== 'general' && t.kind !== 'pic') return;
+                const vr = virtualRoomsMap[t.vRoomKey];
+                const from = Math.max(fromOf(t), W0);
+                if (!vr || from >= end) return;
+                if (!ctxs.some(function(c) { return c.claimLanes(t).length > 0; })) return;
+                const r = by[vr.id] = by[vr.id] || { vr: vr, id: vr.id, open: Infinity, carried: false };
+                r.open = Math.min(r.open, from);
+                if (t.isSplitPart2) r.carried = true;
+            });
+            return Object.keys(by).map(function(k) { return by[k]; })
+                .filter(function(r) { return r.open <= W0 + FOCUS_OPEN_BY * (end - W0); })
+                .map(function(r) { r.end = end; return r; });
+        };
+        // What a candidate asks of the group and what the group has free right now (after the rooms claimed before it).
+        const focusFit = function(r, ctxs) {
+            let needG = 0, needP = 0, longOk = true;
+            pending.forEach(function(t) {
+                if (t.vRoomKey !== r.id || (t.kind !== 'general' && t.kind !== 'pic')) return;
+                if (t.kind === 'pic') needP += t.rawWorkloadMins; else needG += t.rawWorkloadMins;
+                if (t.calculateDuration(r.open, t.customInterrupts, capHeads(t, r.vr)) > r.end - r.open + 0.01) longOk = false;
+            });
+            let gm = 0, pm = 0;
+            ctxs.forEach(function(c) {
+                c.crewLanes.forEach(function(l) {
+                    const w = workers[l], canG = w.canDo('general', true), canP = w.canDo('pic', true);
+                    if (!canG && !canP) return;
+                    let m = 0;
+                    freeRuns(w, r.open, c.W.end, 0).forEach(function(x) { m += netWorkingMins(x.start, x.end, allInterrupts); });
+                    if (canG) gm += m; else pm += m;
+                });
+            });
+            const walls = [];
+            Object.keys(r.vr.areas).forEach(function(a) { (planBlocks.byRoom[a] || []).forEach(function(b) { walls.push(b); }); });
+            const roomMax = r.vr.limit < Infinity ? r.vr.limit * netWorkingMins(r.open, r.end, allInterrupts.concat(walls)) : Infinity;
+            const availG = gm * FOCUS_EFF, availP = pm * FOCUS_EFF;
+            const usable = Math.min(availG + availP, roomMax * FOCUS_EFF);
+            return { needG: needG, needP: needP, need: needG + needP, avail: availG + availP, fits: longOk && needG <= availG + 0.01 && needG + needP <= usable + 0.01, enough: (needG > 0 ? gm : 0) + (needP > 0 ? gm + pm : 0) >= tailMin };
+        };
         groups.forEach(function(g) {
             if (pending.length === 0) return;
             const gStart = g[0].start;
             handoverFor(gStart);
             const ctxs = g.map(function(W) { return ctxOf(W, gStart); }).filter(function(c) { return !!c; });
             if (ctxs.length === 0) return;
+            // Phase 1 (focus rooms): up to FOCUS_N rooms, in order, each claims every head that can work it at the earliest times
+            // (the whole-shift levels only), one room after the other. The first is always claimed; a later one only when it fits in
+            // the free time that is left. A room that took nothing is skipped. Phase 2 is today's fill for everything else (and what
+            // is left of the focus rooms), in the time phase 1 left free.
+            let focus = null;
+            focusCandidates(ctxs, gStart).map(function(r) { r.need0 = focusFit(r, ctxs).need; return r; })
+              .sort(function(a, b) { return a.vr.priority - b.vr.priority || (b.carried ? 1 : 0) - (a.carried ? 1 : 0) || a.open - b.open || (a.vr.supportOnly ? 1 : 0) - (b.vr.supportOnly ? 1 : 0) || a.need0 - b.need0 || String(a.vr.name).localeCompare(String(b.vr.name)); })
+              .forEach(function(r) {
+                if (focus && focus.length >= FOCUS_N) return;
+                const f = focusFit(r, ctxs);
+                if (!f.enough || ((focus && focus.length > 0) && !f.fits)) return;
+                const before = pending.slice();
+                const set = {}; set[r.id] = true;
+                ctxs.forEach(function(c) { c.setClaim(set); });
+                fillGroup(ctxs, true, true);
+                ctxs.forEach(function(c) { c.setClaim(null); });
+                let took = false;
+                before.forEach(function(t) { if (t.vRoomKey === r.id && pending.indexOf(t) === -1 && t.assignedLanes && t.assignedLanes.length) { claimedIds[t.id] = true; took = true; } });
+                if (!took) return;
+                (focus = focus || []).push({ id: r.id, name: r.vr.name, areas: Object.keys(r.vr.areas), priority: r.vr.priority, need: Math.round(f.need), fits: f.fits, open: r.open, carried: r.carried });
+            });
+            if (focus) focusLog.push({ start: gStart, end: Math.max.apply(null, ctxs.map(function(c) { return c.W.end; })), crews: ctxs.map(function(c) { return c.W.crew; }), rooms: focus });
             fillGroup(ctxs, true);
+            if (focus) {
+                const fl = focusLog[focusLog.length - 1];
+                fl.rooms.forEach(function(rm) {
+                    let left = 0;
+                    pending.forEach(function(t) { if (t.vRoomKey === rm.id) left += t.rawWorkloadMins; });
+                    rm.left = Math.round(left);
+                    let fin = 0;
+                    allTasks.forEach(function(t) { if (t.vRoomKey === rm.id && pending.indexOf(t) === -1 && t.assignedLanes && t.assignedLanes.length && t.startMin >= gStart && t.startMin < fl.end) fin = Math.max(fin, t.startMin + t.finalDuration); });
+                    rm.finish = fin;
+                });
+            }
             // PBED: people done early take the clean that queues in another room (moves what is already placed, never what is still
             // waiting: that stays for the leads' pass, as before)
             if (!IS_CURRENT) {
@@ -5413,7 +5630,8 @@ export default function App(props) {
             unscheduled: unscheduled,
             parents: parents,
             parentById: parentById,
-            taskById: taskById
+            taskById: taskById,
+            focus: focusLog
         };
     }, engineDepsRef.current);
 
@@ -5507,6 +5725,14 @@ export default function App(props) {
                 csvContent += `"${wCrew}","${wName}","${t.originalArea}",${tName},"${t.status}","${sTime}","${eTime}",${Math.round(t.finalDuration)}\n`;
             });
         }
+        // PBED: support duty (a role held all shift, or an extra head put on one), one row per bar drawn on the Gantt (minutes = the real free time in it)
+        if (!IS_CURRENT && dutyPlan.on) Object.keys(dutyPlan.bars).forEach(function(k) {
+            const dw = laneRoster[Number(k)];
+            if (!dw) return;
+            dutyPlan.bars[k].forEach(function(b) {
+                csvContent += `"${dw.crew}","${dw.name.replace(/"/g, '""')}","${String(b.room).replace(/"/g, '""')}","${b.label} duty","${b.src === 'extra' ? 'extra head' : 'duty'}","${formatClockTime(ganttStartDate, ganttStartHour, b.start)}","${formatClockTime(ganttStartDate, ganttStartHour, b.end)}",${Math.round(b.mins)}\n`;
+            });
+        });
         scheduleData.unscheduled.forEach(function(t) {
             csvContent += `"","UNSCHEDULED","${t.originalArea}","${t.name.replace(/"/g, '""')}","overflow","","",${Math.round(t.rawWorkloadMins)}\n`;
         });
@@ -5973,6 +6199,28 @@ export default function App(props) {
             equipDone: parentsHere.filter(function(p) { return (p.blocks.length > 0 || (IS_CURRENT && p.lastDoneMs > 0)) && p.unscheduledWork === 0 && p.blocks.every(function(b) { return b.isComplete; }); }).length
         };
     });
+    // PBED: how many shifts run a board saved in Shift Start (they keep their crews, so no room is asked to be finished first there).
+    const savedBoardShifts = IS_CURRENT ? 0 : shiftWindows.filter(function(w) { const b = windowBoards[w.key]; return !!b && !!b[0] && !b[0].fromAuto && !!windowPlans[w.key] && Object.keys(windowPlans[w.key].lineWorkers || {}).length > 0; }).length;
+    // PBED: the production rooms each shift finishes (all its work placed, the last of it ending inside the shift); `carried` = it was started in an earlier shift.
+    // `first` = the rooms the plan asked that shift to finish before anything else (see the focus rooms in the engine); `notDone` = the ones it could not.
+    const focusOfWindow = function(w) {
+        const list = IS_CURRENT || !planFresh ? [] : (scheduleData.focus || []);
+        for (let i = 0; i < list.length; i++) if (list[i].start === w.start && list[i].crews.indexOf(w.crew) > -1) return list[i];
+        return null;
+    };
+    const shiftRooms = IS_CURRENT ? [] : shiftWindows.map(function(w) {
+        const fl = focusOfWindow(w), first = fl ? fl.rooms : [];
+        const areasOf = function(f) { return f.areas || [f.name]; };   // a Clean Together group is one focus room of several areas
+        const isFirst = function(room) { return first.some(function(f) { return areasOf(f).indexOf(room) > -1; }); };
+        const done = roomStats.filter(function(r) { return !isSupportRoom(r.room) && r.end > 0 && r.overflow === 0 && r.end > w.start + 0.01 && r.end <= w.end + 0.01; })
+            .sort(function(a, b) { return a.end - b.end || a.room.localeCompare(b.room); })
+            .map(function(r) { return { room: r.room, carried: r.start < w.start - 0.01, first: isFirst(r.room) }; });
+        const notDone = first.filter(function(f) { return (f.left > 1 || f.finish > w.end + 0.01) && areasOf(f).every(function(a) { return done.every(function(d) { return d.room !== a; }); }); });
+        // a focus room that did finish but that the list above cannot hold (a support room, or a Clean Together group), starred too
+        const extra = first.filter(function(f) { return notDone.indexOf(f) === -1 && areasOf(f).every(function(a) { return done.every(function(d) { return d.room !== a; }); }); })
+            .map(function(f) { return { room: f.name, carried: !!f.carried, first: true }; });
+        return { w: w, done: done.concat(extra), first: first, notDone: notDone };
+    });
     // The Metrics table: production rooms, then a Support band that folds the support rooms away (open when there is nothing above it).
     const roomStatRows = (function() {
         const prod = roomStats.filter(function(r) { return !isSupportRoom(r.room); }), sup = roomStats.filter(function(r) { return isSupportRoom(r.room); });
@@ -6043,13 +6291,82 @@ export default function App(props) {
         if (cursor < ganttTotalMins) gaps.push({ start: cursor, end: ganttTotalMins });
         return gaps;
     });
-    // Blank space on shift per lane (what the waterfall couldn't fill), outlined in yellow on the Gantt.
+    // ---- Support duty (PBED, see SUPPORT DUTY): what the free stretches of support roles and extra heads are called ----
+    // The room a role works in: an equipment area named for it (Janitorial, Chemical, Admin, a Trash room), else an MSS area, else none (the
+    // block then belongs to a room named after the role, like "Trash").
+    const dutyRoomOf = function(role) {
+        const words = role === 'trash' ? ['trash', 'garbage', 'waste', 'refuse'] : [role];
+        const names = [];
+        assets.forEach(function(a) { const k = String(a.area); if (names.indexOf(k) === -1) names.push(k); });
+        lineIndex.forEach(function(l) { if (names.indexOf(l.name) === -1) names.push(l.name); });
+        return names.filter(function(n) { return wordsOf(n).some(function(x) { return words.indexOf(x) > -1; }); })[0] || '';
+    };
+    const dutyPlan = (function() {
+        const none = { on: false, blocks: [], byLane: {}, bars: {}, extras: {}, slots: {}, mins: 0, rooms: {} };
+        if (!dutyActive || IS_CURRENT || !planFresh || !scheduleData.workers) return none;
+        const roomName = {};
+        DUTY_ROLES.forEach(function(r) { roomName[r.id] = dutyRoomOf(r.id) || r.label; });
+        const roomIdOf = function(label) { const l = lineForArea(lineIndex, label); return l ? l.id : 't:' + normS(label); };
+        const res = planSupportDuty({
+            workers: laneRoster.map(function(l) { const w = scheduleData.workers[l.lane]; return { lane: l.lane, crew: l.crew, kind: l.kind, isLead: l.isLead, windows: l.windows, gaps: w && w.idleGaps ? w.idleGaps : [] }; }),
+            shifts: shiftWindows.map(function(w) { return { key: w.key, crew: w.crew, start: w.start, end: w.end }; }),
+            heads: dutyHeads,
+            pref: function(lane, role) { const e = expMap.exp[laneRoster[lane].empId]; return e ? (e[roomIdOf(roomName[role])] || 0) : 0; }
+        });
+        const out = { on: true, blocks: [], byLane: {}, bars: {}, extras: res.extras, slots: res.slots, mins: 0, rooms: roomName };
+        res.blocks.forEach(function(b) {
+            const r = dutyRoleOf(b.role);
+            const blk = Object.assign({}, b, { label: r.label, color: r.color, room: roomName[b.role] });
+            out.blocks.push(blk);
+            (out.byLane[b.lane] = out.byLane[b.lane] || []).push(blk);
+            out.mins += b.end - b.start;
+        });
+        // What is drawn: a person's duty in one shift is one bar, carried over a break or pause (no task of theirs stands between), so a
+        // support role reads as a continuous lane with the equipment on top. The minutes counted are the real free stretches only.
+        Object.keys(out.byLane).forEach(function(k) {
+            const wk = scheduleData.workers[Number(k)];
+            const busy = wk ? wk.schedule : [];
+            const merged = [];
+            out.byLane[k].slice().sort(function(a, b) { return a.start - b.start; }).forEach(function(b) {
+                const prev = merged[merged.length - 1];
+                if (prev && prev.role === b.role && prev.shiftKey === b.shiftKey && !busy.some(function(x) { return x.start < b.start - 0.01 && x.end > prev.end + 0.01; })) { prev.end = Math.max(prev.end, b.end); prev.mins += b.end - b.start; }
+                else merged.push(Object.assign({}, b, { mins: b.end - b.start }));   // mins = the real free time inside the bar (a break stays out of it)
+            });
+            out.bars[k] = merged;
+        });
+        return out;
+    })();
+    // Blank space on shift per lane (what the waterfall couldn't fill), outlined in yellow on the Gantt. Support duty is not blank space.
     const laneIdle = laneRoster.map(function(l) {
         const w = scheduleData.workers[l.lane];
+        let raw = w && w.idleGaps ? w.idleGaps : [];
+        if (dutyPlan.on && dutyPlan.byLane[l.lane]) raw = gapsMinus(raw, dutyPlan.byLane[l.lane]);
         // An area role (Ganttly): the volume is not known ahead, so time without a task is the area's, never blank space.
-        const gaps = IS_CURRENT && isAreaRoleKind(l.kind) && !l.isLead ? [] : w && w.idleGaps ? w.idleGaps.filter(function(g) { return g.end - g.start >= IDLE_SHOW_MINS; }) : [];
+        const gaps = IS_CURRENT && isAreaRoleKind(l.kind) && !l.isLead ? [] : raw.filter(function(g) { return g.end - g.start >= IDLE_SHOW_MINS; });
         return { gaps: gaps, mins: gaps.reduce(function(a, g) { return a + (g.end - g.start); }, 0) };
     });
+    // One support-duty bar (PBED), cut to [lo, hi): `top` / `height` place it on its line. Hover says what it is and why.
+    const renderDutyBar = function(b, l, seat, row, bi) {
+        const s = Math.max(b.start, seat.start), e = Math.min(b.end, seat.end);
+        if (e - s < 1) return null;
+        const leftPx = xOf(s);
+        if (leftPx >= GANTT_TOTAL_WIDTH_PX) return null;
+        const widthPx = Math.min(xEnd(e) - leftPx, GANTT_TOTAL_WIDTH_PX - leftPx);
+        if (widthPx < 2) return null;
+        return dutyBarEl(b, l, 'duty-' + l.lane + '-' + seat.start + '-' + bi, leftPx, widthPx, row * LANE_HEIGHT_PX + 3, LANE_HEIGHT_PX - 6, s, e);
+    };
+    const dutyBarEl = function(b, l, key, leftPx, widthPx, top, height, s, e) {
+        const dutyMins = b.mins === undefined ? e - s : Math.min(b.mins, e - s);
+        const at = formatClockTime(ganttStartDate, ganttStartHour, s) + ' – ' + formatClockTime(ganttStartDate, ganttStartHour, e).replace(/^\S+ /, '') + ' (' + fmtMins(e - s) + (e - s - dutyMins > 1 ? ', ' + fmtMins(dutyMins) + ' of it duty, the rest a break or pause' : '') + ')';
+        const why = b.src === 'extra'
+            ? 'Extra head on ' + b.label + ' for this shift: no room had work this person could take here (a room waiting for production, at its Max Workers, or already taken). Limit on the Crew tab.'
+            : b.role === 'trash' ? 'Holds the Trash role the whole shift. Trash has no equipment, so the shift is the Trash duty.' : 'Holds the ' + b.label + ' role the whole shift. No equipment fits in this stretch, so it is the ' + b.label + ' duty, not blank space.';
+        return (
+            <div key={key} data-duty={b.role} data-duty-src={b.src} data-duty-lane={l.lane} data-duty-span={Math.round(s) + '-' + Math.round(e)} className={'absolute z-[8] rounded-md border flex items-center justify-center overflow-hidden pointer-events-auto cursor-help ' + (b.src === 'extra' ? 'border-dashed' : '')} style={{ left: `${leftPx}px`, width: `${widthPx}px`, top: `${top}px`, height: `${height}px`, backgroundColor: b.color + '30', borderColor: b.color + 'aa' }} title={`${l.name} — ${b.src === 'extra' ? 'extra head, ' : ''}${b.label} duty\n${at}\n${why}`}>
+                {widthPx > 64 && <span className="font-black text-[10px] uppercase tracking-[0.18em] truncate px-1.5" style={{ color: b.color }}>{b.label}{b.src === 'extra' && widthPx > 130 ? ' · extra' : ''}</span>}
+            </div>
+        );
+    };
     // A saved local date-time ("2026-10-09T14:30") as clock text, e.g. "Fri 10/9 2:30 PM".
     // A block that matters for this plan: one that repeats every day, or whose time overlaps the plan window (one whose date cannot be read stays listed so it can be removed).
     const blockInWindow = function(b) {
@@ -6311,6 +6628,15 @@ export default function App(props) {
             if (ct && ct.planned < ct.inRooms) lines.push({ code: 'SCOPE', text: 'Only ' + ct.planned + ' of ' + ct.inRooms + ' pieces of equipment are in this plan (' + (planMode === 'overdueweekly' ? 'Overdue + weekly' : planMode === 'overdue' ? 'Overdue' : 'By type of clean') + '). Setup has the Plan equipment setting.', room: '' });
         }
         // A person who is on no room's team only gets what no room or team could start.
+        // Support duty (PBED): a Tech 1 / 2 who is free and still not on a support role, and why.
+        if (dutyPlan.on && l.kind === 'general' && meWin && dutyPlan.slots[meWin.key] && !(dutyPlan.extras[meWin.key] || []).some(function(x) { return x.lane === lane; })) {
+            const sl = dutyPlan.slots[meWin.key];
+            const roles = DUTY_EXTRA.filter(function(r) { return sl[r]; });
+            const ownW = scheduleData.workers[lane];
+            const freeMins = gapsWithin(ownW && ownW.idleGaps ? ownW.idleGaps : [], meWin.start, meWin.end).filter(function(x) { return x.end - x.start >= DUTY_MIN_GAP; }).reduce(function(acc, x) { return acc + (x.end - x.start); }, 0);
+            if (roles.length && freeMins < DUTY_MIN_IDLE) lines.push({ code: 'DUTY_SHORT', text: 'Free for ' + fmtMins(freeMins) + ' in this shift, under the hour needed to put someone on a support role.', room: '' });
+            else if (roles.length && roles.every(function(r) { return sl[r].left <= 0; })) lines.push({ code: 'DUTY_FULL', text: 'Every support role has the extra heads it is allowed this shift (' + roles.map(function(r) { return dutyRoleOf(r).label + ' ' + sl[r].limit + ' of ' + sl[r].limit; }).join(', ') + '). More can be allowed on the Crew tab.', room: '' });
+        }
         if (cands.length && (l.isPlaceholder || !l.room) && meWin && planWinsOf.indexOf(meWin) > -1) lines.push({ code: 'NOROOM', text: (l.isPlaceholder ? 'This is an extra seat' : l.name + ' is on no room\'s team') + ', so only jobs that no room or team could start reach ' + (l.isPlaceholder ? 'it' : 'them') + '.', room: '' });
         if (!lines.length && ownNext) lines.push({ code: 'NEXT', text: 'Their next job, ' + ownNext.name + ' in ' + ownNext.originalArea + (ownNext.appliedHeads > 1 ? ' (a clean for ' + ownNext.appliedHeads + ' people)' : '') + ', starts at ' + clock(ownNext.startMin) + '; the plan found nothing else it could safely fit before it.', room: ownNext.originalArea });
         if (!lines.length) lines.push({ code: 'OTHER', text: 'The plan found no job it could safely give here.', room: '' });
@@ -6338,7 +6664,8 @@ export default function App(props) {
     const showIdleTip = function(e, lane, g, force) {
         if (IS_CURRENT) return;
         const key = lane + ':' + Math.round(g.start) + '-' + Math.round(g.end);
-        if (idleCacheRef.current.sd !== scheduleData) idleCacheRef.current = { sd: scheduleData, map: {} };
+        const dutySig = dutyPlan.on ? DUTY_EXTRA.map(function(r) { return dutyHeads[r]; }).join(',') : 'off';
+        if (idleCacheRef.current.sd !== scheduleData || idleCacheRef.current.duty !== dutySig) idleCacheRef.current = { sd: scheduleData, duty: dutySig, map: {} };
         const cache = idleCacheRef.current.map;
         if (!cache[key]) cache[key] = explainIdle(lane, g);
         const l = laneRoster[lane];
@@ -6466,15 +6793,47 @@ export default function App(props) {
             const lanes = deptLanesOf(g.name);
             rows.push({ g: g, per: per, people: people, blocks: blocks, start: start, end: end, work: work, pct: work > 0 ? Math.round((done / work) * 100) : 0, late: late, priority: roomPriority[g.name] || 2, leads: leadNames, support: isSupportRoom(g.name), lanes: lanes, chip: restartChipOf(g.name, chipEnd, leftOver), height: ROOM_HEAD_PX + people.length * ROOM_ROW_PX + lanes.length * DEPT_ROW_PX + 6 });
         });
+        // Support duty (PBED): the people who hold a support role (or are an extra head on it) are listed under that role's room, with their duty
+        // drawn on their line. A role with no room of its own (Trash) gets a room named for it, always in the Support section.
+        if (dutyPlan.on) {
+            const dutyRooms = {};
+            DUTY_ROLES.forEach(function(r) { const nm = dutyPlan.rooms[r.id]; if (nm) (dutyRooms[nm] = dutyRooms[nm] || []).push(r.id); });
+            Object.keys(dutyRooms).forEach(function(nm) {
+                const roles = dutyRooms[nm];
+                const mine = [];   // [{ lane, blocks }] in view
+                Object.keys(dutyPlan.bars).forEach(function(k) {
+                    const lane = Number(k);
+                    if (!inView(lane)) return;
+                    const bl = dutyPlan.bars[k].filter(function(b) { return roles.indexOf(b.role) > -1; });
+                    if (bl.length) mine.push({ lane: lane, blocks: bl });
+                });
+                if (!mine.length) return;
+                let row = rows.filter(function(r) { return r.g.name === nm; })[0];
+                if (!row) {
+                    row = { g: { name: nm, tasks: [] }, per: {}, people: [], blocks: [], start: Infinity, end: 0, work: 0, pct: 0, late: 0, priority: roomPriority[nm] || 2, leads: [], support: true, lanes: [], chip: null, height: 0, duty: true, dutyRoles: roles };
+                    rows.push(row);
+                }
+                row.dutyBlocks = [];
+                mine.forEach(function(m) {
+                    let q = row.per[m.lane];
+                    const first = m.blocks.reduce(function(a, b) { return Math.min(a, b.start); }, Infinity);
+                    if (!q) { q = row.per[m.lane] = { lane: m.lane, first: first, last: 0, row: 0 }; row.people.push(q); }
+                    m.blocks.forEach(function(b) { q.last = Math.max(q.last, b.end); row.dutyBlocks.push({ b: b, q: q }); if (row.duty) { row.start = Math.min(row.start, b.start); row.end = Math.max(row.end, b.end); } });
+                });
+                row.people.sort(function(a, b) { return a.first - b.first || laneRoster[a.lane].name.localeCompare(laneRoster[b.lane].name); });
+                row.people.forEach(function(q, i) { q.row = i; });
+                row.height = ROOM_HEAD_PX + row.people.length * ROOM_ROW_PX + row.lanes.length * DEPT_ROW_PX + 6;
+            });
+        }
         // Production rooms first, then the Support section. Inside each: the order the planner set (Setup, or the arrows here), and the
         // rooms nobody has moved by the preset priority, then by when they start.
-        rows.sort(function(a, b) { return roomCmp(a.g.name, b.g.name, function() { return a.priority - b.priority || a.start - b.start || a.g.name.localeCompare(b.g.name); }); });
+        rows.sort(function(a, b) { return (a.duty ? 1 : 0) - (b.duty ? 1 : 0) || roomCmp(a.g.name, b.g.name, function() { return a.priority - b.priority || a.start - b.start || a.g.name.localeCompare(b.g.name); }); });
         const prodRows = rows.filter(function(r) { return !r.support; }), supRows = rows.filter(function(r) { return r.support; });
-        const shown = rows.map(function(r) { return r.g.name; });
+        const shown = rows.filter(function(r) { return !r.duty; }).map(function(r) { return r.g.name; });
         const supOpen = isSupportOpen('gantt') || prodRows.length === 0;
         const placed = [];
         let top = 0;
-        const place = function(r, i, arr) { r.top = top; top += r.height + ROOM_GAP_PX; r.canUp = i > 0; r.canDown = i < arr.length - 1; placed.push(r); };
+        const place = function(r, i, arr) { r.top = top; top += r.height + ROOM_GAP_PX; r.canUp = !r.duty && i > 0; r.canDown = !r.duty && i < arr.length - 1 && !arr[i + 1].duty; placed.push(r); };
         prodRows.forEach(place);
         let band = null;
         if (supRows.length) {
@@ -6504,14 +6863,15 @@ export default function App(props) {
                                     <div className="flex items-center gap-1.5 min-w-0">
                                         <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${getRoomColor(r.g.name)}`} style={bgOf(roomHex(r.g.name))} />
                                         <span className="text-[12px] font-black text-slate-800 truncate min-w-0">{r.g.name}</span>
-                                        <span className="text-[9px] font-black rounded px-1 py-0.5 bg-[#E6F1FB] text-[#00468B] border border-[#B3D4F2] flex-shrink-0" title="Room priority (1 = first)">P{r.priority}</span>
-                                        <span className="ml-auto flex items-center gap-0.5 flex-shrink-0">
+                                        {!r.duty && <span className="text-[9px] font-black rounded px-1 py-0.5 bg-[#E6F1FB] text-[#00468B] border border-[#B3D4F2] flex-shrink-0" title="Room priority (1 = first)">P{r.priority}</span>}
+                                        {r.duty && <span data-duty-room-tag className="text-[9px] font-black rounded px-1 py-0.5 bg-slate-200 text-slate-700 flex-shrink-0" title="Support duty: people who hold this role, and extra heads put on it (Crew tab)">DUTY</span>}
+                                        {!r.duty && <span className="ml-auto flex items-center gap-0.5 flex-shrink-0">
                                             <button data-room-up={r.g.name} disabled={!r.canUp} onClick={function(e) { e.stopPropagation(); moveRoom(r.g.name, -1, lay.shown); }} title="Show this room higher" aria-label="Show this room higher" className="w-5 h-5 rounded text-[9px] leading-none font-black text-[#0072CE] hover:bg-[#E6F1FB] disabled:opacity-25 disabled:hover:bg-transparent no-pan">▲</button>
                                             <button data-room-down={r.g.name} disabled={!r.canDown} onClick={function(e) { e.stopPropagation(); moveRoom(r.g.name, 1, lay.shown); }} title="Show this room lower" aria-label="Show this room lower" className="w-5 h-5 rounded text-[9px] leading-none font-black text-[#0072CE] hover:bg-[#E6F1FB] disabled:opacity-25 disabled:hover:bg-transparent no-pan">▼</button>
-                                        </span>
+                                        </span>}
                                     </div>
                                     <div className="flex items-center gap-1 mt-0.5 min-w-0">
-                                        <span className="text-[10px] font-bold text-slate-500 truncate min-w-0">{fmtMins(r.work)} · {r.people.filter(function(q) { return !q.elsewhere; }).length} {r.people.filter(function(q) { return !q.elsewhere; }).length === 1 ? 'person' : 'people'} · {r.pct}% done</span>
+                                        <span className="text-[10px] font-bold text-slate-500 truncate min-w-0">{r.duty ? 'Support duty' : fmtMins(r.work)} · {r.people.filter(function(q) { return !q.elsewhere; }).length} {r.people.filter(function(q) { return !q.elsewhere; }).length === 1 ? 'person' : 'people'}{r.duty ? '' : ' · ' + r.pct + '% done'}</span>
                                         {r.chip && <span data-restart-chip={r.chip.late ? 'late' : 'spare'} title={r.chip.title} className={`ml-auto flex-shrink-0 text-[9px] font-black rounded px-1 border ${r.chip.late ? 'bg-rose-50 text-rose-700 border-rose-300' : 'bg-emerald-50 text-emerald-700 border-emerald-300'}`}>{r.chip.text}</span>}
                                     </div>
                                 </div>
@@ -6558,11 +6918,15 @@ export default function App(props) {
                                     return laneIdle[q.lane].gaps.map(function(g, gi) {
                                         const gl = xOf(g.start), gw = xEnd(g.end) - gl;
                                         return (
-                                            <div key={`ri-${q.lane}-${gi}`} data-idle-gap={`${Math.round(g.start)}-${Math.round(g.end)}`} data-room-idle={r.g.name} className={'absolute z-[5] rounded border-2 border-dashed border-[#FFB81C] bg-[#FFF6E0]/70 flex items-center justify-center overflow-hidden ' + (IS_CURRENT ? 'pointer-events-none' : 'pointer-events-auto cursor-help')} onMouseEnter={IS_CURRENT ? undefined : function(e) { showIdleTip(e, q.lane, g); }} onMouseMove={IS_CURRENT ? undefined : placeIdleTip} onMouseLeave={IS_CURRENT ? undefined : hideIdleTip} onClick={IS_CURRENT ? undefined : function(e) { pinIdleTip(e, q.lane, g); }} style={{ left: `${gl}px`, width: `${gw}px`, top: `${ROOM_HEAD_PX + q.row * ROOM_ROW_PX + 3}px`, height: `${ROOM_ROW_PX - 6}px` }}>
+                                            <div key={`ri-${q.lane}-${gi}`} data-idle-gap={`${Math.round(g.start)}-${Math.round(g.end)}`} data-room-idle={r.g.name} className={IS_CURRENT ? 'absolute z-[5] rounded border-2 border-dashed border-[#FFB81C] bg-[#FFF6E0]/70 flex items-center justify-center overflow-hidden pointer-events-none' : 'absolute z-[5] rounded border border-dashed border-[#FFB81C] bg-[#FFF6E0]/45 hover:bg-[#FFF6E0]/90 flex items-center justify-center overflow-hidden pointer-events-auto cursor-help'} onMouseEnter={IS_CURRENT ? undefined : function(e) { showIdleTip(e, q.lane, g); }} onMouseMove={IS_CURRENT ? undefined : placeIdleTip} onMouseLeave={IS_CURRENT ? undefined : hideIdleTip} onClick={IS_CURRENT ? undefined : function(e) { pinIdleTip(e, q.lane, g); }} style={{ left: `${gl}px`, width: `${gw}px`, top: `${ROOM_HEAD_PX + q.row * ROOM_ROW_PX + 3}px`, height: `${ROOM_ROW_PX - 6}px` }}>
                                                 {gw > 48 && <span className="text-[9px] font-black text-[#B07800] uppercase tracking-wider truncate px-1">Idle {fmtMins(g.end - g.start)}</span>}
                                             </div>
                                         );
                                     });
+                                })}
+                                {(r.dutyBlocks || []).map(function(x, di) {
+                                    const bl = xOf(x.b.start), bw = Math.max(xEnd(x.b.end) - bl, 4);
+                                    return dutyBarEl(x.b, laneRoster[x.q.lane], 'rd-' + x.q.lane + '-' + di, bl, bw, ROOM_HEAD_PX + x.q.row * ROOM_ROW_PX + 3, ROOM_ROW_PX - 6, x.b.start, x.b.end);
                                 })}
                                 {r.people.map(function(q) {
                                     // Their work in other rooms, faded to 70% (working elsewhere is not idle); click opens it
@@ -6755,13 +7119,16 @@ export default function App(props) {
         const supCount = supRooms.length + fixedSup.length;
         const foldKey = 'crew:' + w.key;   // one fold per shift card
         const supShown = prodRooms.length === 0 && fixedProd.length === 0 || isSupportOpen(foldKey);
+        const focusHere = focusOfWindow(w);
         const roomCard = function(r) {
+                    const firstRoom = focusHere ? focusHere.rooms.filter(function(f) { return (f.areas || [f.name]).some(function(a) { return a === r.name || (r.labels || []).indexOf(a) > -1; }); })[0] : null;
                     return (
                         <div key={r.id} data-auto-room={r.name} data-auto-support={r.support ? '1' : '0'} className="border border-slate-200 rounded-lg overflow-hidden">
                             <div className="flex flex-wrap items-center gap-2 px-3 py-1.5 bg-slate-50 border-b border-slate-100">
                                 <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: roomHexShown((r.labels || [])[0] || r.name) }} />
                                 <span className="text-[9px] font-black rounded px-1.5 py-0.5 bg-[#E6F1FB] text-[#00468B] border border-[#B3D4F2]" title="Room priority (1 = first)">P{r.priority}</span>
                                 <span className="font-black text-sm text-slate-800">{r.name}</span>
+                                {firstRoom && <span data-auto-first={firstRoom.left > 1 ? 'open' : 'done'} className="text-[9px] font-black uppercase rounded px-1.5 py-0.5 bg-[#FFF3C4] text-[#7a5a00] border border-[#F2D45C]" title="This shift was asked to finish this room before anything else: every person who can work it is put on it first.">★ finishes first</span>}
                                 <span className="text-[11px] font-bold text-slate-500">{fmtMins(r.rem)} of work{r.left > 1 ? ' · ' + fmtMins(r.left) + ' left for a later shift' : ' · done this shift'}</span>
                             </div>
                             <div className="p-2 grid grid-cols-1 md:grid-cols-2 gap-2">
@@ -6794,6 +7161,11 @@ export default function App(props) {
                 {prodRooms.map(roomCard)}
                 {ownArea(fixedProd, 'own-prod')}
                 {view.waiting.length > 0 && <div className="text-[11px] font-bold text-slate-500">Waiting for a later shift: {view.waiting.map(function(r) { return r.name + ' (P' + r.priority + ')'; }).join(', ')}</div>}
+                {dutyPlan.on && (dutyPlan.extras[w.key] || []).length > 0 && (
+                    <div data-auto-extras={(dutyPlan.extras[w.key] || []).length} className="text-[11px] font-bold text-slate-600" title="No room was open to them for a good part of the shift (waiting for production, at its Max Workers or taken), so they help a support role for this shift. Limits are on the rules card above.">
+                        Extra heads on support this shift: {(dutyPlan.extras[w.key] || []).map(function(x) { return laneRoster[x.lane].name + ' → ' + dutyRoleOf(x.role).label; }).join(' · ')}
+                    </div>
+                )}
                 {view.floaters.length > 0 && <div className="text-[11px] font-bold text-slate-500">Leaders with no team this shift: {view.floaters.map(function(f) { return f.name; }).join(', ')}</div>}
                 {view.unplaced.length > 0 && <div className="text-[11px] font-bold text-amber-700">Not placed: {view.unplaced.map(function(u) { return u.name + ' (' + u.why + ')'; }).join(', ')}</div>}
                 {supCount > 0 && (prodRooms.length > 0 || fixedProd.length > 0) && supportHeader(foldKey, supRooms.length, fixedSup.length > 0 ? fixedSup.length + ' on their own area' : '')}
@@ -6819,7 +7191,22 @@ export default function App(props) {
     // With a shift picked on the Gantt, the blank-space numbers count that shift only.
     const idleWithin = function(gaps, lo, hi) { return gaps.reduce(function(a, g) { const s0 = Math.max(g.start, lo), e0 = Math.min(g.end, hi); return e0 > s0 ? a + (e0 - s0) : a; }, 0); };
     const laneIdleShown = laneIdle.map(function(li) { return ganttWindow ? idleWithin(li.gaps, ganttWindow.start, ganttWindow.end) : li.mins; });
+    const dutyWithin = function(lane, lo, hi) { return dutyPlan.on && dutyPlan.byLane[lane] ? idleWithin(dutyPlan.byLane[lane], lo, hi) : 0; };   // minutes of support duty (PBED)
     const visibleIdle = visibleLanes.reduce(function(acc, l) { const m = laneIdleShown[l.lane] || 0; if (!l.isLead && m > 0) { acc.mins += m; acc.people++; } return acc; }, { mins: 0, people: 0 });
+    // PBED's plan summary strip: what the people shown are doing, in hours (this shift only when one is picked).
+    const calmStats = (function() {
+        const out = { people: 0, equipMins: 0, dutyMins: 0 };
+        if (IS_CURRENT) return out;
+        const lo = ganttWindow ? ganttWindow.start : 0, hi = ganttWindow ? ganttWindow.end : Infinity;
+        visibleLanes.forEach(function(l) {
+            if (l.isLead) return;
+            out.people++;
+            const w = scheduleData.workers[l.lane];
+            if (w) w.schedule.forEach(function(x) { const a = Math.max(x.start, lo), b = Math.min(x.end, hi); if (b > a) out.equipMins += b - a; });
+            out.dutyMins += dutyWithin(l.lane, lo, hi);
+        });
+        return out;
+    })();
     // Lines picked in Shift Start that no equipment area is named after (so their rooms can't be shown).
     const shiftStartNoEquipLines = shiftStartLines ? lineIndex.filter(function(l) { return shiftStartLines[l.id] && !(lineAssets[l.id] || []).length; }).map(function(l) { return l.name; }) : [];
 
@@ -6836,7 +7223,7 @@ export default function App(props) {
         const teamTxt = l.isLead ? (st.tasks ? st.tasks + ' task' + (st.tasks === 1 ? '' : 's') + ' · ' : '') + (l.teamNames.length ? 'Team of ' + l.teamNames.length + ' · ' + l.teamNames.join(', ') : 'No team assigned') : '';
         const wk = scheduleData.workers[l.lane];
         return (
-            <div key={o.key} data-lane={o.mark ? undefined : l.lane} data-stack-lane={o.mark ? l.lane : undefined} data-idle={o.mark ? undefined : (wk ? Math.round(wk.idleMins || 0) : 0)} data-gaps={o.mark ? undefined : (wk ? JSON.stringify((wk.idleGaps || []).map(function(g) { return [Math.round(g.start), Math.round(g.end)]; })) : '[]')} className={`border-b border-gray-200/60 flex flex-col justify-center px-2 overflow-hidden ${l.isLead ? '' : 'bg-white'} ${o.crewStart ? 'border-t-2 border-t-slate-400' : ''}`} style={{ height: `${LANE_HEIGHT_PX}px`, minHeight: `${LANE_HEIGHT_PX}px`, maxHeight: `${LANE_HEIGHT_PX}px`, flex: `0 0 ${LANE_HEIGHT_PX}px`, boxSizing: 'border-box', borderLeft: gc ? `4px solid ${gc}` : ac ? `4px solid ${ac}` : undefined, paddingLeft: isMember ? '16px' : undefined, backgroundColor: l.isLead && gc ? gc + '1f' : l.isLead ? '#f1f5f9' : ac ? tintOf(ac, 0.12) : undefined }} title={l.isLead ? `${l.name} — Lead (${l.crew} crew)${st.tasks ? ' — ' + (st.bookedMins / 60).toFixed(1) + 'h of tasks, the rest is leadership' : ''}${l.teamNames.length ? '\nTeam: ' + l.teamNames.join(', ') : ''}` : `${l.name} (${l.crew} crew)${l.room ? ' — room: ' + l.room : ''}${l.leadKey ? ' — team of ' + (laneRoster.find(function(x) { return x.key === l.leadKey; }) || {}).name : ''} — ${(st.bookedMins / 60).toFixed(1)}h assigned of ${(st.availMins / 60).toFixed(0)}h on shift${st.idle > 0 ? ' — ' + fmtMins(st.idle) + ' blank space' + (ganttWindow || stack ? ' this shift' : '') : ''}${ac ? '\n' + AREA_ROLE_INFO[l.kind].label + ': the whole shift is the area\'s' + (acTasks.length ? '\n' + acTasks.map(function(t) { return (t.label || 'Task') + ' ' + clockLabelOf(t.from) + ' to ' + clockLabelOf(t.to); }).join('\n') : '') : ''}`}>
+            <div key={o.key} data-lane={o.mark ? undefined : l.lane} data-stack-lane={o.mark ? l.lane : undefined} data-idle={o.mark ? undefined : (wk ? Math.round(wk.idleMins || 0) : 0)} data-gaps={o.mark ? undefined : (wk ? JSON.stringify((wk.idleGaps || []).map(function(g) { return [Math.round(g.start), Math.round(g.end)]; })) : '[]')} className={`border-b border-gray-200/60 flex flex-col justify-center px-2 overflow-hidden ${l.isLead ? '' : 'bg-white'} ${o.crewStart ? 'border-t-2 border-t-slate-400' : ''}`} style={{ height: `${LANE_HEIGHT_PX}px`, minHeight: `${LANE_HEIGHT_PX}px`, maxHeight: `${LANE_HEIGHT_PX}px`, flex: `0 0 ${LANE_HEIGHT_PX}px`, boxSizing: 'border-box', borderLeft: gc ? `4px solid ${gc}` : ac ? `4px solid ${ac}` : undefined, paddingLeft: isMember ? '16px' : undefined, backgroundColor: l.isLead && gc ? gc + '1f' : l.isLead ? '#f1f5f9' : ac ? tintOf(ac, 0.12) : undefined }} title={l.isLead ? `${l.name} — Lead (${l.crew} crew)${st.tasks ? ' — ' + (st.bookedMins / 60).toFixed(1) + 'h of tasks, the rest is leadership' : ''}${l.teamNames.length ? '\nTeam: ' + l.teamNames.join(', ') : ''}` : `${l.name} (${l.crew} crew)${l.room ? ' — room: ' + l.room : ''}${l.leadKey ? ' — team of ' + (laneRoster.find(function(x) { return x.key === l.leadKey; }) || {}).name : ''} — ${(st.bookedMins / 60).toFixed(1)}h assigned of ${(st.availMins / 60).toFixed(0)}h on shift${st.duty > 0 ? ' — ' + fmtMins(st.duty) + ' support duty' : ''}${st.idle > 0 ? ' — ' + fmtMins(st.idle) + ' blank space' + (ganttWindow || stack ? ' this shift' : '') : ''}${ac ? '\n' + AREA_ROLE_INFO[l.kind].label + ': the whole shift is the area\'s' + (acTasks.length ? '\n' + acTasks.map(function(t) { return (t.label || 'Task') + ' ' + clockLabelOf(t.from) + ' to ' + clockLabelOf(t.to); }).join('\n') : '') : ''}`}>
                 <div className="flex items-center gap-1.5 min-w-0">
                     <span className={`text-[9px] font-black rounded px-1 py-0.5 flex-shrink-0 ${getCrewStyle(l.crew).badge}`}>{l.crew}</span>
                     <span className={`text-[11px] ${l.isLead ? 'font-black' : 'font-bold'} truncate min-w-0 ${l.isPlaceholder ? 'text-slate-400 italic' : 'text-slate-800'}`}>{l.name}</span>{roleTag(l)}
@@ -6846,7 +7233,7 @@ export default function App(props) {
                 ) : (
                     <div className="flex items-center gap-1.5 mt-1">
                         <div className="flex-1 min-w-0 h-1 bg-slate-100 rounded-full overflow-hidden"><div className={`h-full ${pct > 100 ? 'bg-rose-500' : 'bg-[#0072CE]'}`} style={{ width: `${Math.min(100, pct)}%` }} /></div>
-                        <span className="text-[9px] font-black text-slate-400 text-right whitespace-nowrap flex-shrink-0">{(st.bookedMins / 60).toFixed(1)}h · {st.done}/{st.tasks}{st.idle > 0 && <span className="text-[#B07800]"> · {fmtMins(st.idle)} idle</span>}</span>
+                        <span className="text-[9px] font-black text-slate-400 text-right whitespace-nowrap flex-shrink-0">{(st.bookedMins / 60).toFixed(1)}h · {st.done}/{st.tasks}{st.duty > 0 && <span data-duty-mins={Math.round(st.duty)} className="text-slate-500"> · {fmtMins(st.duty)} duty</span>}{st.idle > 0 && <span className="text-[#B07800]"> · {fmtMins(st.idle)} idle</span>}</span>
                     </div>
                 )}
             </div>
@@ -6862,7 +7249,7 @@ export default function App(props) {
             booked += x.end - x.start; tasks++;
             if (t && t.isComplete) done++;
         });
-        return { availMins: sl.end - sl.start, bookedMins: booked, tasks: tasks, done: done, idle: idleWithin(laneIdle[sl.lane].gaps, sl.start, sl.end) };
+        return { availMins: sl.end - sl.start, bookedMins: booked, tasks: tasks, done: done, idle: idleWithin(laneIdle[sl.lane].gaps, sl.start, sl.end), duty: dutyWithin(sl.lane, sl.start, sl.end) };
     };
     // The names column of one shift on the one-line view: a card on each row somebody works that shift, grey where nobody does.
     const renderStackNames = function(gi, mark) {
@@ -7072,7 +7459,7 @@ export default function App(props) {
                                     <input type="number" min="5" max="240" value={tailFillDraft !== null ? tailFillDraft : tailFillMins} onChange={function(e) { setTailFillDraft(e.target.value); }} onBlur={commitTailFill} onKeyDown={function(e) { if (e.key === 'Enter') e.target.blur(); }} className="w-14 border border-slate-300 rounded p-1 text-xs font-bold outline-none no-pan text-center" title="The rest of that clean continues later in the shift or on a later shift (a later shift adds the handover minutes set on the Crew tab)" />
                                     <span className="text-[11px] font-bold text-slate-600">working minutes</span>
                                 </div>
-                                <p className="text-[11px] font-bold text-slate-500 mt-2">Each shift, a piece of equipment goes to the person Shift Start gave it to, then anyone else on that room, then the rest of that team, then anyone on the shift whose role allows it. People fill their own room first (whole cleans, then parts of cleans) before they help their team, and their team before the rest of the shift. When a shift has more work than its Tech 1s and 2s can do, Tech 3s and Inspectors get the PIC work first, and Tech 1s and 2s do regular cleaning first, taking PIC when they run out of it or when no Tech 3 or Inspector has time left for it. Shorter jobs fill the gaps between longer ones, and a job longer than a shift starts at clock-in. Any blank space left is outlined in yellow on the Gantt. {leadKind === 'leadership' ? 'Leads take no tasks (set on the Crew tab).' : leadKind === 'pic' ? 'Leads (set on the Crew tab) are given the PIC items (Subcategory "1 - pic"): a lead takes the PIC in their own team\'s rooms, then the shift\'s, as whole cleans, after any Tech 3 or Inspector who could take it (PIC is all they can do) and before a Tech 1 or 2, who keeps to regular cleaning while a lead can take the PIC and picks up PIC only when no lead, Tech 3 or Inspector has time for it. On a 2-person PIC clean the lead pairs with someone on the room or shift; a PIC clean too long for one shift starts with the lead at clock-in. PIC Shift Start hand-placed on someone stays with them. The rest of a lead\'s shift shows as Leadership.' : 'Leads (set on the Crew tab) keep what Shift Start gave them. Otherwise they come last, after the crew is planned: a lead takes PIC nobody on this or a later shift can get to, their own team\'s first, then regular cleaning nobody can get to. The rest of their shift shows as Leadership.'}</p>
+                                <p className="text-[11px] font-bold text-slate-500 mt-2">Each shift, a piece of equipment goes to the person Shift Start gave it to, then anyone else on that room, then the rest of that team, then anyone on the shift whose role allows it. People fill their own room first (whole cleans, then parts of cleans) before they help their team, and their team before the rest of the shift.{focusK > 0 ? ' The rooms a shift is asked to finish first (Crew tab) come before all of this: everyone who can work them takes them before their own room.' : ''} When a shift has more work than its Tech 1s and 2s can do, Tech 3s and Inspectors get the PIC work first, and Tech 1s and 2s do regular cleaning first, taking PIC when they run out of it or when no Tech 3 or Inspector has time left for it. Shorter jobs fill the gaps between longer ones, and a job longer than a shift starts at clock-in. Any blank space left is outlined in yellow on the Gantt. {leadKind === 'leadership' ? 'Leads take no tasks (set on the Crew tab).' : leadKind === 'pic' ? 'Leads (set on the Crew tab) are given the PIC items (Subcategory "1 - pic"): a lead takes the PIC in their own team\'s rooms, then the shift\'s, as whole cleans, after any Tech 3 or Inspector who could take it (PIC is all they can do) and before a Tech 1 or 2, who keeps to regular cleaning while a lead can take the PIC and picks up PIC only when no lead, Tech 3 or Inspector has time for it. On a 2-person PIC clean the lead pairs with someone on the room or shift; a PIC clean too long for one shift starts with the lead at clock-in. PIC Shift Start hand-placed on someone stays with them. The rest of a lead\'s shift shows as Leadership.' : 'Leads (set on the Crew tab) keep what Shift Start gave them. Otherwise they come last, after the crew is planned: a lead takes PIC nobody on this or a later shift can get to, their own team\'s first, then regular cleaning nobody can get to. The rest of their shift shows as Leadership.'}</p>
                             </div>
                         </div>
 
@@ -7425,6 +7812,7 @@ export default function App(props) {
                                             blocks.forEach(function(t) { booked += Math.min(win.end, t.startMin + t.finalDuration) - Math.max(win.start, t.startMin); });
                                             const pct = winLen > 0 ? Math.round((booked / winLen) * 100) : 0;
                                             const doneCount = blocks.filter(function(t) { return t.isComplete; }).length;
+                                            const dutyHere = dutyPlan.on ? (dutyPlan.bars[l.lane] || []).filter(function(b) { return b.start < win.end && b.end > win.start; }) : [];   // PBED support duty
                                             const gc = l.groupIdx >= 0 ? TEAM_COLORS[l.groupIdx % TEAM_COLORS.length] : null;
                                             if (l.isLead && blocks.length === 0) {
                                                 return (
@@ -7452,7 +7840,7 @@ export default function App(props) {
                                                             </div>
                                                         </div>
                                                     </div>
-                                                    {blocks.length === 0 ? (
+                                                    {blocks.length === 0 && dutyHere.length === 0 ? (
                                                         <div className="px-4 py-4 text-sm font-bold text-slate-400">No assignments this shift — available to help.</div>
                                                     ) : (
                                                         <div className="divide-y divide-slate-100">
@@ -7470,6 +7858,18 @@ export default function App(props) {
                                                                             </div>
                                                                             <div className={`font-bold text-sm mt-0.5 ${t.isComplete ? 'text-slate-400 line-through' : 'text-slate-800'}`}>{t.name}</div>
                                                                             <div className="text-[11px] font-bold text-slate-500">{t.originalArea}{partners.length ? ' · with ' + partners.join(', ') : ''}</div>
+                                                                        </div>
+                                                                    </div>
+                                                                );
+                                                            })}
+                                                            {dutyHere.map(function(b, bi) {
+                                                                return (
+                                                                    <div key={'duty' + bi} data-print-duty={b.role} className="px-4 py-2.5 flex items-start gap-3">
+                                                                        <div className="w-1.5 self-stretch rounded-full" style={{ backgroundColor: b.color }} />
+                                                                        <div className="flex-1 min-w-0">
+                                                                            <div className="text-[11px] font-black text-slate-500">{formatClockTime(ganttStartDate, ganttStartHour, Math.max(b.start, win.start))} – {formatClockTime(ganttStartDate, ganttStartHour, Math.min(b.end, win.end)).replace(/^\S+ /, '')}</div>
+                                                                            <div className="font-bold text-sm mt-0.5 text-slate-800">{b.label} duty{b.src === 'extra' ? ' (extra head)' : ''}</div>
+                                                                            <div className="text-[11px] font-bold text-slate-500">{b.room}</div>
                                                                         </div>
                                                                     </div>
                                                                 );
@@ -7551,7 +7951,7 @@ export default function App(props) {
                                             <option value="autoall">Auto crews for every shift (ignore what Shift Start saved)</option>
                                             <option value="shiftstart">Shift Start only (a shift with nothing saved uses the employee table)</option>
                                         </select>
-                                        <p className="text-[11px] font-bold text-slate-500 mt-1.5">{autoCrews ? "Each shift gets its leaders, a room for each leader (the priority rooms first, to the lead with the most time on them; a lead whose usual team knows the room counts for more), and a team built for that room, best fit first: who has spent the most hours in it (counted like the Manager's Hub), who usually works under that lead, and who has worked together before. Chemical, admin and janitorial people stay on their own area. A team stays together on its room and only divides across rooms with the same priority. When a team is done early, its people take cleans that are queued in other rooms (shown faded on their line in the room view)." : 'Crews come from what Shift Start saved; a future shift uses the employee table.'}</p>
+                                        <p className="text-[11px] font-bold text-slate-500 mt-1.5">{autoCrews ? "Each shift gets its leaders, a room for each leader (the priority rooms first, to the lead with the most time on them; a lead whose usual team knows the room counts for more), and a team built for that room, best fit first: who has spent the most hours in it (counted like the Manager's Hub), who usually works under that lead, and who has worked together before. Chemical, admin, janitorial and trash people stay on their own area. A team stays together on its room and only divides across rooms with the same priority. When a team is done early, its people take cleans that are queued in other rooms (shown faded on their line in the room view)." : 'Crews come from what Shift Start saved; a future shift uses the employee table.'}</p>
                                     </div>
                                     {autoCrews && (
                                         <div data-auto-status className="flex flex-wrap items-center gap-2 text-[11px] font-bold">
@@ -7562,6 +7962,33 @@ export default function App(props) {
                                             <button onClick={function() { loadExperience(); }} disabled={expState.status === 'loading'} className="bg-white border border-slate-300 rounded px-2 py-0.5 text-slate-700 hover:bg-slate-50 disabled:opacity-50">Reload history</button>
                                         </div>
                                     )}
+                                    <div data-shift-rules className="rounded-lg border border-slate-200 bg-slate-50/70 p-3 grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <div>
+                                            <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Rooms each shift finishes</label>
+                                            <select data-rooms-per-shift value={roomsPerShift} disabled={!autoCrews} onChange={function(e) { setRoomsPerShift(Number(e.target.value) || 0); }} className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none no-pan bg-white cursor-pointer disabled:opacity-50">
+                                                <option value={2}>Up to 2 rooms, highest priority first</option>
+                                                <option value={1}>1 room, highest priority first</option>
+                                                <option value={0}>Off: spread the crew over every room</option>
+                                            </select>
+                                            <p className="text-[11px] font-bold text-slate-500 mt-1.5">{autoCrews ? 'Each shift puts every person who can work them on the one or two highest-priority rooms that are open to it and finishes those before it starts the rest, so a room is done by the end of the shift instead of everything being half done. The first room is worked first even when it cannot be finished in the shift; a second room only when it fits in the time that is left (otherwise the next room that fits takes its place). A room waiting for production is skipped for the next one. The trade-off: lower-priority rooms can start later than they would have, and a plan that is already overloaded can run a little longer.' : 'Needs auto crews (Crews & rooms are built by).'}</p>
+                                            {autoCrews && roomsPerShift > 0 && savedBoardShifts > 0 && <p data-saved-board-hint className="text-[11px] font-bold text-amber-800 mt-1">{savedBoardShifts} shift{savedBoardShifts === 1 ? '' : 's'} in this plan {savedBoardShifts === 1 ? 'uses' : 'use'} a board saved in Shift Start, so their crews are kept as saved and are not asked to finish rooms first. Choose "Auto crews for every shift" above to change that.</p>}
+                                        </div>
+                                        <div>
+                                            <label className="flex items-center gap-2 text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5 cursor-pointer"><input data-duty-on type="checkbox" checked={dutyOn} onChange={function(e) { setDutyOn(e.target.checked); }} className="no-pan" /> Support roles keep their role all shift</label>
+                                            <p className="text-[11px] font-bold text-slate-500">Janitorial, Chemical, Trash and Admin people hold that role for the whole shift. Their time with no equipment shows as the role's duty, never as blank space, and a Trash role with no equipment shows as a Trash block. When no room is open to a Tech 1 or 2, they become an extra head on a support role, up to:</p>
+                                            <div className="flex flex-wrap items-center gap-3 mt-1.5">
+                                                {DUTY_EXTRA.map(function(k) {
+                                                    return (
+                                                        <label key={k} className="flex items-center gap-1 text-[11px] font-bold text-slate-700">
+                                                            <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: dutyRoleOf(k).color }} />{dutyRoleOf(k).label}
+                                                            <input data-duty-heads={k} type="number" min="0" max="12" value={dutyHeads[k]} disabled={!dutyOn} onChange={function(e) { const n = Math.max(0, Math.min(12, Math.round(Number(e.target.value) || 0))); setDutyHeads(function(prev) { const nx = Object.assign({}, prev); nx[k] = n; return nx; }); }} className="w-12 border border-slate-300 rounded px-1.5 py-0.5 text-[11px] font-bold outline-none no-pan bg-white disabled:opacity-50" />
+                                                        </label>
+                                                    );
+                                                })}
+                                                <span className="text-[10px] font-bold text-slate-400">extra heads per shift</span>
+                                            </div>
+                                        </div>
+                                    </div>
                                     {!autoCrews && (
                                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                     <div>
@@ -7711,7 +8138,7 @@ export default function App(props) {
                                     )}
                                     {!IS_CURRENT && rosterInfo.jobRoles.length > 0 && (
                                         <div className="w-full mt-1 space-y-1">
-                                            <div className="text-slate-600">What each job role (_aa_Role) is assigned — Techs 1 / 2 do regular cleaning and PIC items; Tech 3 only PIC; Inspectors PIC plus admin (data entry) on nights; Chemical Clerk, Admin and Janitorial only their own area; leads {leadKind === 'leadership' ? 'no tasks, only leadership' : leadKind === 'pic' ? 'are given the PIC items (their own team\'s rooms first), after any Tech 3 or Inspector and before Techs 1 / 2; the rest of their shift is leadership' : 'keep what Shift Start gives them and take PIC items, then regular cleaning, nobody else can get to; the rest of their shift is leadership'}:</div>
+                                            <div className="text-slate-600">What each job role (_aa_Role) is assigned — Techs 1 / 2 do regular cleaning and PIC items; Tech 3 only PIC; Inspectors PIC plus admin (data entry) on nights; Chemical Clerk, Admin and Janitorial only their own area{IS_CURRENT ? '' : ' (Trash has no equipment: its shift is the Trash duty)'}; leads {leadKind === 'leadership' ? 'no tasks, only leadership' : leadKind === 'pic' ? 'are given the PIC items (their own team\'s rooms first), after any Tech 3 or Inspector and before Techs 1 / 2; the rest of their shift is leadership' : 'keep what Shift Start gives them and take PIC items, then regular cleaning, nobody else can get to; the rest of their shift is leadership'}:</div>
                                             <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                                                 <label className={`flex items-center gap-1.5 text-[11px] font-bold rounded-lg px-2 py-1 border ${leadKind === 'leadership' ? 'bg-slate-100 text-slate-400 border-slate-200' : 'bg-white text-emerald-900 border-emerald-300'}`} title="Equipment Shift Start gives a lead stays with them when this setting allows that work. PIC items first: leads are given the PIC items (Subcategory 1 - pic), their own team's rooms first, after any Tech 3 / Inspector who could take it and before Techs 1 / 2. Regular cleaning + PIC: leads come last, after the crew is planned, on PIC and regular cleaning nobody else can fit. Time with no task shows as Leadership, not blank space.">
                                                     <span>Leads ({leadCount})</span>
@@ -8107,12 +8534,12 @@ export default function App(props) {
 
                     {/* Gantt Header & Room Key */}
                     <div className="bg-slate-50 px-5 py-2 border-b border-slate-200 flex flex-wrap gap-4 items-center shadow-inner z-10 flex-shrink-0">
-                        <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest mr-2">Color Key:</span>
+                        <span className={IS_CURRENT ? 'text-[10px] font-black text-slate-500 uppercase tracking-widest mr-2' : 'text-[10px] font-bold text-slate-400 uppercase tracking-widest mr-1'}>{IS_CURRENT ? 'Color Key:' : 'Color Key'}</span>
                         {shownRooms.map(function(room) {
                             return (
                                 <div key={room} className="flex items-center gap-1.5">
                                     <div className={`w-3 h-3 rounded-full ${getRoomColor(room)}`} style={bgOf(roomHex(room))}></div>
-                                    <span className="text-[10px] font-bold text-slate-700 uppercase tracking-wider">{room}</span>
+                                    <span className={IS_CURRENT ? 'text-[10px] font-bold text-slate-700 uppercase tracking-wider' : 'text-[11px] font-semibold text-slate-600'}>{room}</span>
                                 </div>
                             );
                         })}
@@ -8174,7 +8601,38 @@ export default function App(props) {
                             )}
                         </div>
                     )}
-                    {!genericView && (scheduleData.unscheduled.length > 0 || countLate > 0 || countConflict > 0) && (
+                    {!IS_CURRENT && !genericView && (
+                        <div data-plan-summary className="bg-white border-b border-slate-200 px-5 py-1.5 text-[11px] font-bold text-slate-600 flex flex-wrap items-center gap-x-5 gap-y-1 flex-shrink-0">
+                            <span className="flex items-center gap-1.5"><Users className="w-3.5 h-3.5 text-slate-400" /><span className="font-black text-slate-800">{calmStats.people}</span> {calmStats.people === 1 ? 'person' : 'people'}</span>
+                            <span data-sum-equip={Math.round(calmStats.equipMins)}><span className="font-black text-slate-800">{fmtMins(calmStats.equipMins)}</span> on equipment</span>
+                            {calmStats.dutyMins > 0 && <span data-sum-duty={Math.round(calmStats.dutyMins)} title="Time of support roles, and of extra heads, with no equipment: shown as the role's duty, not blank space"><span className="font-black text-slate-800">{fmtMins(calmStats.dutyMins)}</span> on support duty</span>}
+                            {activeTab === 'gantt' && (
+                                <span data-blank-total={Math.round(visibleIdle.mins)} className={visibleIdle.mins > 0 ? 'text-[#8A5A00]' : 'text-slate-400'} title="Time on shift with nothing booked that none of the work left for that shift fits. Point at a yellow box to see why it is blank.">
+                                    <span className="font-black">{visibleIdle.mins > 0 ? fmtMins(visibleIdle.mins) : 'No'}</span> blank {ganttWindow ? 'in this shift' : 'on shift'}{visibleIdle.mins > 0 ? ' across ' + visibleIdle.people + ' ' + (visibleIdle.people === 1 ? 'person' : 'people') + ' · point at one to see why it is blank' : ''}
+                                </span>
+                            )}
+                            <span className="ml-auto flex flex-wrap items-center gap-1.5">
+                                {scheduleData.unscheduled.length > 0 && <span data-sum-overflow className="rounded-full border border-rose-200 bg-rose-50 text-rose-700 px-2 py-0.5" title="Work that does not fit in the plan window: extend the plan or add people">{scheduleData.unscheduled.length} task{scheduleData.unscheduled.length === 1 ? '' : 's'} ({(unscheduledWorkMins / 60).toFixed(1)} manpower hrs) overflow the plan window</span>}
+                                {countLate > 0 && <span className="rounded-full border border-rose-200 bg-rose-50 text-rose-700 px-2 py-0.5">{countLate} late / overrun</span>}
+                                {countConflict > 0 && <span className="rounded-full border border-amber-200 bg-amber-50 text-amber-800 px-2 py-0.5">{countConflict} double-booked block{countConflict === 1 ? '' : 's'}</span>}
+                            </span>
+                            {activeTab === 'gantt' && shiftRooms.length > 0 && (
+                                <div data-shift-rooms className="basis-full flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px]">
+                                    <span className="font-black uppercase tracking-widest text-slate-400">Rooms finished</span>
+                                    {shiftRooms.filter(function(x) { return !ganttWindow || x.w.key === ganttWindow.key; }).map(function(x) {
+                                        return (
+                                            <span key={x.w.key} data-shift-rooms-of={x.w.key} className="flex flex-wrap items-center gap-1 min-w-0">
+                                                <span className={`font-black rounded px-1.5 py-0.5 whitespace-nowrap ${getCrewStyle(x.w.crew).badge}`}>{x.w.crew} · {x.w.dayLabel} {formatHourLabel(x.w.startHour)}</span>
+                                                {x.done.length === 0 && x.notDone.length === 0 ? <span className="text-slate-400 font-semibold">none</span> : x.done.map(function(d) { return <span key={d.room} data-room-finished={d.room} data-room-first={d.first ? '1' : '0'} title={(d.first ? 'Asked to be finished first this shift. ' : '') + (d.carried ? 'Started in an earlier shift and finished in this one' : 'Started and finished in this shift')} className={`rounded border font-bold px-1.5 py-0.5 ${d.first ? 'border-[#B3D4F2] bg-[#E6F1FB] text-[#00468B]' : 'border-slate-200 bg-slate-50 text-slate-700'}`}>{d.first ? '★ ' : ''}{d.room}{d.carried ? ' ↩' : ''}</span>; })}
+                                                {x.notDone.map(function(f) { return <span key={'nd' + f.id} data-room-first-open={f.name} title={'Asked to be finished first this shift, but ' + (f.left > 1 ? fmtMins(f.left) + ' of manpower work did not fit, so it carries to the next shift (or past the plan window).' : 'its last clean ends after the shift.')} className="rounded border border-amber-200 bg-amber-50 text-amber-900 font-bold px-1.5 py-0.5">★ {f.name}{f.left > 1 ? ' · ' + fmtMins(f.left) + ' left' : ''}</span>; })}
+                                            </span>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                        </div>
+                    )}
+                    {IS_CURRENT && !genericView && (scheduleData.unscheduled.length > 0 || countLate > 0 || countConflict > 0) && (
                         <div className="bg-rose-50 border-b border-rose-200 px-5 py-1.5 text-[11px] font-bold text-rose-700 flex items-center gap-4 flex-shrink-0">
                             <AlertCircle className="w-3.5 h-3.5" />
                             {scheduleData.unscheduled.length > 0 && <span>{scheduleData.unscheduled.length} task{scheduleData.unscheduled.length === 1 ? '' : 's'} ({(unscheduledWorkMins / 60).toFixed(1)} manpower hrs) overflow the plan window</span>}
@@ -8202,10 +8660,10 @@ export default function App(props) {
                             <span>Generic timeline: each room's equipment end to end by priority, from when the room is handed over, with the people each piece needs. It ignores who is on shift, breaks, crews, Max Workers and roles, so it shows the work, not the plan. Click a room's bars to open it, one row per piece.</span>
                         </div>
                     )}
-                    {activeTab === 'gantt' && !genericView && visibleIdle.mins > 0 && (
+                    {IS_CURRENT && activeTab === 'gantt' && !genericView && visibleIdle.mins > 0 && (
                         <div className="bg-[#FFF6E0] border-b border-[#FFB81C]/60 px-5 py-1.5 text-[11px] font-bold text-[#8A5A00] flex items-center gap-2 flex-shrink-0" data-blank-total={Math.round(visibleIdle.mins)}>
                             <Clock className="w-3.5 h-3.5 flex-shrink-0" />
-                            <span>{fmtMins(visibleIdle.mins)} of blank space {ganttWindow ? 'in this shift' : 'on shift'} across {visibleIdle.people} {visibleIdle.people === 1 ? 'person' : 'people'}, outlined in yellow: none of the work left for that shift that they're allowed to do fits there.{!IS_CURRENT && ' Point at one to see why it is blank.'}</span>
+                            <span>{fmtMins(visibleIdle.mins)} of blank space {ganttWindow ? 'in this shift' : 'on shift'} across {visibleIdle.people} {visibleIdle.people === 1 ? 'person' : 'people'}, outlined in yellow: none of the work left for that shift that they're allowed to do fits there.</span>
                         </div>
                     )}
 
@@ -8292,14 +8750,14 @@ export default function App(props) {
                                                 <RefreshCw className="w-3.5 h-3.5 mr-1" /> Clear Moves ({Object.keys(overrides).length})
                                             </Button>
                                         )}
-                                        {!IS_CURRENT && <div className="flex items-center gap-2 bg-white px-2 py-1 rounded-lg border border-slate-200 shadow-sm">
-                                            <Button variant="outline" onClick={function() { setIncludeTransit(!includeTransit); }} className={`transition-colors text-[10px] px-2 py-1 ${includeTransit ? 'bg-slate-600 text-white border-slate-500' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`} title="Add Prep/Transit Block to Tasks">
+                                        {!IS_CURRENT && <div className="flex items-center gap-1.5">
+                                            <Button variant="outline" size="sm" onClick={function() { setIncludeTransit(!includeTransit); }} className={`transition-colors text-[10px] px-2 py-1 ${includeTransit ? 'bg-slate-600 text-white border-slate-500' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`} title="Add Prep/Transit Block to Tasks">
                                                 <Truck className="w-3 h-3 mr-1" /> Transit
                                             </Button>
-                                            <Button variant="outline" onClick={function() { setIncludeInspection(!includeInspection); }} className={`transition-colors text-[10px] px-2 py-1 ${includeInspection ? 'bg-amber-500/20 text-amber-600 border-amber-500/50' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`} title="Add Inspection Phase to Tasks">
+                                            <Button variant="outline" size="sm" onClick={function() { setIncludeInspection(!includeInspection); }} className={`transition-colors text-[10px] px-2 py-1 ${includeInspection ? 'bg-amber-500/20 text-amber-600 border-amber-500/50' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`} title="Add Inspection Phase to Tasks">
                                                 <Activity className="w-3 h-3 mr-1" /> Inspect
                                             </Button>
-                                            {!genericView && (<Button variant="outline" onClick={function() { setIncludeBreaks(!includeBreaks); }} className={`transition-colors text-[10px] px-2 py-1 ${includeBreaks ? 'bg-amber-500/20 text-amber-600 border-amber-500/50' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`} title="Toggles Standard Shift breaks">
+                                            {!genericView && (<Button variant="outline" size="sm" onClick={function() { setIncludeBreaks(!includeBreaks); }} className={`transition-colors text-[10px] px-2 py-1 ${includeBreaks ? 'bg-amber-500/20 text-amber-600 border-amber-500/50' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`} title="Toggles Standard Shift breaks">
                                                 <Coffee className="w-3 h-3 mr-1" /> Breaks
                                             </Button>)}
                                         </div>}
@@ -8389,7 +8847,7 @@ export default function App(props) {
                                         <div data-gantt-names={stack ? leftIdx : undefined} className="sticky left-0 w-[190px] flex-shrink-0 bg-slate-50 border-r border-gray-300 z-30 shadow-[4px_0_10px_rgba(0,0,0,0.03)] flex flex-col relative no-pan" style={{ height: `${chartRows * LANE_HEIGHT_PX}px` }}>
                                             {stack ? renderStackNames(leftIdx, false) : visibleLanes.map(function(l) {
                                                 const ws = workerStats[l.lane];
-                                                return renderLaneCard(l, { availMins: ws ? ws.availMins : 0, bookedMins: ws ? ws.bookedMins : 0, tasks: ws ? ws.tasks : 0, done: ws ? ws.done : 0, idle: laneIdleShown[l.lane] || 0 }, { key: l.lane, crewStart: crewBlocks.some(function(b) { return b.firstLane === l.lane && l.lane > visibleLaneLo; }) });
+                                                return renderLaneCard(l, { availMins: ws ? ws.availMins : 0, bookedMins: ws ? ws.bookedMins : 0, tasks: ws ? ws.tasks : 0, done: ws ? ws.done : 0, idle: laneIdleShown[l.lane] || 0, duty: ganttWindow ? dutyWithin(l.lane, ganttWindow.start, ganttWindow.end) : dutyWithin(l.lane, 0, Infinity) }, { key: l.lane, crewStart: crewBlocks.some(function(b) { return b.firstLane === l.lane && l.lane > visibleLaneLo; }) });
                                             })}
                                         </div>
 
@@ -8417,7 +8875,7 @@ export default function App(props) {
                                                     const leftPx = xOf(g.start);
                                                     const widthPx = xEnd(g.end) - leftPx;
                                                     return (
-                                                        <div key={`idle-${l.lane}-${seat.start}-${gi}`} data-idle-gap={`${Math.round(g.start)}-${Math.round(g.end)}`} className={'absolute rounded-md border-2 border-dashed border-[#FFB81C] bg-[#FFF6E0]/70 flex items-center justify-center overflow-hidden ' + (IS_CURRENT ? 'pointer-events-none' : 'pointer-events-auto cursor-help')} onMouseEnter={IS_CURRENT ? undefined : function(e) { showIdleTip(e, l.lane, g); }} onMouseMove={IS_CURRENT ? undefined : placeIdleTip} onMouseLeave={IS_CURRENT ? undefined : hideIdleTip} onClick={IS_CURRENT ? undefined : function(e) { pinIdleTip(e, l.lane, g); }} style={{ left: `${leftPx}px`, width: `${widthPx}px`, top: `${row * LANE_HEIGHT_PX + 4}px`, height: `${LANE_HEIGHT_PX - 8}px` }}>
+                                                        <div key={`idle-${l.lane}-${seat.start}-${gi}`} data-idle-gap={`${Math.round(g.start)}-${Math.round(g.end)}`} className={IS_CURRENT ? 'absolute rounded-md border-2 border-dashed border-[#FFB81C] bg-[#FFF6E0]/70 flex items-center justify-center overflow-hidden pointer-events-none' : 'absolute rounded-md border border-dashed border-[#FFB81C] bg-[#FFF6E0]/45 hover:bg-[#FFF6E0]/90 flex items-center justify-center overflow-hidden pointer-events-auto cursor-help'} onMouseEnter={IS_CURRENT ? undefined : function(e) { showIdleTip(e, l.lane, g); }} onMouseMove={IS_CURRENT ? undefined : placeIdleTip} onMouseLeave={IS_CURRENT ? undefined : hideIdleTip} onClick={IS_CURRENT ? undefined : function(e) { pinIdleTip(e, l.lane, g); }} style={{ left: `${leftPx}px`, width: `${widthPx}px`, top: `${row * LANE_HEIGHT_PX + 4}px`, height: `${LANE_HEIGHT_PX - 8}px` }}>
                                                             {widthPx > 48 && <span className="text-[9px] font-black text-[#B07800] uppercase tracking-wider truncate px-1">Idle {fmtMins(g.end - g.start)}</span>}
                                                         </div>
                                                     );
@@ -8461,6 +8919,13 @@ export default function App(props) {
                                                 });
                                             })}
 
+                                            {/* Support duty (PBED): a support role's free stretches, and an extra head's, named for the role (see SUPPORT DUTY) */}
+                                            {dutyPlan.on && chartSeats.map(function(seat) {
+                                                const l = laneRoster[seat.lane], row = seat.row;
+                                                if (l.isLead) return null;
+                                                return (dutyPlan.bars[l.lane] || []).map(function(b, bi) { return renderDutyBar(b, l, seat, row, bi); });
+                                            })}
+
                                             {/* A lead's shift is "Leadership" wherever they have no task (PIC by default; set on the Crew tab) */}
                                             {chartSeats.map(function(seat) {
                                                 const l = laneRoster[seat.lane], row = seat.row;
@@ -8484,8 +8949,8 @@ export default function App(props) {
                                                     const widthPx = Math.min(xEnd(g.end) - leftPx, GANTT_TOTAL_WIDTH_PX - leftPx);
                                                     if (widthPx < 2) return null;
                                                     return (
-                                                        <div key={`lead-${l.lane}-${seat.start}-${gi}`} data-leadership={`${Math.round(g.start)}-${Math.round(g.end)}`} className="absolute z-10 rounded-md border border-black/20 shadow-sm flex items-center justify-center overflow-hidden pointer-events-none" style={{ left: `${leftPx}px`, width: `${widthPx}px`, top: `${row * LANE_HEIGHT_PX + 2}px`, height: `${LANE_HEIGHT_PX - 4}px`, backgroundColor: gc }} title={`${l.name} — Leadership`}>
-                                                            {widthPx > 90 && <span className="text-white font-black text-[11px] uppercase tracking-[0.25em] drop-shadow-md truncate px-2">Leadership</span>}
+                                                        <div key={`lead-${l.lane}-${seat.start}-${gi}`} data-leadership={`${Math.round(g.start)}-${Math.round(g.end)}`} className={IS_CURRENT ? 'absolute z-10 rounded-md border border-black/20 shadow-sm flex items-center justify-center overflow-hidden pointer-events-none' : 'absolute z-10 rounded-md border flex items-center justify-center overflow-hidden pointer-events-none'} style={IS_CURRENT ? { left: `${leftPx}px`, width: `${widthPx}px`, top: `${row * LANE_HEIGHT_PX + 2}px`, height: `${LANE_HEIGHT_PX - 4}px`, backgroundColor: gc } : { left: `${leftPx}px`, width: `${widthPx}px`, top: `${row * LANE_HEIGHT_PX + 3}px`, height: `${LANE_HEIGHT_PX - 6}px`, backgroundColor: gc + '24', borderColor: gc + '73' }} title={`${l.name} — Leadership`}>
+                                                            {widthPx > 90 && (IS_CURRENT ? <span className="text-white font-black text-[11px] uppercase tracking-[0.25em] drop-shadow-md truncate px-2">Leadership</span> : <span className="font-black text-[10px] uppercase tracking-[0.25em] truncate px-2" style={{ color: gc }}>Leadership</span>)}
                                                         </div>
                                                     );
                                                 });
