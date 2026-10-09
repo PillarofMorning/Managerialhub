@@ -490,23 +490,26 @@ const PROD_TOP = 5000;
 const PROD_SIDE_MS = 7 * 86400000;     // runs this far either side of the shift are read, to learn which lines exist
 const DOWN_MIN_MS = 3600000;           // no run for this long inside the shift = the line is down
 const PROD_CACHE_MS = 10 * 60000;
-const PROD_ALIASES: Record<string, string[]> = { wj: ['waterjet', 'water jet'] };
-type ProdLine = { key: string; area: string; line: number; runs: { s: number; e: number }[] };
-type DownRoom = { areaId: string; name: string; lines: string[]; from: number; to: number };
-type PrdState = { status: 'idle' | 'reading' | 'ok' | 'empty' | 'missing' | 'error'; error: string; source: string; query: string; read: number; from: number; to: number; keyOf: string; lineCount: number; planLines: number; down: DownRoom[]; matched: string[]; unmatched: string[]; hasColumns: string[] };
-const PRD_IDLE: PrdState = { status: 'idle', error: "", source: "", query: "", read: 0, from: 0, to: 0, keyOf: "", lineCount: 0, planLines: 0, down: [], matched: [], unmatched: [], hasColumns: [] };
+const PROD_ALIAS_GROUPS: string[][] = [['wj', 'waterjet']];   // names that mean one line, either way round ("WJ", "Waterjet", "Water Jet"; compact)
+type ProdPart = { a: string; n: number };   // one way the schedule spells a line: its compact area text and line number
+type ProdLine = { key: string; area: string; line: number; parts: ProdPart[]; runs: { s: number; e: number; m: boolean }[] };   // m: a Maintenance run (it keeps its line busy but is no proof that the plan is entered)
+type DownRoom = { areaId: string; name: string; lines: string[]; stretches: { line: string; from: number; to: number }[]; from: number; to: number; via: string };
+type PrdState = { status: 'idle' | 'reading' | 'ok' | 'partial' | 'empty' | 'missing' | 'error'; error: string; source: string; query: string; read: number; from: number; to: number; keyOf: string; lineCount: number; planLines: number; planStarts: number; planEnd: number; down: DownRoom[]; matched: string[]; unmatched: string[]; hasColumns: string[] };
+const PRD_IDLE: PrdState = { status: 'idle', error: "", source: "", query: "", read: 0, from: 0, to: 0, keyOf: "", lineCount: 0, planLines: 0, planStarts: 0, planEnd: 0, down: [], matched: [], unmatched: [], hasColumns: [] };
 const compactKey = (v: any) => String(v === undefined || v === null ? '' : v).toLowerCase().replace(/[^a-z0-9]+/g, '');   // "IBL 5", "ibl-5" and "IBL5" are one name
 const prodMs = (v: any) => { if (v === null || v === undefined || v === "") return NaN; const t = typeof v === 'number' ? v : new Date(v).getTime(); return isNaN(t) ? NaN : t; };
 let PRD_CACHE: Record<string, { at: number; rows: any[]; source: string; query: string }> = {};
 
+const aliasHead = (a: string): string => { const m = /^(.*?)(\d*)$/.exec(a) || ["", a, ""], g = PROD_ALIAS_GROUPS.filter(gr => gr.indexOf(m[1]) >= 0)[0]; return g ? g[0] + m[2] : a; };   // "waterjet2" -> "wj2"
 function buildProdLines(rows: any[]): Record<string, ProdLine> {
-    const m: Record<string, ProdLine> = {};
+    const m: Record<string, ProdLine> = Object.create(null);   // no inherited keys: an area called "Constructor" is just a line
     (rows || []).forEach(r => {
         const area = String(getField(r, 'craa5_area') ?? "").trim(), line = parseInt(getField(r, 'craa5_line'), 10) || 1;
         const s = prodMs(getField(r, 'craa5_datestarttime')), e = prodMs(getField(r, 'craa5_dateendtime'));
         if (!area || isNaN(s) || isNaN(e) || e <= s) return;
-        const k = compactKey(area) + '|' + line, L = m[k] = m[k] || { key: k, area, line, runs: [] };
-        L.runs.push({ s, e });
+        const ca = compactKey(area), k = aliasHead(ca) + (line > 1 ? String(line) : ''), L = m[k] = m[k] || { key: k, area, line, parts: [], runs: [] };   // "IBL5" line 1 and "IBL" line 5 are one line, as in the production hub
+        if (!L.parts.some(p => p.a === ca && p.n === line)) L.parts.push({ a: ca, n: line });
+        L.runs.push({ s, e, m: /maint/i.test(String(getField(r, 'craa5_product') ?? "")) });
     });
     Object.keys(m).forEach(k => m[k].runs.sort((a, b) => a.s - b.s));
     return m;
@@ -514,10 +517,11 @@ function buildProdLines(rows: any[]): Record<string, ProdLine> {
 // The lines a room sits on: the first rule that finds any wins.
 function linesForArea(name: string, lines: ProdLine[]): ProdLine[] {
     const c = compactKey(name); if (!c) return [];
+    const forms = (a: string): string[] => { const m = /^(.*?)(\d*)$/.exec(a) || ["", a, ""], g = PROD_ALIAS_GROUPS.filter(gr => gr.indexOf(m[1]) >= 0)[0]; return g ? g.map(x => x + m[2]) : [a]; }, ac = aliasHead(c);
     const rules: ((L: ProdLine) => boolean)[] = [
-        L => compactKey(L.area) + L.line === c,                                                                                  // IBL5 = area IBL, line 5
-        L => compactKey(L.area) === c,                                                                                           // Breading = every Breading line
-        L => (Object.prototype.hasOwnProperty.call(PROD_ALIASES, compactKey(L.area)) ? PROD_ALIASES[compactKey(L.area)] : []).some(al => compactKey(al) === c || compactKey(al) + L.line === c),      // WJ = waterjet
+        L => L.parts.some(p => p.a + p.n === c || aliasHead(p.a) + p.n === ac),                                                  // IBL5 = area IBL, line 5 (WJ2 = Waterjet, line 2)
+        L => L.parts.some(p => p.a === c || aliasHead(p.a) === ac),                                                              // Breading = every Breading line (WJ = every Waterjet line too)
+        L => L.parts.some(p => forms(p.a).some(f => f === c || f + p.n === c)),                                                  // WJ = Waterjet = Water Jet, either way round
     ];
     for (let i = 0; i < rules.length; i++) { const f = lines.filter(rules[i]); if (f.length) return f; }
     return [];
@@ -533,26 +537,35 @@ function downStretch(L: ProdLine, w0: number, w1: number): { from: number; to: n
     if (w1 - cursor > bestTo - bestFrom) { bestFrom = cursor; bestTo = w1; }
     return bestTo - bestFrom >= DOWN_MIN_MS ? { from: bestFrom, to: bestTo } : null;
 }
-// The rooms (MSS areas) with a line down inside [w0, w1). When no line has any run in the window the plan hasn't been entered for it, so nothing is claimed.
-function downRooms(areas: any[], rows: any[], w0: number, w1: number): { down: DownRoom[]; matched: string[]; unmatched: string[]; lineCount: number; planLines: number } {
+// The rooms (MSS areas) with a line down inside [w0, w1). The plan `covers` the shift when some run starts in or after it and a line has a run in it, or when
+// there are runs both before and after it (a weekend the plant does not run: every line is idle); only then are the rooms picked by themselves. Runs that all
+// began earlier (the tail of a long run, the week's sheet ending) say nothing about the lines that have no run, they may just not be entered yet: the rooms are
+// still worked out (`planned` is false) so they can be offered, never added by themselves. A covered plan is only judged up to the end of the last run entered
+// anywhere (`planEnd`): the hours after it are not planned yet, not idle. Maintenance runs keep their line busy but never count as proof that the plan is
+// entered. A room on several lines gets the longest stretch of the line that is down the longest (its line is named in `via`).
+function downRooms(areas: any[], rows: any[], w0: number, w1: number): { down: DownRoom[]; matched: string[]; unmatched: string[]; lineCount: number; planLines: number; planStarts: number; planEnd: number; planned: boolean } {
     const lines = buildProdLines(rows), list = Object.keys(lines).map(k => lines[k]);
-    const planLines = list.filter(L => L.runs.some(r => r.e > w0 && r.s < w1)).length, down: DownRoom[] = [], unmatched: string[] = [], matched: string[] = [];
+    const planLines = list.filter(L => L.runs.some(r => !r.m && r.e > w0 && r.s < w1)).length, planStarts = list.reduce((n, L) => n + L.runs.filter(r => !r.m && r.s >= w0).length, 0);
+    const bracketed = list.some(L => L.runs.some(r => !r.m && r.e <= w0)) && list.some(L => L.runs.some(r => !r.m && r.s >= w1)), planned = (planLines > 0 && planStarts > 0) || bracketed;
+    const planEnd = list.reduce((m, L) => L.runs.reduce((mm, r) => r.m ? mm : Math.max(mm, r.e), m), 0), judgedTo = planned ? Math.min(w1, planEnd) : w1, judge = planned || planLines > 0;
+    const down: DownRoom[] = [], unmatched: string[] = [], matched: string[] = [];
     areas.forEach(a => {
         const name = renderSafe(getField(a, 'craa5_area')), id = String(getField(a, 'craa5_aa_mss_areaid') || "");
         if (!id || isStatusArea(name)) return;
         const ls = linesForArea(name, list);
         if (!ls.length) { if (isProductionArea(a)) unmatched.push(name); return; }
         matched.push(normText(name));
-        if (!planLines) return;
-        const ds = ls.map(L => ({ L, d: downStretch(L, w0, w1) })).filter(x => !!x.d);
+        if (!judge) return;
+        const ds = ls.map(L => ({ L, d: downStretch(L, w0, judgedTo) })).filter(x => !!x.d);
         if (!ds.length) return;
-        down.push({ areaId: id, name, lines: ds.map(x => `${x.L.area} line ${x.L.line}`), from: ds.reduce((m, x) => Math.min(m, x.d!.from), Infinity), to: ds.reduce((m, x) => Math.max(m, x.d!.to), 0) });
+        const best = ds.reduce((b, x) => (x.d!.to - x.d!.from) > (b.d!.to - b.d!.from) ? x : b, ds[0]);
+        down.push({ areaId: id, name, lines: ds.map(x => `${x.L.area} line ${x.L.line}`), stretches: ds.map(x => ({ line: `${x.L.area} line ${x.L.line}`, from: x.d!.from, to: x.d!.to })), from: best.d!.from, to: best.d!.to, via: ls.length > 1 ? `${best.L.area} line ${best.L.line}` : "" });
     });
-    return { down, matched, unmatched, lineCount: list.length, planLines };
+    return { down, matched, unmatched, lineCount: list.length, planLines, planStarts, planEnd, planned };
 }
 // The end of the shift that starts at startMs (a slot in the work schedule), or 0.
-function slotEndFor(slots: Slot[], startMs: number): number {
-    const d = new Date(startMs), s = slots.find(x => x.day === d.getDay() && x.startHour === d.getHours() && d.getMinutes() === 0);
+function slotEndFor(slots: Slot[], startMs: number, crew = ""): number {
+    const d = new Date(startMs), at = slots.filter(x => x.day === d.getDay() && x.startHour === d.getHours() && d.getMinutes() === 0), s = at.filter(x => crew && crewLetterOf(x.crew) === crew)[0] || at[0];   // two crews can start at the same hour: the board's own crew decides
     return s ? slotEndMs(d, s.lengthHours) : 0;
 }
 // The runs overlapping [fromMs, toMs): not cancelled, oldest first. Each way of reading only falls through when it fails.
@@ -575,9 +588,9 @@ async function readProductionRuns(props: any, fromMs: number, toMs: number): Pro
 
 // ============================================================================
 // HISTORY (craa5_taskassignment): this crew's own boards over the last 42 days
-// Every save writes the whole board (a row per person: employee, lead, area, team, time). Reading the team's rows back tells three things: the board the
+// Every save writes the whole board (a row per person: employee, lead, area, team, time). Reading the team's rows back tells four things: the board the
 // team ended each shift with (so the same shift can start from it), how many shifts each person has worked each room (the strength bar and the member
-// suggestions), and how many people a room usually takes. Only the supervisors of the crew are read (their team name), in 14 day pieces, each capped at
+// suggestions), how many shifts each employee has worked under each lead (who to suggest to which lead), and how many people a room usually takes. Only the supervisors of the crew are read (their team name), in 14 day pieces, each capped at
 // 5000 rows and never the whole table; what is kept is the small summary, in this browser for six hours. A shift is the crew's slot in the work schedule;
 // the prep hour before it counts for it.
 // ============================================================================
@@ -595,7 +608,8 @@ const HIST_COLUMNS = ['craa5_taskassignmentid', 'craa5_id', 'craa5__aaemp_guid',
 const HIST_COLUMN_WHY: Record<string, string> = { craa5_taskassignmentid: 'the row id', craa5_id: 'text: the employee name', craa5__aaemp_guid: 'text: the employee id', craa5_lead: 'text: the lead of the room', craa5_team: 'text: the supervisor name the board was saved under', craa5_area: 'text: the room', craa5_datetimeofassignment: 'date and time: when the board was saved', createdon: 'date and time: the row was created' };
 type HistPerson = { id: string; emp: string; lead: string; area: string };   // emp "" = a room with its lead and nobody under them
 type HistBoard = { team: string; startMs: number; savedAt: number; people: HistPerson[] };
-type History = { v: number; key: string; crew: string; names: string[]; at: number; from: number; to: number; boards: HistBoard[]; strength: Record<string, Record<string, number>>; rows: number; pieces: number; failedPieces: number; capped: number; source: string; query: string; columns: string[]; error: string };
+type History = { v: number; key: string; crew: string; names: string[]; at: number; from: number; to: number; boards: HistBoard[]; strength: Record<string, Record<string, number>>; withLead: Record<string, Record<string, number>>; rows: number; pieces: number; failedPieces: number; capped: number; source: string; query: string; columns: string[]; error: string };
+const NO_HIST: History = { v: 2, key: "", crew: "", names: [], at: 0, from: 0, to: 0, boards: [], strength: {}, withLead: {}, rows: 0, pieces: 0, failedPieces: 0, capped: 0, source: "", query: "", columns: [], error: "" };   // stands in when the six weeks cannot be read: leads are then split evenly
 type HistStatus = { state: 'idle' | 'reading' | 'ok' | 'error'; error: string; fromCache: boolean; key: string };
 const HIST_IDLE: HistStatus = { state: 'idle', error: "", fromCache: false, key: "" };
 // What the app decided about starting the board from the remembered team, for the Data check panel.
@@ -618,7 +632,7 @@ function slotInstanceFor(slots: Slot[], crew: string, t: number): { startMs: num
 }
 
 // The summary kept from a crew's rows: its final board of each shift, and how many shifts each person (employee or lead) worked each room.
-function aggregateHistory(rows: any[], slots: Slot[], crew: string): { boards: HistBoard[]; strength: Record<string, Record<string, number>> } {
+function aggregateHistory(rows: any[], slots: Slot[], crew: string): { boards: HistBoard[]; strength: Record<string, Record<string, number>>; withLead: Record<string, Record<string, number>> } {
     type Item = { t: number; id: string; emp: string; lead: string; area: string };
     const groups: Record<string, { team: string; startMs: number; items: Item[] }> = {};   // one per team and shift
     (rows || []).forEach(r => {
@@ -630,6 +644,8 @@ function aggregateHistory(rows: any[], slots: Slot[], crew: string): { boards: H
     });
     const credit: Record<string, Record<string, Record<string, boolean>>> = {}, boards: HistBoard[] = [];
     const give = (who: string, area: string, inst: number) => { if (!who) return; const w = credit[who] = credit[who] || {}, a = w[area] = w[area] || {}; a[String(inst)] = true; };
+    const underLead: Record<string, Record<string, Record<string, boolean>>> = {};   // employee -> lead -> the shifts they worked on that lead's team
+    const giveLead = (who: string, lead: string, inst: number) => { if (!who || !lead) return; const w = underLead[who] = underLead[who] || {}, l = w[lead] = w[lead] || {}; l[String(inst)] = true; };
     Object.keys(groups).forEach(k => {
         const g = groups[k];
         // The employee hubs write progress rows under the same team name with no employee id; Shift Start always saves it, so when any row of the shift has one the rest are not board rows.
@@ -638,7 +654,7 @@ function aggregateHistory(rows: any[], slots: Slot[], crew: string): { boards: H
         if (!g.items.length) return;
         g.items.sort((a, b) => a.t - b.t);
         // A person is credited by employee id (by name only when the row has none), a lead by name.
-        g.items.forEach(it => { const ak = normText(it.area); give(it.emp ? (it.id || normText(it.emp)) : "", ak, g.startMs); give(normText(it.lead), ak, g.startMs); });
+        g.items.forEach(it => { const ak = normText(it.area), who = it.emp ? (it.id || normText(it.emp)) : ""; give(who, ak, g.startMs); give(normText(it.lead), ak, g.startMs); giveLead(who, normText(it.lead), g.startMs); });
         // the final board = the rows of the last save (within a minute of the newest row); where a person appears twice the newest row wins
         const lastT = g.items[g.items.length - 1].t, seen: Record<string, boolean> = {}, people: HistPerson[] = [];
         g.items.filter(it => lastT - it.t <= HIST_GAP_MS).reverse().forEach(it => { const pk = it.id || normText(it.emp) || ('room:' + normText(it.area) + '|' + normText(it.lead)); if (seen[pk]) return; seen[pk] = true; people.push({ id: it.id, emp: it.emp, lead: it.lead, area: it.area }); });
@@ -647,7 +663,9 @@ function aggregateHistory(rows: any[], slots: Slot[], crew: string): { boards: H
     boards.sort((a, b) => b.startMs - a.startMs || b.savedAt - a.savedAt);
     const strength: Record<string, Record<string, number>> = {};
     Object.keys(credit).forEach(who => { strength[who] = {}; Object.keys(credit[who]).forEach(a => { strength[who][a] = Object.keys(credit[who][a]).length; }); });
-    return { boards: boards.slice(0, HIST_KEEP_BOARDS), strength };
+    const withLead: Record<string, Record<string, number>> = {};
+    Object.keys(underLead).forEach(who => { withLead[who] = {}; Object.keys(underLead[who]).forEach(l => { withLead[who][l] = Object.keys(underLead[who][l]).length; }); });
+    return { boards: boards.slice(0, HIST_KEEP_BOARDS), strength, withLead };
 }
 
 // How many shifts a person has worked a room (looked up by employee id, then by name).
@@ -676,26 +694,161 @@ function typicalHeadcount(h: History | null, areaName: string, atMin: number = -
     if (!counts.length) return 0;
     counts.sort((x, y) => x - y); return counts[Math.floor((counts.length - 1) / 2)];
 }
-// Who could fill the rooms that are short of their usual headcount: the people who have worked the room, strongest first, each person used once.
-type Suggest = { id: string; name: string; days: number };
-function suggestMembers(h: History | null, rooms: { id: string; name: string; have: number }[], staff: { id: string; name: string }[], atMin: number): Record<string, Suggest[]> {
+// SUGGESTION PRESETS. Normal = the best application of what the history says; Training = the reverse of it, so people and leads are put where they have
+// the least time and get to learn it. Both only suggest (chips and an "all" button): nothing moves until someone presses.
+type SuggestMode = 'normal' | 'training';
+const SUGGEST_MODES: { key: SuggestMode; label: string; help: string }[] = [
+    { key: 'normal', label: 'Normal', help: 'Best fit: rooms are shared out so every lead has about the same amount of work, each going to the lead who has led it most that still balances; a person goes to the lead they have worked under most (then the room they know best)' },
+    { key: 'training', label: 'Training', help: 'The reverse, so people learn: rooms are shared out evenly, each going to the lead with the least time in it; a person goes to the lead they have worked under the least (then the room they know least)' },
+];
+// How many shifts an employee has worked on a lead's team (any room), looked up by employee id, then by name.
+function shiftsUnderLead(h: History | null, empId: string, empName: string, leadName: string): number {
+    if (!h || !h.withLead || !leadName) return 0;
+    const l = normText(leadName), byId = empId ? h.withLead[String(empId).toLowerCase()] : undefined, byName = h.withLead[normText(empName)];
+    return Math.max(byId && byId[l] ? byId[l] : 0, byName && byName[l] ? byName[l] : 0);
+}
+// How many shifts a lead has led a room (their name on the rows of that room), not counting the shifts they worked it as a member.
+function shiftsLeading(h: History | null, leadName: string, areaName: string): number {
+    if (!h || !leadName) return 0;
+    const byName = h.strength[normText(leadName)], a = normText(areaName);
+    return byName && byName[a] ? byName[a] : 0;
+}
+// Who could lead the rooms nobody leads yet. The rooms are shared out evenly first (a room weighs its usual headcount, leads already holding rooms count for
+// them, the heaviest room first onto the lightest lead), and nobody who has rooms is left with none. Inside that even split the rooms are moved or swapped between
+// leads for as long as that raises the total of shifts-led (Normal) or lowers it (Training), starting from a few different splits and keeping the best, without
+// any lead going above the heaviest load the even split needs. So Normal is the best match the even split allows, Training is the opposite match under the same
+// split, and with no history at all the even split stands.
+type LeadSuggest = { leadId: string; name: string; days: number };
+function suggestLeads(h: History | null, rooms: { id: string; name: string; weight: number }[], leads: { id: string; name: string; load: number; held: number }[], mode: SuggestMode): Record<string, LeadSuggest> {
+    const out: Record<string, LeadSuggest> = {};
+    if (!h || !rooms.length || !leads.length) return out;
+    const ls = leads.slice().sort((a, b) => (normText(a.name) < normText(b.name) ? -1 : normText(a.name) > normText(b.name) ? 1 : 0) || (String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0));
+    const L = ls.length, R = rooms.length, sign = mode === 'training' ? -1 : 1, w = rooms.map(r => Math.max(1, r.weight || 1));
+    const aff = rooms.map(r => ls.map(l => shiftsLeading(h, l.name, r.name))), score = (ri: number, li: number) => sign * aff[ri][li];
+    const order = rooms.map((_, i) => i).sort((a, b) => w[b] - w[a] || a - b);
+    const loadsOf = (who: number[]) => { const load = ls.map(l => l.load || 0), held = ls.map(l => l.held || 0); who.forEach((li, ri) => { load[li] += w[ri]; held[li] += 1; }); return { load, held }; };
+    const totalOf = (who: number[]) => who.reduce((n, li, ri) => n + score(ri, li), 0);
+    const lpt = (rot: number): number[] => {   // the heaviest room first onto the lightest lead; rot changes which lead wins a tie
+        const load = ls.map(l => l.load || 0), who: number[] = rooms.map(() => 0);
+        order.forEach(ri => { let li = rot % L; for (let k = 1; k < L; k++) { const i = (rot + k) % L; if (load[i] < load[li] - 1e-9) li = i; } who[ri] = li; load[li] += w[ri]; });
+        return who;
+    };
+    const starts: number[][] = []; for (let rot = 0; rot < L; rot++) starts.push(lpt(rot));
+    const cap = starts.reduce((m, st) => Math.min(m, loadsOf(st).load.reduce((x, y) => Math.max(x, y), 0)), Infinity);
+    const total = (ls.reduce((n, l) => n + (l.held || 0), 0)) + R, keepAll = total >= L;   // when there are enough rooms for everybody, nobody is left with none
+    const greedy: number[] = rooms.map(() => 0), gl = ls.map(l => l.load || 0);
+    order.forEach(ri => { let li = -1; for (let i = 0; i < L; i++) { if (gl[i] + w[ri] > cap + 1e-9) continue; if (li < 0 || score(ri, i) > score(ri, li) || (score(ri, i) === score(ri, li) && gl[i] < gl[li])) li = i; } if (li < 0) { li = 0; for (let i = 1; i < L; i++) if (gl[i] < gl[li]) li = i; } greedy[ri] = li; gl[li] += w[ri]; });
+    starts.push(greedy);
+    let seed = 12345 + R * 31 + L; const rnd = () => { seed = (seed * 1664525 + 1013904223) % 4294967296; return seed / 4294967296; };   // the same "random" starts every time
+    for (let k = 0; k < 40 && R * L > 6; k++) {
+        const who: number[] = rooms.map(() => 0), load = ls.map(l => l.load || 0), ord = order.slice();
+        for (let i = ord.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)), tmp = ord[i]; ord[i] = ord[j]; ord[j] = tmp; }
+        ord.forEach(ri => { const ok: number[] = []; for (let i = 0; i < L; i++) if (load[i] + w[ri] <= cap + 1e-9) ok.push(i); let li = ok.length ? ok[Math.floor(rnd() * ok.length)] : 0; if (!ok.length) for (let i = 1; i < L; i++) if (load[i] < load[li]) li = i; who[ri] = li; load[li] += w[ri]; });
+        starts.push(who);
+    }
+    const improve = (who0: number[]): number[] => {
+        const who = who0.slice(), st = loadsOf(who), load = st.load, held = st.held;
+        for (let guard = 0; guard < 500; guard++) {
+            let best = { ri: -1, rj: -1, to: -1, delta: 1e-9 };
+            for (let ri = 0; ri < R; ri++) {
+                const cur = who[ri];
+                for (let li = 0; li < L; li++) {   // move a room to another lead
+                    if (li === cur || load[li] + w[ri] > cap + 1e-9 || (keepAll && held[cur] <= 1)) continue;
+                    const delta = score(ri, li) - score(ri, cur); if (delta > best.delta) best = { ri, rj: -1, to: li, delta };
+                }
+                for (let rj = ri + 1; rj < R; rj++) {   // swap two rooms between their leads
+                    const a = cur, b = who[rj]; if (a === b) continue;
+                    if (load[a] - w[ri] + w[rj] > cap + 1e-9 || load[b] - w[rj] + w[ri] > cap + 1e-9) continue;
+                    const delta = score(ri, b) + score(rj, a) - score(ri, a) - score(rj, b); if (delta > best.delta) best = { ri, rj, to: -1, delta };
+                }
+            }
+            if (best.ri < 0) break;
+            if (best.rj < 0) { const from = who[best.ri]; load[from] -= w[best.ri]; held[from] -= 1; load[best.to] += w[best.ri]; held[best.to] += 1; who[best.ri] = best.to; }
+            else { const a = who[best.ri], b = who[best.rj]; load[a] += w[best.rj] - w[best.ri]; load[b] += w[best.ri] - w[best.rj]; who[best.ri] = b; who[best.rj] = a; }
+        }
+        return who;
+    };
+    let pick: number[] | null = null, pickTotal = -Infinity;
+    starts.forEach(st => {
+        const ld = loadsOf(st); if (ld.load.reduce((x, y) => Math.max(x, y), 0) > cap + 1e-9) return;   // a split that needs more than the best even split
+        if (keepAll && ld.held.some(x => x === 0)) return;
+        const done = improve(st), t = totalOf(done); if (t > pickTotal + 1e-9) { pick = done; pickTotal = t; }
+    });
+    {   // then look for anything better by trying the splits that could still beat it (every split on a small board, as many as fit in a fixed number of steps on a big one)
+        const who: number[] = rooms.map(() => 0), load = ls.map(l => l.load || 0), held = ls.map(l => l.held || 0), rest: number[] = [], pref: number[][] = rooms.map((_, ri) => ls.map((__, li) => li).sort((a, b) => score(ri, b) - score(ri, a) || a - b));
+        let nodes = 0; rest[R] = 0; for (let k = R - 1; k >= 0; k--) rest[k] = rest[k + 1] + score(order[k], pref[order[k]][0]);
+        const rec = (k: number, t: number) => {
+            if (++nodes > 300000) return;
+            if (k === R) { if (keepAll && held.some(x => x === 0)) return; if (t > pickTotal + 1e-9) { pickTotal = t; pick = who.slice(); } return; }
+            if (t + rest[k] <= pickTotal + 1e-9) return;   // even the best of what is left cannot beat the plan already found
+            if (keepAll && R - k < held.filter(x => x === 0).length) return;   // not enough rooms left for the leads who have none
+            const ri = order[k];
+            for (let q = 0; q < L; q++) { const li = pref[ri][q]; if (load[li] + w[ri] > cap + 1e-9) continue; who[ri] = li; load[li] += w[ri]; held[li] += 1; rec(k + 1, t + score(ri, li)); load[li] -= w[ri]; held[li] -= 1; }
+        };
+        rec(0, 0);
+    }
+    const who = pick || starts[0];
+    rooms.forEach((r, ri) => { const l = ls[who[ri]]; out[r.id] = { leadId: l.id, name: l.name, days: aff[ri][who[ri]] }; });
+    return out;
+}
+// Minimum-cost matching of the rows of a square matrix to its columns (the classic O(n^3) potentials method). Returns the column chosen for each row.
+function minCostMatch(cost: number[][]): number[] {
+    const n = cost.length, INF = 1e18, u: number[] = [], v: number[] = [], p: number[] = [], way: number[] = [], res: number[] = [];
+    for (let i = 0; i <= n; i++) { u.push(0); v.push(0); p.push(0); way.push(0); }
+    for (let i = 1; i <= n; i++) {
+        p[0] = i; let j0 = 0; const minv: number[] = [], used: boolean[] = [];
+        for (let j = 0; j <= n; j++) { minv.push(INF); used.push(false); }
+        do {
+            used[j0] = true; const i0 = p[j0]; let delta = INF, j1 = 0;
+            for (let j = 1; j <= n; j++) {
+                if (used[j]) continue;
+                const cur = cost[i0 - 1][j - 1] - u[i0] - v[j];
+                if (cur < minv[j]) { minv[j] = cur; way[j] = j0; }
+                if (minv[j] < delta) { delta = minv[j]; j1 = j; }
+            }
+            for (let j = 0; j <= n; j++) { if (used[j]) { u[p[j]] += delta; v[j] -= delta; } else minv[j] -= delta; }
+            j0 = j1;
+        } while (p[j0] !== 0);
+        do { const j1 = way[j0]; p[j0] = p[j1]; j0 = j1; } while (j0);
+    }
+    for (let j = 1; j <= n; j++) res[p[j] - 1] = j - 1;
+    return res;
+}
+// Who could fill the rooms that are short of their usual headcount. Every empty place is matched to a person, each person used once, so the most places are
+// filled and, among those, the total is the best possible: Normal = the people who have worked under the room's lead most (then in the room most), only people
+// with some time under the lead or in the room; Training = the reverse, everyone is a candidate and the people with the least time under that lead and in that
+// room come first.
+type Suggest = { id: string; name: string; days: number; withLead: number };
+function suggestMembers(h: History | null, rooms: { id: string; name: string; have: number; lead: string }[], staff: { id: string; name: string }[], atMin: number, mode: SuggestMode = 'normal'): Record<string, Suggest[]> {
     const out: Record<string, Suggest[]> = {};
     if (!h || !rooms.length || !staff.length) return out;
-    const once: Record<string, boolean> = {}; staff = staff.filter(s => { if (once[s.id]) return false; once[s.id] = true; return true; });
-    const need: Record<string, number> = {}, pairs: { room: string; who: number; days: number }[] = [];
-    rooms.forEach(r => {
-        const usual = typicalHeadcount(h, r.name, atMin) || typicalHeadcount(h, r.name), n = usual - r.have; if (n <= 0) return;
-        need[r.id] = n;
-        staff.forEach((s, i) => { const days = shiftsInArea(h, s.id, s.name, r.name); if (days > 0) pairs.push({ room: r.id, who: i, days }); });
+    const once: Record<string, boolean> = {}; staff = staff.filter(s => { if (once[s.id]) return false; once[s.id] = true; return true; }).sort((a, b) => (normText(a.name) < normText(b.name) ? -1 : normText(a.name) > normText(b.name) ? 1 : 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    const sign = mode === 'training' ? -1 : 1, slots: number[] = [], pair: { days: number; withLead: number }[][] = [];   // slots: the room of each empty place
+    rooms.forEach((r, ri) => {
+        const usual = typicalHeadcount(h, r.name, atMin) || typicalHeadcount(h, r.name), n = usual - r.have;
+        for (let k = 0; k < n; k++) slots.push(ri);
+        pair[ri] = staff.map(s => ({ days: shiftsInArea(h, s.id, s.name, r.name), withLead: shiftsUnderLead(h, s.id, s.name, r.lead) }));
     });
-    pairs.sort((a, b) => b.days - a.days || (a.room < b.room ? -1 : a.room > b.room ? 1 : 0) || a.who - b.who);
-    const used: Record<number, boolean> = {};
-    pairs.forEach(p => {
-        const list = out[p.room] = out[p.room] || [];
-        if (used[p.who] || list.length >= need[p.room]) return;
-        used[p.who] = true; list.push({ id: staff[p.who].id, name: staff[p.who].name, days: p.days });
+    if (!slots.length) return out;
+    const eligible = (ri: number, si: number) => mode === 'training' || pair[ri][si].days > 0 || pair[ri][si].withLead > 0;
+    const people = staff.map((_, si) => si).filter(si => rooms.some((_r, ri) => slots.indexOf(ri) >= 0 && eligible(ri, si)));
+    if (!people.length) return out;
+    const N = people.length + slots.length, BONUS = 1e7, FORBIDDEN = 1e10, cost: number[][] = [];
+    for (let i = 0; i < N; i++) {
+        const row: number[] = [];
+        for (let j = 0; j < N; j++) {
+            if (i < people.length && j < slots.length) { const ri = slots[j], si = people[i]; row.push(eligible(ri, si) ? -(BONUS + sign * (pair[ri][si].withLead * 1000 + pair[ri][si].days)) : FORBIDDEN); }
+            else row.push(0);   // a person with no place, a place with nobody
+        }
+        cost.push(row);
+    }
+    const col = minCostMatch(cost);
+    people.forEach((si, i) => {
+        const j = col[i]; if (j >= slots.length) return;
+        const ri = slots[j], id = rooms[ri].id, list = out[id] = out[id] || [];
+        list.push({ id: staff[si].id, name: staff[si].name, days: pair[ri][si].days, withLead: pair[ri][si].withLead });
     });
-    Object.keys(out).forEach(k => { if (!out[k].length) delete out[k]; });
+    Object.keys(out).forEach(k => out[k].sort((a, b) => sign * (b.withLead - a.withLead) || sign * (b.days - a.days) || (normText(a.name) < normText(b.name) ? -1 : normText(a.name) > normText(b.name) ? 1 : 0)));
     return out;
 }
 
@@ -746,7 +899,7 @@ const histCacheKey = (crew: string, names: string[]) => crew + '|' + names.map(n
 function lsReadHist(key: string): History | null {
     try {
         const raw = window.localStorage.getItem(HIST_LS_KEY), o = raw ? JSON.parse(raw) : {}, h = o && typeof o === 'object' ? o[key] : null;
-        if (!h || typeof h !== 'object' || h.v !== 1 || !Array.isArray(h.boards) || !h.strength || typeof h.at !== 'number' || Date.now() - h.at > HIST_TTL_MS) return null;
+        if (!h || typeof h !== 'object' || h.v !== 2 || !Array.isArray(h.boards) || !h.strength || !h.withLead || typeof h.at !== 'number' || Date.now() - h.at > HIST_TTL_MS) return null;
         return h as History;
     } catch (e) { return null; }
 }
@@ -784,7 +937,7 @@ async function readHistory(props: any, slots: Slot[], crew: string, names: strin
     let all: any[] = []; okPieces.forEach(g => { all = all.concat(g.rows); });
     const agg = aggregateHistory(all, slots, crew), first = okPieces.filter(g => g.rows.length)[0];
     return {
-        v: 1, key, crew, names, at: Date.now(), from, to, boards: agg.boards, strength: agg.strength, rows: all.length, pieces: okPieces.length, failedPieces: got.length - okPieces.length,
+        v: 2, key, crew, names, at: Date.now(), from, to, boards: agg.boards, strength: agg.strength, withLead: agg.withLead, rows: all.length, pieces: okPieces.length, failedPieces: got.length - okPieces.length,
         capped: okPieces.filter(g => g.rows.length >= HIST_CAP).length, source: okPieces[0].source, query: okPieces[0].query, columns: first ? Object.keys(first.rows[0]).filter(k => k.charAt(0) !== '@' && k.indexOf('@') < 0) : [], error: got.filter(g => !g.ok).map(g => g.error)[0] || "",
     };
 }
@@ -841,7 +994,7 @@ const AuthBox = ({ users, onLogin }: any) => (
 
 // What the app read and how it used it, so a wrong crew can be traced without a console: who is signed in, the shift on the clock,
 // each team's lead and crew size, and which columns were found.
-function DataCheckPanel({ onClose, msUser, currentUser, slotCount, currentShift, shiftStartMs, upNextShift, teams, teamsRead, employees, supervisors, taskStatus, areaCount, boardCrew, ownerName, presets, presetStore, presetLog, prd, prdWindow, hist, histStatus, histNames, remembered, onReread }: any) {
+function DataCheckPanel({ onClose, msUser, currentUser, slotCount, currentShift, shiftStartMs, upNextShift, teams, teamsRead, employees, supervisors, taskStatus, areaCount, boardCrew, ownerName, presets, presetStore, presetLog, prd, prdWindow, hist, histStatus, histNames, remembered, onReread, suggestMode, leadSuggestCount, memberSuggestCount }: any) {
     const nameOf = (id: string) => { const e = employees.find((x: any) => empIdOf(x) === id); return e ? formatFullName(getField(e, 'craa5_name')) : ""; };
     const withLookup = employees.filter((e: any) => !!teamIdOfEmp(e)).length;
     const sample = employees[0] || {}, hasKey = (k: string) => Object.keys(sample).some(x => x.toLowerCase() === k.toLowerCase());
@@ -884,10 +1037,10 @@ function DataCheckPanel({ onClose, msUser, currentUser, slotCount, currentShift,
                     <Text size={200} block style={{ color: prd && (prd.status === 'missing' || prd.status === 'error') ? BRAND.red : undefined }}>
                         {!prdWindow ? 'No shift window to read for (no shift covers this board).' : !prd || prd.status === 'idle' ? 'Not read yet (it is read when a board opens).' : prd.status === 'reading' ? 'Reading...'
                             : prd.status === 'missing' ? `The table was not found, so no rooms are picked from it. ${String(prd.error).slice(0, 160)}` : prd.status === 'error' ? `Could not be read: ${String(prd.error).slice(0, 200)}`
-                            : `Read through ${prd.source}: ${prd.read} run${prd.read === 1 ? '' : 's'} (a week either side of ${slotLabel(prdWindow.from)} to ${clockTime(prdWindow.to)}), ${prd.lineCount} line${prd.lineCount === 1 ? '' : 's'} known, ${prd.planLines} with a run in this shift.${prd.status === 'empty' ? ' No line has a run in this shift, so the plan is not entered yet and no room is picked from it.' : ''}`}
+                            : `Read through ${prd.source}: ${prd.read} run${prd.read === 1 ? '' : 's'} (a week either side of ${slotLabel(prdWindow.from)} to ${clockTime(prdWindow.to)}), ${prd.lineCount} line${prd.lineCount === 1 ? '' : 's'} known, ${prd.planLines} with a run in this shift${prd.status === 'ok' && prd.planEnd > 0 && prd.planEnd < prd.to ? `, the plan is entered through ${slotLabel(prd.planEnd)} (the hours after that are not judged)` : ''}.${prd.status === 'ok' && prd.planLines === 0 ? ' No line runs in this shift, but the plan has runs before and after it, so every line is judged idle for it.' : ''}${prd.status === 'empty' ? ' No line has a run in this shift and there are no runs on both sides of it, so the plan is not entered yet and no room is picked from it.' : ''}${prd.status === 'partial' ? ' Every run in this shift began before it and none starts in or after it, so the plan looks like it stops before this shift (not entered yet): no room is picked by itself.' : ''}`}
                     </Text>
-                    {prd && prd.status === 'ok' && <Text size={200} block className="mt-1">{prd.down.length ? `Rooms with a line down for an hour or more: ${prd.down.map((d: any) => `${d.name} (${d.lines.join(', ')}; ${clockTime(d.from)} to ${clockTime(d.to)})`).join(' · ')}` : prd.matched.length ? 'Every line that matches a room is running through the shift.' : 'No room name matches a line in the schedule.'}</Text>}
-                    {prd && (prd.status === 'ok' || prd.status === 'empty') && prd.unmatched.length > 0 && <Text size={200} block className="mt-1" style={{ color: '#8A5A00' }}>Production rooms with no line of that name in the schedule (rename the room or the schedule line to match, for example IBL5 = area IBL line 5): {prd.unmatched.join(', ')}</Text>}
+                    {prd && (prd.status === 'ok' || prd.status === 'partial') && <Text size={200} block className="mt-1">{prd.down.length ? `${prd.status === 'partial' ? 'Rooms that would be down if nothing else is planned (offered, not added by themselves)' : 'Rooms with a line down for an hour or more'}: ${prd.down.map((d: any) => `${d.name} (${d.stretches.map((x: any) => `${x.line} ${clockTime(x.from)} to ${clockTime(x.to)}`).join(', ')})`).join(' · ')}` : prd.matched.length ? (prd.status === 'ok' && prd.planEnd > 0 && prd.planEnd < prd.to ? `Every line that matches a room is running through the planned part of the shift (to ${slotLabel(prd.planEnd)}).` : 'Every line that matches a room is running through the shift.') : 'No room name matches a line in the schedule.'}</Text>}
+                    {prd && (prd.status === 'ok' || prd.status === 'partial' || prd.status === 'empty') && prd.unmatched.length > 0 && <Text size={200} block className="mt-1" style={{ color: '#8A5A00' }}>Production rooms with no run of that name within a week of this shift (the line may just be idle, or the room and the schedule spell it differently: IBL5 = area IBL line 5, WJ = Waterjet): {prd.unmatched.join(', ')}</Text>}
                     {prd && prd.query && <Text size={200} color="neutralSecondary" block className="mt-1" style={{ wordBreak: 'break-all' }}>Query sent: {prd.query}</Text>}
                     {PROD_FIELDS.slice(1).map(c => col(`${PROD_TABLE}.${c}`, prd && prd.read > 0 ? prd.hasColumns.some((k: string) => k.toLowerCase() === c) : null, c === 'craa5_area' ? 'text: the production area, e.g. IBL, Breading' : c === 'craa5_line' ? 'whole number: the line number inside that area' : c === 'craa5_product' ? 'text: the product (a Maintenance run keeps the line busy)' : 'date and time: when the run starts / ends'))}
                     <div className="mt-4 mb-1"><Text size={300} weight="bold" style={{ color: BRAND.blueDark }}>This crew's earlier boards (table {TASK_TABLE}, last {HIST_DAYS} days)</Text></div>
@@ -899,6 +1052,7 @@ function DataCheckPanel({ onClose, msUser, currentUser, slotCount, currentShift,
                     {HIST_COLUMNS.map(c => col(`${TASK_TABLE}.${c}`, hist && hist.rows > 0 ? hist.columns.some((k: string) => k.toLowerCase() === c) : null, HIST_COLUMN_WHY[c] || ''))}
                     {hist && hist.boards.length > 0 && <Text size={200} color="neutralSecondary" block className="mt-1">Boards kept: {hist.boards.slice(0, 8).map((b: HistBoard) => `${formatFullName(b.team)} ${boardLabel(b.startMs)} (${b.people.filter(p => !!p.emp).length} people)`).join(' · ')}</Text>}
                     <Text size={200} block className="mt-1" style={{ color: remembered && !remembered.applied ? '#8A5A00' : undefined }}>{remembered ? `Remembered team: ${remembered.text}${remembered.applied ? ` ${remembered.people} ${remembered.people === 1 ? 'person' : 'people'} in ${remembered.rooms} ${remembered.rooms === 1 ? 'room' : 'rooms'}${remembered.skipped.length ? `; left out because they are away or busy: ${remembered.skipped.join(', ')}` : ''}.` : ''} (${remembered.sameTime} earlier board${remembered.sameTime === 1 ? '' : 's'} at this start time${remembered.matching >= 0 ? `, ${remembered.matching} with the same lines down` : ', lines down not compared'}.)` : 'Remembered team: not looked for on this board yet (it needs the history, the production schedule and an untouched board).'}</Text>
+                    <Text size={200} block className="mt-1">Suggestions: preset {suggestMode === 'training' ? 'Training (the reverse of best fit)' : 'Normal (best fit)'} · {leadSuggestCount} lead suggestion{leadSuggestCount === 1 ? '' : 's'} for the rooms still without a lead · {memberSuggestCount} employee suggestion{memberSuggestCount === 1 ? '' : 's'} for the rooms short of people · {hist && hist.withLead ? `${Object.keys(hist.withLead).length} ${Object.keys(hist.withLead).length === 1 ? 'person has' : 'people have'} shifts under a lead on record` : 'no lead history read yet'}.</Text>
                     <div className="mt-1"><Button size="small" appearance="secondary" onClick={onReread}>Read history again</Button></div>
                     <div className="mt-4 mb-1"><Text size={300} weight="bold" style={{ color: BRAND.blueDark }}>Next-shift setups (table {PRESET_TABLE})</Text></div>
                     <Text size={200} block style={{ color: presetStore.remote === 'ok' ? undefined : presetStore.remote === 'unknown' ? undefined : BRAND.red }}>
@@ -989,10 +1143,11 @@ function AreaSelectionScreen({ areas, selectedAreaIds, onSelectChange, onAddCust
         );
     };
 
-    const prdMissing = prd && prd.status === 'ok' ? prd.down.filter((d: any) => !selectedAreaIds.has(d.areaId)) : [];
+    const prdMissing = prd && (prd.status === 'ok' || prd.status === 'partial') ? prd.down.filter((d: any) => !selectedAreaIds.has(d.areaId)) : [];
     const prdLine = !prd ? null : prd.status === 'reading' ? 'Reading the production schedule...'
-        : prd.status === 'ok' ? (prd.down.length ? `Production schedule${prdWindowLabel}: ${prd.down.length} room${prd.down.length === 1 ? ' has' : 's have'} a line down (${prd.down.map((d: any) => d.name).join(', ')}).`
-            : prd.matched.length ? `Production schedule${prdWindowLabel}: every room that matches a line has it running through the shift.` : `Production schedule${prdWindowLabel}: no room name matches a line in the schedule, so nothing is picked from it (Data check lists the names).`)
+        : prd.status === 'ok' ? (prd.down.length ? `Production schedule${prdWindowLabel}: ${prd.down.length} room${prd.down.length === 1 ? ' has' : 's have'} a line down (${prd.down.map((d: any) => d.name).join(', ')}).${prd.planLines === 0 ? ' No line runs in this shift (the plan has runs before and after it).' : ''}${prd.planEnd > 0 && prd.planEnd < prd.to ? ` The plan is only entered through ${clockTime(prd.planEnd)}, so the hours after that are not judged.` : ''}`
+            : prd.matched.length ? (prd.planEnd > 0 && prd.planEnd < prd.to ? `Production schedule${prdWindowLabel}: every room that matches a line has it running through the part of the shift that is planned (to ${clockTime(prd.planEnd)}). The hours after that are not judged.` : `Production schedule${prdWindowLabel}: every room that matches a line has it running through the shift.`) : `Production schedule${prdWindowLabel}: no room name matches a line in the schedule, so nothing is picked from it (Data check lists the names).`)
+        : prd.status === 'partial' ? `Production schedule${prdWindowLabel}: nothing is planned from this shift on (its runs all began earlier), so the plan looks like it is not entered yet and no room is picked by itself.${prd.down.length ? ` If nothing else is planned, ${prd.down.length === 1 ? 'this room is' : 'these rooms are'} idle: ${prd.down.map((d: any) => d.name).join(', ')}.` : ''}`
         : prd.status === 'empty' ? `Production schedule${prdWindowLabel}: no runs are entered for this shift yet, so nothing is picked from it.`
         : prd.status === 'missing' ? `The production schedule table (${PROD_TABLE}) was not found, so nothing is picked from it.`
         : prd.status === 'error' ? `The production schedule could not be read (${String(prd.error).slice(0, 140)}), so nothing is picked from it.` : null;
@@ -1054,6 +1209,7 @@ export function MainComponent(props: any) {
     const histSeq = useRef(0), histInFlight = useRef(""), histForce = useRef(false), histDone = useRef<Record<string, number>>({});   // histDone: read token -> when it is read again
     const [rememberedTried, setRememberedTried] = useState(false);       // the remembered team was looked for (and used, or decided against) for this board
     const [rememberedLog, setRememberedLog] = useState<RememberedLog | null>(null);
+    const [suggestMode, setSuggestMode] = useState<SuggestMode>('normal');  // the suggestion preset: Normal = best fit, Training = the reverse (kept while the app is open, Normal each time it opens)
     const [boardFresh, setBoardFresh] = useState(false);                  // the board is empty because nothing was saved or set up for this shift (not because what was saved came out empty)
     const [collapsedBuckets, setCollapsedBuckets] = useState<Set<string>>(new Set());
     const [currentStep, setCurrentStep] = useState(0);
@@ -1504,7 +1660,7 @@ export function MainComponent(props: any) {
     // The window the production schedule is read for: the shift on the board (today's, the one about to start, or the setup's).
     const prdWindow = useMemo(() => {
         if (boardMode === 'next') return nextSlot ? { from: nextSlot.startMs, to: nextSlot.endMs } : null;
-        const start = boardCrew && boardCrew === clockCrew ? shiftStartMs : boardCrew && boardCrew === upNextCrew ? upNextStartMs : 0, end = start ? slotEndFor(GLOBAL_DATA_CACHE?.slots || [], start) : 0;
+        const start = boardCrew && boardCrew === clockCrew ? shiftStartMs : boardCrew && boardCrew === upNextCrew ? upNextStartMs : 0, end = start ? slotEndFor(GLOBAL_DATA_CACHE?.slots || [], start, boardCrew) : 0;
         return start && end ? { from: start, to: end } : null;
     }, [boardMode, nextSlot, boardCrew, clockCrew, upNextCrew, shiftStartMs, upNextStartMs]);
     const prdKey = prdWindow ? `${prdWindow.from}-${prdWindow.to}` : "";
@@ -1532,8 +1688,8 @@ export function MainComponent(props: any) {
                     if (!got.rows) { setPrd({ ...PRD_IDLE, status: got.missing ? 'missing' : 'error', error: got.error, query: got.query, keyOf: key, from: w.from, to: w.to }); return; }
                     if (got.rows.length >= PROD_TOP) { setPrd({ ...PRD_IDLE, status: 'error', error: `${got.rows.length} runs came back, the most that is read at once, so some of this shift's runs may be missing and nothing is picked from the schedule`, source: got.source, query: got.query, read: got.rows.length, keyOf: key, from: w.from, to: w.to }); return; }
                     const r = downRooms(roomAreas, got.rows, w.from, w.to);
-                    if (r.planLines > 0 && !hit) PRD_CACHE[key] = { at: Date.now(), rows: got.rows, source: got.source, query: got.query };   // only a schedule that covers the shift is kept
-                    setPrd({ status: r.planLines > 0 ? 'ok' : 'empty', error: "", source: got.source, query: got.query, read: got.rows.length, from: w.from, to: w.to, keyOf: key, lineCount: r.lineCount, planLines: r.planLines, down: r.down, matched: r.matched, unmatched: r.unmatched, hasColumns: got.rows.length ? Object.keys(got.rows[0]) : [] });
+                    if (r.planned && !(hit && Date.now() - hit.at < PROD_CACHE_MS)) PRD_CACHE[key] = { at: Date.now(), rows: got.rows, source: got.source, query: got.query };   // only a schedule that covers the shift is kept
+                    setPrd({ status: r.planned ? 'ok' : r.planLines > 0 ? 'partial' : 'empty', error: "", source: got.source, query: got.query, read: got.rows.length, from: w.from, to: w.to, keyOf: key, lineCount: r.lineCount, planLines: r.planLines, planStarts: r.planStarts, planEnd: r.planEnd, down: r.down, matched: r.matched, unmatched: r.unmatched, hasColumns: got.rows.length ? Object.keys(got.rows[0]) : [] });
                 } catch (e: any) {
                     if (seq !== prdSeq.current) return;
                     if (prdInFlight.current === key) prdInFlight.current = "";
@@ -1557,7 +1713,7 @@ export function MainComponent(props: any) {
         setSelectedAreaIds(prev => { const next = new Set(prev); prd.down.forEach(d => next.add(d.areaId)); return next; });
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [prd, prdKey, prdFresh, prdApplied, selectedSupervisorId, hasAutoAssignedEveryday]);
-    const prdReasons = useMemo(() => { const m: Record<string, string> = {}; if (prd.status === 'ok' && prd.keyOf === prdKey) prd.down.forEach(d => { m[d.areaId] = `line down ${clockTime(d.from)} to ${clockTime(d.to)}`; }); return m; }, [prd, prdKey]);
+    const prdReasons = useMemo(() => { const m: Record<string, string> = {}; if ((prd.status === 'ok' || prd.status === 'partial') && prd.keyOf === prdKey) prd.down.forEach(d => { m[d.areaId] = `${d.via ? d.via + ' down' : 'line down'} ${clockTime(d.from)} to ${clockTime(d.to)}`; }); return m; }, [prd, prdKey]);
 
 
     // ============================================================================
@@ -1610,7 +1766,7 @@ export function MainComponent(props: any) {
     // A board that is still just the Everyday rooms (plus the rooms the schedule picked) starts from the team this crew ran at this time of day before: the newest earlier
     // board of the same start time whose rooms with a line down are today's. Anything already touched, restored or set up is left exactly as it is.
     const rememberedFresh = presetsReady && !isLoading && (boardFresh || (!presetsApplied && boardMode === 'live' && presetRecords.length === 0 && !liveSetupFor() && taskStatus?.ok !== false));
-    const prdSettled = prd.keyOf === prdKey && (prd.status === 'ok' || prd.status === 'empty' || prd.status === 'missing' || prd.status === 'error');
+    const prdSettled = prd.keyOf === prdKey && (prd.status === 'ok' || prd.status === 'partial' || prd.status === 'empty' || prd.status === 'missing' || prd.status === 'error');
     useEffect(() => {
         if (rememberedTried || !histNow || histStatus.state !== 'ok' || !prdWindow || !prdSettled || !rememberedFresh || !selectedSupervisorId || !hasAutoAssignedEveryday || employees.length === 0 || (prd.status === 'ok' && !prdApplied)) return;
         const sup = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId); if (!sup) return;
@@ -1629,7 +1785,7 @@ export function MainComponent(props: any) {
         if (!built.rows.length) { log(false, 'The remembered board had nobody who is available today and no rooms that still exist.', info); return; }
         const note = (areaCount: number, people: number) => `Started from ${formatFullName(pick.board.team)}'s board of ${boardLabel(pick.board.startMs)} (${pick.how === 'matches' ? 'same lines down' : 'newest at this start time'}): ${people} ${people === 1 ? 'person' : 'people'} in ${areaCount} ${areaCount === 1 ? 'room' : 'rooms'}${built.skipped.length ? `, ${built.skipped.length} left out (away or busy)` : ''}. Change anything you like`;
         applyRows(built.rows, sup, note, 'The remembered board has no rooms', 3);
-        const why = prd.status === 'empty' ? 'the production plan is not entered for this shift yet' : prd.status === 'missing' ? 'the production schedule table was not found' : prd.status === 'error' ? 'the production schedule could not be read' : 'no room name matches a line in the schedule';
+        const why = prd.status === 'empty' || prd.status === 'partial' ? 'the production plan is not entered for this shift yet' : prd.status === 'missing' ? 'the production schedule table was not found' : prd.status === 'error' ? 'the production schedule could not be read' : 'no room name matches a line in the schedule';
         log(true, `Started from ${formatFullName(pick.board.team)}'s board of ${boardLabel(pick.board.startMs)}: ${pick.how === 'matches' ? 'the rooms with a line down were the same' : `${why}, so the lines down were not compared and the newest board at this start time was used`}.${built.droppedRooms.length ? ` Rooms that no longer exist were left out: ${built.droppedRooms.join(', ')}.` : ''}`, { ...info, people: built.rows.filter(r => !!r.craa5_id).length, rooms: roomsIn(built.rows) });
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [rememberedTried, histNow, histStatus.state, prd, prdKey, prdSettled, rememberedFresh, prdApplied, prdWindow, selectedSupervisorId, hasAutoAssignedEveryday, employees, supervisors]);
@@ -1637,12 +1793,28 @@ export function MainComponent(props: any) {
     // Rooms that are short of their usual headcount, and who could fill them (the people who have worked the room, strongest first, each used once).
     const roomNameByNorm = useMemo(() => { const m: Record<string, string> = {}; roomAreas.forEach(a => { const n = renderSafe(getField(a, 'craa5_area')); if (n) m[normText(n)] = n; }); return m; }, [roomAreas]);
     const suggestions = useMemo((): Record<string, Suggest[]> => {
-        if (!histNow || currentStep < 3) return {};
-        const rooms = Object.keys(areaAssignments).filter(id => !isStatusArea(getField(areaMap.get(id), 'craa5_area'))).map(id => ({ id, name: renderSafe(getField(areaMap.get(id), 'craa5_area')), have: (assignments[id] || []).length }));
+        if (!histNow || (currentStep !== 3 && !showData)) return {};
+        const leadNameOf = (leadId: string) => renderSafe(getField(employeeMap.get(leadId) || activeSupervisorObj, 'craa5_name'));
+        const rooms = Object.keys(areaAssignments).filter(id => !isStatusArea(getField(areaMap.get(id), 'craa5_area'))).map(id => ({ id, name: renderSafe(getField(areaMap.get(id), 'craa5_area')), have: (assignments[id] || []).length, lead: leadNameOf(areaAssignments[id]) }));
         const staff = availableStaff.map(e => ({ id: String(getField(e, 'craa5__aa_employeeid') || ""), name: renderSafe(getField(e, 'craa5_name')) })).filter(s => !!s.id);
-        return suggestMembers(histNow, rooms, staff, prdWindow ? minutesOfDay(prdWindow.from) : -1);
-    }, [histNow, currentStep, areaAssignments, assignments, availableStaff, areaMap, prdWindow]);
+        return suggestMembers(histNow, rooms, staff, prdWindow ? minutesOfDay(prdWindow.from) : -1, suggestMode);
+    }, [histNow, currentStep, showData, areaAssignments, assignments, availableStaff, areaMap, prdWindow, suggestMode, employeeMap, activeSupervisorObj]);
     const suggestionCount = Object.keys(suggestions).reduce((n, k) => n + suggestions[k].length, 0);
+    // Step 2: the rooms nobody leads yet, and which of the leads on the board could take each one.
+    const candidateLeads = useMemo(() => activeBuckets.filter(l => getField(l, 'craa5__aa_employeeid') !== selectedSupervisorId), [activeBuckets, selectedSupervisorId]);
+    const unledRooms = useMemo(() => [...areas, ...customAreas].filter(a => { const id = String(getField(a, 'craa5_aa_mss_areaid') || ""); return !!id && selectedAreaIds.has(id) && !areaAssignments[id]; }), [areas, customAreas, selectedAreaIds, areaAssignments]);
+    const noHist = !histNow && (histStatus.state === 'error' || !histKey);   // the six weeks cannot be had: no ranking, only an even split of the rooms
+    const leadSuggest = useMemo((): Record<string, LeadSuggest> => {
+        const hh = histNow || (noHist ? NO_HIST : null);
+        if (!hh || (currentStep !== 2 && !showData) || !candidateLeads.length) return {};
+        const atMin = prdWindow ? minutesOfDay(prdWindow.from) : -1, nameOfRoom = (id: string) => renderSafe(getField(areaMap.get(id), 'craa5_area'));
+        const weight = (name: string) => Math.max(1, typicalHeadcount(hh, name, atMin) || typicalHeadcount(hh, name));
+        const pending = unledRooms.map(a => ({ id: String(getField(a, 'craa5_aa_mss_areaid')), name: renderSafe(getField(a, 'craa5_area')) })).filter(r => !isStatusArea(r.name)).map(r => ({ ...r, weight: weight(r.name) }));
+        const leads = candidateLeads.map(l => { const id = String(getField(l, 'craa5__aa_employeeid')); let load = 0, held = 0; Object.keys(areaAssignments).forEach(aid => { if (areaAssignments[aid] === id && !isStatusArea(nameOfRoom(aid))) { load += weight(nameOfRoom(aid)); held += 1; } }); return { id, name: renderSafe(getField(l, 'craa5_name')), load, held }; });
+        return suggestLeads(hh, pending, leads, suggestMode);
+    }, [histNow, noHist, currentStep, showData, candidateLeads, unledRooms, areaAssignments, areaMap, prdWindow, suggestMode]);
+    const leadSuggestCount = Object.keys(leadSuggest).length;
+    const assignLeads = (picks: { areaId: string; leadId: string }[]) => { if (picks.length) setAreaAssignments(p => { const n = { ...p }; picks.forEach(pk => { n[pk.areaId] = pk.leadId; }); return n; }); };
     const addMembers = (picks: { areaId: string; id: string }[]) => {
         if (!picks.length) return;
         const now = new Date().toISOString(), moving: Record<string, boolean> = {}; picks.forEach(pk => { moving[pk.id] = true; });
@@ -1904,6 +2076,7 @@ export function MainComponent(props: any) {
     const crewLetters = ['A', 'B', 'C', 'D'].filter(l => TEAMS.some(t => t.letter === l) || allEmployees.some(e => crewOfPerson(e) === l));
     const liveOk = !clockCrew || shownCrew === clockCrew || shownCrew === upNextCrew;
     const peekNext = shownCrew && slotList.length ? nextSlotOf(slotList, shownCrew, new Date(), shownCrew !== clockCrew && shownCrew === upNextCrew) : null;
+    const nextPillSlot = boardMode === 'next' && nextSlot ? nextSlot : peekNext;   // a setup board keeps naming the shift it was opened for, even once that shift's prep hour has begun
     // A crew that is off needs a shift in the work schedule to set up; one with none listed cannot be opened.
     const crewHasNext = (letter: string) => !slotList.length || !!nextSlotOf(slotList, letter);
     const chooseCrew = (letter: string) => {
@@ -1930,8 +2103,18 @@ export function MainComponent(props: any) {
                 <div className="w-[280px] shrink-0 bg-white rounded-xl border border-slate-200 p-4 flex flex-col h-full max-h-[calc(100vh-250px)] shadow-sm">
                     <div className="shrink-0 flex flex-col gap-3 mb-3">
                         <Text weight="bold" className="uppercase tracking-wider" style={{ color: BRAND.blueDark }}>{currentStep === 2 ? "Select Areas" : "Available Staff"}</Text>
-                        {currentStep > 2 && suggestionCount > 0 && <Button size="small" appearance="primary" title="Fills the rooms that are short of their usual headcount with the people who have worked them most" onClick={() => addMembers(Object.keys(suggestions).reduce((acc: { areaId: string; id: string }[], k) => acc.concat(suggestions[k].map(s => ({ areaId: k, id: s.id }))), []))}>Add all {suggestionCount} suggested</Button>}
-                        {currentStep > 2 && histStatus.key === histKey && histStatus.state === 'reading' && <Text size={100} color="neutralSecondary">Reading the last six weeks of this crew's boards...</Text>}
+                        <div role="group" aria-label="Suggestion preset" className="flex items-center gap-1.5">
+                            <span className="text-[11px] font-extrabold text-slate-500">Suggest</span>
+                            <div className="flex rounded-lg border border-slate-300 overflow-hidden">
+                                {SUGGEST_MODES.map((m, i) => <button key={m.key} data-suggest-mode={m.key} aria-pressed={suggestMode === m.key} onClick={() => setSuggestMode(m.key)} title={m.help} className={`px-2.5 py-1 text-[11px] font-extrabold ${i > 0 ? 'border-l border-slate-300' : ''} ${suggestMode === m.key ? (m.key === 'training' ? 'bg-[#FFB81C] text-slate-900' : 'bg-[#0072CE] text-white') : 'text-slate-600 hover:bg-[#E6F1FB]'}`}>{m.label}</button>)}
+                            </div>
+                        </div>
+                        {currentStep === 2 && leadSuggestCount > 0 && <Button size="small" appearance="primary" title="Gives every room without a lead to the lead suggested for it. The rooms are shared out evenly between the selected leads; the Normal / Training choice above says who gets which" onClick={() => assignLeads(Object.keys(leadSuggest).map(k => ({ areaId: k, leadId: leadSuggest[k].leadId })))}>Assign all {leadSuggestCount} suggested</Button>}
+                        {currentStep === 3 && suggestionCount > 0 && <Button size="small" appearance="primary" title="Fills the rooms that are short of their usual headcount (the Normal / Training choice above says how people are chosen)" onClick={() => addMembers(Object.keys(suggestions).reduce((acc: { areaId: string; id: string }[], k) => acc.concat(suggestions[k].map(s => ({ areaId: k, id: s.id }))), []))}>Add all {suggestionCount} suggested</Button>}
+                        {(currentStep === 2 ? leadSuggestCount > 0 : currentStep === 3 && suggestionCount > 0) && <Text size={100} color="neutralSecondary" data-suggest-caption={suggestMode}>{suggestMode === 'training' ? 'Training: the reverse of best fit, so people learn' : 'Normal: best fit'}{currentStep === 2 && noHist ? ' (the last six weeks could not be read, so the rooms are split evenly)' : ''}</Text>}
+                        {currentStep === 2 && (histNow || noHist) && unledRooms.length > 0 && candidateLeads.length === 0 && <Text size={100} color="neutralSecondary">Select leads on the Leads step to get lead suggestions.</Text>}
+                        {currentStep === 3 && noHist && <Text size={100} color="neutralSecondary">Employee suggestions need the last six weeks of this crew's boards, which could not be read (Data check says why).</Text>}
+                        {currentStep >= 2 && histStatus.key === histKey && histStatus.state === 'reading' && <Text size={100} color="neutralSecondary">Reading the last six weeks of this crew's boards...</Text>}
                         {currentStep > 2 && (
                             <div className="relative">
                                 <div className="flex gap-2">
@@ -1950,7 +2133,13 @@ export function MainComponent(props: any) {
                     <div className="flex-1 overflow-y-auto pr-1">
                         {currentStep === 2
                             ? [...areas, ...customAreas].filter(a => selectedAreaIds.has(getField(a, 'craa5_aa_mss_areaid')) && !areaAssignments[getField(a, 'craa5_aa_mss_areaid')]).map(a => (
-                                <div key={getField(a, 'craa5_aa_mss_areaid')} draggable={true} onDragStart={e => { GLOBAL_DRAG_PAYLOAD = getField(a, 'craa5_aa_mss_areaid'); if (e.dataTransfer) e.dataTransfer.setData("areaId", getField(a, 'craa5_aa_mss_areaid')); }} className={`p-3 rounded-lg mb-2 cursor-grab text-sm font-semibold border ${isProductionArea(a) ? 'bg-[#FFF6E0] border-[#FFB81C] text-slate-800' : 'bg-slate-50 border-slate-200 text-slate-700'}`}>{renderSafe(getField(a, 'craa5_area'))} {getAreaEmoji(a)}</div>
+                                <div key={getField(a, 'craa5_aa_mss_areaid')} draggable={true} onDragStart={e => { GLOBAL_DRAG_PAYLOAD = getField(a, 'craa5_aa_mss_areaid'); if (e.dataTransfer) e.dataTransfer.setData("areaId", getField(a, 'craa5_aa_mss_areaid')); }} className={`p-3 rounded-lg mb-2 cursor-grab text-sm font-semibold border ${isProductionArea(a) ? 'bg-[#FFF6E0] border-[#FFB81C] text-slate-800' : 'bg-slate-50 border-slate-200 text-slate-700'}`}>{renderSafe(getField(a, 'craa5_area'))} {getAreaEmoji(a)}
+                                    {leadSuggest[getField(a, 'craa5_aa_mss_areaid')] && (() => { const ls = leadSuggest[getField(a, 'craa5_aa_mss_areaid')], aid = getField(a, 'craa5_aa_mss_areaid'); return (
+                                        <div className="flex flex-wrap items-center gap-1 mt-1.5 font-normal" data-lead-suggest={aid}>
+                                            <span className="text-[10px] font-bold" style={{ color: BRAND.blue }}>Suggested lead:</span>
+                                            <button className="text-[10px] px-1.5 py-0.5 rounded-full border border-[#0072CE] text-[#00468B] bg-[#E6F1FB] hover:bg-[#cfe3f7]" title={`${formatFullName(ls.name)} has led ${renderSafe(getField(a, 'craa5_area'))} on ${ls.days} ${ls.days === 1 ? 'shift' : 'shifts'} in the last six weeks`} onClick={() => assignLeads([{ areaId: aid, leadId: ls.leadId }])}>+ {formatFullName(ls.name)} ({ls.days === 0 ? 'no history' : `${ls.days} ${ls.days === 1 ? 'shift' : 'shifts'}`})</button>
+                                        </div>); })()}
+                                </div>
                             ))
                             : availableStaff.map(e => (
                                 <div key={getField(e, 'craa5__aa_employeeid')} draggable={true} onDragStart={ev => { ev.dataTransfer.setData("empId", getField(e, 'craa5__aa_employeeid')); ev.stopPropagation(); }} className="p-3 bg-white border border-slate-200 rounded-lg mb-2 cursor-grab shadow-sm hover:border-[#0072CE]">
@@ -1996,7 +2185,7 @@ export function MainComponent(props: any) {
                                             {suggestions[aid] && suggestions[aid].length > 0 && (
                                                 <div className="flex flex-wrap items-center gap-1 mt-1.5" data-suggest={aid}>
                                                     <span className="text-[10px] font-bold" style={{ color: BRAND.blue }}>Suggested:</span>
-                                                    {suggestions[aid].map(s => <button key={s.id} className="text-[10px] px-1.5 py-0.5 rounded-full border border-[#0072CE] text-[#00468B] bg-[#E6F1FB] hover:bg-[#cfe3f7]" title={`${formatFullName(s.name)} has worked ${renderSafe(getField(a, 'craa5_area'))} on ${s.days} ${s.days === 1 ? 'shift' : 'shifts'} in the last six weeks`} onClick={() => addMembers([{ areaId: aid, id: s.id }])}>+ {formatFullName(s.name)} ({s.days})</button>)}
+                                                    {suggestions[aid].map(s => <button key={s.id} className="text-[10px] px-1.5 py-0.5 rounded-full border border-[#0072CE] text-[#00468B] bg-[#E6F1FB] hover:bg-[#cfe3f7]" title={`${formatFullName(s.name)} has worked ${s.withLead} ${s.withLead === 1 ? 'shift' : 'shifts'} under ${formatFullName(renderSafe(getField(employeeMap.get(areaAssignments[aid]) || activeSupervisorObj, 'craa5_name')))} and ${s.days} ${s.days === 1 ? 'shift' : 'shifts'} in ${renderSafe(getField(a, 'craa5_area'))} in the last six weeks`} onClick={() => addMembers([{ areaId: aid, id: s.id }])}>+ {formatFullName(s.name)} ({s.withLead} with lead · {s.days} here)</button>)}
                                                 </div>
                                             )}
                                         </div>
@@ -2119,7 +2308,7 @@ export function MainComponent(props: any) {
                                     ))}
                                     <div className="flex rounded-lg border border-slate-300 overflow-hidden">
                                         <button disabled={!liveOk} onClick={() => chooseMode(false)} title={liveOk ? 'Today: the shift on now' : `Shift ${shownCrew} is not on right now`} className={`px-2.5 py-1 text-[11px] font-extrabold ${boardMode === 'live' ? 'bg-[#0072CE] text-white' : liveOk ? 'text-slate-600 hover:bg-[#E6F1FB]' : 'text-slate-300'}`}>Live</button>
-                                        {peekNext && <button onClick={() => chooseMode(true)} title="Set up the next shift ahead of time" className={`px-2.5 py-1 text-[11px] font-extrabold border-l border-slate-300 ${boardMode === 'next' ? 'bg-[#FFB81C] text-slate-900' : 'text-slate-600 hover:bg-[#FFF6E0]'}`}>Next shift · {slotLabel(peekNext.startMs)}</button>}
+                                        {peekNext && <button onClick={() => chooseMode(true)} title="Set up the next shift ahead of time" className={`px-2.5 py-1 text-[11px] font-extrabold border-l border-slate-300 ${boardMode === 'next' ? 'bg-[#FFB81C] text-slate-900' : 'text-slate-600 hover:bg-[#FFF6E0]'}`}>Next shift · {slotLabel((nextPillSlot || peekNext).startMs)}</button>}
                                     </div>
                                 </div>
                                 {currentStep === 4 && (
@@ -2135,7 +2324,7 @@ export function MainComponent(props: any) {
                     </nav>
                 )}
 
-                {showData && <DataCheckPanel onClose={() => setShowData(false)} msUser={msUser} currentUser={currentUser} slotCount={(GLOBAL_DATA_CACHE?.slots || []).length} currentShift={currentShift} shiftStartMs={shiftStartMs} upNextShift={upNextShift} teams={GLOBAL_DATA_CACHE?.teams || []} teamsRead={GLOBAL_DATA_CACHE?.teamsRead || 0} employees={allEmployees} supervisors={supervisors} taskStatus={taskStatus} areaCount={areas.length} boardCrew={boardCrew} ownerName={ownerLabel} presets={presets} presetStore={presetStore} presetLog={presetLog} prd={prd.keyOf === prdKey ? prd : PRD_IDLE} prdWindow={prdWindow} hist={histNow} histStatus={histStatus.key === histKey ? histStatus : HIST_IDLE} histNames={histNames} remembered={rememberedLog} onReread={() => { histForce.current = true; setHistReload(n => n + 1); }} />}
+                {showData && <DataCheckPanel onClose={() => setShowData(false)} msUser={msUser} currentUser={currentUser} slotCount={(GLOBAL_DATA_CACHE?.slots || []).length} currentShift={currentShift} shiftStartMs={shiftStartMs} upNextShift={upNextShift} teams={GLOBAL_DATA_CACHE?.teams || []} teamsRead={GLOBAL_DATA_CACHE?.teamsRead || 0} employees={allEmployees} supervisors={supervisors} taskStatus={taskStatus} areaCount={areas.length} boardCrew={boardCrew} ownerName={ownerLabel} presets={presets} presetStore={presetStore} presetLog={presetLog} prd={prd.keyOf === prdKey ? prd : PRD_IDLE} prdWindow={prdWindow} hist={histNow} histStatus={histStatus.key === histKey ? histStatus : HIST_IDLE} histNames={histNames} remembered={rememberedLog} onReread={() => { histForce.current = true; setHistReload(n => n + 1); }} suggestMode={suggestMode} leadSuggestCount={leadSuggestCount} memberSuggestCount={suggestionCount} />}
                 <main style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", position: 'relative' }}>{SC}</main>
             </div>
         </FluentProvider>
