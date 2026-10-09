@@ -113,12 +113,15 @@ LEARNINGS & CHAT CONTEXT LOG
 - Entry 24 (Current): every picture upload converts to JPG automatically (Gerald, Oct 9 15:40).
   * One shared block ("PICTURE TO JPG": pictureToJpegDataUrl) opens the picture, flattens it on white and saves it as a JPG, at
     most 1600 px on the long side (an Image column, issue pictures), or at its own size up to 4096 px for a picture going into
-    a File column. A JPG that is already in a File column goes as it is. Documents are never touched.
+    a File column. A JPG that is already in a File column goes as it is (its first bytes are checked, so a HEIC or PNG that was
+    only renamed .jpg is converted). Documents are never touched, and neither is a picture this browser cannot open (a TIFF scan
+    goes into a File column as it is; an Image column says plainly that it cannot take it).
   * iPhone HEIC photos: Chrome and Edge cannot open them (Safari can), so the first HEIC picked loads a small converter
     (heic2any 0.0.4: cdnjs, then jsdelivr, then unpkg) and converts each photo once. A photo whose name or type was changed
     is recognised by its first bytes. If no address loads, the file says why in plain words and can be tried again.
   * Bulk Upload: HEIC cards show the converted picture and the time the photo was taken (read from its EXIF); every card that is
-    not a JPG says "Saved as a JPG"; "What was saved" says "converted from HEIC to JPG".
+    that will become a JPG says "Saved as a JPG"; a photo that cannot be converted for good says why and is not counted as
+    ready; "What was saved" says "converted from HEIC to JPG". The converter's leftover listener per photo is removed again.
   * The same block is in mss - log input (paperwork), hub - Lead and beta - hub - Employee (before / after / completion photos).
 =======================================================================
 */
@@ -623,6 +626,30 @@ const looksLikeHeic = (file) => /hei[cf]/i.test((file && file.type) || '') || HE
 const isJpegFile = (file) => /^image\/(p?jpe?g)$/i.test((file && file.type) || '') || /\.(jpe?g|jfif)$/i.test((file && file.name) || '');
 const HEIC_HELP = 'this is an iPhone HEIC photo and the converter that turns it into a JPG could not be loaded (is the network blocked?). It can be tried again, or save or share the photo as a JPG first (for new photos, set the iPhone to Settings > Camera > Formats > Most Compatible)';
 
+// heic2any 0.0.4 leaves one "message" listener on its worker for every photo it converts, and each one keeps that photo's bytes in
+// memory until the page is reloaded. Each listener answers a single request, so it is taken off again once its answer has come.
+function tidyHeicWorker() {
+  try {
+    const w = window.__heic2any__worker;
+    if (!w || w.__tidy) return;
+    w.__tidy = true;
+    let lastId = null;
+    const post = w.postMessage.bind(w);
+    const add = w.addEventListener.bind(w);
+    w.postMessage = function (msg) { lastId = msg && msg.id; return post.apply(null, arguments); };
+    w.addEventListener = function (type, fn, opts) {
+      if (type !== 'message' || typeof fn !== 'function' || lastId === null) return add(type, fn, opts);
+      const id = lastId;
+      lastId = null;
+      const wrapped = function (ev) {
+        fn.call(this, ev);
+        if (ev && ev.data && ev.data.id === id) w.removeEventListener('message', wrapped);
+      };
+      return add(type, wrapped, opts);
+    };
+  } catch (e) { /* only a tidy-up: the conversion works without it */ }
+}
+
 let heicConverterLoading = null;
 function loadHeicConverter() {
   if (typeof window !== 'undefined' && typeof window.heic2any === 'function') return Promise.resolve(window.heic2any);
@@ -630,7 +657,7 @@ function loadHeicConverter() {
   const tryUrl = (url) => new Promise((resolve, reject) => {
     const s = document.createElement('script');
     s.src = url;
-    s.onload = () => (typeof window.heic2any === 'function' ? resolve(window.heic2any) : reject(new Error('empty')));
+    s.onload = () => { if (typeof window.heic2any === 'function') { tidyHeicWorker(); resolve(window.heic2any); } else reject(new Error('empty')); };
     s.onerror = () => { if (s.parentNode) s.parentNode.removeChild(s); reject(new Error('blocked')); };
     document.head.appendChild(s);
   });
@@ -2361,6 +2388,7 @@ function SubmissionForm({ selection, onSubmit, logEvent, editingItem, pictureSup
   const previewSources = formData.image ? [formData.image] : (storedShown ? storedSources : []);
   const handleStoredMissing = useCallback(() => setStoredMissing(true), []);
   const [preparingPicture, setPreparingPicture] = useState(false);
+  const pictureSeq = useRef(0); // each pick gets a number; Remove or a newer pick makes an older conversion's result be ignored
 
   // Stored ids are only trusted while they still name the same equipment (someone may have changed the names elsewhere).
   // One filtered query of at most MAX_EQUIPMENT rows; an id whose equipment now has another name becomes a text entry.
@@ -2389,19 +2417,24 @@ function SubmissionForm({ selection, onSubmit, logEvent, editingItem, pictureSup
     logEvent(`Image selected: ${file.name} (${(file.size/1024).toFixed(1)} KB)`, 'debug');
     setPictureError('');
     setPreparingPicture(true);
+    const mine = ++pictureSeq.current;
     try {
       const dataUrl = await compressImage(file);
+      if (mine !== pictureSeq.current) return; // Remove was pressed meanwhile: the picture stays removed
       setFormData(prev => ({ ...prev, image: dataUrl }));
       logEvent(`Image resized for upload: ${Math.round(dataUrl.length * 0.75 / 1024)} KB JPEG`, 'debug');
     } catch (err) {
+      if (mine !== pictureSeq.current) return;
       setPictureError(err.message);
       logEvent(`Image could not be prepared: ${err.message}`, 'error', { fileName: file.name, fileType: file.type, sizeKB: Math.round(file.size / 1024) });
     } finally {
-      setPreparingPicture(false);
+      if (mine === pictureSeq.current) setPreparingPicture(false);
     }
   };
 
   const handleRemoveImage = () => {
+    pictureSeq.current += 1; // a picture still being converted is dropped when it finishes
+    setPreparingPicture(false);
     setFormData(prev => ({ ...prev, image: null }));
     setPictureError('');
     // Removing a stored picture means clearing it on the server when the form is saved
@@ -3722,35 +3755,61 @@ const mimeFromName = (name) => {
   return (m && MIME_BY_EXTENSION[m[1].toLowerCase()]) || 'application/octet-stream';
 };
 
-// What goes up for one picked file. A picture is always saved as a JPG: for an Image column it is also shrunk (as observation
-// pictures are); for a File column a picture that is not a JPG yet (PNG, HEIC, WebP ...) is converted at its own size, and one
-// that is too big for the column is shrunk. Documents and JPGs go as they are.
+// The first bytes of a file say what it really is, whatever its name claims
+const readHead = (file, n) => new Promise((resolve) => {
+  try {
+    const reader = new FileReader();
+    reader.onload = () => resolve(new Uint8Array(reader.result));
+    reader.onerror = () => resolve(null);
+    reader.readAsArrayBuffer(file.slice(0, n));
+  } catch (e) { resolve(null); }
+});
+const hasJpegBytes = async (file) => {
+  const head = await readHead(file, 3);
+  return !head || (head[0] === 0xFF && head[1] === 0xD8 && head[2] === 0xFF); // unreadable: take its word
+};
+
+// What goes up for one picked file. A picture is saved as a JPG: for an Image column it is also shrunk (as observation pictures
+// are); for a File column a picture that is not a JPG yet (PNG, HEIC, WebP ...) is converted at its own size, and one that is too
+// big for the column is shrunk. A picture this browser cannot open (a TIFF scan, say) goes into a File column as it is, like any
+// document. A file that is called .jpg but is really a HEIC or PNG is told apart by its first bytes.
 async function prepareAssetUpload(file, f) {
   if (!file || !file.size) throw new Error('the file is empty');
   const limit = f.maxKB ? f.maxKB * 1024 : 0;
   const tooBig = (n) => `the file is ${formatBytes(n)} and ${f.label} takes at most ${formatBytes(limit)}`;
   const stem = String(file.name || '').replace(/\.[^.]+$/, '') || (f.kind === 'image' ? 'picture' : 'file');
   const ext = (/\.([a-z0-9]+)$/i.exec(file.name || '') || ['', ''])[1].toUpperCase();
+  const picture = isPictureFile(file);
+  const realJpeg = picture && isJpegFile(file) && await hasJpegBytes(file);
+  const heic = picture && !realJpeg && (looksLikeHeic(file) || await sniffHeic(file));
+  const convertedFrom = realJpeg ? '' : (heic ? 'HEIC' : (isJpegFile(file) ? 'picture' : (ext || 'picture')));
   const asJpg = async (opts) => {
     const bytes = dataUrlToBytes(await compressImage(file, opts));
-    return { body: bytes, name: `${stem}.jpg`, mimeType: 'image/jpeg', bytes: bytes.length, shrunk: true, convertedFrom: isJpegFile(file) ? '' : (ext || 'picture') };
+    return { body: bytes, name: `${stem}.jpg`, mimeType: 'image/jpeg', bytes: bytes.length, shrunk: true, convertedFrom };
   };
   if (f.kind === 'image') {
-    if (!isPictureFile(file)) throw new Error(`${f.label} only takes pictures`);
+    if (!picture) throw new Error(`${f.label} only takes pictures`);
     const up = await asJpg();
     if (limit && up.bytes > limit) throw new Error(tooBig(up.bytes));
     return up;
   }
-  if (isPictureFile(file) && !isJpegFile(file)) {
-    let up = await asJpg({ maxSide: 0, quality: 0.9 });
-    if (limit && up.bytes > limit) up = await asJpg();
-    if (limit && up.bytes > limit) throw new Error(tooBig(up.bytes));
-    return up;
+  if (picture && !realJpeg) {
+    try {
+      let up = await asJpg({ maxSide: 0, quality: 0.9 });
+      if (limit && up.bytes > limit) up = await asJpg();
+      if (limit && up.bytes > limit) throw new Error(tooBig(up.bytes));
+      return up;
+    } catch (error) {
+      // A HEIC that cannot be turned into a JPG, or a file that is simply too big, stops here; a picture this browser cannot open goes as it is
+      if (heic || error.retry || /^the file is /.test(error.message)) throw error;
+    }
   }
   if (limit && file.size > limit) {
-    if (isPictureFile(file)) {
-      const up = await asJpg();
-      if (up.bytes <= limit) return up;
+    if (picture) {
+      try {
+        const up = await asJpg();
+        if (up.bytes <= limit) return up;
+      } catch (e) { /* the file is too big either way */ }
     }
     throw new Error(tooBig(file.size));
   }
@@ -7887,11 +7946,15 @@ function bulkIssuePayload(it, kit) {
   return { db, local };
 }
 
+// Picture types every browser opens, so the app can say up front that they become JPGs (a TIFF scan, say, may not open)
+const opensInBrowser = (file) => /^image\/(png|webp|gif|bmp|avif|apng|svg\+xml)$/i.test((file && file.type) || '') || /\.(png|webp|gif|bmp|avif|apng|svg)$/i.test((file && file.name) || '');
+
 // Why a file cannot go up yet ('' = ready). `places` counts the files of the list per destination.
 // A file that failed for good (fatal) also waits, until something about it changes.
 function bulkProblem(it, byName, places, kit) {
   if (it.status === 'done' || it.status === 'uploading') return '';
   if (!it.file.size) return 'This file is empty.';
+  if (it.convertFatal && it.convertNote) { const why = endSentence(it.convertNote); return why.charAt(0).toUpperCase() + why.slice(1); }
   if (it.target === 'newIssue' || it.target === 'issue') return bulkIssueProblem(it, kit, places);
   // The equipment is being changed: it waits until one is picked (or the search is closed)
   if (it.choosing) return 'Pick the equipment from the search.';
@@ -8019,6 +8082,7 @@ function AssetsBulkUpload({ meta, set, mapColumn, mapKey, metaDone, loadAssetMet
         preview: picture && !heic ? URL.createObjectURL(file) : '',
         converting: !!(picture && heic),
         convertNote: '',
+        convertFatal: false, // the conversion failed for good (a broken photo), not just because the converter could not be loaded
         target,
         column: ready ? bulkDefaultColumn(uploadFields, picture, file.name) : '',
         columnTouched: false,
@@ -8055,15 +8119,17 @@ function AssetsBulkUpload({ meta, set, mapColumn, mapKey, metaDone, loadAssetMet
           if (!itemsRef.current.some(x => x.key === it.key)) continue; // taken off the list meanwhile
           let url = '';
           let note = '';
+          let failure = {};
           try {
             // Safari opens a HEIC photo itself; anything else converts it
             try { await decodePicture(it.file); url = URL.createObjectURL(it.file); } catch (e) { url = URL.createObjectURL(await heicToJpegBlob(it.file)); }
           } catch (error) {
+            failure = error;
             note = error.message;
             logEvent(`Bulk upload: "${it.file.name}" could not be converted to a JPG yet: ${error.message}`, 'warn');
           }
           if (!mounted.current || !itemsRef.current.some(x => x.key === it.key)) { if (url) URL.revokeObjectURL(url); continue; }
-          patchItem(it.key, { preview: url, converting: false, convertNote: note });
+          patchItem(it.key, { preview: url, converting: false, convertNote: note, convertFatal: !!note && !failure.retry });
         }
       })();
     }
@@ -8815,7 +8881,7 @@ function BulkFileCard({ it, problem, fields, byName, set, mapColumn, kit, onChan
           )}
         </div>
         {it.taken && <p className="text-[11px] text-slate-500 -mt-1">Taken {bulkTakenText(it.taken)}</p>}
-        {it.picture && !isJpegFile(it.file) && !done && (
+        {it.picture && !isJpegFile(it.file) && !done && !it.convertFatal && (it.heic || opensInBrowser(it.file) || it.target !== 'asset' || ((fields.find(f => f.name === it.column) || {}).kind === 'image')) && (
           <p className="text-[11px] text-slate-500 -mt-1" data-testid="bulk-to-jpg">{it.converting ? 'Converting to JPG...' : 'Saved as a JPG'}{it.convertNote ? <span className="text-[#7A5200]"> (preview not ready: {endSentence(it.convertNote)})</span> : null}</p>
         )}
 
