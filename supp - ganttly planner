@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 const APP_MODE = 'planner';   // 'current' = Ganttly, the floor app (file "supp - ganttly"); 'planner' = PBED, plan / brief / execute / debrief (file "supp - ganttly planner")
 // 🚨 ARCHITECTURE NOTE: One program, two apps. The two repo files are byte-identical except the line above. Ganttly (current)
-// shows the past 12 hours and the next 24 by the clock (shifts cut at the edges), moving on every hour; it reads PBED's saved
+// shows the shift on now and the next two shifts (shifts cut at the edges), moving on at every shift change; it reads PBED's saved
 // room setup and presets but never writes them, keeps its own check-offs / moves / custom tasks / downtimes (browser key
 // itp_current_plan_v1) and its own absent marks, "present on this shift" people and Live Reforecast switch (itp_current_v1),
 // and hides the planning controls (Setup tab, plan window, rotation, headcount, role mapping, Metrics). PBED is the whole thing.
@@ -780,14 +780,36 @@ function buildShiftWindows(slots, planStart, horizonMins) {
         .sort(function(a, b) { return a.start - b.start || a.crew.localeCompare(b.crew); });
 }
 
-// Ganttly (current): the past 12 hours and the next 24 by the clock (Gerald, Oct 8), as one window { date, hour, hours, startMs }
-// that starts 12 hours before the top of this hour and runs to the top of the hour after the next 24 hours, so it always shows
-// at least 12 hours back and 24 ahead (37 hours) and moves on every hour. Shifts are cut at its edges; `startMs` is the
-// window's own clock-in ms (DST-safe), the shift keys are built from it.
-const LIVE_HOURS_BACK = 12, LIVE_HOURS_AHEAD = 24;
-function currentShiftWindow(now) {
-    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours() - LIVE_HOURS_BACK, 0, 0);
-    return { date: getLocalYMD(start), hour: start.getHours(), hours: LIVE_HOURS_BACK + LIVE_HOURS_AHEAD + 1, startMs: start.getTime() };
+// Ganttly (current): the shift on now plus the next two shifts (Gerald, Oct 9; it was the past 12 hours and the next 24), as one
+// window { date, hour, hours, startMs }. It starts at the clock-in (top of the hour) of the shift on now (between shifts: of the
+// next one) and ends when the second shift after it ends; "a shift" = a distinct clock-in time, so crews that start together are
+// one shift. It moves on at every shift change (recomputed every hour). With no rotation it falls back to 12 hours back / 24 ahead.
+// `startMs` is the window's own clock-in ms (DST-safe), the shift keys are built from it.
+const LIVE_HOURS_BACK = 12, LIVE_HOURS_AHEAD = 24, LIVE_NEXT_SHIFTS = 2;
+function currentShiftWindow(now, rotation) {
+    const nowMs = now.getTime();
+    const top = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), 0, 0).getTime();
+    let start = null, hours = 0;
+    if (rotation && rotation.length) {
+        const base = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 2, 0, 0, 0);
+        const all = buildShiftWindows(rotation, base, 9 * 1440).map(function(w) {
+            return { s: base.getTime() + w.shiftStart * 60000, e: base.getTime() + w.shiftEnd * 60000 };
+        }).sort(function(a, b) { return a.s - b.s; });
+        const starts = [];
+        all.forEach(function(w) { if (w.e > nowMs && starts.indexOf(w.s) < 0) starts.push(w.s); });
+        const pick = starts.slice(0, 1 + LIVE_NEXT_SHIFTS);
+        if (pick.length) {
+            let end = 0;
+            all.forEach(function(w) { if (pick.indexOf(w.s) > -1 && w.e > end) end = w.e; });
+            start = new Date(pick[0]);
+            hours = Math.max(1, Math.round((end - pick[0]) / 3600000));
+        }
+    }
+    if (start === null) {
+        start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours() - LIVE_HOURS_BACK, 0, 0);
+        hours = LIVE_HOURS_BACK + LIVE_HOURS_AHEAD + 1;
+    }
+    return { date: getLocalYMD(start), hour: start.getHours(), hours: hours, startMs: start.getTime() };
 }
 
 // Working minutes inside [start, end) once breaks / downtimes (possibly overlapping) are removed.
@@ -2312,7 +2334,7 @@ export default function App(props) {
     // Ganttly (current): the window is the past 12 hours and the next 24 by the clock, from the top of the hour, moving on
     // every hour. The saved window belongs to PBED.
     const liveHour = Math.floor(liveTime.getTime() / 3600000);
-    const liveWindow = useMemo(function() { return IS_CURRENT ? currentShiftWindow(liveTime) : null; }, [liveHour]);
+    const liveWindow = useMemo(function() { return IS_CURRENT ? currentShiftWindow(liveTime, shiftRotation) : null; }, [liveHour, shiftRotation]);
     const ganttStartDate = liveWindow ? liveWindow.date : savedStartDate;
     const ganttStartHour = liveWindow ? liveWindow.hour : savedStartHour;
     const planHours = liveWindow ? liveWindow.hours : savedPlanHours;
@@ -5294,10 +5316,30 @@ export default function App(props) {
     // time are one group and sit on separate rows. Only the "All shifts" view; a single shift picked on the Gantt, PBED and the
     // dashboard are unchanged. Every x position goes through xOf / xEnd (xEnd = the end of a block: it stops before a gap).
     // ============================================================================
+    const displayData = activeTab === 'focus' && focusRoom ? scheduleData.groups.filter(function(g) { return g.name === focusRoom; }) : scheduleData.groups;
+    // Focus Mode (Ganttly, Gerald Oct 9): with a room picked, only the people attached to it are shown: whoever has a task in the room,
+    // the people the crew plan put on its line, and the leads of those people. null = nobody filtered out.
+    const focusLanes = (function() {
+        if (!IS_CURRENT || activeTab !== 'focus' || !focusRoom) return null;
+        const set = {};
+        displayData.forEach(function(g) { g.tasks.forEach(function(t) { t.assignedLanes.forEach(function(l) { set[l] = true; }); }); });
+        const lid = areaLine[String(focusRoom)];
+        if (lid) {
+            const crewOf = {};
+            shiftWindows.forEach(function(w) { crewOf[w.key] = w.crew; });
+            Object.keys(windowPlans).forEach(function(k) {
+                ((windowPlans[k].lineWorkers || {})[lid] || []).forEach(function(id) { const ln = laneByEmpCrew[id + '|' + crewOf[k]]; if (ln !== undefined) set[ln] = true; });
+            });
+        }
+        laneRoster.forEach(function(l) { if (set[l.lane] && l.leadKey && laneByKey[l.leadKey] !== undefined) set[laneByKey[l.leadKey]] = true; });
+        return set;
+    })();
+    const focusRoster = focusLanes ? laneRoster.filter(function(l) { return !!focusLanes[l.lane]; }) : laneRoster;
+
     const INTERRUPT_PX = 190;
     const stackOn = IS_CURRENT && (activeTab === 'gantt' || activeTab === 'focus') && !ganttWindow;
     const stack = (function() {
-        if (!stackOn || !shiftWindows.length || !laneRoster.length) return null;
+        if (!stackOn || !shiftWindows.length || !focusRoster.length) return null;
         const wins = shiftWindows.slice().sort(function(a, b) { return a.start - b.start || a.crew.localeCompare(b.crew); });
         const groups = [];
         wins.forEach(function(w) {
@@ -5308,7 +5350,7 @@ export default function App(props) {
         const byLane = {};
         groups.forEach(function(g, gi) {
             g.wins.forEach(function(w) {
-                laneRoster.forEach(function(l) {
+                focusRoster.forEach(function(l) {
                     if (!l.windows.some(function(x) { return x.start === w.start && x.end === w.end; })) return;
                     const slot = { lane: l.lane, row: g.rows, start: w.start, end: w.end, group: gi, crew: w.crew };
                     g.rows++; g.slots.push(slot); (byLane[l.lane] = byLane[l.lane] || []).push(slot);
@@ -5317,7 +5359,7 @@ export default function App(props) {
             g.px = (g.start / 60) * zoomLevel + INTERRUPT_PX * Math.max(0, gi - 1);   // where its interruption starts
         });
         // A lane that matches no shift (can't happen from the roster) is kept visible on the first group.
-        laneRoster.forEach(function(l) {
+        focusRoster.forEach(function(l) {
             if (byLane[l.lane]) return;
             const g = groups[0], slot = { lane: l.lane, row: g.rows, start: g.start, end: g.end, group: 0, crew: l.crew };
             g.rows++; g.slots.push(slot); byLane[l.lane] = [slot];
@@ -5382,6 +5424,7 @@ export default function App(props) {
             }
         };
     })();
+    const focusRows = focusLanes && !stack ? laneRoster.filter(function(l) { return !!focusLanes[l.lane] && (!ganttWindow || l.crew === ganttWindow.crew); }).map(function(l) { return l.lane; }) : null;
     const xOf = function(min) { return stack ? stack.xOf(min) : (min / 60) * zoomLevel; };
     const xEnd = function(min) { return stack ? stack.xEnd(min) : (min / 60) * zoomLevel; };
     const leftIdx = stack ? Math.min(leftGroup, stack.groups.length - 1) : 0;
@@ -5431,6 +5474,11 @@ export default function App(props) {
                     newLanes = stack.lanesNear(row, newMin, dragState.appliedHeads);
                     if (!newLanes) return;
                     newLane = newLanes[0];
+                } else if (focusRows) {
+                    // Focus Mode on one shift: the rows are only the people shown, so the row picks the lane
+                    const n = Math.max(1, dragState.appliedHeads), row = Math.max(0, Math.min(dragState.initialRow + Math.round(deltaY / LANE_HEIGHT_PX), focusRows.length - n));
+                    newLanes = focusRows.slice(row, row + n);
+                    if (newLanes.length) newLane = newLanes[0]; else newLanes = null;
                 }
 
                 // A pointer move that lands on the same 15-minute step and lane changes nothing: no re-render.
@@ -5462,7 +5510,7 @@ export default function App(props) {
             window.removeEventListener('pointerup', handlePointerUp);
             window.removeEventListener('pointercancel', handlePointerUp);
         };
-    }, [dragState, isPanning, panStartX, panScrollLeft, zoomLevel, hasDragged, laneRoster.length, visibleLaneLo, visibleLaneCount, scheduleData, stack]);
+    }, [dragState, isPanning, panStartX, panScrollLeft, zoomLevel, hasDragged, laneRoster.length, visibleLaneLo, visibleLaneCount, scheduleData, stack, focusRows ? focusRows.join(',') : '']);
 
     const onPanDown = function(e) {
         if (e.target && typeof e.target.closest === 'function' && (e.target.closest('.gantt-block-anim') || e.target.closest('.no-pan') || e.target.closest('input') || e.target.closest('button') || e.target.closest('select'))) return;
@@ -5617,8 +5665,6 @@ export default function App(props) {
 
     const activeEditorTask = selectedTaskEditor ? scheduleData.taskById[selectedTaskEditor] || null : null;
 
-    const displayData = activeTab === 'focus' && focusRoom ? scheduleData.groups.filter(function(g) { return g.name === focusRoom; }) : scheduleData.groups;
-
     // Grey "off shift" bands per lane (time outside that worker's crew windows).
     const ganttTotalMins = dynamicTotalHours * 60;
     const laneOffShift = laneRoster.map(function(l) {
@@ -5653,7 +5699,7 @@ export default function App(props) {
     const ROOM_HEAD_PX = 40, ROOM_ROW_PX = 24, ROOM_GAP_PX = 8, SUPPORT_BAND_PX = 28;
     const roomLayout = function() {
         const rows = [];
-        const inView = function(l) { return l >= visibleLaneLo && l < visibleLaneLo + visibleLaneCount; };
+        const inView = function(l) { return l >= visibleLaneLo && l < visibleLaneLo + visibleLaneCount && (!focusLanes || !!focusLanes[l]); };
         // Every task of every person shown, whatever the room: the ones outside a room are drawn faded on that person's line in the
         // rooms they belong to, so time spent elsewhere never reads as blank space.
         const byLane = {};
@@ -5918,10 +5964,11 @@ export default function App(props) {
         if (!last || last.crew !== l.crew) crewBlocks.push({ crew: l.crew, firstLane: l.lane, count: 1 });
         else last.count += 1;
     });
-    const visibleLanes = laneRoster.slice(visibleLaneLo, visibleLaneLo + visibleLaneCount);
+    const visibleLanes = laneRoster.slice(visibleLaneLo, visibleLaneLo + visibleLaneCount).filter(function(l) { return !focusLanes || !!focusLanes[l.lane]; });
     // The rows of the lane chart: one per visible person, or (one line) the most any shift has. A "seat" = a person on a row for
     // a stretch of time (their whole plan on the by-person view; one shift of it on the one-line view).
-    const chartRows = stack ? stack.rows : visibleLaneCount;
+    const chartRows = stack ? stack.rows : visibleLanes.length;
+    const visibleRowOf = function(lane) { for (let i = 0; i < visibleLanes.length; i++) if (visibleLanes[i].lane === lane) return i; return Math.max(0, lane - visibleLaneLo); };
     const chartSeats = stack ? stack.groups.reduce(function(acc, g) { return acc.concat(g.slots); }, []) : visibleLanes.map(function(l, row) { return { lane: l.lane, row: row, start: 0, end: Infinity }; });
     const roomView = !IS_CURRENT && activeTab === 'gantt' && ganttView === 'rooms';   // PBED's room-first chart
     // With a shift picked on the Gantt, the blank-space numbers count that shift only.
@@ -7479,7 +7526,7 @@ export default function App(props) {
                                                         ? (dragState.currentLanes || Array.from({ length: task.appliedHeads }, function(_, i) { return baseLane + i; }))
                                                         : task.assignedLanes;
                                                     const activeDuration = isDraggingMe && !task.isFrozen ? task.calculateDuration(rMin, task.customInterrupts, task.appliedHeads) : task.finalDuration;
-                                                    const sortedLanes = rLanes.slice().sort(function(a,b) { return a-b; }).filter(function(l) { return l >= visibleLaneLo && l < visibleLaneLo + visibleLaneCount; });
+                                                    const sortedLanes = rLanes.slice().sort(function(a,b) { return a-b; }).filter(function(l) { return l >= visibleLaneLo && l < visibleLaneLo + visibleLaneCount && (!focusLanes || !!focusLanes[l]); });
                                                     if (sortedLanes.length === 0) return null;
 
                                                     const late = isLate(task);
@@ -7508,7 +7555,7 @@ export default function App(props) {
                                                     // One DOM block per assigned lane, so split teams (e.g. Worker 1 and Worker 5) don't paint over 2-4.
                                                     return sortedLanes.map(function(lane, laneIdx) {
                                                         const isPrimaryLane = (laneIdx === 0);
-                                                        const topPx = (stack ? stack.rowOf(lane, rMin) : lane - visibleLaneLo) * LANE_HEIGHT_PX;
+                                                        const topPx = (stack ? stack.rowOf(lane, rMin) : visibleRowOf(lane)) * LANE_HEIGHT_PX;
                                                         const ringCls = task.hasConflict ? 'outline outline-2 outline-dashed outline-amber-500' : late ? 'ring-2 ring-rose-500' : task.isInProgress ? 'ring-2 ring-sky-500' : '';
                                                         return (
                                                             <div
@@ -7518,7 +7565,7 @@ export default function App(props) {
                                                                     if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
                                                                     draggedRef.current = false;
                                                                     setHasDragged(false);
-                                                                    setDragState({ taskId: task.id, initialX: e.clientX, initialY: e.clientY, initialMin: task.startMin, initialLane: task.assignedLanes[0] || 0, initialRow: stack ? stack.rowOf(task.assignedLanes[0] || 0, task.startMin) : 0, currentMin: task.startMin, currentLane: task.assignedLanes[0] || 0, currentLanes: null, appliedHeads: task.appliedHeads });
+                                                                    setDragState({ taskId: task.id, initialX: e.clientX, initialY: e.clientY, initialMin: task.startMin, initialLane: task.assignedLanes[0] || 0, initialRow: stack ? stack.rowOf(task.assignedLanes[0] || 0, task.startMin) : visibleRowOf(task.assignedLanes[0] || 0), currentMin: task.startMin, currentLane: task.assignedLanes[0] || 0, currentLanes: null, appliedHeads: task.appliedHeads });
                                                                     if (e.currentTarget && typeof e.currentTarget.setPointerCapture === 'function') e.currentTarget.setPointerCapture(e.pointerId);
                                                                 }}
                                                                 onPointerUp={function(e) {
