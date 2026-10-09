@@ -8,7 +8,8 @@ import { FluentProvider, createLightTheme, Button, Text, DataGrid, DataGridHeade
 // managers) lands on the board of the supervisor on the current shift.
 // The current shift comes from craa5_workshift (same reading rules as Ganttly).
 // Save Progress writes the whole board to craa5_taskassignment; every time the app opens
-// (or View As switches supervisor) the board is rebuilt from what that supervisor saved in the last 16 hours.
+// (or View As switches supervisor) the board is rebuilt from what that supervisor saved during the current shift
+// (and up to an hour before it began); the board of an earlier shift never loads.
 // ============================================================================
 
 // --- Session cache (survives Power Apps remounts) ---
@@ -109,17 +110,26 @@ function crewOf(sup: any, everyone: any[], fallbackShift: string) {
 // ============================================================================
 // SAVED ASSIGNMENTS (craa5_taskassignment)
 // Save Progress writes one row per person per area (plus an empty row for an area nobody is in). Opening the app reads the last
-// 24 hours, keeps the last 16, and rebuilds a supervisor's board from the rows whose team is that supervisor.
+// 24 hours and rebuilds a supervisor's board from the rows whose team is that supervisor and that were saved since the current
+// shift began (minus the prep hour). When no shift covers the clock, the last 16 hours are used instead.
 // Rows are matched by team, never by shift letter: the letter on a row comes from whichever app wrote it, and they don't agree.
+// Save Progress still closes every open row of the team from the last 16 hours, so the old shift's rows never linger as open.
 // ============================================================================
 const TASK_TABLE = "craa5_taskassignment";
 const TASK_FETCH_HOURS = 24;
 const TASK_LOOKBACK_MS = 16 * 3600000;
+const SHIFT_PREP_MS = 3600000;   // a board saved up to an hour before the shift began still counts for it (supervisors set up before clock-in)
 const TASK_TIMEOUT_MS = 10000;
 const TASK_COLUMNS = ['craa5_taskassignmentid', 'craa5_id', 'craa5_lead', 'craa5_area', 'craa5_starttime', 'craa5_endtime', 'craa5_datetimeofassignment', 'createdon', 'craa5_shift', 'craa5_team', 'craa5_percentagecomplete', 'craa5_complete', 'statecode', 'craa5__currentstatus', 'craa5_whatisbeingdone', 'craa5_whatislefttodo', 'craa5__future_or_notes', 'craa5_badgenumber', 'craa5_leademail', 'craa5_supervisoremail', 'craa5_uid_associated', 'craa5__aaemp_guid', 'craa5_email'];
 // What the board itself needs; used when this environment refuses the longer list above (a column it doesn't have).
 const TASK_CORE_COLUMNS = ['craa5_taskassignmentid', 'craa5_id', 'craa5_lead', 'craa5_area', 'craa5_starttime', 'craa5_endtime', 'craa5_datetimeofassignment', 'createdon', 'craa5_shift', 'craa5_team', 'craa5_percentagecomplete', 'craa5_complete', 'statecode', 'craa5_whatisbeingdone', 'craa5_whatislefttodo', 'craa5__aaemp_guid'];
-const noSavedNote = (others: number) => others ? `No saved assignments for this supervisor in the last 16 h (${others} saved rows belong to other teams)` : 'No saved assignments from anyone in the last 16 h';
+const clockTime = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+// Why a board came up empty. shiftStart is 0 when no shift covers now; earlier is true when this supervisor has saves from before this shift.
+const noSavedNote = (others: number, shiftStart: number, earlier: boolean) => {
+    if (earlier) return `New shift since ${clockTime(shiftStart)}: nothing saved yet`;
+    const span = shiftStart ? `yet this shift (since ${clockTime(shiftStart)})` : 'in the last 16 h';
+    return others ? `Nothing saved for this supervisor ${span}; ${others} saved ${others === 1 ? 'row belongs' : 'rows belong'} to other teams` : `Nothing saved ${span}`;
+};
 const odataDate = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
 const rowBelongsTo = (r: any, sup: any) => {
     const name = getField(sup, 'craa5_name'), email = getEmployeeEmail(sup);
@@ -458,7 +468,9 @@ export function MainComponent(props: any) {
     const hydrateState = useCallback((c: any) => {
         if (!c) return;
         // Shift and user first: React 17 renders each set separately, and the board defaults read these.
-        setCurrentShift(c.shift || ""); setShiftStartMs(c.shiftStartMs || 0); setMsUser(c.msUser || null);
+        // The shift is worked out again every time the app opens, so a page that has been loaded for hours still knows which shift it is.
+        const sh = findCurrentShift(c.slots || []);
+        setCurrentShift(sh.crew); setShiftStartMs(sh.startMs); setMsUser(c.msUser || null);
         setAllEmployees(c.allEmployees || []); setSupervisors(c.supervisors || []); setLeads(c.leads || []); setAreas(c.areas || []); setTaskStatus(c.taskStatus || null); setPresetRecords(c.presetRecords || []);
         if (c.resolvedUser) {
             setCurrentUser(c.resolvedUser);
@@ -477,6 +489,7 @@ export function MainComponent(props: any) {
     const switchBoard = useCallback(async (supId: string) => {
         if (!supId) return;
         setDisableAutoLogin(true); resetBoard(); setSelectedSupervisorId(supId);
+        if (GLOBAL_DATA_CACHE?.slots) { const sh = findCurrentShift(GLOBAL_DATA_CACHE.slots); setCurrentShift(sh.crew); setShiftStartMs(sh.startMs); }
         setBusyLabel("Reading saved assignments..."); setIsLoading(true);
         try {
             const t = await readSavedAssignments(propsRef.current);
@@ -499,10 +512,10 @@ export function MainComponent(props: any) {
     const areaMap = useMemo(() => { const m = new Map(); [...areas, ...customAreas].forEach(a => { const aId = getField(a, 'craa5_aa_mss_areaid'); if (aId) m.set(aId, a); }); return m; }, [areas, customAreas]);
     const unselectedAvailableLeads = useMemo(() => leads.filter(l => !selectedLeadIds.has(getField(l, 'craa5__aa_employeeid')) && !isEmployeeUtilized(l)), [leads, selectedLeadIds]);
 
-    // Available staff: hides anyone whose latest task in the 16-hour lookback is still open
+    // Available staff: hides anyone whose latest task this shift (and the prep hour before it) is still open; the shift before is over, so its open rows don't count
     const availableStaff = useMemo(() => {
-        const latestEmpState = new Map();
-        [...presetRecords].sort(byTaskTime).forEach((t: any) => {
+        const latestEmpState = new Map(), liveFrom = shiftStartMs ? shiftStartMs - SHIFT_PREP_MS : 0;
+        presetRecords.filter((t: any) => taskTime(t) >= liveFrom).sort(byTaskTime).forEach((t: any) => {
             const eName = (getField(t, 'craa5_id') || "").trim();
             const eGuid = getField(t, 'craa5__aaemp_guid') || getField(t, 'craa5_aaemp_guid') || "";
             const empKey = (eGuid || eName).toLowerCase();
@@ -524,7 +537,7 @@ export function MainComponent(props: any) {
             if (!customIds.has(eId) && (activeDbGuids.has(eId) || activeDbNames.has(eName) || isEmployeeUtilized(e))) return false;
             return true;
         });
-    }, [employees, customEmployees, unselectedAvailableLeads, presetRecords, selectedLeadIds, assignments]);
+    }, [employees, customEmployees, unselectedAvailableLeads, presetRecords, selectedLeadIds, assignments, shiftStartMs]);
 
     const activeBuckets = useMemo(() => {
         const m = new Map(); const s = supervisors.find(x => getField(x, 'craa5__aa_employeeid') === selectedSupervisorId); if (s) m.set(getField(s, 'craa5__aa_employeeid'), s);
@@ -537,8 +550,8 @@ export function MainComponent(props: any) {
         if (!selectedSupervisorId || isLoading || !taskStatus) return null;
         if (!taskStatus.ok) return { tone: 'error', text: `Saved assignments could not be read (${String(taskStatus.error).slice(0, 140)})` };
         if (boardNote) return boardNote;
-        return presetRecords.length === 0 ? { tone: 'none', text: noSavedNote(0) } : null;
-    }, [selectedSupervisorId, isLoading, taskStatus, boardNote, presetRecords]);
+        return presetRecords.length === 0 ? { tone: 'none', text: noSavedNote(0, shiftStartMs, false) } : null;
+    }, [selectedSupervisorId, isLoading, taskStatus, boardNote, presetRecords, shiftStartMs]);
 
     // Tailwind runtime
     useEffect(() => { if (!document.getElementById('tailwind-cdn')) { const s = document.createElement('script'); s.id = 'tailwind-cdn'; s.src = 'https://cdn.tailwindcss.com'; document.head.appendChild(s); } }, []);
@@ -588,13 +601,13 @@ export function MainComponent(props: any) {
                 ]);
                 const empData = empRaw.length ? empRaw : (p.inputEmployees || []);
                 const areaData = areaRaw.length ? areaRaw : (p.inputAreas || []);
-                const { crew, startMs } = findCurrentShift(parseWorkShiftRows(shiftRows));
-                if (!crew) logError('No craa5_workshift row covers the current time; shift left blank.');
+                const slots = parseWorkShiftRows(shiftRows);
+                if (!findCurrentShift(slots).crew) logError('No craa5_workshift row covers the current time; shift left blank.');
 
                 const sups = empData.filter((e: any) => roleOf(e) === 'supervisor').sort((a: any, b: any) => (getField(a, 'craa5_name') || "").localeCompare(getField(b, 'craa5_name') || ""));
                 const lds = empData.filter((e: any) => roleOf(e) === 'lead');
 
-                GLOBAL_DATA_CACHE = { allEmployees: empData, supervisors: sups, leads: lds, areas: areaData, presetRecords: saved.recent, taskStatus: saved.status, msUser, shift: crew, shiftStartMs: startMs, resolvedUser: resolveUserIdentity(msUser, empData) };
+                GLOBAL_DATA_CACHE = { allEmployees: empData, supervisors: sups, leads: lds, areas: areaData, presetRecords: saved.recent, taskStatus: saved.status, msUser, slots, resolvedUser: resolveUserIdentity(msUser, empData) };
                 GLOBAL_INIT_STATUS = 'COMPLETE'; hydrateState(GLOBAL_DATA_CACHE);
             } catch (e: any) { logError('Loading failed', e?.message || e); GLOBAL_INIT_STATUS = GLOBAL_DATA_CACHE ? 'COMPLETE' : 'IDLE'; } finally { setIsLoading(false); }
         };
@@ -616,7 +629,7 @@ export function MainComponent(props: any) {
     useEffect(() => {
         if (isLoading || disableAutoLogin || supervisors.length === 0 || selectedSupervisorId) return;
         const byLetter = (l: string) => (l ? supervisors.find(s => getShiftOf(s) === l) : undefined);
-        const since = shiftStartMs || Date.now() - 4 * 3600000;   // only saves made during this shift count (the last hour of the shift before is the outgoing supervisor's)
+        const since = shiftStartMs || Date.now() - 4 * 3600000;   // saves made during this shift (the last hour of the shift before is the outgoing supervisor's)
         const savedSince = (s: any, from: number) => presetRecords.some(r => taskTime(r) >= from && rowBelongsTo(r, s));
         const newestSaver = (from: number) => {
             let best: any = null, bestT = 0;
@@ -624,7 +637,8 @@ export function MainComponent(props: any) {
             return best;
         };
         const onShift = byLetter(currentShift);
-        const pick = (onShift && savedSince(onShift, since)) ? onShift : (newestSaver(since) || onShift || newestSaver(0) || byLetter(currentUser ? getShiftOf(currentUser) : "") || supervisors[0]);
+        // With a shift known, the previous shift's last saver is never the default. With none known (no craa5_workshift row covers now), the last 16 hours stand in for it.
+        const pick = (onShift && savedSince(onShift, since - SHIFT_PREP_MS)) ? onShift : (newestSaver(since) || onShift || (shiftStartMs ? null : newestSaver(0)) || byLetter(currentUser ? getShiftOf(currentUser) : "") || supervisors[0]);
         if (pick) setSelectedSupervisorId(getField(pick, 'craa5__aa_employeeid'));
     }, [isLoading, supervisors, selectedSupervisorId, disableAutoLogin, currentShift, shiftStartMs, currentUser, presetRecords]);
 
@@ -635,10 +649,14 @@ export function MainComponent(props: any) {
         const supName = String(getField(sup, 'craa5_name') || "");
         // Employee-hub progress rows share this table and the team name but never carry an employee id (Shift Start always saves it),
         // so they are left out of the board. If none of the team's rows has an id, nothing is left out.
-        const mine = presetRecords.filter(r => rowBelongsTo(r, sup)), idOfRow = (r: any) => String(getField(r, 'craa5__aaemp_guid') || getField(r, 'craa5_aaemp_guid') || "").trim();
+        // Only this shift's saves come back (plus up to an hour of set-up before it began): the board of an earlier shift never loads.
+        const restoreFrom = shiftStartMs ? shiftStartMs - SHIFT_PREP_MS : 0;
+        const ofTeam = presetRecords.filter(r => rowBelongsTo(r, sup)), mine = ofTeam.filter(r => taskTime(r) >= restoreFrom);
+        const otherTeams = presetRecords.filter(r => taskTime(r) >= restoreFrom && !rowBelongsTo(r, sup)).length;   // only this shift's, so a name mismatch shows up and the previous shift's rows don't
+        const idOfRow = (r: any) => String(getField(r, 'craa5__aaemp_guid') || getField(r, 'craa5_aaemp_guid') || "").trim();
         const hasIds = mine.some(r => idOfRow(r));
         const tr = mine.filter(r => !hasIds || !String(getField(r, 'craa5_id') || "").trim() || idOfRow(r));
-        if (tr.length === 0) { setBoardNote({ tone: 'none', text: noSavedNote(presetRecords.length) }); setPresetsApplied(true); return; }
+        if (tr.length === 0) { setBoardNote({ tone: 'none', text: noSavedNote(otherTeams, shiftStartMs, ofTeam.length > 0) }); setPresetsApplied(true); return; }
 
         const shiftLeads = crewOf(sup, allEmployees, currentShift).leads;
         const idOf = (e: any) => getField(e, 'craa5__aa_employeeid') || getField(e, 'craa5_aa_employeeid');
@@ -700,9 +718,9 @@ export function MainComponent(props: any) {
         setSelectedLeadIds(nl); setSelectedAreaIds(na); setAreaAssignments(aa); setAssignments(as); setAreaDetails(ad); setEmployeeStartTimes(est); setPresetsApplied(true);
         const areaCount = Object.keys(aa).length, people = Object.keys(as).reduce((n, k) => n + as[k].length, 0);
         if (areaCount > 0) { setBoardNote({ tone: 'ok', text: `Restored ${people} ${people === 1 ? 'person' : 'people'} in ${areaCount} ${areaCount === 1 ? 'area' : 'areas'} from the last save` }); setCurrentStep(4); }
-        else setBoardNote({ tone: 'none', text: 'Everything this supervisor saved in the last 16 h is already finished' });
+        else setBoardNote({ tone: 'none', text: `Everything this supervisor saved ${shiftStartMs ? 'this shift' : 'in the last 16 h'} is already finished` });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [presetRecords, presetsApplied, supervisors, areas, selectedSupervisorId, allEmployees, currentShift]);
+    }, [presetRecords, presetsApplied, supervisors, areas, selectedSupervisorId, allEmployees, currentShift, shiftStartMs]);
 
     // Everyday areas start in "Assigned For Today"
     useEffect(() => {
