@@ -65,6 +65,12 @@ import {
   search of all equipment, and "Create new asset". When a line is changed, the
   earlier entries of this order that were saved to the wrong equipment (or with
   no equipment ID) are found and moved to the chosen equipment on submit.
+  "Break up" is for a line that covers several pieces of equipment (its text lists
+  them, or the equipment has since been split into records named after it). The
+  pieces are suggested (never added for the admin) or searched by hand, and each
+  becomes a line of its own with its own equipment ID. The line's hours are shared
+  out among its pieces, so the other lines keep theirs. Nothing in the SAP rows
+  changes.
   Missing equipment can also be added to the order. One craa5__log_ row is
   written per equipment:
     craa5_equipmentguid     = craa5_aa_assetsid (what mss - calendar matches on)
@@ -150,6 +156,7 @@ const freqLabel = (col) => (FREQUENCIES.find(f => f.col === col) || {}).label ||
 const ASSET_SELECT = ['craa5_aa_assetsid', 'craa5_equipmentidentifier', 'craa5_roomname', 'craa5_areaname'];
 const LOG_SELECT = ['craa5__log_id', 'craa5_equipment', 'craa5_equipmentguid', 'craa5_sap', 'craa5_room', 'craa5_area', 'craa5_lastcleaned', 'craa5_lastcleanedby', 'craa5_hoursworked'];
 const FIX_SELECT = ['craa5__log_id', 'craa5_equipment', 'craa5_equipmentguid', 'craa5_sap', 'craa5_room', 'craa5_area'];
+const RETRO_SELECT = FIX_SELECT.concat(['craa5_lastcleaned']);
 
 // Row limits: every query is capped so no screen can pull thousands of rows.
 const LIMITS = {
@@ -1538,6 +1545,20 @@ const loggedFor = async (api, pieceId, from, to) => {
     pg = await pg.next();
   }
 };
+// Of the earlier entries a changed order line would move onto target, the ones whose day target already has an entry for the same
+// order: an order broken up into pieces has one entry per piece on one day, and moving one onto a sibling would log that equipment
+// twice and lose the other piece's record. Reads only. unchecked: target has too many entries in that period to look through.
+const coveredByTarget = async (api, rows, target) => {
+  const out = { covered: new Set(), unchecked: false };
+  if (!rows.length || !target || target.isNew) return out;
+  const days = rows.map(r => dayKey(r.craa5_lastcleaned)).filter(Boolean).sort();
+  if (!days.length) return out;
+  const got = await loggedFor(api, target.id, days[0], days[days.length - 1]);
+  if (got.capped) out.unchecked = true;
+  got.list.forEach((x) => { out.covered.add(`${x.sap}|${x.day}`); });
+  return out;
+};
+const isCovered = (cov, r) => { const d = dayKey(r.craa5_lastcleaned); return !!d && cov.covered.has(`${normCode(r.craa5_sap)}|${d}`); };
 // For each entry to break up, the pieces that still need an entry: not those another entry already covers for the same
 // SAP order and date. jobs: [{ id, pieces }]. Reads only; throws if it cannot check.
 const planSplits = async (api, jobs) => {
@@ -1733,7 +1754,7 @@ const useStyles = makeStyles({
   addPanel: { marginTop: '12px', padding: '10px', backgroundColor: '#FFF6E6', border: `1px dashed ${BRAND.yellow}`, borderRadius: '6px' },
   // Long equipment lists scroll inside their own box instead of running off the page
   pickList: { maxHeight: '300px', overflow: 'auto', marginTop: '6px', backgroundColor: '#FFFFFF', border: '1px solid #E4ECF6', borderRadius: '4px' },
-  linesScroll: { maxHeight: '50vh', overflow: 'auto', marginTop: '6px', border: '1px solid #E4ECF6', borderRadius: '4px' },
+  linesScroll: { maxHeight: '50vh', overflow: 'auto', scrollPaddingTop: '40px', marginTop: '6px', border: '1px solid #E4ECF6', borderRadius: '4px' },
   // Submit stays in view at the bottom of the form, however long the equipment list is
   submitBar: { position: 'sticky', bottom: '-12px', zIndex: 3, backgroundColor: '#FFFFFF', margin: '0 -12px -12px', padding: '10px 12px 12px', borderTop: `2px solid ${BRAND.line}`, boxShadow: '0 -4px 10px rgba(16,35,58,.08)', display: 'flex', flexDirection: 'column', gap: '8px' },
   submitMessages: { maxHeight: '110px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '4px' },
@@ -1844,6 +1865,8 @@ const useSuggest = (store, col, text, ctxRoom) => {
 // Status chip of an order line: [text, style key]
 const lineStatus = (l, dupe) => {
   if (dupe) return ['already logged', 'warn'];
+  if (l.splitting) return ['add pieces', 'warn'];
+  if (l.parent) return [`piece ${l.piece} of ${l.pieceCount}`, 'info'];
   if (!l.asset) return ['needs equipment', 'warn'];
   if (l.how === 'linked') return ['linked', 'ok'];
   if (l.how === 'best fit') return [`best fit · ${TIER_LABEL[l.tier] || ''}${l.ambiguous ? ' · check' : ''}`, l.tier === 'high' && !l.ambiguous ? 'ok' : 'warn'];
@@ -1887,8 +1910,15 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   const [moreRank, setMoreRank] = useState({});      // lineKey -> { busy, ranked, error } (similar names looked up on demand)
   const [newFor, setNewFor] = useState({});          // lineKey -> { name, room, area } typed for "Create new asset"
   const [retro, setRetro] = useState({});            // lineKey -> { status, count, more, from, stillUsed, filter, apply, error }
+  const [pieces, setPieces] = useState({});          // lineKey -> the equipment its SAP row is broken up into (a key here means break up is on)
+  const [hints, setHints] = useState({});            // lineKey -> { status, found, error } pieces looked for when break up was started
+  const [splitOpen, setSplitOpen] = useState({});    // lineKey -> true while its pieces are being edited
   const seq = useRef(0);
   const orderGen = useRef(0);
+  const piecesRef = useRef(pieces);                  // read by lookups that finish later, to see whether the line was broken up meanwhile
+  piecesRef.current = pieces;
+  const wrapRef = useRef(null);                      // the lines box, to move the focus into a pieces editor that was just opened
+  const focusTo = useRef('');                        // selector (inside the lines box) of the control that takes the focus after the next render
   const photoSeq = useRef(0);
   const retroSeq = useRef({});
   const listRef = useRef(null);
@@ -1934,10 +1964,16 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
   }, [hi, suggestions.length]);
 
+  // Include ticks, typed hours and edits made on the pieces of a row go with the pieces: a piece added again starts fresh
+  const dropPieceState = (isPiece) => {
+    const drop = (p) => { const x = {}; Object.keys(p).forEach((k) => { if (!isPiece(k)) x[k] = p[k]; }); return x; };
+    setExcluded(drop); setHoursOverride(drop); setEdits(drop);
+  };
   // Manual picks and earlier-entry scans; orderGen makes any lookup still running for them stale
   const resetPicks = () => {
     orderGen.current += 1;
-    setChosen({}); setPanel({}); setMoreRank({}); setRetro({});
+    setChosen({}); setPanel({}); setMoreRank({}); setRetro({}); setPieces({}); setHints({}); setSplitOpen({});
+    dropPieceState(k => k.indexOf('~') >= 0);
     retroSeq.current = {};
   };
   const clearOrderState = () => {
@@ -1951,9 +1987,12 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   useEffect(() => {
     if (seenVer.current === dataVer) return;
     seenVer.current = dataVer;
-    if (Object.keys(chosen).length || Object.keys(retro).length) {
+    if (Object.keys(chosen).length || Object.keys(retro).length || Object.keys(pieces).length) {
       resetPicks();
-      setNote('Equipment IDs were changed on the Fix tab, so the equipment for this order was worked out again. Check the lines and use Change again if needed.');
+      setNote('Equipment IDs were changed on the Fix tab, so the equipment for this order was worked out again. Check the lines and use Change or Break up again if needed.');
+    } else if (Object.keys(hints).length) {
+      orderGen.current += 1; // pieces looked for earlier were worked out from the old IDs (and a lookup still running is stale)
+      setHints({});
     }
   }, [dataVer]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -1962,6 +2001,22 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     const seen = new Set();
     const out = [];
     matches.forEach((e) => {
+      const list = pieces[e.key];
+      if (list) {
+        // Broken up: the SAP row stands for several pieces of equipment, one line each. Until there are two it is a single line
+        // that still has to be filled in.
+        const ms = { equipment: e.equipment, room: e.room, area: e.area };
+        const keep = list.filter(a => !seen.has(a.id));
+        keep.forEach(a => seen.add(a.id));
+        if (keep.length < 2) {
+          out.push({ key: e.key, msId: e.msId, col: e.col, how: 'pieces', tier: 'manual', ambiguous: false, reason: '', asset: null, auto: null, linked: null, ranked: [], partial: false, ms, name: e.equipment, room: e.room, area: e.area, splitting: true });
+          return;
+        }
+        keep.forEach((a, i) => {
+          out.push({ key: `${e.key}~${a.id}`, parent: e.key, piece: i + 1, pieceCount: keep.length, msId: e.msId, col: e.col, how: 'piece', tier: 'manual', ambiguous: false, reason: '', asset: a, auto: null, linked: null, ranked: [], partial: false, ms, name: a.name, room: a.room, area: a.area });
+        });
+        return;
+      }
       const pick = chosen[e.key];
       if (!pick && e.how === 'same as another line') return;
       const asset = pick || e.asset;
@@ -1984,20 +2039,81 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     });
     // Apply "edit pre-filled details" overrides, only to the equipment they were made for
     return out.map(l => { const ed = edits[l.key]; return ed && l.asset && !l.asset.isNew && ed.id === l.asset.id ? { ...l, name: ed.name, room: ed.room, area: ed.area } : l; });
-  }, [matches, chosen, extras, edits]);
+  }, [matches, chosen, extras, edits, pieces]);
 
-  const takenIds = useMemo(() => new Set(lines.map(l => l.asset && !l.asset.isNew && l.asset.id).filter(Boolean)), [lines]);
+  // The equipment a line gives up while its SAP row is broken up (its automatic match or its Change pick) stays reserved for that row,
+  // so no other line, extra or pieces list can take it before the row goes back to one piece of equipment
+  const reservedIds = useMemo(() => {
+    const m = {};
+    matches.forEach((e) => {
+      if (!pieces[e.key]) return;
+      const a = chosen[e.key] || e.asset;
+      if (a && !a.isNew && a.id) m[e.key] = a.id;
+    });
+    return m;
+  }, [matches, pieces, chosen]);
+  // Equipment already on a line, among the pieces of a row being broken up, or reserved for such a row
+  const takenIds = useMemo(() => {
+    const ids = lines.map(l => l.asset && !l.asset.isNew && l.asset.id).filter(Boolean);
+    matches.forEach((e) => {
+      (pieces[e.key] || []).forEach((a) => { ids.push(a.id); });
+      if (reservedIds[e.key]) ids.push(reservedIds[e.key]);
+    });
+    return new Set(ids);
+  }, [lines, matches, pieces, reservedIds]);
   const takenRef = useRef(takenIds);
   takenRef.current = takenIds;
+  // What the pieces of one row cannot use: all of the above except the equipment that row itself gave up
+  const takenFor = (key) => {
+    const mine = reservedIds[key];
+    if (!mine) return takenIds;
+    // Two SAP rows can be linked to the same equipment: then it is free for neither while the other holds it too
+    const heldElsewhere = lines.some(l => (l.parent || l.key) !== key && l.asset && l.asset.id === mine)
+      || matches.some(e => e.key !== key && (reservedIds[e.key] === mine || (pieces[e.key] || []).some(a => a.id === mine)));
+    if (heldElsewhere) return takenIds;
+    const x = new Set(Array.from(takenIds));
+    x.delete(mine);
+    return x;
+  };
+  // The SAP row broken up into pieces that holds this equipment, as { name, inPieces } (inPieces: among its pieces, else reserved
+  // for it), or null
+  const brokenUpOwner = (id) => {
+    let found = null;
+    matches.forEach((e) => {
+      const name = e.equipment || 'another line';
+      if ((pieces[e.key] || []).some(a => a.id === id)) found = { name, inPieces: true };
+      else if (reservedIds[e.key] === id && !found) found = { name, inPieces: false };
+    });
+    return found;
+  };
   const included = lines.filter(l => !excluded[l.key] && l.asset);
+  // The order's hours are shared evenly by SAP row: a row broken up shares its part among its pieces, so breaking one up never
+  // changes the hours of the other rows. Hours typed by hand come off the part they were typed for: a line's (or a broken-up row's,
+  // if typed before it was broken up) off the order total, a piece's off the part of its own row.
   const evenHours = useMemo(() => {
-    const free = included.filter(l => hoursOverride[l.key] === undefined);
-    const fixed = included.reduce((s, l) => s + (hoursOverride[l.key] !== undefined ? parseFloat(hoursOverride[l.key]) || 0 : 0), 0);
-    const split = splitHours((parseFloat(totalHours) || 0) - fixed, free.length);
+    const typed = (k) => (hoursOverride[k] !== undefined ? parseFloat(hoursOverride[k]) || 0 : null);
+    const rows = [];  // one per SAP row (or added equipment) with lines on it: { key, lines }; a row still being broken up keeps its part
+    const at = {};
+    lines.forEach((l) => {
+      if (excluded[l.key] || !(l.asset || l.splitting)) return;
+      const k = l.parent || l.key;
+      if (at[k] === undefined) { at[k] = rows.length; rows.push({ key: k, lines: [] }); }
+      if (l.asset) rows[at[k]].lines.push(l);
+    });
+    const free = rows.filter(r => typed(r.key) === null);
+    const fixed = rows.reduce((s, r) => s + (typed(r.key) || 0), 0);
+    const share = splitHours((parseFloat(totalHours) || 0) - fixed, free.length);
     const map = {};
-    free.forEach((l, i) => { map[l.key] = split[i] || 0; });
+    rows.forEach((r) => {
+      if (!r.lines.length) return;
+      const part = typed(r.key) !== null ? typed(r.key) : share[free.indexOf(r)] || 0;
+      if (!r.lines[0].parent) { if (typed(r.key) === null) map[r.key] = part; return; }
+      const open = r.lines.filter(l => typed(l.key) === null);
+      const each = splitHours(part - r.lines.reduce((s, l) => s + (typed(l.key) || 0), 0), open.length);
+      open.forEach((l, j) => { map[l.key] = each[j] || 0; });
+    });
     return map;
-  }, [included, hoursOverride, totalHours]);
+  }, [lines, excluded, hoursOverride, totalHours]);
   const lineHours = (l) => (hoursOverride[l.key] !== undefined ? parseFloat(hoursOverride[l.key]) || 0 : evenHours[l.key] || 0);
   const hoursSum = Math.round(included.reduce((s, l) => s + lineHours(l), 0) * 100) / 100;
   const isDupe = (l) => !!(l.asset && !l.asset.isNew && dupes.has(l.asset.id));
@@ -2030,15 +2146,17 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     if (!room || !area || !name) { setNote('Enter room, area and equipment name for the new equipment.'); return; }
     if (lines.some(l => l.asset && l.asset.isNew && sameText(l.name, name) && sameText(l.room, room) && sameText(l.area, area))) { setNote(`${name} is already being added to this order.`); return; }
     setNote('');
+    const g0 = orderGen.current;
     try {
       const existing = await store.findAssetExact(name, room, area);
+      if (orderGen.current !== g0) return; // the order was changed while this looked
       if (existing) {
-        if (takenIds.has(existing.id)) { setNote(`${existing.name} is already on this order.`); return; }
+        if (takenRef.current.has(existing.id)) { setNote(`${existing.name} is already on this order.`); return; }
         addExtra(existing);
         setNote(`${existing.name} already exists in ${placeText(existing)}; added the existing equipment instead of creating a duplicate.`);
         return;
       }
-    } catch (e) { setNote(`Could not check for an existing match: ${errText(e)}`); return; }
+    } catch (e) { if (orderGen.current === g0) setNote(`Could not check for an existing match: ${errText(e)}`); return; }
     seq.current += 1;
     addExtra({ id: `new:${seq.current}`, isNew: true, name, room, area });
   };
@@ -2063,9 +2181,16 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     if (!filter) { setRetro(p => ({ ...p, [l.key]: { status: 'ready', count: 0, from, stillUsed, filter: null, apply: false } })); return; }
     setRetro(p => ({ ...p, [l.key]: { status: 'scanning', count: 0, from, stillUsed, filter, apply: p[l.key] ? p[l.key].apply : true } }));
     try {
-      const rows = await api.query(LOG_TABLE, { select: ['craa5__log_id'], filter, top: LIMITS.countCap + 1 });
+      const rows = await api.query(LOG_TABLE, { select: RETRO_SELECT, filter, top: LIMITS.countCap + 1 });
+      const some = rows.slice(0, LIMITS.countCap);
+      // Entries the new equipment already has for the same order and day are not moved (see coveredByTarget)
+      const cov = await coveredByTarget(api, some, to);
       if (retroSeq.current[l.key] !== n) return;
-      setRetro(p => ({ ...p, [l.key]: { ...p[l.key], status: 'ready', count: Math.min(rows.length, LIMITS.countCap), more: rows.length > LIMITS.countCap } }));
+      if (cov.unchecked) { setRetro(p => ({ ...p, [l.key]: { ...p[l.key], status: 'error', error: `${to.name} has too many entries to check the earlier ones against`, apply: false } })); return; }
+      const movable = some.filter(r => !isCovered(cov, r));
+      const skipped = some.length - movable.length;
+      // Entries the new equipment already covers show this order was logged piece by piece: the rest are not ticked for the admin
+      setRetro(p => ({ ...p, [l.key]: { ...p[l.key], status: 'ready', count: movable.length, more: rows.length > LIMITS.countCap, skipped, ...(skipped > 0 ? { apply: false } : {}) } }));
     } catch (e) {
       if (retroSeq.current[l.key] === n) setRetro(p => ({ ...p, [l.key]: { ...p[l.key], status: 'error', error: errText(e), apply: false } }));
     }
@@ -2074,7 +2199,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   useEffect(() => {
     lines.forEach(l => {
       const r = retro[l.key];
-      if (!r || !r.from || !chosen[l.key]) return;
+      if (!r || !r.from || !chosen[l.key] || l.splitting) return;
       const used = lines.some(x => x.key !== l.key && !chosen[x.key] && x.asset && x.asset.id === r.from.id);
       if (used !== !!r.stillUsed) scanRetro(l, l.asset);
     });
@@ -2095,8 +2220,14 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     scanRetro(l, asset);
   };
   const undoChoice = (l) => {
-    if (l.auto && !l.auto.isNew && lines.some(x => x.key !== l.key && x.asset && x.asset.id === l.auto.id)) {
-      setNote(`${l.auto.name} (${placeText(l.auto)}) is now used by another line of this order. Change that line first, or pick other equipment here.`);
+    if (l.auto && !l.auto.isNew && takenIds.has(l.auto.id) && !(l.asset && l.asset.id === l.auto.id)) {
+      const owner = brokenUpOwner(l.auto.id);
+      const what = `${l.auto.name} (${placeText(l.auto)})`;
+      setNote(!owner
+        ? `${what} is now used by another line of this order. Change that line first, or pick other equipment here.`
+        : owner.inPieces
+          ? `${what} is now one of the pieces of “${owner.name}”. Take it out of those pieces first, or pick other equipment here.`
+          : `${what} is kept for “${owner.name}”, which is broken up into pieces. Pick other equipment here.`);
       return;
     }
     setChosen(p => { const x = { ...p }; delete x[l.key]; return x; });
@@ -2125,7 +2256,8 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     const n0 = retroSeq.current[l.key] || 0;
     const g0 = orderGen.current;
     rankMore(l).then(r => {
-      if (next || chosen[l.key] || orderGen.current !== g0 || (retroSeq.current[l.key] || 0) !== n0) return; // the admin picked something or changed order meanwhile
+      // the admin picked something, changed order or broke the line up meanwhile
+      if (next || chosen[l.key] || orderGen.current !== g0 || (retroSeq.current[l.key] || 0) !== n0 || piecesRef.current[l.key]) return;
       const n = r.find(ok);
       if (n) choose(l, n.asset);
     });
@@ -2134,14 +2266,18 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     const f = newFor[l.key] || { name: l.ms.equipment, room: l.ms.room, area: l.ms.area };
     const name = safeString(f.name), room = safeString(f.room), area = safeString(f.area);
     if (!name || !room || !area) { setNote('Enter a name, room and area for the new asset.'); return; }
-    if (lines.some(x => x.key !== l.key && x.asset && x.asset.isNew && sameText(x.asset.name, name) && sameText(x.asset.room, room) && sameText(x.asset.area, area))) {
+    const sameNew = (a) => !!a && a.isNew && sameText(a.name, name) && sameText(a.room, room) && sameText(a.area, area);
+    // (a new asset picked for a row that is broken up now is not on a line, but it comes back with "One piece only")
+    if (lines.some(x => x.key !== l.key && sameNew(x.asset)) || matches.some(e => e.key !== l.key && pieces[e.key] && sameNew(chosen[e.key]))) {
       setNote(`${name} (${room} / ${area}) is already being created for another line.`);
       return;
     }
+    const g0 = orderGen.current;
     try {
       const existing = await store.findAssetExact(name, room, area);
+      if (orderGen.current !== g0 || piecesRef.current[l.key]) return; // the order changed, or the line was broken up, while this looked
       if (existing) {
-        if (takenIds.has(existing.id) && !(l.asset && l.asset.id === existing.id)) { setNote(`${existing.name} (${placeText(existing)}) is already on this order.`); return; }
+        if (takenRef.current.has(existing.id) && !(l.asset && l.asset.id === existing.id)) { setNote(`${existing.name} (${placeText(existing)}) is already on this order.`); return; }
         choose(l, existing);
         setNote(`${existing.name} already exists in ${placeText(existing)}; using it instead of creating a duplicate.`);
         setView(l, 'list');
@@ -2152,6 +2288,83 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     choose(l, { id: `new:${seq.current}`, isNew: true, name, room, area });
     setView(l, 'list');
   };
+
+  // --- Break a line up into pieces: one entry per piece of equipment, each saved with its own equipment ID ---
+  // Looks for the pieces the SAP row's text lists, or equipment named after it (a hint only: nothing is added until the admin says so)
+  const lookForPieces = async (e) => {
+    const g0 = orderGen.current;
+    setHints(p => ({ ...p, [e.key]: { status: 'busy' } }));
+    try {
+      // Equipment that already has the row's own name is the match, so no pieces are suggested then
+      const known = [e.linked, chosen[e.key]].filter(Boolean).map(a => ({ asset: a }));
+      // A new map of log use every time: the log can change on the Unify tab, and a failed lookup must not be remembered
+      const found = await suggestPieces(store, { equipment: e.equipment, room: e.room, area: e.area, ranked: (e.ranked || []).concat(known) }, new Map());
+      if (orderGen.current === g0) setHints(p => ({ ...p, [e.key]: { status: 'ready', found } }));
+    } catch (err) {
+      if (orderGen.current === g0) setHints(p => ({ ...p, [e.key]: { status: 'error', error: errText(err) } }));
+    }
+  };
+  const startBreakUp = (l) => {
+    const e = matches.find(x => x.key === (l.parent || l.key));
+    if (!e) return;
+    setPieces(p => (p[e.key] ? p : { ...p, [e.key]: [] }));
+    setSplitOpen(p => ({ ...p, [e.key]: true }));
+    closePanel(l);
+    setNote('');
+    focusTo.current = `[data-split="${e.key}"]`;
+    // Looked for again when the last lookup failed or found nothing (a brief outage looks like "no pieces")
+    const h = hints[e.key];
+    if (!h || h.status === 'error' || (h.status === 'ready' && !h.found)) lookForPieces(e);
+  };
+  const editPieces = (l) => { focusTo.current = `[data-split="${l.parent}"]`; setSplitOpen(p => ({ ...p, [l.parent]: true })); };
+  const closeSplit = (key) => setSplitOpen(p => { const x = { ...p }; delete x[key]; return x; });
+  // "Edit pre-filled details" is on: the pieces of a row get their boxes too (a rename typed for the row's own equipment goes with it)
+  const pieceEdits = (key, list, prev) => {
+    const x = { ...prev };
+    list.forEach((a) => {
+      const k = `${key}~${a.id}`;
+      if (a.isNew || x[k]) return;
+      x[k] = prev[key] && prev[key].id === a.id ? prev[key] : { id: a.id, name: a.name, room: a.room, area: a.area };
+    });
+    return x;
+  };
+  // list: the pieces so far (fewer than two is still being chosen), or null for one piece of equipment again
+  const setPiecesFor = (key, list) => {
+    if (!list) {
+      setPieces(p => { const x = { ...p }; delete x[key]; return x; });
+      closeSplit(key);
+      dropPieceState(k => k.indexOf(`${key}~`) === 0);
+      focusTo.current = `[data-break-up="${key}"]`;
+      // "Edit pre-filled details" is on: the line that comes back gets its boxes (edit mode may have been switched on while it was broken up)
+      const e = matches.find(m => m.key === key);
+      const back = e && (chosen[key] || e.asset);
+      if (editMode && back && !back.isNew) setEdits(p => (p[key] && p[key].id === back.id ? p : { ...p, [key]: { id: back.id, name: back.name, room: back.room, area: back.area } }));
+      return;
+    }
+    const gone = (pieces[key] || []).filter(a => !list.some(x => x.id === a.id)).map(a => `${key}~${a.id}`);
+    if (gone.length) dropPieceState(k => gone.indexOf(k) >= 0);
+    if (editMode) setEdits(p => pieceEdits(key, list, p));
+    setPieces(p => ({ ...p, [key]: list }));
+  };
+  // The suggested pieces that are not in the list yet and not on another line of the order
+  const addFound = (key, found) => {
+    const list = pieces[key] || [];
+    const taken = takenFor(key);
+    focusTo.current = `[data-split="${key}"]`;
+    setPiecesFor(key, list.concat(found.assets.filter(a => !list.some(x => x.id === a.id) && !taken.has(a.id))));
+  };
+  // A pieces editor that was just opened (or fed from the hint) takes the focus, so the keyboard carries on inside it (its box, not a
+  // field: a touch screen keyboard should not pop up over the hint). When the editor closes, the focus goes back to the line's button.
+  // A box taller than the lines box is scrolled into view by its top (below the sticky column header), so its title and hint stay in sight.
+  useEffect(() => {
+    const sel = focusTo.current;
+    if (!sel) return;
+    focusTo.current = '';
+    const el = wrapRef.current && wrapRef.current.querySelector(sel);
+    if (!el) return;
+    try { el.focus({ preventScroll: true }); } catch (_) { el.focus(); }
+    if (el.scrollIntoView) el.scrollIntoView({ block: el.offsetHeight > wrapRef.current.clientHeight - 44 ? 'start' : 'nearest' });
+  });
 
   const startEdit = (on) => {
     setEditMode(on);
@@ -2191,15 +2404,16 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     const total = parseFloat(totalHours);
     if (!(total > 0) || total > 200) return 'Enter the hours it took (greater than 0).';
     if (lines.length === 0) return 'This SAP order is not in the list. Add the equipment it covers.';
+    if (lines.some(l => !excluded[l.key] && l.splitting)) return 'Add at least two pieces for the highlighted line, or choose One piece only.';
     if (lines.some(l => !excluded[l.key] && !l.asset)) return 'Choose the equipment for the highlighted line(s), or untick them.';
-    if (lines.some(l => !excluded[l.key] && (!safeString(l.name) || !safeString(l.room) || !safeString(l.area)))) return 'Every equipment line needs a name, room and area.';
+    if (lines.some(l => !excluded[l.key] && (!safeString(l.name) || !safeString(l.room) || !safeString(l.area)))) return 'Every equipment line needs a name, room and area. Tick Edit pre-filled details to fill in what is missing, or untick the line.';
     if (included.length === 0) return 'Nothing to log: no equipment selected.';
     const sigs = included.map(l => (l.asset.isNew ? `new|${normName(l.name)}|${normName(l.room)}|${normName(l.area)}` : l.asset.id));
     if (sigs.some((x, i) => sigs.indexOf(x) !== i)) return 'Two lines use the same equipment. Change one of them.';
     if (included.every(isDupe)) return 'Every selected equipment already has this order logged for that date.';
     if (included.some(l => !isDupe(l) && !(lineHours(l) > 0))) return 'Every selected equipment needs hours greater than 0.';
     if (Math.abs(hoursSum - total) > 0.01) return `Line hours add up to ${hoursSum} but the order total is ${total}.`;
-    if (Object.values(retro).some(r => r.status === 'scanning')) return 'Still checking earlier entries for a changed line. Try again in a moment.';
+    if (lines.some(l => !l.splitting && retro[l.key] && retro[l.key].status === 'scanning')) return 'Still checking earlier entries for a changed line. Try again in a moment.';
     if (photoBusy) return 'Still preparing the paperwork picture. Try again in a moment.';
     return '';
   };
@@ -2238,8 +2452,13 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
       const filter = retroFilter(normalizedCode, r.from, l.ms, stillUsed);
       if (!filter) continue;
       try {
-        const got = await api.query(LOG_TABLE, { select: FIX_SELECT, filter, top: LIMITS.countCap + 1 });
-        const rows = got.slice(0, LIMITS.countCap);
+        const got = await api.query(LOG_TABLE, { select: RETRO_SELECT, filter, top: LIMITS.countCap + 1 });
+        const some = got.slice(0, LIMITS.countCap);
+        // Not onto equipment that already has the same order on the same day (the pieces of an order broken up earlier)
+        const cov = await coveredByTarget(api, some, l.asset);
+        if (cov.unchecked) { notes.push(`${l.name}: earlier entries were not moved because ${l.asset.name} has too many entries to check them against.`); continue; }
+        const rows = some.filter(x => !isCovered(cov, x));
+        if (rows.length < some.length) notes.push(`${l.name}: ${plural(some.length - rows.length, 'earlier entry stays', 'earlier entries stay')} where ${some.length - rows.length === 1 ? 'it is' : 'they are'} because ${l.asset.name} already has an entry for that order on the same day.`);
         retroRows[l.key] = rows.filter(x => !claimed.has(x.craa5__log_id) && !seen.has(`log|${cleanGuid(x.craa5__log_id)}`));
         retroRows[l.key].forEach(x => claimed.add(x.craa5__log_id));
         if (got.length > LIMITS.countCap) notes.push(`${l.name}: more than ${LIMITS.countCap} earlier entries; the first ${LIMITS.countCap} are moved.`);
@@ -2247,14 +2466,15 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     }
     lines.forEach(l => {
       const r = retro[l.key];
-      if (excluded[l.key] && r && r.apply && r.count) notes.push(`${l.name}: ${plural(r.count, 'earlier entry was', 'earlier entries were')} not moved because the line is unticked.`);
+      if (excluded[l.key] && !l.splitting && r && r.apply && r.count) notes.push(`${l.name}: ${plural(r.count, 'earlier entry was', 'earlier entries were')} not moved because the line is unticked.`);
     });
     // 1. Equipment edits made through "Edit pre-filled details" (only for the equipment each edit was made for)
+    const edited = {};
     for (const l of lines) {
       if (excluded[l.key] || !l.asset || l.asset.isNew || !edits[l.key] || edits[l.key].id !== l.asset.id) continue;
       const a = l.asset;
       if (a.name !== l.name || a.room !== l.room || a.area !== l.area) {
-        try { await store.updateAsset(a, l.name, l.room, l.area); }
+        try { edited[l.key] = await store.updateAsset(a, l.name, l.room, l.area); }
         catch (e) { return { saved: 0, notes, info, error: `Could not update ${a.name}: ${errText(e)}` }; }
       }
     }
@@ -2265,7 +2485,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
       try { resolved[l.key] = (await store.findAssetExact(l.name, l.room, l.area)) || (await store.createAsset({ name: l.name, room: l.room, area: l.area })); }
       catch (e) { return { saved: 0, notes, info, error: `Could not create ${l.name}: ${errText(e)}` }; }
     }
-    const assetOf = (l) => resolved[l.key] || l.asset;
+    const assetOf = (l) => resolved[l.key] || edited[l.key] || l.asset;
     // Added equipment gets the SAP order stored on its SAP row
     for (const l of included.filter(x => x.extra)) {
       try { await storeCode(assetOf(l), l.col, notes); } catch (e) { notes.push(`${assetOf(l).name}: could not store the SAP order (${errText(e)}).`); }
@@ -2413,6 +2633,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
           {view !== 'list' && <Button size="small" onClick={() => setView(l, 'list')}>Best fits</Button>}
           {view !== 'search' && <Button size="small" onClick={() => setView(l, 'search')}>Search all equipment</Button>}
           {view !== 'new' && <Button size="small" onClick={() => setView(l, 'new')}>Create new asset</Button>}
+          <Button size="small" disabled={saving} aria-label={`Break up into pieces: ${l.ms.equipment || 'this line'}`} data-break-up={l.key} onClick={() => startBreakUp(l)}>Break up into pieces</Button>
           {chosen[l.key] && <Button size="small" disabled={saving} onClick={() => undoChoice(l)}>Undo change</Button>}
           {l.asset && <Button size="small" appearance="subtle" onClick={() => closePanel(l)}>Done</Button>}
         </div>
@@ -2424,9 +2645,54 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
               <Checkbox checked={!!rt.apply} disabled={saving} onChange={(e, d) => setRetro(p => ({ ...p, [l.key]: { ...p[l.key], apply: !!d.checked } }))}
                 label={`On submit, also move ${rt.count}${rt.more ? '+' : ''} earlier ${rt.count === 1 && !rt.more ? 'entry' : 'entries'} for this line${rt.from ? ` (saved to ${rt.from.name} · ${placeText(rt.from)}, or with no equipment ID)` : ' (saved with no equipment ID)'} to ${l.asset ? l.asset.name : 'the chosen equipment'}.`} />
             )}
+            {rt.status === 'ready' && rt.skipped > 0 && (
+              <Text className={styles.hint} block>
+                {plural(rt.skipped, 'earlier entry stays', 'earlier entries stay')} where {rt.skipped === 1 ? 'it is' : 'they are'}: {l.asset ? l.asset.name : 'the chosen equipment'} already has an entry for that order on the same day.
+                {rt.count > 0 ? ' This order looks logged piece by piece, so the box above is not ticked: tick it only if those entries really belong to this equipment.' : ''}
+              </Text>
+            )}
             {rt.status === 'ready' && !rt.count && <Text className={styles.hint} block>No earlier entries need correcting.</Text>}
           </div>
         )}
+      </div>
+    );
+  };
+
+  // The pieces of a SAP row being broken up: a hint, the pieces so far, and a search to add more
+  const renderSplit = (key) => {
+    const e = matches.find(x => x.key === key);
+    if (!e) return null;
+    const ms = { equipment: e.equipment, room: e.room, area: e.area };
+    const list = pieces[key] || [];
+    const taken = takenFor(key);
+    const hint = hints[key];
+    const found = hint && hint.status === 'ready' ? hint.found : null;
+    const unused = found ? found.assets.filter(a => !list.some(x => x.id === a.id)) : [];   // suggested, not among the pieces yet
+    const onOther = unused.filter(a => taken.has(a.id));                                      // ...and used by another line
+    const where = placeText(ms);
+    const seen = wrapRef.current ? wrapRef.current.clientWidth : 0;                          // the box stays at the left edge, so it must fit the visible width
+    const boxW = seen ? Math.max(260, Math.min(640, seen - 24)) : 640;
+    return (
+      <div className={styles.changePanel} style={{ position: 'sticky', left: 0, width: boxW, boxSizing: 'border-box' }} data-split={key} tabIndex={-1} role="group" aria-label={`Pieces of ${ms.equipment || 'this line'}`}>
+        <Text weight="semibold" block>Break up “{ms.equipment || '(unnamed)'}”{where ? ` in ${where}` : ''} into pieces</Text>
+        <Text className={styles.hint} block>Each piece gets its own entry with the same date, SAP order and initials, saved to that equipment. The hours of this line are shared out among its pieces. Nothing is saved until you submit.</Text>
+        <div aria-live="polite">
+          {hint && hint.status === 'busy' && <Text className={styles.hint} block>Looking for the pieces…</Text>}
+          {hint && hint.status === 'error' && list.length < 2 && <Text className={styles.errorText} block role="alert">Could not look for the pieces: {hint.error}. Search below to add them.</Text>}
+          {hint && hint.status === 'ready' && !found && list.length === 0 && <Text className={styles.hint} block>No pieces were found for this line. Search below to add them.</Text>}
+          {unused.length > 0 && (
+            <div className={styles.hint} style={{ marginTop: 4 }}>
+              {found.how === 'text' ? 'This line lists several things. Found: ' : 'Equipment here that starts with this name: '}<strong>{found.assets.map(a => a.name).join(', ')}</strong>.
+              {onOther.length > 0 && ` ${onOther.map(a => a.name).join(', ')} ${onOther.length === 1 ? 'is' : 'are'} already on another line of this order.`}
+              {' '}
+              {unused.length > onOther.length && <Button size="small" appearance="primary" className={styles.btnPrimary} disabled={saving} aria-label={`Use these pieces for ${ms.equipment || 'this line'}`} onClick={() => addFound(key, found)}>Use these pieces</Button>}
+            </div>
+          )}
+        </div>
+        <div style={{ marginTop: 6 }}>
+          <PiecesEditor store={store} g={ms} list={list} missing={found ? found.missing : []} taken={taken} disabled={saving}
+            onChange={(next) => setPiecesFor(key, next)} onDone={() => { focusTo.current = `[data-edit-pieces="${key}"]`; closeSplit(key); }} />
+        </div>
       </div>
     );
   };
@@ -2551,7 +2817,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
         </div>
       )}
       {lines.length > 0 && linesOpen && (
-        <div className={styles.linesScroll}>
+        <div className={styles.linesScroll} ref={wrapRef}>
           <table className={styles.linesTable} style={{ marginTop: 0 }}>
             <thead><tr>
               {['Include', 'Equipment', 'Room', 'Area', 'Frequency', 'Hours', 'Status'].map((h, i) => (
@@ -2559,26 +2825,39 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
               ))}
             </tr></thead>
             <tbody>
-              {lines.map(l => {
+              {lines.reduce((rows, l, li) => {
                 const off = !!excluded[l.key];
                 const dupe = isDupe(l);
                 const editing = editMode && edits[l.key] && l.asset && !l.asset.isNew && edits[l.key].id === l.asset.id;
-                const open = !off && !l.extra && !!l.ms && (!!panel[l.key] || !l.asset);
+                const split = !!(l.parent || l.splitting);                // a line of a SAP row that is broken up
+                const open = !split && !off && !l.extra && !!l.ms && (!!panel[l.key] || !l.asset);
+                // The pieces editor sits under the last piece of the SAP row (or under the line itself while it has fewer than two)
+                const lastPiece = !!l.parent && !(lines[li + 1] && lines[li + 1].parent === l.parent);
+                const splitShown = l.splitting ? !off : lastPiece && !!splitOpen[l.parent];
                 const rt = retro[l.key];
-                const differs = l.ms && l.asset && !(sameText(l.ms.equipment, l.asset.name) && samePlace(l.ms.room, l.asset.room) && samePlace(l.ms.area, l.asset.area));
+                const differs = l.ms && l.asset && !(l.piece > 1) && !(sameText(l.ms.equipment, l.asset.name) && samePlace(l.ms.room, l.asset.room) && samePlace(l.ms.area, l.asset.area));
+                // A SAP row that lists several things but is matched to one piece of equipment
+                const lists = !split && !l.extra && !off && !!l.ms && !!l.asset && textParts(l.ms.equipment).length > 1 && !sameText(l.ms.equipment, l.name);
                 const [statusText, statusKind] = lineStatus(l, dupe);
-                return (
+                rows.push(
                   <React.Fragment key={l.key}>
-                    <tr style={off ? { color: '#94A3B8' } : !l.asset ? { backgroundColor: '#FFF6E6' } : undefined}>
+                    <tr style={off ? { color: '#94A3B8' } : !l.asset ? { backgroundColor: '#FFF6E6' } : l.parent ? { backgroundColor: '#F3F8FE' } : undefined}>
                       <td className={styles.td}><input type="checkbox" aria-label={`Include ${l.name}`} checked={!off} disabled={saving} onChange={(e) => setExcluded(p => ({ ...p, [l.key]: !e.target.checked }))} /></td>
                       <td className={styles.td}>
                         {editing ? (
                           <Input size="small" aria-label={`Name for ${l.name}`} value={edits[l.key].name} disabled={saving} onChange={(e, d) => setEdits(p => ({ ...p, [l.key]: { ...p[l.key], name: d.value } }))} />
                         ) : <strong>{l.name || '(unnamed)'}</strong>}
                         {differs && <div className={styles.hint}>SAP row: {l.ms.equipment}{placeText(l.ms) ? ` · ${placeText(l.ms)}` : ''}</div>}
+                        {lists && <div className={styles.hint}>This SAP row lists several things. Use Break up to log each one.</div>}
                         {l.extra && <Button size="small" appearance="subtle" style={{ marginLeft: 6 }} aria-label={`Remove ${l.name} from this order`} disabled={saving} onClick={() => setExtras(p => p.filter(x => x.key !== l.key))}>Remove</Button>}
-                        {!l.extra && l.ms && l.asset && !off && !panel[l.key] && (
-                          <Button size="small" appearance="subtle" style={{ marginLeft: 6 }} aria-label={`Change equipment for ${l.ms.equipment}`} disabled={saving} onClick={() => openChange(l)}>Change</Button>
+                        {!l.extra && !split && l.ms && l.asset && !off && !panel[l.key] && (
+                          <>
+                            <Button size="small" appearance="subtle" style={{ marginLeft: 6 }} aria-label={`Change equipment for ${l.ms.equipment}`} disabled={saving} onClick={() => openChange(l)}>Change</Button>
+                            <Button size="small" appearance={lists ? 'secondary' : 'subtle'} aria-label={`Break up ${l.ms.equipment} into pieces`} data-break-up={l.key} disabled={saving} onClick={() => startBreakUp(l)}>Break up</Button>
+                          </>
+                        )}
+                        {l.piece === 1 && !splitOpen[l.parent] && (
+                          <Button size="small" appearance="subtle" style={{ marginLeft: 6 }} aria-label={`Edit pieces: ${l.ms.equipment}`} data-edit-pieces={l.parent} disabled={saving} onClick={() => editPieces(l)}>Edit pieces</Button>
                         )}
                       </td>
                       <td className={styles.td}>{editing ? <Input size="small" aria-label={`Room for ${l.name}`} list={roomList} value={edits[l.key].room} disabled={saving} onChange={(e, d) => { setEdits(p => ({ ...p, [l.key]: { ...p[l.key], room: d.value } })); setTyping(t => ({ ...t, room: d.value })); }} /> : l.room}</td>
@@ -2593,20 +2872,23 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
                       </td>
                       <td className={styles.td}>
                         <span className={tagClass(statusKind)} title={l.reason || undefined}>{statusText}</span>
-                        {!off && rt && rt.apply && rt.count > 0 && <div className={styles.hint}>+ moves {rt.count}{rt.more ? '+' : ''} earlier</div>}
+                        {!off && !l.splitting && rt && rt.apply && rt.count > 0 && <div className={styles.hint}>+ moves {rt.count}{rt.more ? '+' : ''} earlier</div>}
                       </td>
                     </tr>
                     {open && <tr><td className={styles.td} colSpan={7}>{renderPanel(l)}</td></tr>}
                   </React.Fragment>
                 );
-              })}
+                // The pieces editor is a row of its own, so adding or removing the last piece does not start it over
+                if (splitShown) rows.push(<tr key={`split-${l.parent || l.key}`}><td className={styles.td} colSpan={7}>{renderSplit(l.parent || l.key)}</td></tr>);
+                return rows;
+              }, [])}
             </tbody>
           </table>
         </div>
       )}
       {lines.length > 0 && linesOpen && (
         <Text className={styles.hint} block style={{ marginTop: 6 }}>
-          Equipment is picked automatically (linked, or the best fit in the same room and area); use Change to pick another. Total hours are split evenly across the selected equipment; edit a line to override it. Lines sum to {hoursSum}.
+          Equipment is picked automatically (linked, or the best fit in the same room and area); use Change to pick another. Use Break up when one line covers several pieces of equipment: each piece gets its own entry and the pieces share the line's hours. Total hours are split evenly across the lines; edit a line to override it. Lines sum to {hoursSum}.
           {dupeShare > 0 ? ` ${dupeShare} h is on equipment already logged for this date and will not be saved again.` : ''}
         </Text>
       )}
@@ -2747,8 +3029,9 @@ const splitNotes = (s) => [
   s.undated > 0 && `${plural(s.undated, 'entry has', 'entries have')} no date, so ${s.undated === 1 ? 'it was' : 'they were'} not broken up: there is no date to check the pieces against.`,
 ].filter(Boolean).join(' ');
 
-// Break-up of one entry: the pieces so far, each with a remove button, and a search to add more
-const PiecesEditor = ({ store, g, list, disabled, onChange, missing = [] }) => {
+// Break-up of one entry: the pieces so far, each with a remove button, and a search to add more.
+// The Add tab passes taken (equipment other lines of the order use, which cannot be pieces too) and onDone (a Done button).
+const PiecesEditor = ({ store, g, list, disabled, onChange, missing = [], taken = null, onDone = null }) => {
   const styles = useStyles();
   const label = g.equipment || 'blank entry';
   // Names in the entry's text that had no equipment: kept in view until the pieces are as many as the text lists
@@ -2771,9 +3054,10 @@ const PiecesEditor = ({ store, g, list, disabled, onChange, missing = [] }) => {
         </div>
       ))}
       <div style={{ marginTop: '4px' }}>
-        <AssetPicker key={list.length} autoFocus={acted.current} idTails store={store} exclude={new Set(list.map(a => a.id))} ariaLabel={`Search equipment to add as a piece of ${label}`} placeholder="Search to add a piece…" disabled={disabled} onPick={(a) => change(list.concat([a]))} />
+        <AssetPicker key={list.length} autoFocus={acted.current} idTails store={store} exclude={new Set(list.map(a => a.id).concat(taken ? Array.from(taken) : []))} ariaLabel={`Search equipment to add as a piece of ${label}`} placeholder="Search to add a piece…" disabled={disabled} onPick={(a) => change(list.concat([a]))} />
       </div>
       <Button size="small" appearance="transparent" disabled={disabled} aria-label={`One piece only: ${label}`} onClick={() => onChange(null)}>One piece only</Button>
+      {onDone && list.length >= 2 && <Button size="small" appearance="secondary" disabled={disabled} aria-label={`Done with the pieces of ${label}`} onClick={onDone}>Done</Button>}
     </div>
   );
 };
