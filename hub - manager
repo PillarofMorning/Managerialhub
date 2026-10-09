@@ -14,6 +14,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
  * - Version 6.0: "Prod Gantt" became "Prod Weekly", a Ganttly-style timeline (a lane per line, runs as colored bars, color key, now line, double-click an empty spot to schedule there). "Daily Shifts" became "Employee Query": type a name and see how often, and for how long, that person was assigned to each area, days and hours worked, a recommended strongest area and the team they were on most. The Personnel Gantt popout is still opened from a day in "Shift Cal".
  * - Version 6.1: Employee Query has a second way in, "By room or area": type a room or area and see who has spent the most time there (hours, shifts, first and last day, whose team), with the most experienced first. Only that area's assignments are read, in 14-day pieces, three at a time, and nothing is read until an area is picked.
  * - Version 6.2: Overview "Active Production Lines" are grouped (Running, Down for sanitation, Idle) with a button for each, a "Mark down for sanitation" button on a line (kept on this computer for a day) and the support lines folded at the bottom. "Team Deployment" now reads the board the way Shift Start does: the shift comes from the work schedule (craa5_workshift), it shows everything saved since that shift began (any supervisor, newest row per person), and "How this is read" lists what was used and which columns were found. Prod Weekly shows production lines on top and support lines below. The Schedule Input tab is gone (runs are added in the production schedule app; this app still adjusts, moves and deletes them).
+ * - Version 6.3: Team Deployment shows a small blue "Training" tag beside a person who is marked "In training" (set on the People page), with the training area as its hover text. It is read once for the Overview (kept 5 minutes, read again after Reload data), and "How this is read" says whether it could be read.
  * * 🗺️ DATAVERSE MAPPING CHEAT SHEET:
  * | Logical Name             | Purpose in App                                      |
  * |--------------------------|-----------------------------------------------------|
@@ -485,6 +486,12 @@ const WORKSHIFT_COLUMNS = ['craa5_shiftcode', 'craa5_dayname', 'craa5_daynumber'
 const DEPLOY_COLUMNS = ['craa5_id', 'craa5__aaemp_guid', 'craa5_lead', 'craa5_team', 'craa5_area', 'craa5_shift', 'craa5_starttime', 'craa5_datetimeofassignment', 'craa5_percentagecomplete', 'craa5_whatisbeingdone', 'statecode'];
 const SHIFT_PREP_MS = 3600000;              // a board saved up to an hour before the shift began still counts for it (supervisors set up before clock-in)
 const DEPLOY_FALLBACK_MS = 16 * 3600000;    // with no work-schedule row for now, the last 16 hours stand in for the shift
+// The "In training" tag on Team Deployment (set on the People page): one lazy read of the flagged employees. The list names its columns, never the
+// whole row: the employee table also holds a secret PIN column that must not be read into memory by this feature, and a failed read is never retried without the list.
+const TRAINING_FIELDS = ['craa5__aa_employeeid', 'craa5_name', 'craa5_intraining', 'craa5_trainingarea'];
+const TRAINING_FILTER = 'craa5_intraining eq true and statecode eq 0';
+const TRAINING_TOP = 200;
+const TRAINING_FRESH_MS = 5 * 60000;       // the flagged list is kept this long (and dropped by Reload data)
 const FMT_SUFFIX = '@OData.Community.Display.V1.FormattedValue';
 function parseWorkShiftRows(rows) {
     const read = (r, n) => (r[n + FMT_SUFFIX] !== undefined && r[n + FMT_SUFFIX] !== null && r[n + FMT_SUFFIX] !== '') ? r[n + FMT_SUFFIX] : r[n];
@@ -613,7 +620,7 @@ function buildDeployment(rows, shift, nowMs) {
     Object.keys(active).forEach(k => {
         const r = active[k], area = String(renderSafe(r.craa5_area) || '').trim();
         const person = {
-            id: r.craa5_taskassignmentid || k, name: formatFullName(r.craa5_id) || 'Area Task', area, lead: String(renderSafe(r.craa5_lead) || '').trim(),
+            id: r.craa5_taskassignmentid || k, guid: idOfRow(r), name: formatFullName(r.craa5_id) || 'Area Task', area, lead: String(renderSafe(r.craa5_lead) || '').trim(),
             team: String(renderSafe(r.craa5_team) || '').trim(), startMs: msOf(r.craa5_starttime) || taskTimeMs(r), pct: Number(r.craa5_percentagecomplete) || 0,
             status: String(renderSafe(r.craa5_whatisbeingdone) || renderSafe(r.craa5__currentstatus) || '').trim(),
         };
@@ -1368,6 +1375,40 @@ export default function ScheduleApp({ dataApi, ...props }) {
     // Team Deployment: the board Shift Start saved for this shift (see buildDeployment for the rules).
     const deployment = useMemo(() => buildDeployment(allAssignments, shiftNow, currentTime), [allAssignments, shiftNow, currentTime]);
     const deployCols = useMemo(() => columnsSeen(allAssignments.filter(t => taskTimeMs(t) >= deployment.from), DEPLOY_COLUMNS), [allAssignments, deployment.from]);
+
+    // The "Training" tags on Team Deployment: one lazy read of the employees marked In training, made only while the Overview shows people on the board.
+    // It is not one of the blocking page-load reads and never reaches the Data check banner (Team Deployment's "How this is read" says how it went).
+    // state: '' = not asked yet, 'loading', 'ok' or 'failed'. The answer, a failed one too, is kept for TRAINING_FRESH_MS and dropped by Reload data.
+    const [trainTags, setTrainTags] = useState({ state: '', map: Object.create(null), n: 0, capped: false });   // map: employee id (cleanGuid) -> training area text
+    const trainRef = useRef({ at: 0, tick: -1, busy: false, seq: 0 });
+    const depHasPeople = deployment.onFloor > 0, trainMinute = Math.floor(currentTime / 60000);
+    useEffect(() => {
+        if (activeTab !== 'overview' || !apiReady || !depHasPeople) return;
+        const ref = trainRef.current;
+        if (ref.tick === reloadTick && (ref.busy || (ref.at > 0 && Date.now() - ref.at < TRAINING_FRESH_MS))) return;   // asked already, and still fresh
+        const seq = ++ref.seq;
+        ref.tick = reloadTick; ref.busy = true; ref.at = 0;
+        setTrainTags(prev => prev.state === '' ? { ...prev, state: 'loading' } : prev);
+        (async () => {
+            let rows = null;
+            try {
+                // The columns are always named: the employee table also holds a secret PIN column, so a failed read is never repeated without the list.
+                rows = await queryRecords(TABLE_EMPLOYEE, dataApiRef.current, { filter: TRAINING_FILTER, select: TRAINING_FIELDS, top: TRAINING_TOP });
+            } catch (err) { console.error('[Manager] Training tags failed', err); rows = null; }
+            if (seq !== ref.seq) return;   // Reload data started a newer read, which has the say
+            ref.busy = false; ref.at = Date.now();
+            if (!Array.isArray(rows)) { setTrainTags({ state: 'failed', map: Object.create(null), n: 0, capped: false }); return; }
+            const map = Object.create(null);
+            let n = 0;
+            rows.forEach(r => {
+                const g = cleanGuid(r && r.craa5__aa_employeeid);
+                if (!g) return;
+                map[g] = String(renderSafe(r.craa5_trainingarea) || '').trim();
+                n++;
+            });
+            setTrainTags({ state: 'ok', map, n, capped: rows.length >= TRAINING_TOP });
+        })();
+    }, [activeTab, apiReady, depHasPeople, reloadTick, trainMinute]);
 
     // Production lines, one card per area + line, each with what it is doing right now (or at noon of the Target Date when another day is picked).
     const lineBoard = useMemo(() => {
@@ -2231,6 +2272,10 @@ export default function ScheduleApp({ dataApi, ...props }) {
 
     const renderOverviewTab = () => {
         const lb = lineBoard, sh = shiftNow, dep = deployment, dn = dep.notes;
+        const tt = trainTags, trainOk = tt.state === 'ok';
+        const trainingOf = (p) => (trainOk && p.guid && tt.map[p.guid] !== undefined) ? { area: tt.map[p.guid] } : null;   // a person flagged In training, with the area (may be blank)
+        let trainingNow = 0;
+        if (trainOk) dep.cards.forEach(c => c.people.forEach(p => { if (trainingOf(p)) trainingNow++; }));
         const prodCounts = { running: 0, sanitation: 0, idle: 0 };
         lb.production.forEach(l => { prodCounts[l.st.state]++; });
         const supCounts = { running: 0, sanitation: 0, idle: 0 };
@@ -2332,7 +2377,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
                     <span className="px-3 py-1 bg-green-50 text-green-700 rounded-full text-xs font-black border border-green-200 tracking-wider">LIVE</span>
                 </div>
                 <div className="px-6 pt-4 text-sm font-bold text-slate-600" role="status">
-                    {dep.onFloor} on the floor · {pluralize(dep.cards.length, 'lead')} · {pluralize(dep.supervisors.length, 'supervisor')}{dep.out.length ? ` · ${dep.out.length} out or late` : ''}
+                    {dep.onFloor} on the floor · {pluralize(dep.cards.length, 'lead')} · {pluralize(dep.supervisors.length, 'supervisor')}{dep.out.length ? ` · ${dep.out.length} out or late` : ''}{trainingNow > 0 ? <span data-training-count={trainingNow}>{` · ${trainingNow} in training`}</span> : null}
                 </div>
                 <details className="px-6 pt-2 text-xs text-slate-600" data-panel="deployment-details">
                     <summary className="cursor-pointer font-extrabold text-[#0072CE]">How this is read</summary>
@@ -2346,6 +2391,7 @@ export default function ScheduleApp({ dataApi, ...props }) {
                             {dn.earlierCrew > 0 ? ` ${dn.earlierCrew} left out: saved in that hour by the crew going home.` : ''}{dn.nextCrew > 0 ? ` ${dn.nextCrew} left out: saved in the last hour by the crew coming on, for their own shift.` : ''}{dn.noId > 0 ? ` ${dn.noId} left out: no employee id (equipment progress rows).` : ''}{dn.noRoom > 0 ? ` ${dn.noRoom} ${dn.noRoom === 1 ? 'person' : 'people'} left out: no room or no lead on the row, so Shift Start cannot place them either.` : ''}</li>
                         <li>Each person is on the board once, where their newest row puts them. A finished row takes them off ({dn.finishedRows} finished {dn.finishedRows === 1 ? 'row' : 'rows'}). People saved as PTO, Sick, Late or Left Early are listed apart.</li>
                         <li>Columns needed. craa5_workshift ({WORKSHIFT_COLUMNS.join(', ')}): {workSlots.rows ? (workSlots.missing.length ? <b className="text-[#B80022]">missing {workSlots.missing.join(', ')}</b> : 'all found') : 'no rows to check'}. craa5_taskassignment ({DEPLOY_COLUMNS.join(', ')}): {dn.inWindow ? (deployCols.missing.length ? <b className="text-[#B80022]">missing {deployCols.missing.join(', ')}</b> : 'all found') : 'no rows to check'}.</li>
+                        {(tt.state === 'ok' || tt.state === 'failed') && <li className="text-slate-500" data-testid="td-training-read" data-state={tt.state}>{trainOk ? `Training tags: read for ${tt.capped ? 'at least ' : ''}${pluralize(tt.n, 'person', 'people')}.` : 'Training tags: could not be read.'}</li>}
                     </ul>
                 </details>
                 <div className="p-6 bg-slate-50/50 overflow-x-auto" tabIndex={0} role="region" aria-label="Team deployment by lead">
@@ -2368,10 +2414,14 @@ export default function ScheduleApp({ dataApi, ...props }) {
                                         {card.people.map(p => {
                                             const diffMs = currentTime - p.startMs;
                                             const durationStr = diffMs > 0 ? formatMsToDuration(diffMs) : "Just Started";
+                                            const training = trainingOf(p);
                                             return (
-                                                <div key={p.id} className="bg-white p-3 rounded-lg border border-slate-200 shadow-sm hover:shadow-md transition-shadow">
+                                                <div key={p.id} data-person={p.guid || undefined} data-training={training ? '1' : undefined} className="bg-white p-3 rounded-lg border border-slate-200 shadow-sm hover:shadow-md transition-shadow">
                                                     <div className="flex justify-between items-baseline mb-1">
-                                                        <span className="font-bold text-sm text-slate-900 truncate pr-2">{p.name}</span>
+                                                        <span className="flex items-center gap-1.5 min-w-0">
+                                                            <span className="font-bold text-sm text-slate-900 truncate pr-2">{p.name}</span>
+                                                            {training && <span data-testid="td-training-chip" title={training.area ? `Training on: ${training.area}` : undefined} className="text-[10px] font-extrabold uppercase tracking-wider px-1.5 py-0.5 rounded-full bg-[#0072CE] text-white flex-shrink-0">Training</span>}
+                                                        </span>
                                                         <span className="text-xs font-semibold text-[#0072CE] flex-shrink-0">{durationStr}</span>
                                                     </div>
                                                     <div className="flex justify-between items-center gap-2">
