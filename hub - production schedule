@@ -42,6 +42,19 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
  *                      Payloads: every save of this visit with the exact columns sent and any column Dataverse refused.
  *                      The header pill always shows the last save.
  *
+ *   7. CHANGE REQUESTS - the "Schedule Change Request Form" Supply Chain sends when the schedule moves inside the time fence. Upload
+ *                      the Excel file (or paste its cells) and every line is matched to a run by item number and original date:
+ *                      a quantity change shortens or lengthens the run in proportion to its cases (12 h at 9,900 cases is 6 h at
+ *                      4,950; hours can be typed), a date change moves it, a product TAKEN OFF removes it, a product ADDED takes its
+ *                      line, start time and hours per case from its last runs. Later runs are pushed when the change overlaps them.
+ *                      Nothing is saved until Apply; a line that is not certain (several runs fit, the cases disagree, the run has
+ *                      started, the form puts a change in the fixed zone with no approval) is not ticked and says why. Every changed
+ *                      run gets a note and a batch tag, the schedule is read back after the save and Undo puts it all back. The same
+ *                      form read twice changes nothing twice. "Applies by itself when sure" (off until switched on) applies a request
+ *                      without a click when every line is certain. An email flow (Power Automate) can drop forms in the optional table
+ *                      craa5_schedulechange; the tab reads the waiting ones every 2 minutes while the page is open and writes
+ *                      applied / review / failed back to the row.
+ *
  * SCROLLING: the host canvas never scrolls the page, so the app is one screen tall (h-screen) and the area under the
  * header scrolls on its own (<main>), the same shell as the Manager hub.
  *
@@ -52,6 +65,8 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
  * | craa5_aa_assets      | Equipment + cleaning minutes (craa5_hoursrequired = base minutes,              |
  * |                      | craa5_MINALRG = allergen minutes, craa5_heads, craa5_areaname).                |
  * | craa5__aa_employee   | Roster (name, craa5_shift = crew A-D, role, job-role lookup).                  |
+ * | craa5_schedulechange | OPTIONAL inbox for change request forms: craa5_name, craa5_formjson (the form's cells as JSON), |
+ * |                      | craa5_status (new / applied / review / failed / dismissed), craa5_result, craa5_sender. |
  *
  * OPTIONAL COLUMNS on craa5__aa_prd_schd (add them so nothing stays only in the browser; Data Check > Columns lists them):
  *     craa5_ordernumber (Single line of text)    craa5_cases (Whole number)    craa5_notes (Multiple lines of text, 2000)
@@ -81,6 +96,7 @@ const UndoIcon = Ico(<><path d="M3 7v6h6" /><path d="M21 17a9 9 0 0 0-9-9 9 9 0 
 const AlertIcon = Ico(<><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" /><path d="M12 9v4" /><path d="M12 17h.01" /></>);
 const ChevronIcon = Ico(<polyline points="6 9 12 15 18 9" />);
 const CheckIcon = Ico(<><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></>);
+const MailIcon = Ico(<><rect width="20" height="16" x="2" y="4" rx="2" /><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7" /></>);
 
 // ============================================================================
 // COMPANY THEME (same as the Manager hub)
@@ -120,6 +136,10 @@ const SIDE_MAX = 3000;         // runs whose Order # / Cases / Notes are kept in
 const API_TIMEOUT_MS = 20000;
 const QUERY_LIMIT = 1000;
 const RANGE_LIMIT = 2000;
+const TABLE_INBOX = "craa5_schedulechange";   // optional: change requests an email flow drops off (see the Change Requests tab)
+const LS_CR_DONE = 'prodsched_changes_done_v1';   // forms already applied here (their signature and when), so reading one again says so
+const INBOX_POLL_MS = 120000, INBOX_TOP = 25;     // the inbox is looked at every 2 minutes while the page is open
+const CR_MAX_FORMS = 30;       // request forms held at once in the Change Requests tab
 const APPLY_CONC = 4;          // saves in flight at once when a bulk upload is applied
 const MAX_OPEN_WEEKS = 6;       // 'Open all' in step 3 opens this many weeks at most
 const MAX_SHEETS = 120;        // plans (weekly sheets) held at once in the Import view
@@ -169,6 +189,13 @@ const COLUMN_GUIDE = [
         { name: 'craa5_role', need: 'optional', why: 'Lead or employee' },
         { name: 'craa5_roleid', alt: '_craa5_roleid_value', need: 'optional', why: 'Job role (sanitation or production)' },
     ] },
+    { key: 'inbox', table: TABLE_INBOX, optionalTable: true, title: 'Change request inbox', note: 'Optional table. An email flow (Power Automate) drops each schedule change request form here; the Change Requests tab reads the waiting ones every 2 minutes while it is open, shows what each would change and, if you switch it on, applies the certain ones by itself. Without this table, upload the form by hand.', cols: [
+        { name: 'craa5_name', label: 'Name', type: 'Single line of text (the table\'s primary column)', need: 'required', why: 'The email subject or file name' },
+        { name: 'craa5_formjson', label: 'Form JSON', type: 'Multiple lines of text (maximum length)', need: 'required', why: 'The cells of the form as JSON (rows of cells). The flow\'s Excel script fills it' },
+        { name: 'craa5_status', label: 'Status', type: 'Single line of text (50)', need: 'required', why: 'The flow writes "new". The app sets applied, review (needs a look), failed or dismissed' },
+        { name: 'craa5_result', label: 'Result', type: 'Multiple lines of text (2000)', need: 'optional', why: 'What the app did, or why it left the request for you to look at' },
+        { name: 'craa5_sender', label: 'Sender', type: 'Single line of text (200)', need: 'optional', why: 'Who sent the email (shown on the request)' },
+    ] },
 ];
 
 function safeGetXrm() {
@@ -186,7 +213,7 @@ const withTimeout = (promise, ms, label) => new Promise((resolve, reject) => {
 });
 
 // Reads rows. Returns an array, or null when EVERY attempt failed (a failed read is never mistaken for "no data").
-async function queryRecords(entityNames, dataApi, { orderby, filter = "statecode eq 0", top = QUERY_LIMIT } = {}) {
+async function queryRecords(entityNames, dataApi, { orderby, filter = "statecode eq 0", top = QUERY_LIMIT, quiet = false } = {}) {
     const web = safeGetXrm()?.WebApi;
     const names = Array.isArray(entityNames) ? entityNames : [entityNames];
     let emptyResult = null;
@@ -196,7 +223,7 @@ async function queryRecords(entityNames, dataApi, { orderby, filter = "statecode
             try {
                 const res = await withTimeout(web.retrieveMultipleRecords(en, `?${odata}`), API_TIMEOUT_MS, `Xrm.WebApi ${en}`);
                 if (Array.isArray(res?.entities)) { if (res.entities.length || names.length === 1) return res.entities; emptyResult = res.entities; continue; }
-            } catch (e) { console.warn(`[ProdSchedule] ${en} via Xrm.WebApi:`, e?.message || e); }
+            } catch (e) { if (!quiet) console.warn(`[ProdSchedule] ${en} via Xrm.WebApi:`, e?.message || e); }
         }
         if (dataApi?.queryTable) {
             try {
@@ -211,7 +238,7 @@ async function queryRecords(entityNames, dataApi, { orderby, filter = "statecode
                 }
                 if (rows.length || names.length === 1) return rows.slice(0, top);
                 emptyResult = rows;
-            } catch (e) { console.warn(`[ProdSchedule] ${en} via dataApi:`, e?.message || e); }
+            } catch (e) { if (!quiet) console.warn(`[ProdSchedule] ${en} via dataApi:`, e?.message || e); }
         }
     }
     return emptyResult;
@@ -343,6 +370,7 @@ function badColumns(err, cols) {
     const named = cols.filter(c => msg.indexOf(c.toLowerCase()) >= 0);
     return named.length ? named : (/propert|column|attribute|field/.test(msg) ? cols : []);
 }
+const TABLE_GONE_RE = /resource not found for the segment|(table|entity)\b.{0,60}(does not exist|doesn.t exist|not found)|could not find .{0,40}(table|entity)|0x80060891|0x80040217/i;   // a whole table that is not there (not just a column)
 const errText = (e) => String(e && e.message ? e.message : e || 'Unknown error');
 const clipFields = (b) => { const o = {}; Object.keys(b).forEach(k => { const v = b[k]; o[k] = typeof v === 'string' && v.length > 160 ? v.slice(0, 159) + '…' : v; }); return o; };
 const colLabel = (c) => ({ [F_ORDER]: 'Order Number', [F_CASES]: 'Cases', [F_NOTES]: 'Notes', [F_AREA_ID]: 'MSS Area GUID', [F_BATCH]: 'Import Batch' }[c] || c);   // the display names the Columns list tells Gerald to create
@@ -371,6 +399,8 @@ const DEFAULT_SETTINGS = {
     extraLines: [],         // lineKeys added by hand
     lineOrder: [],          // lineKeys in the order the Gantt shows them
     cleanHeads: 2,          // sanitation people assumed when no sanitation shift is defined
+    crAuto: false,          // Change Requests: apply a request by itself when every line is certain
+    crScale: true,          // Change Requests: a run gets shorter / longer in proportion to its cases
 };
 
 // ============================================================================
@@ -460,7 +490,8 @@ function cellStr(v) {
 }
 function parseSheetDate(v) {
     const sane = (d) => d && d.getFullYear() >= 2000 && d.getFullYear() <= 2100 ? d : null;   // anything else (a stray 1998 cell) is not a week of this schedule
-    if (v instanceof Date && !isNaN(v.getTime())) return sane(new Date(v.getFullYear(), v.getMonth(), v.getDate()));
+    // Excel date cells arrive as local midnight give or take a few seconds either way (a zone whose old offset differs from today's lands at 23:59:50 the day before): an hour of slack
+    if (v instanceof Date && !isNaN(v.getTime())) { const w = new Date(v.getTime() + HOUR); return sane(new Date(w.getFullYear(), w.getMonth(), w.getDate())); }
     if (typeof v === 'number' && v > 30000 && v < 80000) { const d = new Date(Date.UTC(1899, 11, 30) + v * DAY); return sane(new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())); }
     const s = cellStr(v);
     let m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s);
@@ -971,6 +1002,407 @@ async function readPlanFile(file) {
     });
     return { sheets, skipped };
 }
+// One file -> { forms: [{ name, grid, parsed }], skipped: [{ name, why }] }. Every sheet that has the form's "original amount" / "new amount" columns is a form.
+async function readChangeFile(file) {
+    const lower = file.name.toLowerCase(), forms = [], skipped = [], rejects = [];
+    if (file.size > MAX_FILE_MB * 1024 * 1024) return { forms, skipped: [{ name: file.name, why: `the file is over ${MAX_FILE_MB} MB` }] };
+    let sheetsOf;
+    if (/\.(csv|tsv|txt)$/.test(lower)) sheetsOf = [{ n: '', grid: parseDelimited(await readAsText(file)) }];
+    else {
+        const X = await loadXlsx(), buf = await readAsBuffer(file), wb = X.read(buf, { type: 'array', cellDates: true });
+        sheetsOf = wb.SheetNames.map(n => { const ws = wb.Sheets[n]; trimSheetRange(ws, X); return { n, grid: X.utils.sheet_to_json(ws, { header: 1, raw: true, defval: '' }) }; });
+    }
+    sheetsOf.forEach(sh => {
+        const p = parseChangeForm(sh.grid, { name: sh.n }), label = sheetsOf.length > 1 && sh.n ? `${file.name} · ${sh.n}` : file.name;
+        if (p.error) rejects.push({ name: label, why: p.error }); else forms.push({ name: label, grid: sh.grid, parsed: p });
+    });
+    if (!forms.length) rejects.forEach(r => skipped.push(r));   // an empty spare sheet next to the real form is not worth a warning
+    return { forms, skipped };
+}
+
+// ============================================================================
+// SCHEDULE CHANGE REQUESTS (pure): the form Supply Chain sends when the schedule moves inside the time fence
+//   parseChangeForm  the cells of the form -> { form } | { error }: who asked and why, fixed zone / approval, every change line
+//   planChanges      each line against the runs on the schedule -> what it would do, how sure the match is
+//   crNote           the sentence saved on a run that a request changed
+// The form's own rules: a product ADDED has only a new amount and a new date; a product TAKEN OFF has its original amount, ZERO as the
+// new amount and its original date; an INCREASE or DECREASE has original and new amounts and dates (a blank new date = the same day).
+// Amounts are cases, like the Cases column of a run.
+// ============================================================================
+const CR_MAX_RUN = 31 * DAY;                                   // no request makes a run longer than this
+const CR_MAX_LINES = 200;                                      // lines read from one form
+const CR_ROUND = 15 * 60000;                                   // a changed run length is rounded to a quarter hour, like the plan's own times
+const crRound = (ms) => Math.max(CR_ROUND, Math.round(ms / CR_ROUND) * CR_ROUND);
+const crText = (v) => cellStr(v).replace(/\s+/g, ' ').trim();
+const CR_WEEKDAY = /^(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)[a-z]*\.?,?\s*/i;
+// An amount: null = blank (or a dash), a number, or NaN when it is something else. "9,900" and "9,900 cs" are 9900.
+function crQty(v) {
+    if (typeof v === 'number') return isFinite(v) ? v : NaN;
+    const t = crText(v).replace(/,/g, '');
+    if (!t || isPlaceholder(t)) return null;
+    const m = /^(-?\d+(?:\.\d+)?)\s*(?:cs|cases?|ea|each|units?|pcs?)?$/i.exec(t);
+    return m ? Number(m[1]) : NaN;
+}
+// The item (SAP) number as text without leading zeros, '' when blank, `bad` when it is not a number.
+function crCode(v) {
+    if (typeof v === 'number') return isFinite(v) && v > 0 && Math.floor(v) === v && v < 1e9 ? { code: String(v) } : { code: '', bad: 'is not an item number' };
+    const t = crText(v).replace(/\.0+$/, '');
+    if (!t || isPlaceholder(t)) return { code: '', blank: true };
+    const m = /^0*(\d{1,9})$/.exec(t);
+    return m ? { code: m[1] } : { code: '', bad: `"${clipText(t, 20)}" is not an item number` };
+}
+// A date as Excel, an email or a person gives it: a date cell, "Sat 10/24/26", "10/24/2026", "2026-10-24", "10/24" (the form's year).
+function crDay(v, refMs) {
+    const t = crText(v);
+    if (!t || isPlaceholder(t)) return { d: null, text: '' };
+    let d = parseSheetDate(v);
+    if (d) return { d, text: t };
+    if (/^\d{5}(?:\.\d+)?$/.test(t)) { d = parseSheetDate(Number(t)); if (d) return { d, text: t }; }   // an Excel date that a flow turned into text
+    const s = t.replace(CR_WEEKDAY, '');
+    if (s !== t) { d = parseSheetDate(s); if (d) return { d, text: t }; }
+    const m = /^(\d{1,2})[\/\-](\d{1,2})$/.exec(s);
+    if (m) {
+        const ref = new Date(isFinite(refMs) ? refMs : Date.now());
+        let y = ref.getFullYear(), c = new Date(y, Number(m[1]) - 1, Number(m[2]));
+        if (c.getMonth() !== Number(m[1]) - 1 || c.getDate() !== Number(m[2])) return { d: null, text: t };
+        if (c.getTime() < ref.getTime() - 120 * DAY) c = new Date(y + 1, Number(m[1]) - 1, Number(m[2]));   // months behind the form's date: next year's
+        return { d: c, text: t };
+    }
+    return { d: null, text: t };
+}
+const crSameDay = (a, b) => !!a && !!b && a.getTime() === b.getTime();
+const crHas = (x) => x !== null && x !== undefined && !(typeof x === 'number' && isNaN(x));
+// What one line asks for: add | remove | change | move | same | incomplete | bad
+function crKind(L) {
+    const oa = L.origAmt, na = L.newAmt;
+    if (!L.code || (typeof oa === 'number' && isNaN(oa)) || (typeof na === 'number' && isNaN(na)) || L.dateBad) return 'bad';
+    const oPos = crHas(oa) && oa > 0, nPos = crHas(na) && na > 0, dateMove = !!L.origDate && !!L.newDate && !crSameDay(L.origDate, L.newDate);
+    if (crHas(na) && na === 0) return L.origDate || L.newDate ? 'remove' : 'incomplete';
+    if (!oPos && nPos) return L.newDate || L.origDate ? 'add' : 'incomplete';
+    if (oPos && nPos) return na !== oa ? 'change' : dateMove ? 'move' : 'same';
+    return dateMove ? 'move' : 'incomplete';   // amounts missing: only a new date makes it a request
+}
+// The cells of one form (a sheet, or a pasted table) -> { form } or { error }
+function parseChangeForm(grid, opts) {
+    const o = opts || {}, rows = Array.isArray(grid) ? grid : [];
+    const low = (v) => crText(v).toLowerCase();
+    let h = -1, cols = null;
+    for (let r = 0; r < Math.min(rows.length, 120) && h < 0; r++) {
+        const cells = (rows[r] || []).map(low), find = (re) => cells.findIndex(c => re.test(c));
+        const orig = find(/^orig(?:inal)?\s*(?:amount|amt|qty|quantity|cases?)\b/), nw = find(/^new\s*(?:amount|amt|qty|quantity|cases?)\b/);
+        if (orig >= 0 && nw >= 0) {
+            h = r;
+            cols = { orig, nw, reason: find(/reason/), code: find(/^(?:code|item|item\s*(?:code|#|no\.?|number)|product(?:\s*code)?|sap\s*(?:item|code|material)|material)$/), desc: find(/^desc/), origDate: find(/^orig(?:inal)?\s*date/), newDate: find(/^new\s*date/) };
+        }
+    }
+    if (h < 0) return { error: 'No "original amount" and "new amount" columns found: this is not a schedule change request form.' };
+    if (cols.code < 0) return { error: 'The form has no "Code" column for the item number.' };
+    // the header block above the table and the signature block below it: a label, then the first filled cell to its right
+    const info = { date: null, plant: '', requestor: '', planners: '', reason: '', fixedZone: '', signature: '', approval: '' };
+    const LABELS = [['plant', /^plant\b.*\bproduced\b/], ['requestor', /^change requestor\b/], ['planners', /^ddp planners?\b/], ['reason', /^requested change\b/], ['fixedZone', /^change requested in fixed zone\b/], ['signature', /^supply chain signature\b(?!.*\bmay include\b)/], ['approval', /^plant approval\b/]];
+    const valueRight = (row, from) => { for (let c = from + 1; c < row.length; c++) if (crText(row[c]) && !isPlaceholder(crText(row[c]))) return row[c]; return ''; };
+    let reasonRow = -1;
+    rows.forEach((row, r) => {
+        row = row || [];
+        for (let c = 0; c < Math.min(3, row.length); c++) {
+            const t = low(row[c]);
+            if (!t || t.charAt(0) === '*') continue;
+            for (let k = 0; k < LABELS.length; k++) {
+                if (!LABELS[k][1].test(t)) continue;
+                const val = valueRight(row, c), key = LABELS[k][0];
+                if (key === 'fixedZone') { const y = crText(val).toLowerCase(); info.fixedZone = /^y/.test(y) ? 'Y' : /^n/.test(y) ? 'N' : ''; }
+                else if (!info[key]) info[key] = crText(val);
+                if (key === 'reason' && reasonRow < 0) reasonRow = r;
+                break;
+            }
+        }
+    });
+    // anything typed under the reason, before the change table (the merged "details" row of the form)
+    if (reasonRow >= 0) {
+        const extra = [];
+        for (let r = reasonRow + 1; r < h; r++) {
+            const t = crText((rows[r] || []).find(v => crText(v)) || '');
+            if (!t) continue;
+            if (/^(?:type in details|change detail|\*)/i.test(t) || LABELS.some(l => l[1].test(t.toLowerCase()))) break;
+            extra.push(t);
+        }
+        if (extra.length) info.reason = clipText([info.reason].concat(extra).filter(Boolean).join(' '), 400);
+    }
+    for (let r = 0; r < h && !info.date; r++) (rows[r] || []).forEach(v => { if (!info.date && (v instanceof Date || typeof v === 'number' || /\d/.test(crText(v)))) { const d = parseSheetDate(v); if (d) info.date = d; } });
+    const ref = info.date ? info.date.getTime() : Date.now();
+    const lines = [], problems = [];
+    for (let r = h + 1; r < rows.length; r++) {
+        const row = rows[r] || [];
+        const first = crText(row.find(v => crText(v) !== '') || '');
+        if (/^\*/.test(first) || /^(?:change requested in fixed zone|supply chain signature|plant approval)/i.test(first)) break;   // the footer: the form's own rules and signatures
+        const cc = crCode(row[cols.code]), oa = crQty(row[cols.orig]), na = crQty(row[cols.nw]);
+        const od = cols.origDate >= 0 ? crDay(row[cols.origDate], ref) : { d: null, text: '' }, nd = cols.newDate >= 0 ? crDay(row[cols.newDate], ref) : { d: null, text: '' };
+        if (cc.blank && oa === null && na === null && !od.text && !nd.text) continue;   // an empty line of the form (its description formula alone is not a request)
+        if (lines.length >= CR_MAX_LINES) { problems.push(`More than ${CR_MAX_LINES} lines: the rest were not read.`); break; }
+        const L = { row: r + 1, reasonCode: cols.reason >= 0 ? crText(row[cols.reason]) : '', code: cc.code, desc: cols.desc >= 0 && !isPlaceholder(crText(row[cols.desc])) ? crText(row[cols.desc]) : '',
+            origAmt: oa, newAmt: na, origDate: od.d, newDate: nd.d, bad: [] };
+        if (cc.blank) L.bad.push('The item number is blank'); else if (cc.bad) L.bad.push(cc.bad.charAt(0) === '"' ? cc.bad : `The item number ${cc.bad}`);
+        if (typeof oa === 'number' && isNaN(oa)) L.bad.push(`The original amount "${clipText(crText(row[cols.orig]), 20)}" is not a number`);
+        if (typeof na === 'number' && isNaN(na)) L.bad.push(`The new amount "${clipText(crText(row[cols.nw]), 20)}" is not a number`);
+        if (od.text && !od.d) { L.bad.push(`The original date "${clipText(od.text, 20)}" is not a date`); L.dateBad = true; }
+        if (nd.text && !nd.d) { L.bad.push(`The new date "${clipText(nd.text, 20)}" is not a date`); L.dateBad = true; }
+        L.kind = crKind(L);
+        lines.push(L);
+    }
+    if (!lines.length) problems.push('The form has no change lines.');
+    return { form: { ...info, lines, problems, name: o.name || '', sig: crSig(info, lines) } };
+}
+const crYmd = (d) => d ? getLocalYMD(d) : '';
+// the same form read twice (a re-upload, an email sent again) has the same signature
+function crSig(info, lines) {
+    return `${crYmd(info.date)}|${info.requestor}|${lines.map(l => [l.code, l.origAmt, l.newAmt, crYmd(l.origDate), crYmd(l.newDate)].join(':')).join(',')}`;
+}
+// The runs of an item and the day it last ran: the line, the usual start time and length, hours per case. For a product the form ADDS.
+function crRecall(runs) {
+    const by = {}, out = {};
+    runs.slice().sort((a, b) => b.start - a.start).forEach(r => { if (r.code !== null && r.code !== undefined && r.end > r.start) (by[r.code] = by[r.code] || []).push(r); });
+    Object.keys(by).forEach(k => {
+        const l = by[k], last = l[0];
+        const rates = l.slice(0, 12).filter(r => r.cases > 0).map(r => (r.end - r.start) / HOUR / r.cases).sort((a, b) => a - b);
+        out[k] = { product: last.product, area: last.area, line: last.line, allergen: last.allergen, allergenType: last.allergenType, crumb: last.crumb,
+            startClock: hhmmOf(last.start), hours: (last.end - last.start) / HOUR, perCase: rates.length ? rates[Math.floor(rates.length / 2)] : null };
+    });
+    return out;
+}
+// The reading window for one line: the runs of its days and a few either side (a line with no date looks from the form's date on).
+function crWindow(form, L, nowMs) {
+    const ds = [L.origDate, L.newDate].filter(Boolean).map(d => d.getTime());
+    const base = midnightOf(ds.length ? Math.min.apply(null, ds) : (form.date ? form.date.getTime() : nowMs));
+    const from = addDaysLocal(base, ds.length ? -3 : -2).getTime();
+    const to = ds.length ? addDaysLocal(midnightOf(Math.max.apply(null, ds)), 4).getTime() : addDaysLocal(new Date(from), 50).getTime();
+    return { from, to, key: `${from}|${to}` };
+}
+const CR_KIND_LABEL = { change: 'Change the quantity', move: 'Move to another day', remove: 'Take off the schedule', add: 'Add to the schedule', same: 'No change', incomplete: 'Not enough on this line', bad: 'Could not be read' };
+// The sentence saved on a run that a request changed (one line; mergeNotes keeps what is already there).
+function crNote(form, row) {
+    const L = row.L, md = form.date ? `${form.date.getMonth() + 1}/${form.date.getDate()}` : '', parts = [];
+    if (row.kind === 'remove') parts.push('taken off the schedule');
+    else if (row.kind === 'add') parts.push(`added, ${fmtNum(L.newAmt)} cases`);
+    else {
+        const b = row.before, a = row.after;
+        if (b && a && crHas(L.newAmt) && (b.cases === null || b.cases === undefined ? L.origAmt : b.cases) !== L.newAmt) parts.push(`cases ${fmtNum(b.cases === null || b.cases === undefined ? L.origAmt : b.cases)} to ${fmtNum(L.newAmt)}`);
+        if (b && a && Math.abs((a.end - a.start) - (b.end - b.start)) >= 60000) parts.push(`run ${fmtHrs(b.end - b.start)} to ${fmtHrs(a.end - a.start)}`);
+        if (L.origDate && L.newDate && !crSameDay(L.origDate, L.newDate)) parts.push(`moved ${fmtDay(L.origDate.getTime())} to ${fmtDay(L.newDate.getTime())}`);
+    }
+    if (!parts.length) parts.push('request received');
+    return clipText(`Schedule change${md ? ` ${md}` : ''}: ${parts.join(', ')}${form.reason ? ` (${clipText(form.reason, 160)})` : ''}.${form.approval ? ` Approved: ${clipText(form.approval, 60)}.` : ''}`, 400);
+}
+// Every line of a form against the runs on the schedule.
+//   existing  the runs around the form's dates (normRun shape, any line, any spelling of the area)
+//   recallMap crRecall() of the added items
+//   opts      { edits: { lineIndex: { pick, hours, include, area, line, time, asAdd } }, push, scale, nowMs, gapCtx }
+// Row status: ok | already (nothing left to do) | pick (several runs fit: choose) | missing (no such run) | needs (an added run needs a line,
+// time or hours) | blocked (cannot be placed) | same | incomplete | bad.   certain = found by item and day, nothing odd about it.
+function planChanges(form, existing, recallMap, opts) {
+    const o = opts || {}, edits = o.edits || {}, push = o.push !== false, scale = o.scale !== false, nowMs = o.nowMs || Date.now();
+    const byCode = {}, byLine = {}, byId = {}, claimed = {};
+    existing.forEach(r => {
+        byId[r.id] = r;
+        if (r.code !== null && r.code !== undefined) (byCode[r.code] = byCode[r.code] || []).push(r);
+        const k = canonLine(r.area, r.line); (byLine[k] = byLine[k] || []).push(r);
+    });
+    const noApproval = form.fixedZone === 'Y' && !form.approval && !form.signature;   // the form's own rule: a change in the fixed zone needs one of them
+    const rows = form.lines.map((L, i) => {
+        const ed = edits[i] || {};
+        const row = { i, L, kind: ed.asAdd && (L.kind === 'change' || L.kind === 'move') ? 'add' : L.kind, status: 'ok', m: null, cands: [], tier: 0, certain: false, caution: false, include: false,
+            before: null, after: null, pushes: [], add: null, warns: [], what: '', gaps: [], note: '', error: '', hand: false };
+        const warn = (t, caution) => { row.warns.push(t); if (caution) row.caution = true; };
+        const finish = () => {
+            const ok = row.status === 'ok';
+            if (ok && noApproval) warn('The form puts this change in the fixed zone and has no plant approval or supply chain signature: check with Supply Chain, then tick it', true);
+            row.include = ed.include !== undefined ? ok && !!ed.include : ok && row.certain && !row.caution;
+            if (ok || row.status === 'already') row.note = crNote(form, row);
+            return row;
+        };
+        if (row.kind === 'bad' || row.kind === 'incomplete' || row.kind === 'same') {
+            row.status = row.kind;
+            if (row.kind === 'incomplete') row.error = L.newAmt === null && crHas(L.origAmt) ? 'There is no new amount. If the product is taken off the schedule, the form needs a 0 there.' : 'There is not enough on this line to know what to change.';
+            if (row.kind === 'bad') row.error = L.bad.join('. ');
+            return finish();
+        }
+        const code = Number(L.code), all = byCode[code] || [];
+        const free = (list) => list.filter(r => !claimed[r.id]);
+        const dayEnd = (d) => addDaysLocal(d, 1).getTime();
+        const poolOf = (day) => {
+            const a = day.getTime(), b = dayEnd(day), starts = (r) => r.start >= a && r.start < b, carries = (r) => r.start < a && r.end > a;
+            return { t1: free(all.filter(starts)), t2: free(all.filter(carries)), near: free(all.filter(r => r.start >= a - DAY && r.start < b + DAY && !starts(r) && !carries(r))) };
+        };
+        // the run a line means: picked by hand, else the only run of the item that starts that day (or runs through it), else the one whose cases fit
+        const findRun = (day) => {
+            if (ed.pick && byId[ed.pick] && byId[ed.pick].code === code) return { m: byId[ed.pick], cands: [byId[ed.pick]], tier: 0, hand: true };
+            if (!day) {
+                const from = (form.date ? form.date.getTime() : nowMs) - DAY, list = free(all.filter(r => r.end > from && r.start < from + 45 * DAY)).sort(byStart);
+                return list.length === 1 ? { m: list[0], cands: list, tier: 4 } : { m: null, cands: list.slice(0, 8), tier: 4 };
+            }
+            const P = poolOf(day), list = P.t1.length ? P.t1 : P.t2, tier = P.t1.length ? 1 : P.t2.length ? 2 : 0;
+            if (!list.length) return { m: null, cands: P.near, tier: P.near.length ? 3 : 0 };
+            if (list.length === 1) return { m: list[0], cands: list, tier };
+            const hit = crHas(L.origAmt) ? list.filter(r => r.cases === L.origAmt) : [];
+            return hit.length === 1 ? { m: hit[0], cands: list, tier } : { m: null, cands: list, tier };
+        };
+        const claim = (f) => { Object.assign(row, { m: f.m, cands: f.cands, tier: f.tier, hand: !!f.hand }); if (f.m) claimed[f.m.id] = i; };
+        const checkFound = (f) => {
+            if (!f.m) return;
+            row.certain = f.tier === 1 || f.hand === true;
+            if (f.tier === 2) warn(`The run started on an earlier day and carries into ${fmtDay(L.origDate.getTime())}`, true);
+            if (f.tier === 4) warn('The form has no original date: this is the only run of the item in the next weeks', true);
+            if (!f.hand && crHas(L.origAmt) && crHas(f.m.cases) && f.m.cases !== L.origAmt) warn(`The schedule has ${fmtNum(f.m.cases)} cases for this run, the form says ${fmtNum(L.origAmt)}`, true);
+        };
+        const lineRunsOf = (area, line) => byLine[canonLine(area, line)] || [];
+        // where a run would sit, with later runs pushed when it overlaps (never a swap: a longer run is not a drag)
+        const place = (run, start, end) => {
+            const pl = planPlacement(run, { start, end, area: run.area, line: run.line }, lineRunsOf(run.area, run.line), push, true);
+            if (pl.mode === 'blocked') { row.status = 'blocked'; row.error = pl.error; return false; }
+            row.pushes = pl.updates.slice(1).map(u => ({ run: byId[u.id], start: u.patch.start, end: u.patch.end })).filter(p => p.run);
+            row.pushes.forEach(p => { if (claimed[p.run.id] !== undefined && claimed[p.run.id] !== i) warn(`${runTitle(p.run)} is changed by another line of this form`, true); });
+            if (row.pushes.length) warn(`${row.pushes.length} later run${row.pushes.length === 1 ? ' is' : 's are'} pushed later to make room`, true);
+            return true;
+        };
+        // the cleaning gaps either side of the run's new place; only a gap this change makes short (or makes shorter) is reported, not one that was already short
+        const gapCheck = (run, start, end, was) => {
+            if (!o.gapCtx) return;
+            const moved = {}; row.pushes.forEach(p => { moved[p.run.id] = { start: p.start, end: p.end }; });
+            const around = (cand, pushed) => gapsAround(cand, lineRunsOf(run.area, run.line).filter(r => r.id !== run.id).map(r => pushed && moved[r.id] ? { ...r, ...moved[r.id] } : r).map(r => ({ ...r, area: run.area, line: run.line })), o.gapCtx);
+            const g = around({ ...run, start, end }, true), g0 = was ? around({ ...run, start: was.start, end: was.end }, false) : null;
+            [['before', 'Before'], ['after', 'After']].forEach(k => {
+                const x = g[k[0]], x0 = g0 && g0[k[0]];
+                if (!x || !(x.status === 'short' || x.status === 'overlap')) return;
+                if (x0 && x0.prevId === x.prevId && x0.nextId === x.nextId && x0.gapMs <= x.gapMs) return;   // it was this short before the request
+                row.gaps.push(x); warn(`${k[1]}: ${gapText(x)}`, true);
+            });
+        };
+
+        if (row.kind === 'remove') {
+            const f = findRun(L.origDate || L.newDate);
+            claim(f);
+            if (!f.m) { row.status = f.cands.length ? 'pick' : 'already'; row.what = row.status === 'already' ? `No run of item ${L.code} on ${fmtDay((L.origDate || L.newDate).getTime())}: nothing to remove` : ''; return finish(); }
+            checkFound(f);
+            row.before = { start: f.m.start, end: f.m.end, cases: f.m.cases };
+            row.what = `Remove ${runTitle(f.m)}, ${lineLabelOf(f.m.area, f.m.line)}, ${fmtDT(f.m.start)}`;
+            if (f.m.notes || f.m.order) warn('This run has notes or an order number: they go with it (Undo puts them back)', false);
+            return finish();
+        }
+
+        if (row.kind === 'change' || row.kind === 'move') {
+            const f = findRun(L.origDate);
+            claim(f);
+            if (!f.m) {
+                if (f.cands.length) { row.status = 'pick'; return finish(); }
+                // maybe it was done already: the run is on its new day with the new amount
+                const there = L.newDate ? (poolOf(L.newDate).t1.concat(poolOf(L.newDate).t2)) : [];
+                const done = there.find(r => row.kind === 'move' || !crHas(L.newAmt) || r.cases === L.newAmt);
+                if (done) { row.status = 'already'; row.m = done; row.what = `${runTitle(done)} is already on ${fmtDay(done.start)} with ${crHas(done.cases) ? fmtNum(done.cases) : '?'} cases`; return finish(); }
+                row.status = 'missing'; row.what = `No run of item ${L.code} on ${L.origDate ? fmtDay(L.origDate.getTime()) : 'the schedule'}`; return finish();
+            }
+            checkFound(f);
+            const m = f.m, base = crHas(m.cases) ? m.cases : L.origAmt, dur0 = m.end - m.start;
+            const shift = L.newDate && L.origDate ? Math.round((L.newDate.getTime() - L.origDate.getTime()) / DAY) : 0;
+            let dur1 = dur0;
+            if (ed.hours !== undefined && isFinite(ed.hours) && ed.hours > 0) dur1 = Math.round(ed.hours * HOUR);
+            else if (scale && crHas(L.newAmt) && crHas(base) && base > 0 && L.newAmt !== base) dur1 = crRound(dur0 * L.newAmt / base);
+            if (dur1 > CR_MAX_RUN) { row.status = 'blocked'; row.error = `The run would be ${fmtHrs(dur1)} long. Type the hours it should have.`; row.what = `${runTitle(m)}: the length worked out from the cases is too long`; return finish(); }
+            const start1 = shift ? addDaysLocal(new Date(m.start), shift).getTime() : m.start, end1 = start1 + dur1, cases1 = crHas(L.newAmt) ? L.newAmt : (crHas(m.cases) ? m.cases : null);
+            row.before = { start: m.start, end: m.end, cases: crHas(m.cases) ? m.cases : null };
+            row.after = { start: start1, end: end1, cases: cases1, hours: dur1 / HOUR };
+            if (start1 === m.start && end1 === m.end && (cases1 === row.before.cases || cases1 === null)) { row.status = 'already'; row.what = `${runTitle(m)} already has ${crHas(m.cases) ? fmtNum(m.cases) : 'this'} cases and these times`; return finish(); }
+            if (end1 < nowMs) warn('This run is already over', true);
+            else if (start1 < nowMs) warn('This run has already started', true);
+            if (place(m, start1, end1)) gapCheck(m, start1, end1, { start: m.start, end: m.end });
+            const bits = [];
+            if (crHas(L.newAmt) && cases1 !== row.before.cases) bits.push(`${fmtNum(row.before.cases !== null ? row.before.cases : L.origAmt)} to ${fmtNum(cases1)} cases`);
+            if (dur1 !== dur0) bits.push(`${fmtHrs(dur0)} to ${fmtHrs(dur1)} long`);
+            if (shift) bits.push(`${fmtDay(m.start)} to ${fmtDay(start1)}`);
+            row.what = `${runTitle(m)}, ${lineLabelOf(m.area, m.line)}: ${bits.join(', ')}`;
+            return finish();
+        }
+
+        // add: the form names no line, so it comes from the last run of the item (or what was typed on the card)
+        const day = L.newDate || L.origDate;
+        const there = poolOf(day).t1.concat(poolOf(day).t2);
+        const dup = there.find(r => r.cases === L.newAmt);
+        if (dup) { row.status = 'already'; row.m = dup; row.what = `${runTitle(dup)} is already on ${fmtDay(dup.start)} with ${fmtNum(dup.cases)} cases`; return finish(); }
+        const rc = recallMap[L.code] || {};
+        const area = ed.area !== undefined ? ed.area : (rc.area || ''), lineNo = Math.max(1, parseInt(ed.line !== undefined ? ed.line : (rc.line || 1), 10) || 1);
+        const time = ed.time !== undefined ? ed.time : (rc.startClock || '');
+        let hours = ed.hours !== undefined && isFinite(ed.hours) && ed.hours > 0 ? ed.hours : null;
+        if (hours === null && rc.perCase && L.newAmt) hours = crRound(L.newAmt * rc.perCase * HOUR) / HOUR;
+        if (hours === null && rc.hours) hours = rc.hours;
+        if (hours !== null && hours * HOUR > CR_MAX_RUN) { warn(`${fmtHrs(hours * HOUR)} is too long for one run: type the hours it should have`, true); hours = null; }
+        const missing = []; if (!area) missing.push('line'); if (!withTime(day, time)) missing.push('start time'); if (!(hours > 0)) missing.push('length');
+        const add = { area, line: lineNo, time, hours, product: rc.product || L.desc || '', allergen: !!rc.allergen, allergenType: rc.allergenType || '', crumb: !!rc.crumb, fromHistory: !!rc.area && ed.area === undefined, missing, start: 0, end: 0 };
+        row.add = add; row.caution = true;
+        if (there.length) warn(`Item ${L.code} already runs that day (${there.map(r => `${fmtNum(r.cases) || '?'} cases`).join(', ')}): this adds another run`, true);
+        if (day.getTime() < midnightOf(nowMs).getTime()) warn('This day is already over', true);
+        if (missing.length) { row.status = 'needs'; row.what = `Add item ${L.code} on ${fmtDay(day.getTime())}`; return finish(); }
+        add.start = withTime(day, time).getTime(); add.end = add.start + Math.round(hours * HOUR);
+        const probe = { id: '__add', area, line: lineNo };
+        if (place(probe, add.start, add.end)) gapCheck(probe, add.start, add.end);
+        if (rc.area && ed.area === undefined) warn('The line, start time and length come from the last run of this item: check them', false);
+        row.after = { start: add.start, end: add.end, cases: L.newAmt, hours };
+        row.what = `Add ${add.product || `item ${L.code}`}, ${lineLabelOf(area, lineNo)}, ${fmtDT(add.start)} to ${fmtTime(add.end)}`;
+        return finish();
+    });
+    // two lines that change the same run (or push it) would fight: the first keeps it
+    const touched = {};
+    rows.forEach(r => {
+        if (!r.include) return;
+        const ids = [r.m && r.m.id].concat(r.pushes.map(p => p.run.id)).filter(Boolean);
+        const clash = ids.find(id => touched[id] !== undefined);
+        if (clash) { r.include = false; r.status = 'blocked'; r.error = `Another line of this form already changes ${runTitle(byId[clash])}`; return; }
+        ids.forEach(id => { touched[id] = r.i; });
+    });
+    return rows;
+}
+
+// ---- the rest of the pure part: the inbox cells, requests that touch the same run, and "is it safe to apply by itself?"
+// The cells a flow saved in the inbox: the JSON of an Excel range (rows of cells), or the table pasted as text.
+function crInboxGrid(raw) {
+    const t = String(raw === undefined || raw === null ? '' : raw).trim();
+    if (!t) return { error: 'The request has no form cells (the form JSON column is empty).' };
+    let v;
+    if (t.charAt(0) === '[' || t.charAt(0) === '{') {
+        try { v = JSON.parse(t); } catch (e) { return { error: `The form cells are not valid JSON (${clipText(errText(e), 80)}).` }; }
+        if (v && !Array.isArray(v) && typeof v === 'object') v = v.values || v.grid || v.rows || v.cells || v.result || null;   // a flow may wrap the range in an object
+        if (!Array.isArray(v) || !v.length || !v.every(Array.isArray)) return { error: 'The form cells are not a list of rows.' };
+    } else v = parseDelimited(t);
+    return { grid: v.slice(0, 400).map(r => r.slice(0, 40)) };
+}
+// Two requests that change the same run: the first keeps it, the later one waits until that one is applied and read again.
+function crCrossForms(plans) {
+    const touched = {};
+    plans.forEach(rows => {
+        if (!rows) return;
+        rows.forEach(r => {
+            if (!r.include) return;
+            const runs = [r.m].concat(r.pushes.map(p => p.run)).filter(Boolean), clash = runs.find(x => touched[x.id]);
+            if (clash) { r.include = false; r.status = 'blocked'; r.error = `An earlier request in this batch already changes ${runTitle(clash)}. Apply that one first, then read this request again.`; return; }
+            runs.forEach(x => { touched[x.id] = true; });
+        });
+    });
+}
+// Why a line is not simply going to happen (the first thing worth saying)
+function crWhy(r) {
+    if (r.error) return r.error;
+    if (r.status === 'pick') return r.cands.length ? 'more than one run could be meant: pick the right one' : 'no run found';
+    if (r.status === 'needs') return `needs a ${r.add.missing.join(', ')}`;
+    if (r.status === 'missing') return r.what || 'no such run on the schedule';
+    if (r.warns.length) return r.warns[0];
+    return 'needs a look';
+}
+// May a request be applied without anyone looking? Only when every line is plain and certain, or already done, and a change in the fixed zone is approved on the form.
+function crAutoVerdict(form, rows) {
+    if (!form || !rows || !rows.length) return { ok: false, why: 'The form has no lines to apply.' };
+    if (form.fixedZone === 'Y' && !form.approval && !form.signature) return { ok: false, why: 'A change in the fixed zone needs the plant approval or the supply chain signature on the form, and this form has neither.' };
+    const bad = rows.find(r => !(r.status === 'already' || r.status === 'same' || (r.status === 'ok' && r.include)));
+    if (bad) return { ok: false, why: `Line ${bad.L.row}${bad.L.code ? ` (item ${bad.L.code})` : ''} needs a look: ${crWhy(bad)}.` };
+    if (!rows.some(r => r.status === 'ok' && r.include)) return { ok: true, nothing: true, why: 'Everything on the form is already on the schedule.' };
+    return { ok: true };
+}
 
 // ============================================================================
 // RUN CHECK (pure): is each run saved completely, and on a real MSS production area?
@@ -1305,14 +1737,15 @@ const GAP_STYLE = {
 //   swap  : dropped past the middle of the one neighbour next to it -> the two trade places (same span, gap kept)
 //   push  : later runs on the line are pushed just far enough (when "Push later runs" is on)
 //   blocked: overlaps something and cannot resolve
+// noSwap = never trade places (a change request that lengthens a run pushes the later runs instead)
 // ============================================================================
-function planPlacement(run, tgt, lineRuns, push) {
+function planPlacement(run, tgt, lineRuns, push, noSwap) {
     const patchSelf = { start: tgt.start, end: tgt.end, area: tgt.area, line: tgt.line };
     const others = lineRuns.filter(r => r.id !== run.id).sort(byStart);
     const clashes = others.filter(r => r.start < tgt.end && r.end > tgt.start);
     if (!clashes.length) return { mode: 'free', updates: [{ id: run.id, patch: patchSelf }] };
     const sameLine = run.area === tgt.area && run.line === tgt.line;
-    if (sameLine && clashes.length === 1) {
+    if (sameLine && clashes.length === 1 && !noSwap) {   // noSwap: a run that was resized or added does not trade places
         const seq = lineRuns.slice().sort(byStart);
         const i = seq.findIndex(r => r.id === run.id), j = seq.findIndex(r => r.id === clashes[0].id);
         const c = clashes[0], mid = (tgt.start + tgt.end) / 2, cmid = (c.start + c.end) / 2;
@@ -2706,6 +3139,546 @@ function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, g
 }
 
 // ============================================================================
+// CHANGE REQUESTS (view): read a form (upload, paste or the inbox), show what each line would do to the schedule, apply it, Undo
+// ============================================================================
+// the days of the schedule one form needs to see (a line that cannot be read, or asks for nothing, needs none)
+function crWindows(form, nowMs) {
+    const seen = {}, out = [];
+    form.lines.forEach(L => { if (L.kind === 'bad' || L.kind === 'same' || L.kind === 'incomplete') return; const w = crWindow(form, L, nowMs); if (!seen[w.key]) { seen[w.key] = true; out.push(w); } });
+    return out;
+}
+const CR_LOOK = {
+    ok: { label: 'WILL CHANGE', cls: 'bg-[#E6F1FB] text-[#00468B] border-[#0072CE]' },
+    out: { label: 'LEFT OUT', cls: 'bg-slate-100 text-slate-500 border-slate-300' },
+    check: { label: 'CHECK, THEN TICK', cls: 'bg-[#FFF6E0] text-[#7A5200] border-[#FFB81C]' },
+    already: { label: 'ALREADY DONE', cls: 'bg-slate-100 text-slate-500 border-slate-300' },
+    same: { label: 'NO CHANGE', cls: 'bg-slate-100 text-slate-500 border-slate-300' },
+    pick: { label: 'WHICH RUN?', cls: 'bg-[#FFF6E0] text-[#7A5200] border-[#FFB81C]' },
+    needs: { label: 'NEEDS DETAILS', cls: 'bg-[#FFF6E0] text-[#7A5200] border-[#FFB81C]' },
+    missing: { label: 'NOT FOUND', cls: 'bg-[#FDE8EC] text-[#B00020] border-[#E4002B]' },
+    blocked: { label: 'BLOCKED', cls: 'bg-[#FDE8EC] text-[#B00020] border-[#E4002B]' },
+    incomplete: { label: 'NOT ENOUGH', cls: 'bg-[#FDE8EC] text-[#B00020] border-[#E4002B]' },
+    bad: { label: "CAN'T READ", cls: 'bg-[#FDE8EC] text-[#B00020] border-[#E4002B]' },
+};
+function crAmountsText(L) {
+    const a = (n) => n === null || n === undefined ? '' : isNaN(n) ? '?' : fmtNum(n), d = (x) => x ? fmtDay(x.getTime()) : '';
+    const oa = a(L.origAmt), na = a(L.newAmt);
+    const amt = oa && na ? `${oa} to ${na} cases` : na ? `${na} cases` : oa ? `${oa} cases` : 'no amounts';
+    return [amt, L.origDate && L.newDate && !crSameDay(L.origDate, L.newDate) ? `${d(L.origDate)} to ${d(L.newDate)}` : d(L.newDate || L.origDate)].filter(Boolean).join(' · ');
+}
+const crHrsText = (h) => h === null || h === undefined || !isFinite(h) ? '' : String(Math.round(h * 100) / 100);
+
+function ChangeLine({ row, ed, setEd, lineChoices, areaNames }) {
+    const L = row.L, i = row.i;
+    const look = row.status === 'ok' && !row.include ? (ed.include === false ? CR_LOOK.out : CR_LOOK.check) : CR_LOOK[row.status] || CR_LOOK.bad;
+    const hoursNow = ed.hoursText !== undefined ? ed.hoursText : crHrsText(row.add ? row.add.hours : row.after ? row.after.hours : null);
+    const commitArea = (t) => { const r = resolveArea(t, areaNames); setEd(i, r.exact ? (r.line > 1 ? { area: r.area, line: r.line } : { area: r.area }) : { area: String(t).trim() }); };
+    const hoursBox = (
+        <Field label="Run hours"><input type="number" min="0.25" step="0.25" className={smallIn + 'w-20'} data-testid="cr-hours" value={hoursNow} onChange={(e) => { const v = e.target.value; setEd(i, { hoursText: v, hours: v === '' || isNaN(Number(v)) ? undefined : Number(v) }); }} /></Field>
+    );
+    return (
+        <div className={`px-3 py-2.5 border-t border-slate-100 flex flex-wrap gap-x-4 gap-y-2 text-xs ${row.status === 'already' || row.status === 'same' ? 'opacity-70' : ''}`} data-testid="cr-line" data-status={row.status} data-include={row.include ? '1' : '0'}>
+            <div className="flex items-start gap-2 min-w-0 flex-1 basis-80">
+                <input type="checkbox" className="mt-1" checked={row.include} disabled={row.status !== 'ok'} title={row.status === 'ok' ? 'Apply this line' : 'Nothing to apply on this line yet'} onChange={(e) => setEd(i, { include: e.target.checked })} />
+                <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                        <span className={`px-1.5 py-0.5 rounded border text-[10px] font-black ${look.cls}`}>{look.label}</span>
+                        <b className="text-slate-800">{CR_KIND_LABEL[row.kind] || row.kind}</b>
+                        <span className="font-bold text-slate-700">{L.code || '?'}</span><span className="text-slate-600 min-w-0 truncate">{L.desc}</span>
+                    </div>
+                    <div className="text-slate-600 mt-0.5">Line {L.row} of the form: {crAmountsText(L)}</div>
+                    {row.what && <div className="font-semibold text-slate-800 mt-0.5">{row.what}</div>}
+                    {row.before && row.after && <div className="text-slate-600 mt-0.5">{fmtDT(row.before.start)} to {fmtTime(row.before.end)}, then {fmtDT(row.after.start)} to {fmtTime(row.after.end)} ({fmtHrs(row.after.end - row.after.start)})</div>}
+                    {row.error && <div className="text-[#B00020] font-semibold mt-0.5">{row.error}</div>}
+                    {row.warns.map((w, k) => <div key={k} className="text-[#7A5200] font-semibold">{w}</div>)}
+                    {row.pushes.length > 0 && <div className="text-slate-500">Pushed later: {row.pushes.slice(0, 3).map(p => `${runTitle(p.run)} to ${fmtDT(p.start)}`).join('; ')}{row.pushes.length > 3 ? ` and ${row.pushes.length - 3} more` : ''}</div>}
+                </div>
+            </div>
+            <div className="flex flex-wrap items-start gap-2 flex-1 basis-64">
+                {row.status === 'pick' && (
+                    <Field label="Which run is it?" plain>
+                        <select className={smallIn + 'w-full max-w-xs'} data-testid="cr-pick" value={ed.pick || ''} onChange={(e) => setEd(i, { pick: e.target.value })}>
+                            <option value="">{row.cands.length ? 'Pick the run...' : 'No run to pick'}</option>
+                            {row.cands.map(r => <option key={r.id} value={r.id}>{fmtDT(r.start)} to {fmtTime(r.end)} · {lineLabelOf(r.area, r.line)} · {r.cases !== null && r.cases !== undefined ? `${fmtNum(r.cases)} cases` : 'no cases saved'}</option>)}
+                        </select>
+                    </Field>
+                )}
+                {row.status === 'missing' && L.newAmt > 0 && row.kind !== 'add' && <Btn kind="ghost" onClick={() => setEd(i, { asAdd: true })} title="There is no run to change: add the new amount as a new run instead">Add it as a new run</Btn>}
+                {(row.kind === 'add' && ed.asAdd) && <Btn kind="ghost" onClick={() => setEd(i, { asAdd: false })}>Back to a change</Btn>}
+                {row.kind === 'add' && row.add && (<>
+                    <Field label="Line" plain>
+                        <ComboBox value={ed.area !== undefined ? ed.area : row.add.area} options={lineChoices} allowNew newWord="as a new line" ariaLabel={`Line for item ${L.code}`} placeholder="pick a line"
+                            className={smallIn + 'w-36 ' + (!row.add.area ? 'border-[#E4002B] bg-[#FDE8EC]' : '')}
+                            onText={(t) => setEd(i, { area: t })} onPick={(o) => commitArea(o.value)} onCommit={commitArea} />
+                    </Field>
+                    <Field label="Line #"><input type="number" min="1" className={smallIn + 'w-14'} value={ed.line !== undefined ? ed.line : row.add.line} onChange={(e) => setEd(i, { line: e.target.value })} /></Field>
+                    <Field label="Starts"><input type="time" className={smallIn + (!row.add.time ? ' border-[#E4002B] bg-[#FDE8EC]' : '')} data-testid="cr-time" value={ed.time !== undefined ? ed.time : row.add.time} onChange={(e) => setEd(i, { time: e.target.value })} /></Field>
+                    {hoursBox}
+                </>)}
+                {row.status === 'ok' && row.kind !== 'add' && row.kind !== 'remove' && (<>
+                    {hoursBox}
+                    {ed.hoursText !== undefined && <Btn kind="ghost" className="mt-5" onClick={() => setEd(i, { hoursText: undefined, hours: undefined })} title="Go back to the length worked out from the cases">Use the cases</Btn>}
+                </>)}
+            </div>
+        </div>
+    );
+}
+
+function ChangeView({ api, lineChoices, settings, updateSettings, gapCtx, apiReady, reloadTick, onDone, onView, onOpenCheck, onPending, active }) {
+    const [forms, setForms] = useState([]);          // [{ id, n, name, source: file | paste | inbox, inboxId, sender, at, parsed: { form } | { error } }]
+    const [text, setText] = useState('');
+    const [skipped, setSkipped] = useState([]);
+    const [reading, setReading] = useState(null);
+    const [dragOver, setDragOver] = useState(false);
+    const [edits, setEdits] = useState({});          // form id -> line index -> { pick, hours, hoursText, include, area, line, time, asAdd }
+    const [data, setData] = useState({});            // form id -> { runs, loading, failed }: the schedule around the form's dates
+    const [recallMap, setRecallMap] = useState({});  // item -> { product, area, line, startClock, hours, perCase } from its last runs
+    const [applying, setApplying] = useState(null);  // { done, total, phase }
+    const [result, setResult] = useState(null);      // { type, message, lines, changes, tick, confirmUndo, busy, sigs, inboxIds }
+    const [open, setOpen] = useState({ auto: true, s1: true, s2: true });
+    const [fold, setFold] = useState({});            // form id -> true when folded away
+    const [inbox, setInbox] = useState({ state: 'idle', at: 0, waiting: 0 });
+    const [epoch, setEpoch] = useState(0);           // bumped when the schedule changed under the forms (an apply, an undo): every form reads its days again
+    const [doneMap, setDoneMap] = useState(() => lsRead(LS_CR_DONE, {}));
+    const applyingRef = useRef(false), cancelRef = useRef(false), mountedRef = useRef(true), barRef = useRef(null);
+    const seqRef = useRef(1), winCache = useRef({}), loadedRef = useRef({}), askedRef = useRef({}), autoTried = useRef({}), inboxSeen = useRef({});
+    const inboxRef = useRef(inbox); inboxRef.current = inbox;
+    const formsRef = useRef(forms); formsRef.current = forms;
+    const autoRetry = useRef({});
+    const applyRef = useRef(null), checkRef = useRef(null);
+    useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
+    useEffect(() => { if (result && barRef.current && barRef.current.scrollIntoView) { try { barRef.current.scrollIntoView({ block: 'nearest' }); } catch (e) { /* older engines */ } } }, [result && result.tick]);
+    const areaNames = useMemo(() => lineChoices.map(o => o.value), [lineChoices]);
+    // the first two parts fold away once a form is read (so the lines to check are in view) and open again when the forms are cleared
+    useEffect(() => { setOpen(o => ({ ...o, auto: forms.length === 0, s1: forms.length === 0 })); }, [forms.length === 0]);
+
+    // ---- bringing forms in
+    const addForms = (list) => {
+        const prev = formsRef.current, names = {};
+        list.forEach(x => { if (x.source !== 'inbox') names[x.name] = true; });
+        const kept = prev.filter(f => !(f.source !== 'inbox' && names[f.name]));   // the same file read again replaces the first reading
+        const room = Math.max(0, CR_MAX_FORMS - kept.length), take = list.slice(0, room);
+        if (take.length < list.length) setSkipped([{ name: `${list.length - take.length} more form${list.length - take.length === 1 ? '' : 's'}`, why: `only ${CR_MAX_FORMS} forms are held at once: apply or remove some (the x), then read these again` }]);
+        const next = kept.concat(take.map(x => { const n = seqRef.current++; return { id: `f${n}`, n, name: x.name, source: x.source, inboxId: x.inboxId || '', sender: x.sender || '', at: x.at || Date.now(), parsed: x.parsed, hold: !!x.hold, inboxStatus: x.inboxStatus || '', inboxResult: x.inboxResult || '' }; }));
+        formsRef.current = next;   // a second form added in the same moment (the inbox and an upload) starts from this list
+        setForms(next);
+    };
+    const readFiles = async (files) => {
+        const list = Array.prototype.slice.call(files || []);
+        if (!list.length) return;
+        const added = [], skip = [];
+        for (let i = 0; i < list.length; i++) {
+            if (!mountedRef.current) return;
+            setReading({ done: i, total: list.length, name: list[i].name });
+            try {
+                const got = await readChangeFile(list[i]);
+                got.forms.forEach(f => added.push({ ...f, source: 'file' })); got.skipped.forEach(s => skip.push(s));
+                if (!got.forms.length && !got.skipped.length) skip.push({ name: list[i].name, why: 'nothing in it' });
+            } catch (e) { skip.push({ name: list[i].name, why: errText(e) }); }
+            await new Promise(r => setTimeout(r, 0));
+        }
+        if (!mountedRef.current) return;
+        setSkipped(skip); if (added.length) addForms(added);
+        setReading(null);
+    };
+    const readPasted = (t) => {
+        const g = t && t.trim() ? parseDelimited(t) : null;
+        if (!g) return;
+        const p = parseChangeForm(g, {});
+        if (p.error) { setSkipped([{ name: 'Pasted form', why: p.error }]); return; }
+        setSkipped([]); addForms([{ name: 'Pasted form', grid: g, parsed: p, source: 'paste' }]); setText('');
+    };
+    // What this page last wrote (or found) in each inbox row: a status is not written twice, and a request that was applied is never relabelled "dismissed".
+    const inboxLast = useRef({});
+    const inboxMark = (id, status, result, what) => {
+        if (!id) return;
+        const res = clipText(result, 1900), last = inboxLast.current[id];
+        if (last && last.status === status && last.result === res) return;
+        inboxLast.current[id] = { status, result: res };
+        api.inboxSet(id, { craa5_status: status, craa5_result: res }, what);
+    };
+    const removeForm = (f) => {
+        const next = formsRef.current.filter(x => x.id !== f.id); formsRef.current = next; setForms(next);
+        setEdits(e => { const n = { ...e }; delete n[f.id]; return n; }); setData(d => { const n = { ...d }; delete n[f.id]; return n; });
+        delete loadedRef.current[f.id]; delete autoTried.current[f.id];
+        const was = f.inboxId && inboxLast.current[f.inboxId];
+        if (f.source === 'inbox' && f.inboxId && !(was && was.status === 'applied')) inboxMark(f.inboxId, 'dismissed', 'Dismissed from the Change Requests tab.', 'dismiss change request');
+    };
+    const clearAll = () => { forms.forEach(f => { if (f.source !== 'inbox') removeForm(f); }); setSkipped([]); setText(''); setResult(null); };
+
+    // ---- the inbox: requests an email flow dropped off
+    const addInboxForms = (items) => {
+        const list = items.map(x => {
+            const g = crInboxGrid(x.json), p = g.error ? { error: g.error } : parseChangeForm(g.grid, { name: x.name });
+            inboxLast.current[x.id] = { status: x.status || 'new', result: clipText(x.result || '', 1900) };
+            if (p.error) inboxMark(x.id, 'failed', p.error, 'change request could not be read');
+            // a row already marked review or failed was looked at before (or undone by hand): it waits for a person, it is never applied by itself
+            return { name: x.name || 'Change request', source: 'inbox', inboxId: x.id, sender: x.sender, at: x.at, parsed: p, hold: x.status === 'review' || x.status === 'failed', inboxStatus: x.status, inboxResult: x.result };
+        });
+        addForms(list);
+    };
+    const checkInbox = async (manual) => {
+        if (!apiReady) { setInbox({ state: 'preview', at: Date.now(), waiting: 0 }); return; }
+        const cur = inboxRef.current;
+        if (!manual && cur.state === 'unavailable' && Date.now() - cur.at < 10 * 60000) return;   // a table that is not there is asked about every 10 minutes, not every 2
+        setInbox(p => ({ ...p, state: p.state === 'ok' ? 'ok' : 'loading' }));
+        const rows = await api.inboxList();
+        if (!mountedRef.current) return;
+        if (rows === null) { setInbox({ state: 'unavailable', at: Date.now(), waiting: 0 }); return; }
+        const fresh = rows.filter(x => !inboxSeen.current[x.id]).slice(0, Math.max(0, CR_MAX_FORMS - formsRef.current.length));   // what does not fit is looked at again on the next round, when there is room
+        fresh.forEach(x => { inboxSeen.current[x.id] = true; });
+        if (fresh.length) addInboxForms(fresh);
+        setInbox({ state: 'ok', at: Date.now(), waiting: rows.length });
+    };
+    checkRef.current = checkInbox;
+    useEffect(() => {
+        if (!apiReady) { setInbox({ state: 'preview', at: Date.now(), waiting: 0 }); return; }
+        const t0 = setTimeout(() => checkRef.current(false), 1500), t = setInterval(() => checkRef.current(false), INBOX_POLL_MS);
+        return () => { clearTimeout(t0); clearInterval(t); };
+    }, [apiReady, reloadTick]);
+
+    // ---- reading the schedule around each form (one read per window, remembered until something changes)
+    const loadForm = async (f, key) => {
+        const ws = crWindows(f.parsed.form, Date.now());
+        setData(d => ({ ...d, [f.id]: { runs: (d[f.id] && d[f.id].runs) || [], loading: true, failed: false } }));
+        let failed = false;
+        await poolRun(ws, 3, async (w) => { if (winCache.current[w.key]) return; const rows = await api.readWindow(w.from, w.to); if (rows === null) failed = true; else winCache.current[w.key] = rows; });
+        if (!mountedRef.current || loadedRef.current[f.id] !== key) return;
+        const seen = {}, runs = [];
+        ws.forEach(w => (winCache.current[w.key] || []).forEach(r => { if (!seen[r.id]) { seen[r.id] = true; runs.push(r); } }));
+        setData(d => ({ ...d, [f.id]: { runs, loading: false, failed } }));
+    };
+    useEffect(() => {
+        const key = `${reloadTick}|${epoch}`;
+        if (loadedRef.current.__rk !== reloadTick) { loadedRef.current.__rk = reloadTick; winCache.current = {}; }   // Reload reads every day again (an apply or an undo sets the cache itself)
+        forms.forEach(f => { if (!f.parsed.form || loadedRef.current[f.id] === key) return; loadedRef.current[f.id] = key; loadForm(f, key); });
+    }, [forms, reloadTick, epoch]);
+    // the last runs of the products a form ADDS (they say which line, when it starts and how long)
+    const addCodes = useMemo(() => {
+        const out = {};
+        forms.forEach(f => { if (f.parsed.form) f.parsed.form.lines.forEach((L, i) => { const ed = edits[f.id] && edits[f.id][i]; if (L.code && (L.kind === 'add' || (ed && ed.asAdd && (L.kind === 'change' || L.kind === 'move')))) out[L.code] = true; }); });
+        return Object.keys(out).sort();
+    }, [forms, edits]);
+    const addKey = addCodes.join(',');
+    useEffect(() => {
+        const need = addCodes.filter(c => !askedRef.current[c]);
+        if (!need.length) return;
+        need.forEach(c => { askedRef.current[c] = true; });
+        (async () => { const got = await api.recallItems(need); if (mountedRef.current && got) setRecallMap(m => ({ ...m, ...got })); })();
+    }, [addKey, reloadTick]);
+
+    // ---- the plan: every form against the schedule
+    const setEd = (fid, i, patch) => setEdits(e => { const f = { ...(e[fid] || {}) }; f[i] = { ...(f[i] || {}), ...patch }; return { ...e, [fid]: f }; });
+    const plans = useMemo(() => {
+        const now = Date.now();
+        const list = forms.map(f => {
+            const dd = data[f.id];
+            if (!f.parsed.form || !dd || dd.loading || dd.failed) return null;
+            return planChanges(f.parsed.form, dd.runs, recallMap, { edits: edits[f.id] || {}, push: settings.push !== false, scale: settings.crScale !== false, nowMs: now, gapCtx });
+        });
+        crCrossForms(list);
+        return list;
+    }, [forms, data, edits, recallMap, settings.push, settings.crScale, gapCtx]);
+    const jobs = useMemo(() => {
+        const out = [];
+        forms.forEach((f, fi) => { const pl = plans[fi]; if (pl) pl.forEach(r => { if (r.include && r.status === 'ok') out.push({ f, r }); }); });
+        return out;
+    }, [forms, plans]);
+    const loadingAny = forms.some(f => f.parsed.form && (!data[f.id] || data[f.id].loading));
+    const failedAny = forms.some(f => data[f.id] && data[f.id].failed);
+    const canApply = jobs.length > 0 && !applying && !loadingAny;
+    const jobCounts = useMemo(() => { const c = { change: 0, remove: 0, add: 0 }; jobs.forEach(j => { c[j.r.kind === 'remove' ? 'remove' : j.r.kind === 'add' ? 'add' : 'change']++; }); return c; }, [jobs]);
+    // the tab's badge: forms that still have something to do or to look at
+    const pendingCount = useMemo(() => forms.filter((f, fi) => !f.parsed.form || (plans[fi] && plans[fi].some(r => r.status !== 'already' && r.status !== 'same')) ).length, [forms, plans]);
+    useEffect(() => { if (onPending) onPending(pendingCount); }, [pendingCount]);
+
+    // ---- apply
+    const stampNow = () => { const d = new Date(); return `${getLocalYMD(d)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
+    const verifyApplied = async (expect, wins) => {
+        const fresh = {}; let readFailed = 0;
+        await poolRun(wins, 3, async (w) => { const rows = await api.readWindow(w.from, w.to); if (rows === null) readFailed++; else fresh[w.key] = rows; });
+        const byId = {}, byKey = {}, haveAny = Object.keys(fresh).length > 0;
+        Object.keys(fresh).forEach(k => fresh[k].forEach(e => { byId[e.id] = e; const kk = `${canonLine(e.area, e.line)}|${e.code}`; (byKey[kk] = byKey[kk] || []).push(e); }));
+        let checked = 0, found = 0, casesExp = 0, casesOk = 0, notesExp = 0, notesOk = 0;
+        const problems = [];
+        if (haveAny) expect.forEach(x => {
+            checked++;
+            if (x.type === 'delete') { if (!byId[x.id]) found++; else problems.push(`${x.label} is still on the schedule`); return; }
+            const e = x.type === 'create' ? (byKey[`${canonLine(x.run.area, x.run.line)}|${x.run.code}`] || []).find(r => Math.abs(r.start - x.start) < 60000) : byId[x.id];
+            if (!e) { problems.push(`${x.label} was not found when the schedule was read back`); return; }
+            if (Math.abs(e.start - x.start) >= 60000 || Math.abs(e.end - x.end) >= 60000) { problems.push(`${x.label} came back with other times`); return; }
+            found++;
+            if (x.cases !== undefined && x.cases !== null) { casesExp++; if (Number(e.cases) === Number(x.cases)) casesOk++; }
+            if (x.note) { notesExp++; if (e.notes && e.notes.indexOf(x.note.split('\n')[0].slice(0, 30)) >= 0) notesOk++; }
+        });
+        return { checked, found, problems, casesExp, casesOk, notesExp, notesOk, readFailed, fresh };
+    };
+    // only: form ids to apply (null = every ticked line of every form); auto = it is applying by itself
+    const apply = async (only, auto) => {
+        if (applyingRef.current) return { ok: false, reason: 'busy' };
+        const sel = jobs.filter(j => !only || only.indexOf(j.f.id) >= 0);
+        if (!sel.length) return { ok: false, reason: 'nothing' };
+        applyingRef.current = true; cancelRef.current = false;
+        const total = sel.length, stamp = stampNow(), sideBase = api.sideReport().skipped;
+        setApplying({ done: 0, total, phase: 'looking' });
+        // the picture on screen may be minutes old, or the schedule edited somewhere else: look again, and if it moved show the new picture first
+        const fids = {}; sel.forEach(j => { fids[j.f.id] = j.f; });
+        const winMap = {}; Object.keys(fids).forEach(id => crWindows(fids[id].parsed.form, Date.now()).forEach(w => { winMap[w.key] = w; }));
+        const wins = Object.keys(winMap).map(k => winMap[k]);
+        const sig = (rows) => rows.map(e => `${e.id}|${e.start}|${e.end}|${e.area}|${e.line}|${e.order}|${e.cases}|${e.notes}`).sort().join(';');
+        const look = {}; let lookFailed = false;
+        try { await poolRun(wins, 3, async (w) => { const rows = await api.readWindow(w.from, w.to); if (rows === null) lookFailed = true; else look[w.key] = rows; }); } catch (e) { lookFailed = true; }
+        if (!mountedRef.current) { applyingRef.current = false; return { ok: false, reason: 'gone' }; }
+        const changedSince = wins.some(w => look[w.key] && sig(look[w.key]) !== sig(winCache.current[w.key] || []));
+        if (lookFailed || changedSince) {
+            applyingRef.current = false; setApplying(null);
+            if (changedSince) { Object.keys(look).forEach(k => { winCache.current[k] = look[k]; }); setEpoch(n => n + 1); }
+            setResult({ type: 'warn', message: lookFailed ? 'Could not read the schedule again to check it before saving, so nothing was changed.' : 'The schedule changed since this request was checked (a run was added, moved or deleted). Nothing was changed. The request is checked again: look at it, then apply.', tick: Date.now() });
+            return { ok: false, reason: lookFailed ? 'unreadable' : 'changed' };
+        }
+        setApplying({ done: 0, total, phase: 'saving' }); setResult(null);
+        const changes = [], expect = [], done_ = {}, counts = { changed: 0, removed: 0, added: 0, pushed: 0 };
+        let failure = null, done = 0;
+        try {
+            await poolRun(sel, APPLY_CONC, async (j) => {
+                if (failure || cancelRef.current) return;
+                const r = j.r, m = r.m, meta = { quiet: true, what: `change request ${j.f.name}` }, batch = clipText(`${stamp} · change request · ${j.f.name}`, BATCH_MAX);
+                try {
+                    if (r.kind === 'remove') {
+                        await api.deleteRun(m.id, meta); changes.push({ type: 'delete', run: m }); counts.removed++;
+                        expect.push({ type: 'delete', id: m.id, label: runTitle(m) });
+                    } else if (r.kind === 'add') {
+                        const a = r.add, run = { area: a.area, line: a.line, code: Number(r.L.code), product: a.product, start: a.start, end: a.end, allergen: a.allergen, allergenType: a.allergenType, crumb: a.crumb };
+                        const id = await api.saveRun('create', null, run, { cases: r.L.newAmt, notes: r.note, batch }, meta);
+                        changes.push({ type: 'create', id }); counts.added++;
+                        expect.push({ type: 'create', id, run, start: a.start, end: a.end, cases: r.L.newAmt, note: r.note, label: runTitle(run) });
+                    } else {
+                        const A = r.after, run = { area: m.area, line: m.line, code: m.code, product: m.product, start: A.start, end: A.end, allergen: m.allergen, allergenType: m.allergenType, crumb: m.crumb };
+                        const cases = A.cases === null || A.cases === undefined ? m.cases : A.cases, notes = mergeNotes(m.notes, r.note);
+                        await api.saveRun('update', m.id, run, { order: m.order, cases, notes, batch }, meta);
+                        changes.push({ type: 'update', id: m.id, before: m }); counts.changed++;
+                        expect.push({ type: 'update', id: m.id, start: A.start, end: A.end, cases, note: r.note, label: runTitle(m) });
+                        for (let k = 0; k < r.pushes.length; k++) {
+                            const p = r.pushes[k];
+                            await api.patchRun(p.run.id, { start: p.start, end: p.end }, 'change request: push later', meta);
+                            changes.push({ type: 'patch', id: p.run.id, before: { start: p.run.start, end: p.run.end } }); counts.pushed++;
+                            expect.push({ type: 'patch', id: p.run.id, start: p.start, end: p.end, label: runTitle(p.run) });
+                        }
+                    }
+                } catch (err) { if (!failure) failure = err; return; }
+                done_[j.f.id] = (done_[j.f.id] || 0) + 1; done++;
+                setApplying({ done, total, phase: 'saving' });
+            });
+        } finally { applyingRef.current = false; }
+        const cancelled = cancelRef.current && !failure;
+        let verify = null;
+        if (expect.length && mountedRef.current) { setApplying({ done, total, phase: 'checking' }); try { verify = await verifyApplied(expect, wins); } catch (e) { verify = null; } }
+        if (!mountedRef.current) return { ok: false, reason: 'gone' };
+        setApplying(null);
+        const lines = [];
+        if (verify) {
+            if (verify.checked) lines.push(`Read back ${verify.found} of ${verify.checked} changes.${verify.readFailed ? ` (${verify.readFailed} read${verify.readFailed === 1 ? '' : 's'} failed)` : ''}`);
+            verify.problems.slice(0, 6).forEach(t => lines.push(t));
+            const rep = api.columnReport();
+            if (verify.casesExp > 0 && verify.casesOk === 0 && !rep.refused[F_CASES]) { api.markRefused(F_CASES, `Dataverse accepted the save but none of ${verify.casesExp} runs came back with their cases`); expect.forEach(x => { if (x.id && x.cases !== undefined && x.cases !== null) api.keepSide(x.id, { cases: x.cases }, [F_CASES]); }); }
+            if (verify.notesExp > 0 && verify.notesOk === 0 && !rep.refused[F_NOTES]) { api.markRefused(F_NOTES, `Dataverse accepted the save but none of ${verify.notesExp} runs came back with their notes`); expect.forEach(x => { if (x.id && x.note) api.keepSide(x.id, { notes: x.note }, [F_NOTES]); }); }
+        }
+        const notStored = Object.keys(api.columnReport().refused);
+        if (notStored.length) lines.push(`Dataverse does not have these columns yet: ${notStored.map(colLabel).join(', ')}. See Data Check > Columns.`);
+        const sd = api.sideReport().skipped - sideBase;
+        if (sd > 0) lines.push(`${sd} run${sd === 1 ? '' : 's'} could not be kept in this browser, so their Cases / Notes were not saved anywhere.`);
+        const parts = []; if (counts.changed) parts.push(`${counts.changed} changed`); if (counts.added) parts.push(`${counts.added} added`); if (counts.removed) parts.push(`${counts.removed} taken off`); if (counts.pushed) parts.push(`${counts.pushed} pushed later`);
+        const summary = parts.join(', ') || 'nothing changed';
+        // which forms are now finished: every line applied, already there, or not a change
+        const sigs = [], inboxIds = [];
+        Object.keys(fids).forEach(id => {
+            const f = fids[id], fi = forms.findIndex(x => x.id === id), pl = plans[fi] || [];
+            const finished = !failure && !cancelled && pl.every(r => r.status === 'already' || r.status === 'same' || (r.status === 'ok' && r.include));
+            if (done_[id]) sigs.push(f.parsed.form.sig);
+            if (f.source === 'inbox' && f.inboxId && done_[id]) {
+                inboxIds.push(f.inboxId);
+                inboxMark(f.inboxId, finished ? 'applied' : 'review', `${auto ? 'Applied by itself' : 'Applied by hand'} ${stamp}: ${summary}.${finished ? '' : ' Some lines still need a look.'}`, 'change request result');
+            }
+        });
+        if (sigs.length) { const dm = lsRead(LS_CR_DONE, {}); sigs.forEach(s => { dm[s] = Date.now(); }); const keep = {}; Object.keys(dm).sort((a, b) => dm[b] - dm[a]).slice(0, 60).forEach(k => { keep[k] = dm[k]; }); lsWrite(LS_CR_DONE, keep); setDoneMap(keep); }
+        const tick = Date.now();
+        winCache.current = verify ? verify.fresh : {}; setEpoch(n => n + 1);
+        const bad = verify && (verify.problems.length > 0 || verify.readFailed > 0) || notStored.length > 0;
+        if (failure) setResult({ type: 'error', message: `Stopped after ${done} of ${total}: ${errText(failure)}. What was already saved (${summary}) stays; Undo puts it back. Apply again to carry on: finished lines show as ALREADY DONE.`, lines, changes, tick, sigs, inboxIds });
+        else if (cancelled) setResult({ type: 'warn', message: `Stopped by you after ${done} of ${total} (${summary}). Apply again to carry on.`, lines, changes, tick, sigs, inboxIds });
+        else setResult({ type: bad ? 'warn' : 'success', message: `${auto ? 'Applied by itself' : 'Done'}: ${summary}.`, lines, changes, tick, sigs, inboxIds, viewMs: sel[0].r.after ? sel[0].r.after.start : sel[0].r.before ? sel[0].r.before.start : 0 });
+        onDone();
+        return { ok: !failure && !cancelled, reason: failure ? 'failed' : cancelled ? 'stopped' : '', done };
+    };
+    applyRef.current = apply;
+    const undoApplied = async () => {
+        if (!result || !result.changes || !result.changes.length || result.busy) return;
+        if (!result.confirmUndo) { setResult({ ...result, confirmUndo: true }); return; }
+        const list = result.changes.slice(), doneAt = {};
+        setResult({ ...result, busy: true });
+        let failure = null;
+        await poolRun(list.map((c, i) => ({ c, i })), APPLY_CONC, async (it) => {
+            if (failure) return;
+            const c = it.c, meta = { quiet: true, what: 'undo change request' };
+            try {
+                if (c.type === 'create') await api.deleteRun(c.id, meta);
+                else if (c.type === 'update') await api.saveRun('update', c.id, c.before, { order: c.before.order, cases: c.before.cases, notes: c.before.notes, batch: c.before.batch || '', clear: true }, meta);
+                else if (c.type === 'patch') await api.patchRun(c.id, c.before, 'undo change request', meta);
+                else await api.saveRun('create', null, c.run, { order: c.run.order, cases: c.run.cases, notes: c.run.notes, batch: c.run.batch }, meta);
+                doneAt[it.i] = true;
+            } catch (err) { if (!failure) failure = err; }
+        });
+        const n = Object.keys(doneAt).length, left = list.filter((c, i) => !doneAt[i]);
+        if (!failure) {   // the form is not "applied" any more, and its inbox row says so
+            const dm = lsRead(LS_CR_DONE, {}); (result.sigs || []).forEach(s => { delete dm[s]; }); lsWrite(LS_CR_DONE, dm); setDoneMap(dm);
+            (result.inboxIds || []).forEach(id => inboxMark(id, 'review', 'Applied, then undone by hand.', 'change request undone'));
+            Object.keys(autoTried.current).forEach(k => { autoTried.current[k] = true; });   // an undone request is not applied by itself again
+        }
+        winCache.current = {}; setEpoch(e => e + 1); onDone();
+        if (!mountedRef.current) return;
+        setResult(failure ? { type: 'error', message: `Undid ${n} of ${list.length} changes, then failed: ${errText(failure)}. ${left.length} still to undo: press Undo again to carry on.`, changes: left, tick: Date.now(), sigs: result.sigs, inboxIds: result.inboxIds } : { type: 'success', message: `Undone: ${n} change${n === 1 ? '' : 's'} put back.`, tick: Date.now() });
+    };
+
+    // ---- applying by itself: a request whose every line is plain and certain (and approved, in the fixed zone)
+    const plansSig = forms.map((f, fi) => f.id + ':' + (plans[fi] ? plans[fi].map(r => r.status + (r.include ? '+' : '-')).join('') : '-')).join('|');
+    useEffect(() => {
+        if (applying || applyingRef.current) return;
+        for (let fi = 0; fi < forms.length; fi++) {
+            const f = forms[fi], pl = plans[fi];
+            if (!pl || autoTried.current[f.id]) continue;
+            autoTried.current[f.id] = true;
+            if (f.hold) continue;
+            const v = crAutoVerdict(f.parsed.form, pl);
+            if (!settings.crAuto) continue;   // switched off: nothing happens by itself (a form already on screen when it is switched on is left for the next one)
+            if (!v.ok) { if (f.source === 'inbox' && f.inboxId) inboxMark(f.inboxId, 'review', v.why, 'change request needs a look'); continue; }
+            if (v.nothing) { if (f.source === 'inbox' && f.inboxId) inboxMark(f.inboxId, 'applied', 'Nothing to change: it is already on the schedule.', 'change request already done'); continue; }
+            applyRef.current([f.id], true).then(res => { if (res && (res.reason === 'changed' || res.reason === 'busy') && (autoRetry.current[f.id] = (autoRetry.current[f.id] || 0) + 1) <= 2) delete autoTried.current[f.id]; });   // the schedule moved under it: look again, twice at most
+            break;   // one request at a time
+        }
+    }, [plansSig, settings.crAuto, !!applying]);
+
+    // ---- what is on screen
+    const inboxText = inbox.state === 'ok' ? `Inbox connected: ${inbox.waiting} request${inbox.waiting === 1 ? '' : 's'} waiting. Last looked at ${fmtTime(inbox.at)}; it looks again every 2 minutes while this page is open.`
+        : inbox.state === 'unavailable' ? `The inbox table (${TABLE_INBOX}) was not found, so nothing arrives by itself yet. Data Check > Columns lists the table to create. Until then, upload the form here.`
+        : inbox.state === 'preview' ? 'Preview mode: there is no Dataverse, so there is no inbox. Upload the form here.'
+        : 'Looking at the inbox...';
+    const applyHint = canApply || applying ? '' : loadingAny ? 'Reading the schedule around the dates on the form...' : failedAny ? 'Could not read the schedule: press Reload (top right) and try again.' : !forms.length ? 'Read a change request first.' : 'Nothing is ticked to apply. A line that says CHECK, THEN TICK needs a look first; WHICH RUN? and NEEDS DETAILS need an answer.';
+    const pct = applying && applying.total ? Math.round((applying.done / applying.total) * 100) : 0;
+    const waiting = forms.length > 0;
+    // Kept mounted so the inbox poll and the waiting forms survive a tab change, but nothing is drawn while another tab is open.
+    if (!active) return null;
+    return (
+        <div className="space-y-5" data-testid="changes-view">
+            <Section title="Automatic: email or folder" open={open.auto} onToggle={() => setOpen(o => ({ ...o, auto: !o.auto }))} summary={`${settings.crAuto ? 'Applies by itself when sure' : 'Asks you before changing the schedule'} · ${inbox.state === 'ok' ? `inbox connected, ${inbox.waiting} waiting` : inbox.state === 'unavailable' ? 'no inbox table yet' : 'upload by hand'}`}>
+                <p className="text-sm text-slate-500 mb-3">A schedule change request form comes by email. A small email flow (Power Automate: it watches your mailbox, or a folder, and saves each form's cells into the <code className="px-1 bg-slate-100 rounded">{TABLE_INBOX}</code> table) is what makes it arrive here by itself. This page reads that table every 2 minutes while it is open, works out what each line would do to the schedule, and waits for you, or, if you switch it on, applies the certain ones by itself. Nothing is changed unless a line is certain: the run is found by item and day, its cases match the form, it has not started, and a change in the fixed zone carries the plant approval or signature. Anything else stays here for you. Every apply can be undone.</p>
+                <div className="flex flex-wrap items-center gap-2">
+                    <Chip on={!!settings.crAuto} onClick={() => updateSettings(s => ({ ...s, crAuto: !s.crAuto }))} title="When a form is read (uploaded, or found in the inbox) and every line is certain, change the schedule without asking">{settings.crAuto ? 'Applies by itself when sure: ON' : 'Applies by itself when sure: OFF'}</Chip>
+                    <Chip on={settings.crScale !== false} onClick={() => updateSettings(s => ({ ...s, crScale: s.crScale === false }))} title="A run for fewer cases gets shorter, for more cases longer, in the same proportion (12 hours at 9,900 cases is 6 hours at 4,950). Off: only the cases change.">Run length follows the cases</Chip>
+                    <Btn kind="ghost" onClick={() => checkInbox(true)} disabled={!apiReady || inbox.state === 'loading'}>Check the inbox now</Btn>
+                    {inbox.state === 'unavailable' && onOpenCheck && <Btn kind="yellow" onClick={() => onOpenCheck('columns')}>Show the table to create</Btn>}
+                </div>
+                <p className={`mt-2 text-xs font-semibold ${inbox.state === 'unavailable' ? 'text-[#7A5200]' : 'text-slate-600'}`} data-testid="cr-inbox">{inboxText}</p>
+            </Section>
+
+            <Section title="1. Bring in a change request" open={open.s1} onToggle={() => setOpen(o => ({ ...o, s1: !o.s1 }))} summary={waiting ? `${forms.length} form${forms.length === 1 ? '' : 's'} read` : 'Nothing read yet'}
+                right={!open.s1 && waiting ? (
+                    <label className="px-3 py-1.5 rounded-lg text-xs font-extrabold border bg-white text-[#00468B] border-[#0072CE] hover:bg-[#E6F1FB] cursor-pointer inline-flex items-center gap-1.5"><UploadIcon className="w-3.5 h-3.5" /> Add another form
+                        <input type="file" multiple accept=".xlsx,.xls,.xlsm,.csv,.tsv,.txt" className="hidden" data-testid="cr-files-more" onChange={(e) => { const fl = e.target.files; readFiles(fl); e.target.value = ''; }} /></label>
+                ) : null}>
+                <p className="text-sm text-slate-500 mb-3">Choose the form you got from Supply Chain (the Excel file), or copy its cells in Excel and paste them below. Every sheet that has the form's "original amount" and "new amount" columns is read as one request. You see what each line would change before anything is saved.</p>
+                <div className={`rounded-xl border-2 border-dashed p-4 flex flex-wrap items-center gap-3 transition-colors ${dragOver ? 'border-[#0072CE] bg-[#E6F1FB]' : 'border-slate-300 bg-slate-50'}`}
+                    onDragOver={(e) => { e.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)}
+                    onDrop={(e) => { e.preventDefault(); setDragOver(false); readFiles(e.dataTransfer && e.dataTransfer.files); }}>
+                    <label className="px-3 py-1.5 rounded-lg text-xs font-extrabold border bg-[#0072CE] text-white hover:bg-[#00468B] border-[#0072CE] cursor-pointer inline-flex items-center gap-1.5"><UploadIcon className="w-3.5 h-3.5" /> Choose the change request form
+                        <input type="file" multiple accept=".xlsx,.xls,.xlsm,.csv,.tsv,.txt" className="hidden" data-testid="cr-files" onChange={(e) => { const fl = e.target.files; readFiles(fl); e.target.value = ''; }} /></label>
+                    <span className="text-xs text-slate-500">or drop the file here</span>
+                    {reading && <span className="text-xs font-bold text-[#00468B]">Reading {reading.done + 1} of {reading.total}: {reading.name}...</span>}
+                    {forms.some(f => f.source !== 'inbox') && <Btn kind="ghost" className="ml-auto" onClick={clearAll}>Clear uploaded forms</Btn>}
+                </div>
+                <textarea className="w-full h-20 mt-3 border border-slate-300 rounded-lg p-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-[#0072CE]/40" placeholder="...or paste the form's cells here (Ctrl+V)" value={text} data-testid="cr-paste"
+                    onChange={(e) => setText(e.target.value)} onPaste={(e) => { const t = e.clipboardData && e.clipboardData.getData('text'); if (t) { e.preventDefault(); setText(t); readPasted(t); } }} />
+                <div className="mt-2"><Btn onClick={() => readPasted(text)} disabled={!text.trim()}>Read pasted form</Btn></div>
+                {skipped.length > 0 && (
+                    <div className="mt-2 p-2 rounded-lg bg-[#FFF6E0] border border-[#FFB81C]/60 text-[11px] text-slate-700" data-testid="cr-skipped">
+                        <b>Not read:</b> {skipped.slice(0, 8).map((s, i) => <span key={i}>{i ? '; ' : ' '}{s.name} ({s.why})</span>)}
+                    </div>
+                )}
+            </Section>
+
+            {waiting && (
+                <Section title="2. Check what it changes" open={open.s2} onToggle={() => setOpen(o => ({ ...o, s2: !o.s2 }))}
+                    summary={loadingAny ? 'Reading the schedule...' : `${jobs.length} line${jobs.length === 1 ? '' : 's'} to apply across ${forms.length} form${forms.length === 1 ? '' : 's'}`}>
+                    <div className="space-y-3">
+                        {forms.map((f, fi) => {
+                            const form = f.parsed.form, pl = plans[fi], dd = data[f.id], folded = !!fold[f.id];
+                            const srcLabel = f.source === 'inbox' ? 'From the inbox' : f.source === 'paste' ? 'Pasted' : 'Uploaded';
+                            const counts = pl ? { todo: pl.filter(r => r.include && r.status === 'ok').length, look: pl.filter(r => r.status !== 'already' && r.status !== 'same' && !(r.include && r.status === 'ok')).length, done: pl.filter(r => r.status === 'already' || r.status === 'same').length } : null;
+                            const appliedAt = form && doneMap[form.sig];
+                            return (
+                                <div key={f.id} className="border border-slate-200 rounded-xl overflow-hidden bg-white" data-testid="cr-form">
+                                    <div className="px-3 py-2 bg-[#E6F1FB] flex flex-wrap items-center gap-x-3 gap-y-1">
+                                        <button type="button" aria-expanded={!folded} onClick={() => setFold(m => ({ ...m, [f.id]: !m[f.id] }))} className="flex items-center gap-1.5 font-black text-[#00468B] text-sm min-w-0 text-left">
+                                            <ChevronIcon className={`w-4 h-4 flex-shrink-0 text-[#0072CE] transition-transform ${folded ? '-rotate-90' : ''}`} /><span className="truncate" title={f.name}>{f.name}</span></button>
+                                        <span className="px-1.5 py-0.5 rounded border border-[#B3D4F2] bg-white text-[10px] font-black text-[#00468B]">{srcLabel}</span>
+                                        {counts && <span className="text-[11px] font-bold text-slate-600">{counts.todo} to apply{counts.look ? ` · ${counts.look} need a look` : ''}{counts.done ? ` · ${counts.done} nothing to do` : ''}</span>}
+                                        <button type="button" className="ml-auto text-slate-400 hover:text-[#E4002B]" title={f.source === 'inbox' ? 'Dismiss this request (it is marked dismissed in the inbox)' : 'Remove this form'} onClick={() => removeForm(f)}><XIcon className="w-4 h-4" /></button>
+                                    </div>
+                                    {!folded && (<div>
+                                        {!form && <div className="px-3 py-2 text-sm font-semibold text-[#B00020]">{f.parsed.error}</div>}
+                                        {form && (<>
+                                            <div className="px-3 py-2 text-xs text-slate-700 flex flex-wrap gap-x-5 gap-y-1">
+                                                {form.date && <span><b>Form date</b> {fmtDay(form.date.getTime())}</span>}
+                                                {(form.requestor || f.sender) && <span><b>From</b> {[form.requestor, f.sender].filter(Boolean).join(' · ')}</span>}
+                                                {form.plant && <span><b>Plant</b> {form.plant}</span>}
+                                                <span className="min-w-0"><b>Reason</b> {form.reason || 'none written'}</span>
+                                                <span><b>Fixed zone</b> {form.fixedZone === 'Y' ? 'yes' : form.fixedZone === 'N' ? 'no' : 'not answered'}</span>
+                                                {(form.approval || form.signature) && <span><b>Approved by</b> {[form.approval, form.signature].filter(Boolean).join(', ')}</span>}
+                                            </div>
+                                            {form.fixedZone === 'Y' && !form.approval && !form.signature && <div className="mx-3 mb-2 p-2 rounded-lg bg-[#FDE8EC] border border-[#E4002B]/40 text-xs font-semibold text-[#B00020]" data-testid="cr-noapproval">This is a change inside the fixed zone (the next 7 days) and the form has no plant approval or supply chain signature. The form says one is needed: check with Supply Chain before applying. It will not be applied by itself.</div>}
+                                            {f.hold && f.inboxResult && <div className="mx-3 mb-2 p-2 rounded-lg bg-[#FFF6E0] border border-[#FFB81C]/60 text-xs text-slate-700" data-testid="cr-held">This request was looked at before and is waiting for you ({f.inboxStatus}): {f.inboxResult}</div>}
+                                            {appliedAt && <div className="mx-3 mb-2 p-2 rounded-lg bg-slate-50 border border-slate-200 text-xs text-slate-600" data-testid="cr-seen">This form was applied here on {fmtDT(appliedAt)}. Reading it again is safe: lines that are already done show as ALREADY DONE and are not changed twice.</div>}
+                                            {form.problems.map((t, k) => <div key={k} className="mx-3 mb-2 text-xs font-semibold text-[#7A5200]">{t}</div>)}
+                                            {(!dd || dd.loading) && <div className="px-3 py-2 text-xs font-bold text-[#00468B]">Reading the schedule around the dates on this form...</div>}
+                                            {dd && dd.failed && <div className="px-3 py-2 text-xs font-semibold text-[#B00020]">Could not read the schedule for these dates. Press Reload (top right).</div>}
+                                            {pl && pl.map(r => <ChangeLine key={r.i} row={r} ed={(edits[f.id] && edits[f.id][r.i]) || {}} setEd={(i, patch) => setEd(f.id, i, patch)} lineChoices={lineChoices} areaNames={areaNames} />)}
+                                        </>)}
+                                    </div>)}
+                                </div>
+                            );
+                        })}
+                    </div>
+                </Section>
+            )}
+
+            {/* Outside the folding steps on purpose: Apply, its result and Undo stay reachable whichever step is folded */}
+            {(waiting || result) && (
+                <div ref={barRef} className="sticky bottom-0 z-30 -mx-4 px-4 py-3 bg-white/95 border-t border-slate-200 shadow-[0_-6px_14px_rgba(15,23,42,0.08)]">
+                    {result && (
+                        <div className={`mb-2 p-2.5 rounded-lg border text-sm font-semibold max-h-32 overflow-y-auto ${result.type === 'success' ? 'bg-[#DCFCE7] border-[#16A34A]/50 text-[#166534]' : result.type === 'warn' ? 'bg-[#FFF6E0] border-[#FFB81C] text-slate-800' : 'bg-[#FDE8EC] border-[#E4002B]/40 text-[#B00020]'}`} data-testid="cr-result">
+                            <div>{result.message}</div>
+                            {result.lines && result.lines.map((l, i) => <div key={i} className="text-xs font-semibold mt-0.5">{l}</div>)}
+                        </div>
+                    )}
+                    {applying && <div className="mb-2 h-1.5 rounded bg-slate-200 overflow-hidden"><div className="h-full bg-[#0072CE] transition-all" style={{ width: `${applying.phase === 'checking' || applying.phase === 'looking' ? 100 : pct}%`, background: applying.phase === 'checking' || applying.phase === 'looking' ? '#FFB81C' : undefined }} /></div>}
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+                        {waiting && <Btn onClick={() => apply(null, false)} disabled={!canApply} className="min-w-[15rem]" title="Change the schedule as shown above">{applying ? (applying.phase === 'looking' ? 'Looking at the schedule again...' : applying.phase === 'checking' ? 'Checking what was saved...' : `Saving ${applying.done} of ${applying.total}...`) : `Apply to schedule (${jobs.length} line${jobs.length === 1 ? '' : 's'}${jobs.length ? `: ${[jobCounts.change && `${jobCounts.change} change`, jobCounts.add && `${jobCounts.add} add`, jobCounts.remove && `${jobCounts.remove} take off`].filter(Boolean).join(', ')}` : ''})`}</Btn>}
+                        {applying && applying.phase === 'saving' && <Btn kind="danger" onClick={() => { cancelRef.current = true; }}>Stop</Btn>}
+                        {waiting && applyHint && <span className="text-xs text-slate-500 font-semibold min-w-0 flex-1 basis-56">{applyHint}</span>}
+                        {!apiReady && <span className="text-xs text-[#B27B00] font-bold">Preview mode: nothing is saved to Dataverse.</span>}
+                        {result && result.changes && result.changes.length > 0 && !applying && (result.confirmUndo || result.busy
+                            ? <span className="flex flex-wrap items-center gap-2"><span className="text-xs font-bold text-[#B00020]">{result.busy ? 'Undoing...' : `Put the ${result.changes.length} change${result.changes.length === 1 ? '' : 's'} back as they were? Edits made since are lost.`}</span>
+                                <Btn kind="dangerSolid" onClick={undoApplied} disabled={result.busy}>Yes, undo</Btn><Btn kind="ghost" onClick={() => setResult({ ...result, confirmUndo: false })} disabled={result.busy}>No</Btn></span>
+                            : <Btn kind="danger" onClick={undoApplied}>Undo this change</Btn>)}
+                        {result && (result.type === 'success' || result.type === 'warn') && result.viewMs > 0 && !applying && <Btn kind="ghost" onClick={() => onView(result.viewMs)}>View on the schedule</Btn>}
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+const ChangeViewMemo = memo(ChangeView);
+
+// ============================================================================
 // SHIFTS + ROSTER
 // ============================================================================
 let SHIFT_SEQ = 1;
@@ -3139,7 +4112,12 @@ function ColumnsPanel({ colStatus, probeColumns, probing, resetRefused, apiReady
     const toCreate = [];
     const untested = [];
     COLUMN_GUIDE.forEach(t => { if (t.key !== 'runs') return; rowsOf(t).forEach(x => { if (x.c.need !== 'optional' || x.st.s === 'found') return; (x.st.s === 'missing' ? toCreate : untested).push(x); }); });
-    const missing = COLUMN_GUIDE.reduce((n, t) => n + rowsOf(t).filter(x => x.st.s === 'missing').length, 0);
+    const missing = COLUMN_GUIDE.reduce((n, t) => n + (t.optionalTable ? 0 : rowsOf(t).filter(x => x.st.s === 'missing').length), 0);
+    const tablesToCreate = COLUMN_GUIDE.filter(t => t.optionalTable && !rowsOf(t).some(x => x.st.s === 'found'));
+    const copyTable = async (t) => {
+        const txt = `In Dataverse create a table with the display name "Schedule Change" (its name will be ${t.table}) and these columns:\n` + t.cols.map(c => `- Display name "${c.label || c.name}", type ${c.type} (column name ${c.name}): ${c.why}`).join('\n');
+        setCopied((await copyText(txt)) ? 'Copied' : 'Could not copy: select the list and copy it by hand'); setTimeout(() => setCopied(''), 4000);
+    };
     const copyList = async () => {
         const txt = `On the table ${TABLE_PROD} (Production Schedule) create:\n` + toCreate.map(x => `- Display name "${x.c.label || x.c.name}", type ${x.c.type} (the column name will be ${x.c.name}): ${x.c.why}`).join('\n');
         setCopied((await copyText(txt)) ? 'Copied' : 'Could not copy: select the list and copy it by hand'); setTimeout(() => setCopied(''), 4000);
@@ -3165,6 +4143,14 @@ function ColumnsPanel({ colStatus, probeColumns, probing, resetRefused, apiReady
                     <p className="text-[11px] text-slate-500 mt-2">In Dataverse: Tables, {TABLE_PROD}, Columns, New column. Type the display name above and pick the type; Dataverse builds the column name from it. Then press "I added them, try again".</p>
                 </div>
             )}
+            {tablesToCreate.map(t => (
+                <div key={`new-${t.key}`} className="bg-[#FFF6E0] border border-[#FFB81C] rounded-xl p-4" data-testid="table-to-create">
+                    <div className="flex flex-wrap items-center gap-3 mb-1"><h3 className="text-xs font-black uppercase tracking-wider text-slate-700">Optional table to create: {t.title} <code className="normal-case tracking-normal font-semibold">{t.table}</code></h3><Btn kind="ghost" onClick={() => copyTable(t)}>Copy this list</Btn>{copied && <span className="text-xs font-bold text-[#166534]">{copied}</span>}</div>
+                    <p className="text-[11px] text-slate-600 mb-2">{t.note}</p>
+                    <ul className="text-xs text-slate-800 space-y-1">{t.cols.map(c => <li key={c.name}><b>{c.label || c.name}</b> · {c.type} · <code className="px-1 bg-white rounded border border-slate-200">{c.name}</code> <span className="text-slate-500">{c.why}</span></li>)}</ul>
+                    <p className="text-[11px] text-slate-500 mt-2">In Dataverse: Tables, New table. Display name "Schedule Change" (so the table name is {t.table}); the Name column is already there. Add the other columns with the display names and types above, then press "Test the columns in Dataverse".</p>
+                </div>
+            ))}
             {COLUMN_GUIDE.map(t => (
                 <div key={t.key} className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
                     <div className="px-4 py-2 bg-[#E6F1FB]"><h3 className="text-xs font-black uppercase tracking-wider text-[#00468B]">{t.title} <code className="normal-case tracking-normal font-semibold text-slate-600">{t.table}</code></h3><p className="text-[11px] text-slate-600">{t.note}</p></div>
@@ -3219,7 +4205,7 @@ function PayloadsPanel({ payloadsRef, clearPayloads, tick }) {
                         <button type="button" className="w-full text-left px-3 py-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs hover:bg-slate-50" onClick={() => setOpenId(openId === e.n ? null : e.n)} aria-expanded={openId === e.n}>
                             <span className="font-mono text-slate-400">{fmtSec(e.t)}</span>
                             <span className={`px-1.5 py-0.5 rounded border text-[10px] font-black uppercase ${e.op === 'delete' ? 'bg-[#FDE8EC] text-[#B00020] border-[#E4002B]' : e.op === 'create' ? 'bg-[#DCFCE7] text-[#166534] border-[#16A34A]' : 'bg-[#E6F1FB] text-[#00468B] border-[#0072CE]'}`}>{e.op}</span>
-                            <span className="text-slate-700 min-w-0 flex-1 basis-40 truncate">{e.what || e.table}{e.id ? <span className="text-slate-400"> · {String(e.id).slice(-8)}</span> : ''}</span>
+                            <span className="text-slate-700 min-w-0 flex-1 basis-40 truncate">{e.table !== TABLE_PROD ? `${e.table}: ` : ''}{e.what || e.table}{e.id ? <span className="text-slate-400"> · {String(e.id).slice(-8)}</span> : ''}</span>
                             <span className="text-slate-500">{Object.keys(e.fields).length} column{Object.keys(e.fields).length === 1 ? '' : 's'}</span>
                             {e.sent.map(c => <span key={c} className="px-1 rounded border text-[10px] font-bold bg-[#DCFCE7] text-[#166534] border-[#16A34A]">{colLabel(c)}</span>)}
                             {e.dropped.map(c => <span key={c} className="px-1 rounded border text-[10px] font-bold bg-[#FFF6E0] text-slate-800 border-[#FFB81C]" title="Dataverse refused this column">{colLabel(c)} not stored</span>)}
@@ -3674,6 +4660,48 @@ export default function ProductionScheduleApp({ dataApi }) {
         markRefused: (col, why) => { colStateRef.current.refused[col] = why; bumpPayloads(); },
         keepSide: (id, extras, dropped) => rememberSide(id, extras, dropped),
         sideReport: () => ({ skipped: sideSkipRef.current }),
+        patchRun,
+        // the last runs of some items (which line, when they start, how long, hours per case): what a product the form ADDS needs
+        recallItems: async (codes) => {
+            const valid = codes.filter(c => /^\d{1,9}$/.test(c));
+            if (!valid.length) return {};
+            let rows2 = [];
+            if (!apiReady) rows2 = runsRef.current.slice();
+            else {
+                for (let i = 0; i < valid.length; i += 10) {
+                    const chunk = valid.slice(i, i + 10);
+                    const got = await queryRecords(TABLE_PROD, dataApiRef.current, { filter: `statecode eq 0 and (${chunk.map(c => `craa5_productcode eq ${c}`).join(' or ')})`, orderby: 'craa5_datestarttime desc', top: 400 });
+                    if (got) rows2 = rows2.concat(got.map(r => normRun(r, sideRef.current)));
+                }
+            }
+            return crRecall(rows2.filter(r => r.code !== null && valid.indexOf(String(r.code)) >= 0));
+        },
+        // change requests an email flow dropped in the inbox table: the waiting ones (null = the table could not be read), and a status/result write-back
+        inboxList: async () => {
+            const rows2 = await queryRecords(TABLE_INBOX, dataApiRef.current, { filter: "statecode eq 0 and (craa5_status eq 'new' or craa5_status eq 'review' or craa5_status eq 'failed')", orderby: 'createdon asc', top: INBOX_TOP, quiet: true });   // the table is optional: its absence is not worth a console warning
+            if (rows2 === null) return null;
+            noteKeys('inbox', rows2);
+            colStateRef.current.probed['inbox|craa5_status'] = { s: 'found' };   // a filter on a column that is not there is refused, so this worked because it is
+            return rows2.map(r => ({ id: String(r.craa5_schedulechangeid || r.craa5_ScheduleChangeId || ''), name: renderSafe(rv(r, 'craa5_name')), sender: renderSafe(rv(r, 'craa5_sender')), json: rv(r, 'craa5_formjson') || '', status: String(rv(r, 'craa5_status') || 'new'), result: renderSafe(rv(r, 'craa5_result')), at: Date.parse(r.createdon) || 0 })).filter(x => x.id);
+        },
+        inboxSet: async (id, fields, what) => {
+            const w = writer();
+            if (!w || !apiReady || !id) return false;
+            const body = { ...fields }, wanted = Object.keys(fields);
+            for (let attempt = 0; attempt < 3; attempt++) {
+                try {
+                    await w.update(TABLE_INBOX, id, body);
+                    logPayload({ op: 'update', table: TABLE_INBOX, id, what: what || 'inbox', fields: clipFields(body), sent: Object.keys(body), dropped: wanted.filter(c => !(c in body)), ok: true, error: '', preview: false });
+                    return true;
+                } catch (e) {
+                    logPayload({ op: 'update', table: TABLE_INBOX, id, what: what || 'inbox', fields: clipFields(body), sent: [], dropped: [], ok: false, error: errText(e), preview: false });
+                    const bad = badColumns(e, Object.keys(body)).filter(c => c !== 'craa5_status');
+                    if (!bad.length) return false;
+                    bad.forEach(c => { delete body[c]; });   // a missing Result column must not stop the Status from being written
+                }
+            }
+            return false;
+        },
     };
     // The Import view is kept in the page while another tab shows; it gets one fixed object (always reaching the latest functions)
     // and fixed callbacks, so a click or drag on the Gantt does not redraw a big loaded plan behind the scenes.
@@ -3687,6 +4715,10 @@ export default function ProductionScheduleApp({ dataApi }) {
         markRefused: (c, w) => importLatest.current.markRefused(c, w),
         keepSide: (id, x, d) => importLatest.current.keepSide(id, x, d),
         sideReport: () => importLatest.current.sideReport(),
+        patchRun: (id, patch, what, meta) => importLatest.current.patchRun(id, patch, what, meta),
+        recallItems: (c) => importLatest.current.recallItems(c),
+        inboxList: () => importLatest.current.inboxList(),
+        inboxSet: (id, f, w) => importLatest.current.inboxSet(id, f, w),
     }), []);
     const importDone = useMemo(() => () => { loadedRef.current = []; setReloadTick(n => n + 1); }, []);
     const importShow = useMemo(() => (ms) => { setTab('schedule'); setView(v => ({ days: 7, from: addDaysLocal(midnightOf(ms), -new Date(ms).getDay()).getTime() })); }, []);
@@ -3695,6 +4727,8 @@ export default function ProductionScheduleApp({ dataApi }) {
     // ------------------------------------------------------------------------
     // DATA CHECK: column status, the run check (reads in slices, judges, fixes by group) and the Data Check tab's plumbing
     // ------------------------------------------------------------------------
+    const [crPending, setCrPending] = useState(0);   // change request forms waiting for someone (the badge on their tab)
+    const onCrPending = useMemo(() => (n) => setCrPending(n), []);
     const [checkSub, setCheckSub] = useState('run');
     const [probing, setProbing] = useState(false);
     const openCheck = useMemo(() => (sub) => { setCheckSub(sub || 'run'); setTab('check'); }, []);
@@ -3726,7 +4760,7 @@ export default function ProductionScheduleApp({ dataApi }) {
                     const page = await withTimeout(api.queryTable(j.t.table, { pageSize: 1, select: [col] }), API_TIMEOUT_MS, 'Column test'), row = page && page.rows && page.rows[0];
                     st.probed[key] = !row ? { s: 'unknown', why: 'the table has no rows to test against' } : Object.keys(row).some(k => k.toLowerCase() === col) ? { s: 'found' } : { s: 'unknown', why: 'the row came back without this column, which can also mean it is empty' };
                 } else st.probed[key] = { s: 'unknown' };
-            } catch (e) { st.probed[key] = badColumns(e, [j.c.name]).length ? { s: 'missing', why: errText(e) } : { s: 'unknown', why: errText(e) }; }
+            } catch (e) { st.probed[key] = badColumns(e, [j.c.name]).length || (j.t.optionalTable && TABLE_GONE_RE.test(errText(e))) ? { s: 'missing', why: errText(e) } : { s: 'unknown', why: errText(e) }; }
             if (j.t.key === 'runs' && j.c.need === 'optional') { if (st.probed[key].s === 'missing') st.refused[j.c.name] = st.probed[key].why; else if (st.probed[key].s === 'found') delete st.refused[j.c.name]; }
         });
         setProbing(false); bumpPayloads();
@@ -4023,6 +5057,7 @@ export default function ProductionScheduleApp({ dataApi }) {
         { id: 'schedule', label: 'Schedule', icon: GanttIcon },
         { id: 'month', label: 'Month', icon: CalendarIcon },
         { id: 'import', label: 'Import Weeks', icon: UploadIcon },
+        { id: 'changes', label: 'Change Requests', icon: MailIcon, badge: crPending },
         { id: 'shifts', label: 'Shifts & Roster', icon: UsersIcon },
         { id: 'cleaning', label: 'Cleaning Times', icon: SprayIcon },
         { id: 'check', label: 'Data Check', icon: CheckIcon },
@@ -4043,7 +5078,7 @@ export default function ProductionScheduleApp({ dataApi }) {
                 <div className="leading-tight"><div className="text-sm font-black uppercase tracking-widest text-[#00468B]">Production Schedule</div><div className="text-[10px] text-slate-400">plan · import · shifts · cleaning</div></div>
                 <div className="flex flex-wrap gap-1.5 ml-2">
                     {TABS.map(t => { const I = t.icon; return (
-                        <button key={t.id} type="button" onClick={() => setTab(t.id)} className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-xs font-extrabold border whitespace-nowrap transition-colors ${tab === t.id ? 'bg-[#0072CE] text-white border-[#0072CE]' : 'bg-white text-slate-600 border-slate-300 hover:bg-[#E6F1FB]'}`}><I className="w-4 h-4" />{t.label}</button>); })}
+                        <button key={t.id} type="button" onClick={() => setTab(t.id)} className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-xs font-extrabold border whitespace-nowrap transition-colors ${tab === t.id ? 'bg-[#0072CE] text-white border-[#0072CE]' : 'bg-white text-slate-600 border-slate-300 hover:bg-[#E6F1FB]'}`}><I className="w-4 h-4" />{t.label}{t.badge > 0 && <span className="px-1.5 rounded-full bg-[#FFB81C] text-slate-900 text-[10px] font-black" data-testid="cr-badge">{t.badge}</span>}</button>); })}
                 </div>
                 <div className="ml-auto flex items-center gap-2">
                     {lastPay && (() => {
@@ -4150,6 +5185,10 @@ export default function ProductionScheduleApp({ dataApi }) {
                     <div style={{ display: tab === 'import' ? 'block' : 'none' }}>
                         <ImportViewMemo areaOptions={areaOptions} lineChoices={lineChoices} settings={settings} updateSettings={updateSettings} api={importApi} gapCtx={gapCtx} apiReady={apiReady} reloadTick={reloadTick}
                             onDone={importDone} onView={importShow} onOpenCheck={openCheck} />
+                    </div>
+                    <div style={{ display: tab === 'changes' ? 'block' : 'none' }}>
+                        <ChangeViewMemo api={importApi} lineChoices={lineChoices} settings={settings} updateSettings={updateSettings} gapCtx={gapCtx} apiReady={apiReady} reloadTick={reloadTick}
+                            onDone={importDone} onView={importShow} onOpenCheck={openCheck} onPending={onCrPending} active={tab === 'changes'} />
                     </div>
                     {tab === 'check' && <DataCheckView sub={checkSub} setSub={setCheckSub} auditRef={auditRef} subscribe={auditSubscribe} startAudit={startAudit} cancelAudit={cancelAudit} fixRuns={fixRuns} deleteRuns={deleteRuns}
                         undoFix={undoFix} openRun={openRunFromCheck} mssIdx={mssIdx} payloadsRef={payloadsRef} payloadTick={payloadTick} colStatus={colStatus} refusedCols={refusedCols} probeColumns={probeColumns} probing={probing}
