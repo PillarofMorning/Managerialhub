@@ -291,6 +291,7 @@ const LEAD_WORK_KINDS = [
 const LEAD_WORK_KEY = '__leads__';   // stored with the job role choices
 const TEAM_COLORS = ['#0ea5e9', '#8b5cf6', '#f59e0b', '#10b981', '#ef4444', '#ec4899', '#14b8a6', '#6366f1'];
 const NIGHT_START_HOUR = 18;
+const GHOST_OPACITY = 0.7;   // a person's work in another room, drawn on their line in this room (PBED's room-first Gantt)
 const IDLE_SHOW_MINS = 10;   // blank space on shift shorter than this (a few minutes before a break) isn't flagged
 const NIGHT_END_HOUR = 6;
 function defaultWorkKind(roleKey) {
@@ -1277,8 +1278,22 @@ const EXP_PIECE_TOP = 2000;        // rows per read
 const EXP_PARALLEL = 3;            // reads running at once
 const EXP_CACHE_KEY = 'itp_exp_v1';
 const EXP_CACHE_MS = 6 * 3600000;  // the counts are kept in this browser for six hours
-const EXP_FIELDS = ['craa5_taskassignmentid', 'craa5__aaemp_guid', 'craa5_id', 'craa5_area', 'craa5_lead', 'craa5_team', 'createdon', 'craa5_datetimeofassignment'];
+const EXP_VERSION = 3;             // 3 = hours (the Manager's Hub rules), who worked with whom (a shift counts once), night crews from the rotation; an older saved count is read again
+const EXP_FIELDS = ['craa5_taskassignmentid', 'craa5__aaemp_guid', 'craa5_id', 'craa5_area', 'craa5_lead', 'craa5_team', 'craa5_shift', 'craa5_starttime', 'craa5_endtime', 'createdon', 'craa5_datetimeofassignment', 'statecode'];
+// Hours follow the Manager's Hub (hub - manager, Employee Query): an assignment lasts from its start to its end time; a row with no
+// end time runs to the next row of the same person in that shift, else to the end of the shift (6 PM for days, 6 AM for nights),
+// never more than 16 hours; a row replaced within 5 minutes was a slip and is ignored; a "time assigned" is one shift in one area.
+const EXP_MAX_ROW_MS = 16 * 3600000;
+const EXP_SLIP_MS = 5 * 60000;
+const EXP_DAY_CUT_HOUR = 5;        // a day shift's day begins at 05:00
+const EXP_NIGHT_CUT_HOUR = 12;     // a night row before noon belongs to the evening before
+const EXP_SHIFT_HOURS = 10;        // hours that count as one shift of experience when teams are compared (12 h less breaks, walking, set-up)
+const EXP_PAIR_KEEP = 12;          // the people each person has worked with the most are kept (the rest is noise)
 const AUTO_EFF = 0.8;              // share of a shift that is cleaning time (breaks, walking, set-up)
+// How much "who they have worked with" counts next to "who knows the room" when teams are built (both in shifts): a shift under the
+// team's lead, and a shift on the same team as someone already on it (averaged over the team so far). A lead's usual team also
+// counts a little when rooms are dealt to leads.
+const AUTO_AFF_LEAD = 0.5, AUTO_AFF_PAIR = 0.5, AUTO_AFF_TEAM = 0.5, AUTO_USUAL_MIN = 2;
 // One piece of history: Shift Start's saved rows (they carry the employee id and a room) created in [sinceMs, untilMs).
 // Returns the rows, or null when the table couldn't be read.
 async function fetchExperiencePiece(dataApi, sinceMs, untilMs) {
@@ -1306,43 +1321,173 @@ async function fetchExperiencePiece(dataApi, sinceMs, untilMs) {
     }
     return failed ? null : [];
 }
-// Counts of shift days per person and room, kept by employee id (or name) and room name so they don't depend on the lines table.
-// own[personKey][roomNameKey] = { a: room label, d: shift days }, led[leadNameKey][roomNameKey] likewise for the days a lead's team was there.
-function newExperience() { return { own: {}, led: {}, seen: {}, rows: 0, used: 0, capped: 0, pieces: 0, failed: 0, total: 0, from: 0, to: 0 }; }
-// A night belongs to the day it began: rows saved before 5 AM count for the day before.
-function shiftDayOf(ms) { const d = new Date(ms - 5 * 3600000); return d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate(); }
+// Experience is counted from Shift Start's saved rows. Every row is kept (compactly, per person) while the pieces are read and the
+// counts are worked out once at the end (`finishExperience`), because how long a row lasted depends on the person's next row.
+// Kept by employee id (or name) and room name so they don't depend on the lines table:
+//   own[personKey][roomNameKey] = { a: room label, d: shift days, h: hours }, led[leadNameKey][roomNameKey] likewise for the days
+//   (and hours) a lead's team was there; wl[personKey][leadNameKey] = shift days on that lead's team (any room); pair[personKey]
+//   [otherPersonKey] = shifts the two were on the same team in the same room (only the people each person worked with most).
+function newExperience() { return { own: {}, led: {}, wl: {}, pair: {}, people: {}, rows: 0, used: 0, capped: 0, pieces: 0, failed: 0, total: 0, from: 0, to: 0 }; }
+// Day shifts run 6 AM to 6 PM, night shifts 6 PM to 6 AM. Which crews work nights comes from the shift rotation (a crew whose shifts mostly
+// start in the evening or after midnight; with the standard rotation A and B are the day crews, C and D the night crews). A row with no
+// crew letter is judged by the time of day.
+function expNightCrews(rotation) {
+    const cnt = {}, out = {};
+    (Array.isArray(rotation) && rotation.length ? rotation : DEFAULT_SHIFT_ROTATION).forEach(function(sl) {
+        const c = normalizeShift(sl && sl.crew);
+        if (!c) return;
+        const n = cnt[c] = cnt[c] || { day: 0, night: 0 };
+        if (Number(sl.startHour) >= 17 || Number(sl.startHour) < EXP_DAY_CUT_HOUR) n.night++; else n.day++;
+    });
+    Object.keys(cnt).forEach(function(c) { out[c] = cnt[c].night > cnt[c].day; });
+    return out;
+}
+function expIsNight(crew, ms, nights) {
+    if (crew && nights && nights[crew] !== undefined) return !!nights[crew];
+    if (crew === 'A' || crew === 'B') return false;
+    if (crew === 'C' || crew === 'D') return true;
+    const h = new Date(ms).getHours();
+    return h >= 17 || h < EXP_DAY_CUT_HOUR;
+}
+// The shift day a row belongs to (a night belongs to the evening it began), as yyyymmdd.
+function expDayNo(ms, night) {
+    const d = new Date(ms);
+    const x = new Date(d.getFullYear(), d.getMonth(), d.getDate() - (d.getHours() < (night ? EXP_NIGHT_CUT_HOUR : EXP_DAY_CUT_HOUR) ? 1 : 0));
+    return x.getFullYear() * 10000 + (x.getMonth() + 1) * 100 + x.getDate();
+}
+// When the shift a row started in ends (0 when that cannot be told).
+function expShiftEnd(ms, night) {
+    const d = new Date(ms), h = d.getHours();
+    if (night ? (h >= EXP_NIGHT_CUT_HOUR && h < 17) : h < EXP_DAY_CUT_HOUR) return 0;
+    const end = night ? new Date(d.getFullYear(), d.getMonth(), d.getDate() + (h >= EXP_NIGHT_CUT_HOUR ? 1 : 0), 6).getTime()
+        : new Date(d.getFullYear(), d.getMonth(), d.getDate(), 18).getTime();
+    return end > ms ? end : 0;
+}
+// A time column as ms: the raw value first (a formatted one is only a label).
+function expTimeMs(r, name) { return rowTimeMs(r && r[name] !== undefined && r[name] !== null ? r[name] : getRowField(r, name)); }
 function addExperienceRows(agg, rows) {
     (rows || []).forEach(function(r) {
         agg.rows++;
         const area = String(getRowField(r, 'craa5_area') || '').trim();
         const an = normS(area);
-        if (!an || an === 'unassigned' || OUT_AREA_NAMES.indexOf(an) > -1) return;
+        if (!an) return;
         const nm = String(getRowField(r, 'craa5_id') || '').trim();
         if (/unassigned/i.test(nm)) return;
         const guid = String(getRowField(r, 'craa5__aaemp_guid') || '').replace(/[{}]/g, '').toLowerCase();
         const me = normS(formatFullName(nm));
         const pk = guid || (me ? 'n:' + me : '');
         if (!pk) return;
-        const t = rowTimeMs(getRowField(r, 'craa5_datetimeofassignment')) || rowTimeMs(getRowField(r, 'createdon'));
-        if (!t) return;
-        const day = shiftDayOf(t);
-        agg.used++;
-        const bump = function(kind, map, key) {
-            const k = kind + '|' + key + '|' + an + '|' + day;
-            if (agg.seen[k]) return;   // saved again the same shift day: counts once
-            agg.seen[k] = 1;
-            const m = map[key] = map[key] || {};
-            const e = m[an] = m[an] || { a: area, d: 0 };
-            e.d++;
-        };
-        bump('o', agg.own, pk);
-        const lead = normS(formatFullName(String(getRowField(r, 'craa5_lead') || '').trim()));
-        const sup = normS(formatFullName(String(getRowField(r, 'craa5_team') || '').trim()));
-        if (lead && lead !== me && lead !== sup) bump('l', agg.led, lead);
+        const saved = expTimeMs(r, 'craa5_datetimeofassignment') || expTimeMs(r, 'createdon');
+        const start = expTimeMs(r, 'craa5_starttime') || saved;
+        if (!start) return;
+        const end = expTimeMs(r, 'craa5_endtime');
+        // Absence rows and "unassigned" are kept: they still end the assignment before them. They are not rooms.
+        const skip = OUT_AREA_NAMES.indexOf(an) > -1 || an === 'unassigned';
+        if (!skip) agg.used++;
+        (agg.people[pk] = agg.people[pk] || []).push({
+            s: start, e: end > start ? end : 0, sv: saved || start, cr: normalizeShift(getRowField(r, 'craa5_shift')),
+            ac: r.statecode === 0 || r.statecode === '0', an: an, a: area, skip: skip,
+            lk: normS(formatFullName(String(getRowField(r, 'craa5_lead') || '').trim())), sk: normS(formatFullName(String(getRowField(r, 'craa5_team') || '').trim())), me: me
+        });
     });
 }
+// Works the counts out from the kept rows (see the note above) and drops the rows.
+function finishExperience(agg, nowMs, nights) {
+    const own = {}, ledMax = {}, wl = {}, grp = {};
+    Object.keys(agg.people).forEach(function(pk) {
+        const items = agg.people[pk];
+        items.sort(function(a, b) { return a.s - b.s || a.sv - b.sv; });
+        items.forEach(function(it) { it.night = expIsNight(it.cr, it.s, nights); });
+        items.forEach(function(it, i) {   // no crew letter: the previous row's shift while it is still running
+            if (it.cr || !i) return;
+            const pv = items[i - 1], pe = expShiftEnd(pv.s, pv.night);
+            if (pe && it.s < pe) it.night = pv.night;
+        });
+        items.forEach(function(it, i) {
+            const next = items[i + 1];
+            const sEnd = expShiftEnd(it.s, it.night);
+            const limit = sEnd ? Math.min(sEnd, it.s + EXP_MAX_ROW_MS) : it.s + EXP_MAX_ROW_MS;
+            let stop = it.e;
+            if (!stop) {
+                if (it.ac && nowMs >= it.s && nowMs < limit) stop = nowMs;
+                else if (next && next.s <= limit) stop = next.s;
+                else if (sEnd) stop = limit;
+                else stop = it.s;
+            }
+            if (stop - it.s > EXP_MAX_ROW_MS) stop = it.s + EXP_MAX_ROW_MS;
+            if (next && next.s < stop) stop = Math.max(it.s, next.s);   // moved: the newest row takes over from its start
+            it.ms = it.skip ? 0 : Math.max(0, stop - it.s);
+            // a slip: replaced by the next row, or a row that ran under 5 minutes. A row whose end cannot be told counts a shift, hours unknown.
+            it.slip = (!!next && (next.s - it.s) < EXP_SLIP_MS) || (stop > it.s && it.ms < EXP_SLIP_MS);
+            it.day = expDayNo(it.s, it.night);
+        });
+        items.forEach(function(it) {
+            if (it.skip || it.slip) return;
+            const o = own[pk] = own[pk] || {};
+            const e = o[it.an] = o[it.an] || { a: it.a, days: {}, ms: 0 };
+            e.a = it.a; e.days[it.day] = (e.days[it.day] || 0) + it.ms; e.ms += it.ms;
+            // A real lead of their own (not the person, not the supervisor holding the room): the lead's team was there.
+            const real = !!it.lk && it.lk !== it.me && it.lk !== it.sk;
+            if (real) {
+                const lm = ledMax[it.lk] = ledMax[it.lk] || {};
+                const le = lm[it.an] = lm[it.an] || { a: it.a, days: {} };
+                le.days[it.day] = Math.max(le.days[it.day] || 0, it.ms);   // the team's time there that day: its longest member
+                const w = wl[pk] = wl[pk] || {};
+                const wd = w[it.lk] = w[it.lk] || {};
+                wd[it.day] = 1;
+            }
+            const gk = it.day + '|' + it.an + '|' + (real ? it.lk : 's:' + it.sk);
+            (grp[gk] = grp[gk] || {})[pk] = 1;
+        });
+    });
+    agg.own = {};
+    Object.keys(own).forEach(function(pk) {
+        agg.own[pk] = {};
+        Object.keys(own[pk]).forEach(function(an) { const e = own[pk][an]; const ds = Object.keys(e.days); agg.own[pk][an] = { a: e.a, d: ds.length, h: Math.round(e.ms / 360000) / 10, u: ds.filter(function(d) { return e.days[d] === 0; }).length }; });
+    });
+    agg.led = {};
+    Object.keys(ledMax).forEach(function(lk) {
+        agg.led[lk] = {};
+        Object.keys(ledMax[lk]).forEach(function(an) {
+            const e = ledMax[lk][an], ds = Object.keys(e.days);
+            agg.led[lk][an] = { a: e.a, d: ds.length, h: Math.round(ds.reduce(function(a, d) { return a + e.days[d]; }, 0) / 360000) / 10, u: ds.filter(function(d) { return e.days[d] === 0; }).length };
+        });
+    });
+    agg.wl = {};
+    Object.keys(wl).forEach(function(pk) { agg.wl[pk] = {}; Object.keys(wl[pk]).forEach(function(lk) { agg.wl[pk][lk] = Object.keys(wl[pk][lk]).length; }); });
+    // Who worked with whom: the shifts two people were on the same team in the same room (rooms the supervisor held count as one team).
+    // A shift counts once for a pair, however many rooms the team went through that day (the keys start with the day, so a pair's rooms
+    // of one day come together).
+    const pairs = {}, pairDay = {};
+    Object.keys(grp).sort().forEach(function(gk) {
+        const who = Object.keys(grp[gk]);
+        if (who.length < 2 || who.length > 60) return;
+        const day = gk.slice(0, gk.indexOf('|'));
+        for (let i = 0; i < who.length; i++) for (let j = i + 1; j < who.length; j++) {
+            const a = who[i] < who[j] ? who[i] : who[j], b = who[i] < who[j] ? who[j] : who[i];
+            const m = pairs[a] = pairs[a] || {}, md = pairDay[a] = pairDay[a] || {};
+            if (md[b] === day) continue;
+            md[b] = day;
+            m[b] = (m[b] || 0) + 1;
+        }
+    });
+    const all = {};
+    Object.keys(pairs).forEach(function(a) { Object.keys(pairs[a]).forEach(function(b) {
+        const n = pairs[a][b];
+        if (n < 2) return;
+        (all[a] = all[a] || []).push({ k: b, n: n });
+        (all[b] = all[b] || []).push({ k: a, n: n });
+    }); });
+    agg.pair = {};
+    Object.keys(all).forEach(function(pk) {
+        const top = all[pk].sort(function(x, y) { return y.n - x.n || (x.k < y.k ? -1 : 1); }).slice(0, EXP_PAIR_KEEP);
+        agg.pair[pk] = {};
+        top.forEach(function(x) { agg.pair[pk][x.k] = x.n; });
+    });
+    agg.people = {};
+}
 // Reads the last `days` days of Shift Start's saved rows a few days at a time, a few reads at once, and counts them.
-async function fetchExperience(dataApi, days, onProgress) {
+async function fetchExperience(dataApi, days, onProgress, nights) {
     const agg = newExperience();
     const now = Date.now();
     agg.to = now; agg.from = now - days * 86400000;
@@ -1363,36 +1508,72 @@ async function fetchExperience(dataApi, days, onProgress) {
     const jobs = [];
     for (let i = 0; i < Math.min(EXP_PARALLEL, pieces.length); i++) jobs.push(run());
     await Promise.all(jobs);
-    agg.seen = {};
+    finishExperience(agg, Date.now(), nights);
     return agg;
 }
-// { employeeId: { roomId: shift days } } from the counts. A room is a Shift Start line (by the same name rule as the equipment
-// areas) or, for an area no line matches, 't:<area>'. A lead's number for a room is the larger of the days they were on it and
-// the days their team was.
+// What the counts say, by employee id:
+//   exp[emp][roomId]   experience on the room in "shift equivalents" (hours / EXP_SHIFT_HOURS, plus one for each shift day whose hours cannot be told; the shift days when no hours are known)
+//   days[emp][roomId]  shifts on the room, hrs[emp][roomId] hours on it (what the Crew tab shows)
+//   lead[emp][leadId]  shifts on that lead's team, any room (the person's usual team)
+//   together[emp][emp2] shifts the two were on the same team in the same room
+// A room is a Shift Start line (by the same name rule as the equipment areas) or, for an area no line matches, 't:<area>'. A lead's
+// number for a room is the larger of what they did there and what their team did.
+function expScore(d, h, u) { return h > 0 ? h / EXP_SHIFT_HOURS + (u || 0) : d; }
+const EXP_NONE = { exp: {}, days: {}, hrs: {}, lead: {}, together: {} };
 function buildExperienceMap(agg, who, lines) {
-    const out = {};
+    const out = { exp: {}, days: {}, hrs: {}, lead: {}, together: {} };
     if (!agg || !who) return out;
     const idOfKey = function(k) { return who.idByName[k] || who.idByName[normS(k)] || ''; };
+    const idOfPk = function(pk) { return pk.indexOf('n:') === 0 ? idOfKey(pk.slice(2)) : (who.idByGuid[pk] || ''); };
     const roomIdOf = function(label) { const l = lineForArea(lines || [], label); return l ? l.id : 't:' + normS(label); };
     const own = {}, led = {};
-    const add = function(into, emp, label, n) {
+    const add = function(into, emp, label, d, h, u) {
         if (!emp) return;
         const rid = roomIdOf(label);
         const m = into[emp] = into[emp] || {};
-        m[rid] = (m[rid] || 0) + n;
+        const e = m[rid] = m[rid] || { d: 0, h: 0, u: 0 };
+        e.d += d; e.h += h || 0; e.u += u || 0;
     };
     Object.keys(agg.own || {}).forEach(function(pk) {
-        const emp = pk.indexOf('n:') === 0 ? idOfKey(pk.slice(2)) : (who.idByGuid[pk] || '');
-        Object.keys(agg.own[pk]).forEach(function(an) { add(own, emp, agg.own[pk][an].a, agg.own[pk][an].d); });
+        const emp = idOfPk(pk);
+        Object.keys(agg.own[pk]).forEach(function(an) { const e = agg.own[pk][an]; add(own, emp, e.a, e.d, e.h, e.u); });
     });
     Object.keys(agg.led || {}).forEach(function(lk) {
         const emp = idOfKey(lk);
-        Object.keys(agg.led[lk]).forEach(function(an) { add(led, emp, agg.led[lk][an].a, agg.led[lk][an].d); });
+        Object.keys(agg.led[lk]).forEach(function(an) { const e = agg.led[lk][an]; add(led, emp, e.a, e.d, e.h, e.u); });
     });
     Object.keys(own).concat(Object.keys(led)).forEach(function(emp) {
-        if (out[emp]) return;
-        const m = out[emp] = {};
-        [own[emp] || {}, led[emp] || {}].forEach(function(src) { Object.keys(src).forEach(function(rid) { m[rid] = Math.max(m[rid] || 0, src[rid]); }); });
+        if (out.exp[emp]) return;
+        const m = out.exp[emp] = {}, dm = out.days[emp] = {}, hm = out.hrs[emp] = {};
+        [own[emp] || {}, led[emp] || {}].forEach(function(src) {
+            Object.keys(src).forEach(function(rid) {
+                const e = src[rid];
+                m[rid] = Math.max(m[rid] || 0, expScore(e.d, e.h, e.u));
+                dm[rid] = Math.max(dm[rid] || 0, e.d);
+                hm[rid] = Math.max(hm[rid] || 0, e.h);
+            });
+        });
+    });
+    Object.keys(agg.wl || {}).forEach(function(pk) {
+        const emp = idOfPk(pk);
+        if (!emp) return;
+        Object.keys(agg.wl[pk]).forEach(function(lk) {
+            const le = idOfKey(lk);
+            if (!le || le === emp) return;
+            const m = out.lead[emp] = out.lead[emp] || {};
+            m[le] = Math.max(m[le] || 0, agg.wl[pk][lk]);
+        });
+    });
+    Object.keys(agg.pair || {}).forEach(function(pa) {
+        const ea = idOfPk(pa);
+        if (!ea) return;
+        Object.keys(agg.pair[pa]).forEach(function(pb) {
+            const eb = idOfPk(pb);
+            if (!eb || eb === ea) return;
+            const n = agg.pair[pa][pb];
+            const m = out.together[ea] = out.together[ea] || {}, m2 = out.together[eb] = out.together[eb] || {};
+            m[eb] = Math.max(m[eb] || 0, n); m2[ea] = Math.max(m2[ea] || 0, n);
+        });
     });
     return out;
 }
@@ -1437,13 +1618,20 @@ function apportion(total, weights, min1, caps) {
 //  3. Each leader gets one room, best match first: the top priority level picks its leaders first, each room going to the lead
 //     with the most days on it. More rooms than leaders: the rest queue behind the leader with the least work. More leaders than
 //     rooms: a big room gets a second team. A lead left over floats.
-//  4. A team's size follows its rooms' work. People are matched to teams by their days on the team's rooms, Tech 3s and
-//     Inspectors by the team's PIC work.
+//  4. A team's size follows its rooms' work. People are matched to teams best fit first: their experience on the team's rooms
+//     (hours, like the Manager's Hub), the shifts they spent under the team's lead (their usual team) and the shifts they spent
+//     with the people already on the team, so a usual team forms around its lead. Tech 3s and Inspectors by the team's PIC work.
 //  5. A team stays together on its first room. It only divides across rooms that share that room's priority level.
 function autoCrewBoard(inp) {
     const mins = Math.max(0, inp.mins || 0);
     const exp = inp.exp || {};
     const expOf = function(emp, room) { const e = exp[emp]; return (e && e[room]) || 0; };
+    // inp.days / inp.hrs: shifts and hours on a room (shown, not compared); inp.lead[emp][lead]: shifts under that lead;
+    // inp.together[emp][emp2]: shifts on the same team in the same room. All optional.
+    const daysOf = function(emp, room) { const e = (inp.days || {})[emp]; return e && e[room] !== undefined ? e[room] : expOf(emp, room); };
+    const hrsOf = function(emp, room) { const e = (inp.hrs || {})[emp]; return (e && e[room]) || 0; };
+    const usualOf = function(emp, lead) { const m = (inp.lead || {})[emp]; return (m && m[lead]) || 0; };
+    const togOf = function(a, b) { const t = inp.together || {}; return Math.max((t[a] && t[a][b]) || 0, (t[b] && t[b][a]) || 0); };
     const nameCmp = function(a, b) { return String(a.name).localeCompare(String(b.name)); };
     const people = (inp.people || []).slice().sort(nameCmp);
     const leads = (inp.leads || []).slice().sort(nameCmp);
@@ -1507,6 +1695,14 @@ function autoCrewBoard(inp) {
             slots.push(best);
         }
     }
+    // How well a lead's usual team (the present people who spent the most shifts under them) knows a room: the average of the
+    // best few, so a lead who comes with a team that knows the room is a better pick for it than the lead's own days alone say.
+    const teamFit = function(lead, room) {
+        const k = Math.max(1, Math.round(P / Math.max(1, leads.length)));
+        const usuals = pool.filter(function(p) { return usualOf(p.id, lead) >= AUTO_USUAL_MIN; })
+            .sort(function(a, b) { return usualOf(b.id, lead) - usualOf(a.id, lead) || nameCmp(a, b); }).slice(0, k);
+        return usuals.length ? usuals.reduce(function(a, p) { return a + expOf(p.id, room); }, 0) / usuals.length : 0;
+    };
     const owners = leads.length > 0
         ? leads.map(function(l) { return { id: l.id, name: l.name, pseudo: false, taken: false }; })
         : slots.map(function(_, k) { return { id: '', name: '', pseudo: true, taken: false, k: k }; });
@@ -1517,7 +1713,7 @@ function autoCrewBoard(inp) {
         let t1 = t0;
         while (t1 < slotList.length && slotList[t1].room.priority === slotList[t0].room.priority) t1++;
         const pairs = [];
-        slotList.slice(t0, t1).forEach(function(s) { owners.forEach(function(o) { if (!o.taken) pairs.push({ s: s, o: o, x: o.pseudo ? 0 : expOf(o.id, s.room.id) }); }); });
+        slotList.slice(t0, t1).forEach(function(s) { owners.forEach(function(o) { if (!o.taken) pairs.push({ s: s, o: o, x: o.pseudo ? 0 : expOf(o.id, s.room.id) + AUTO_AFF_TEAM * teamFit(o.id, s.room.id) }); }); });
         pairs.sort(function(a, b) { return b.x - a.x || a.s.i - b.s.i || String(a.o.name).localeCompare(String(b.o.name)) || (a.o.k || 0) - (b.o.k || 0); });
         pairs.forEach(function(pr) { if (pr.s.owner || pr.o.taken) return; pr.s.owner = pr.o; pr.o.taken = true; });
         t0 = t1;
@@ -1551,20 +1747,32 @@ function autoCrewBoard(inp) {
     const picCap = picIdeal.map(function(x, i) { return Math.min(totalQ[i], Math.ceil(x - 1e-9)); });
     const fill = function(group, quotas, ideal) {
         const left = quotas.slice(), placed = {}, count = quotas.map(function() { return 0; });
-        const pairs = [];
-        group.forEach(function(p) {
-            teams.forEach(function(t, i) {
-                if (quotas[i] <= 0) return;
-                let x = 0;
-                t.rooms.forEach(function(r, k) { x += expOf(p.id, r.id) * (k === 0 ? 1 : 0.5); });
-                pairs.push({ p: p, i: i, x: x });
+        // Best fit first, over everyone and every team that still has room: experience on the team's rooms, shifts under the team's
+        // lead (the person's usual team) and shifts with the people already on the team. Each placement changes the fit of the rest,
+        // so a usual team forms around its lead. Ties: the earlier team, then the name.
+        const fitOf = function(p, i) {
+            const t = teams[i];
+            let x = 0;
+            t.rooms.forEach(function(r, k) { x += expOf(p.id, r.id) * (k === 0 ? 1 : 0.5); });
+            const u = t.owner.pseudo ? 0 : usualOf(p.id, t.owner.id);
+            let c = 0;
+            if (t.members.length) { t.members.forEach(function(q) { c += togOf(p.id, q.id); }); c /= t.members.length; }
+            return x + AUTO_AFF_LEAD * u + AUTO_AFF_PAIR * c;
+        };
+        for (let guard = 0; guard < 1000; guard++) {
+            let best = null;
+            group.forEach(function(p) {
+                if (placed[p.id]) return;
+                teams.forEach(function(t, i) {
+                    if (left[i] <= 0) return;
+                    const f = fitOf(p, i);
+                    if (f <= 0) return;
+                    if (!best || f > best.f + 1e-9 || (f > best.f - 1e-9 && (i < best.i || (i === best.i && nameCmp(p, best.p) < 0)))) best = { p: p, i: i, f: f };
+                });
             });
-        });
-        pairs.sort(function(a, b) { return b.x - a.x || a.i - b.i || nameCmp(a.p, b.p); });
-        pairs.forEach(function(pr) {
-            if (pr.x <= 0 || placed[pr.p.id] || left[pr.i] <= 0) return;
-            placed[pr.p.id] = 1; left[pr.i]--; count[pr.i]++; teams[pr.i].members.push(pr.p);
-        });
+            if (!best) break;
+            placed[best.p.id] = 1; left[best.i]--; count[best.i]++; teams[best.i].members.push(best.p);
+        }
         group.forEach(function(p) {
             if (placed[p.id]) return;
             let bi = -1;
@@ -1623,9 +1831,23 @@ function autoCrewBoard(inp) {
     teams.forEach(function(t, ti) {
         t.rooms.forEach(function(r, k) {
             const rv = byRoom[r.id] = byRoom[r.id] || { id: r.id, name: r.name, priority: r.priority, work: r.work, rem: before[r.id], left: remOf(r), teams: [], support: !!r.support, labels: r.labels || [] };
+            const mine = t.members.filter(function(m) { return t.parts[m.id].id === r.id; });
+            const bondOf = function() {
+                let n = 0, of = 0;
+                for (let i = 0; i < mine.length; i++) for (let j = i + 1; j < mine.length; j++) { of++; if (togOf(mine[i].id, mine[j].id) >= AUTO_USUAL_MIN) n++; }
+                return { pairs: n, of: of };
+            };
             rv.teams.push({
-                lead: t.owner.pseudo ? '' : t.owner.name, leadId: t.owner.id, leadExp: t.owner.pseudo ? 0 : expOf(t.owner.id, r.id), queued: k > 0, split: t.split && t.parts && t.members.some(function(m) { return t.parts[m.id].id === r.id; }),
-                members: t.members.filter(function(m) { return t.parts[m.id].id === r.id; }).map(function(m) { return { id: m.id, name: m.name, kind: m.kind, exp: expOf(m.id, r.id) }; }),
+                lead: t.owner.pseudo ? '' : t.owner.name, leadId: t.owner.id, leadExp: t.owner.pseudo ? 0 : daysOf(t.owner.id, r.id), leadHrs: t.owner.pseudo ? 0 : hrsOf(t.owner.id, r.id), queued: k > 0, split: t.split && t.parts && t.members.some(function(m) { return t.parts[m.id].id === r.id; }),
+                members: mine.map(function(m) {
+                    // the two people on the team they have worked with the most (2+ shifts together)
+                    const withs = mine.filter(function(q) { return q.id !== m.id && togOf(m.id, q.id) >= AUTO_USUAL_MIN; })
+                        .sort(function(a, b) { return togOf(m.id, b.id) - togOf(m.id, a.id) || nameCmp(a, b); }).slice(0, 2)
+                        .map(function(q) { return { name: q.name, n: togOf(m.id, q.id) }; });
+                    return { id: m.id, name: m.name, kind: m.kind, exp: daysOf(m.id, r.id), hrs: hrsOf(m.id, r.id), usual: t.owner.pseudo ? 0 : usualOf(m.id, t.owner.id), withs: withs };
+                }),
+                usualN: t.owner.pseudo ? 0 : mine.filter(function(m) { return usualOf(m.id, t.owner.id) >= AUTO_USUAL_MIN; }).length,
+                bond: bondOf(),
                 order: ti
             });
         });
@@ -2122,7 +2344,7 @@ export default function App(props) {
     // Who-does-what history for the auto crews: the counts (kept in this browser for a few hours) and how the read is going.
     const [expAgg, setExpAgg] = useState(function() {
         const c = IS_CURRENT ? null : readJson(EXP_CACHE_KEY);
-        return c && c.v === 1 && c.days === EXP_DAYS && Date.now() - c.builtAt < EXP_CACHE_MS ? c : null;
+        return c && c.v === EXP_VERSION && c.days === EXP_DAYS && Date.now() - c.builtAt < EXP_CACHE_MS ? c : null;
     });
     const [expState, setExpState] = useState({ status: 'idle', done: 0, total: 0 });
     const expReqRef = useRef(0);
@@ -2725,9 +2947,9 @@ export default function App(props) {
                 if (req !== expReqRef.current || (d < t && d - shown < Math.max(1, Math.ceil(t / 5)))) return;   // a few steps, not one render per piece
                 shown = d;
                 setExpState({ status: 'loading', done: d, total: t });
-            });
+            }, expNightCrews(shiftRotation));
             if (req !== expReqRef.current) return;
-            agg.v = 1; agg.days = EXP_DAYS; agg.builtAt = Date.now();
+            agg.v = EXP_VERSION; agg.days = EXP_DAYS; agg.builtAt = Date.now();
             const dead = agg.total > 0 && agg.failed >= agg.total;
             if (!dead) { setExpAgg(agg); try { localStorage.setItem(EXP_CACHE_KEY, JSON.stringify(agg)); } catch (e) {} }
             setExpState({ status: dead ? 'error' : 'ready', done: agg.total, total: agg.total });
@@ -2781,7 +3003,7 @@ export default function App(props) {
         if (!odWanted || isLoading) return;
         loadOverdue(false);
     }, [odWanted, isLoading, hiddenRooms, assets.length, planMode, roomCleanType]);
-    const expMap = useMemo(function() { return autoCrews ? buildExperienceMap(expAgg, rosterInfo.who, lineIndex) : {}; }, [autoCrews, expAgg, rosterInfo, lineIndex]);
+    const expMap = useMemo(function() { return autoCrews ? buildExperienceMap(expAgg, rosterInfo.who, lineIndex) : EXP_NONE; }, [autoCrews, expAgg, rosterInfo, lineIndex]);
     // Each shift's crews, in time order: leaders, rooms, teams. Work a shift can't get to is carried to the next one.
     const autoPlan = useMemo(function() {
         const none = { boards: {}, views: {}, rooms: [] };
@@ -2826,7 +3048,7 @@ export default function App(props) {
             const res = autoCrewBoard({
                 people: workers.map(function(p) { return { id: p.id, name: p.name, kind: p.kind }; }),
                 leads: leadsHere.map(function(p) { return { id: p.id, name: p.name }; }),
-                rooms: roomList, exp: expMap, mins: Math.max(0, w.end - w.start), carry: carry
+                rooms: roomList, exp: expMap.exp, days: expMap.days, hrs: expMap.hrs, lead: expMap.lead, together: expMap.together, mins: Math.max(0, w.end - w.start), carry: carry
             });
             carry = res.carry;
             if (res.board) {
@@ -4655,7 +4877,37 @@ export default function App(props) {
                 });
                 return out;
             };
-            return { wholePass: wholePass, partPass: partPass, swapPic: swapPic, hasPlan: !!plan, hasLeads: leadLanes.length > 0, leadFirst: leadFirst, setFirst: function(v) { inFirst = !!v; } };
+            // PBED: a regular clean that waits in the queue of its own room while someone else on the shift is free earlier takes the
+            // earlier slot (the room's own people first on a tie), so a team that is done early works on, instead of sitting idle next
+            // to a room that is still running. Only one-person cleans that start at least a "filling gaps" stretch after they could
+            // have; never a part of a longer clean, a clean placed by hand or PIC / admin work (those keep their role rules). Moved
+            // only when it finishes at least that much sooner. Returns how many moved.
+            const relieve = function() {
+                if (IS_CURRENT || !plan) return 0;
+                let moved = 0;
+                const cands = allTasks.filter(function(t) {
+                    if (t.kind !== 'general' || t.isPinned || t.isFrozen || t.isSplitPart1 || t.isSplitPart2 || overrides[t.id] || !t.assignedLanes || t.assignedLanes.length !== 1 || t.appliedHeads !== 1) return false;
+                    return crewLanes.indexOf(t.assignedLanes[0]) > -1 && t.startMin >= W.start && t.startMin < W.end && pending.indexOf(t) === -1;
+                }).sort(function(a, b) { return a.startMin - b.startMin || a.assignedLanes[0] - b.assignedLanes[0]; });
+                cands.forEach(function(t) {
+                    const x = t.assignedLanes[0];
+                    const was = { start: t.startMin, dur: t.finalDuration, segs: t.segments };
+                    const from = Math.max(fromOf(t), W.start);
+                    if (was.start - from < tailMin || isLongJob(t, 1)) return;
+                    const who = whoFor(t);
+                    if (who.must !== null && plan.manualLine && plan.manualLine[who.lid]) return;   // equipment hand-placed on a person in Shift Start stays theirs
+                    const pool = crewFor(who);
+                    if (pool.length < 2) return;
+                    const vRoom = virtualRoomsMap[t.vRoomKey];
+                    unbook(t);
+                    const fit = wholeFit(t, 1, pool, null, from, W.end, vRoom, who);
+                    if (!fit || fit.t + fit.dur > was.start + was.dur - tailMin + 0.01) { rebook(t, x, was); return; }
+                    placeTask(t, 1, fit.ids, fit.t, fit.dur);
+                    moved++;
+                });
+                return moved;
+            };
+            return { wholePass: wholePass, partPass: partPass, swapPic: swapPic, relieve: relieve, hasPlan: !!plan, hasLeads: leadLanes.length > 0, leadFirst: leadFirst, setFirst: function(v) { inFirst = !!v; } };
         };
         // The rest of a clean picked up on a later shift (or left over) carries the handover minutes, once, per head; picked up
         // on the shift it was cut on, none.
@@ -4726,6 +4978,15 @@ export default function App(props) {
             const ctxs = g.map(function(W) { return ctxOf(W, gStart); }).filter(function(c) { return !!c; });
             if (ctxs.length === 0) return;
             fillGroup(ctxs, true);
+            // PBED: people done early take the clean that queues in another room (moves what is already placed, never what is still
+            // waiting: that stays for the leads' pass, as before)
+            if (!IS_CURRENT) {
+                for (let again = 0; again < 4; again++) {
+                    let n = 0;
+                    ctxs.forEach(function(c) { n += c.relieve(); });
+                    if (n === 0) break;
+                }
+            }
         });
         // What leads didn't take inside the shifts' own fill (PIC-first leads take whole PIC there, see leadR / leadT / leadC)
         // comes last of all, once every shift's crew is planned:
@@ -5392,15 +5653,35 @@ export default function App(props) {
     const ROOM_HEAD_PX = 40, ROOM_ROW_PX = 24, ROOM_GAP_PX = 8, SUPPORT_BAND_PX = 28;
     const roomLayout = function() {
         const rows = [];
+        const inView = function(l) { return l >= visibleLaneLo && l < visibleLaneLo + visibleLaneCount; };
+        // Every task of every person shown, whatever the room: the ones outside a room are drawn faded on that person's line in the
+        // rooms they belong to, so time spent elsewhere never reads as blank space.
+        const byLane = {};
+        displayData.forEach(function(g) { g.tasks.forEach(function(t) { t.assignedLanes.forEach(function(l) { if (inView(l)) (byLane[l] = byLane[l] || []).push({ t: t, room: g.name }); }); }); });
+        const winCrew = {};
+        shiftWindows.forEach(function(w) { winCrew[w.key] = w.crew; });
         displayData.forEach(function(g) {
             const per = {}, blocks = [];
             g.tasks.forEach(function(t) {
-                const lanes = t.assignedLanes.filter(function(l) { return l >= visibleLaneLo && l < visibleLaneLo + visibleLaneCount; });
+                const lanes = t.assignedLanes.filter(inView);
                 if (!lanes.length) return;
                 blocks.push({ t: t, lanes: lanes });
                 lanes.forEach(function(l) { const q = per[l] = per[l] || { lane: l, first: Infinity, last: 0 }; q.first = Math.min(q.first, t.startMin); q.last = Math.max(q.last, t.startMin + t.finalDuration); });
             });
             if (!blocks.length) return;
+            // The room's team (the people the crew plan put on this room) is listed even when all their work is in other rooms.
+            const lid = areaLine[String(g.name)];
+            Object.keys(windowPlans).forEach(function(k) {
+                const ids = lid && windowPlans[k].lineWorkers[lid] ? windowPlans[k].lineWorkers[lid] : [];
+                ids.forEach(function(id) {
+                    const ln = laneByEmpCrew[id + '|' + winCrew[k]];
+                    if (ln === undefined || !inView(ln) || per[ln]) return;
+                    // "elsewhere" only for someone who really works in another room; a lead with no task at all is already named in the room's tooltip
+                    const away = !!(byLane[ln] && byLane[ln].length);
+                    if (!away && laneRoster[ln].isLead) return;
+                    per[ln] = { lane: ln, first: 1e9, last: 0, elsewhere: true, away: away };
+                });
+            });
             const people = Object.keys(per).map(function(k) { return per[k]; }).sort(function(a, b) {
                 return a.first - b.first || (laneRoster[b.lane].isLead ? 1 : 0) - (laneRoster[a.lane].isLead ? 1 : 0) || laneRoster[a.lane].name.localeCompare(laneRoster[b.lane].name);
             });
@@ -5411,7 +5692,6 @@ export default function App(props) {
                 work += b.t.rawWorkloadMins; if (b.t.isComplete) done += b.t.rawWorkloadMins; if (isLate(b.t)) late++;
             });
             // The leads of the room's team (from the crews in the plan), so the leader shows even when they hold no task there.
-            const lid = areaLine[String(g.name)];
             const leadNames = [];
             Object.keys(windowPlans).forEach(function(k) {
                 const ids = lid && windowPlans[k].lineWorkers[lid] ? windowPlans[k].lineWorkers[lid] : [];
@@ -5434,7 +5714,7 @@ export default function App(props) {
             if (prodRows.length > 0) { band = { top: top, n: supRows.length, open: supOpen }; top += SUPPORT_BAND_PX + ROOM_GAP_PX; }
             if (supOpen) supRows.forEach(place);
         }
-        return { rows: placed, band: band, shown: shown, height: Math.max(top, 60) };
+        return { rows: placed, band: band, shown: shown, height: Math.max(top, 60), byLane: byLane };
     };
     const renderRoomChart = function() {
         const lay = roomLayout();
@@ -5463,15 +5743,15 @@ export default function App(props) {
                                             <button data-room-down={r.g.name} disabled={!r.canDown} onClick={function(e) { e.stopPropagation(); moveRoom(r.g.name, 1, lay.shown); }} title="Show this room lower" aria-label="Show this room lower" className="w-5 h-5 rounded text-[9px] leading-none font-black text-[#0072CE] hover:bg-[#E6F1FB] disabled:opacity-25 disabled:hover:bg-transparent no-pan">▼</button>
                                         </span>
                                     </div>
-                                    <div className="text-[10px] font-bold text-slate-500 mt-0.5 truncate">{fmtMins(r.work)} · {r.people.length} {r.people.length === 1 ? 'person' : 'people'} · {r.pct}% done</div>
+                                    <div className="text-[10px] font-bold text-slate-500 mt-0.5 truncate">{fmtMins(r.work)} · {r.people.filter(function(q) { return !q.elsewhere; }).length} {r.people.filter(function(q) { return !q.elsewhere; }).length === 1 ? 'person' : 'people'} · {r.pct}% done</div>
                                 </div>
                                 {r.people.map(function(q) {
                                     const l = laneRoster[q.lane];
                                     return (
-                                        <div key={q.lane} data-room-person={l.name} data-room-person-start={Math.round(q.first)} className="flex items-center gap-1 pl-4 pr-2 border-b border-dashed border-gray-200/80" style={{ height: `${ROOM_ROW_PX}px`, borderLeft: `4px solid ${l.isLead ? '#0072CE' : '#cbd5e1'}` }} title={`${l.name} (${l.crew} crew)${l.isLead ? ' — Lead' : ''}\nstarts ${formatClockTime(ganttStartDate, ganttStartHour, q.first)}`}>
+                                        <div key={q.lane} data-room-person={l.name} data-room-person-start={Math.round(q.first)} className="flex items-center gap-1 pl-4 pr-2 border-b border-dashed border-gray-200/80" style={{ height: `${ROOM_ROW_PX}px`, borderLeft: `4px solid ${l.isLead ? '#0072CE' : '#cbd5e1'}` }} title={`${l.name} (${l.crew} crew)${l.isLead ? ' — Lead' : ''}\n${q.elsewhere ? (q.away ? 'on this room\'s team, working elsewhere' : 'on this room\'s team, no work planned') : 'starts ' + formatClockTime(ganttStartDate, ganttStartHour, q.first)}`}>
                                             <span className={`text-[8px] font-black rounded px-1 flex-shrink-0 ${getCrewStyle(l.crew).badge}`}>{l.crew}</span>
                                             <span className={`text-[10px] truncate min-w-0 flex-1 ${l.isLead ? 'font-black text-slate-900' : 'font-bold text-slate-700'}`}>{l.name}</span>
-                                            <span className="text-[9px] font-black text-slate-400 flex-shrink-0 whitespace-nowrap">{formatClockTime(ganttStartDate, ganttStartHour, q.first).replace(/^\S+ /, '')}</span>
+                                            <span className="text-[9px] font-black text-slate-400 flex-shrink-0 whitespace-nowrap">{q.elsewhere ? (q.away ? 'elsewhere' : 'no work') : formatClockTime(ganttStartDate, ganttStartHour, q.first).replace(/^\S+ /, '')}</span>
                                         </div>
                                     );
                                 })}
@@ -5499,6 +5779,38 @@ export default function App(props) {
                                 })}
                                 {r.people.map(function(q) {
                                     return <div key={q.lane} className="absolute border-t border-dashed border-gray-200/80 pointer-events-none" style={{ left: 0, right: 0, top: `${ROOM_HEAD_PX + q.row * ROOM_ROW_PX}px` }} />;
+                                })}
+                                {r.people.map(function(q) {
+                                    // Blank space: nothing booked for them in ANY room (the gaps come from the person's whole plan)
+                                    const l = laneRoster[q.lane];
+                                    if (l.isLead) return null;
+                                    return laneIdle[q.lane].gaps.map(function(g, gi) {
+                                        const gl = xOf(g.start), gw = xEnd(g.end) - gl;
+                                        return (
+                                            <div key={`ri-${q.lane}-${gi}`} data-idle-gap={`${Math.round(g.start)}-${Math.round(g.end)}`} data-room-idle={r.g.name} className="absolute z-[5] rounded border-2 border-dashed border-[#FFB81C] bg-[#FFF6E0]/70 pointer-events-none flex items-center justify-center overflow-hidden" style={{ left: `${gl}px`, width: `${gw}px`, top: `${ROOM_HEAD_PX + q.row * ROOM_ROW_PX + 3}px`, height: `${ROOM_ROW_PX - 6}px` }}>
+                                                {gw > 48 && <span className="text-[9px] font-black text-[#B07800] uppercase tracking-wider truncate px-1">Idle {fmtMins(g.end - g.start)}</span>}
+                                            </div>
+                                        );
+                                    });
+                                })}
+                                {r.people.map(function(q) {
+                                    // Their work in other rooms, faded to 70% (working elsewhere is not idle); click opens it
+                                    return (lay.byLane[q.lane] || []).filter(function(x) { return x.room !== r.g.name; }).map(function(x) {
+                                        const t = x.t;
+                                        const gl = xOf(t.startMin), gw = Math.max(xEnd(t.startMin + t.finalDuration) - gl, 6);
+                                        return (
+                                            <div
+                                                key={`gh-${t.id}-${q.lane}`}
+                                                data-ghost={t.id} data-ghost-room={x.room} data-lane={q.lane} data-start={Math.round(t.startMin)} data-end={Math.round(t.startMin + t.finalDuration)}
+                                                onClick={function() { setSelectedTaskEditor(t.id); }}
+                                                title={`${laneRoster[q.lane].name} is working elsewhere\n${t.name} · ${x.room}\n${timeRange(t)}`}
+                                                className={`no-pan absolute z-10 cursor-pointer rounded flex items-center overflow-hidden border border-dashed border-slate-600 hover:brightness-110 ${getRoomColor(t.originalArea)}`}
+                                                style={bgOf(taskHex(t), { left: `${gl}px`, width: `${gw}px`, top: `${ROOM_HEAD_PX + q.row * ROOM_ROW_PX + 3}px`, height: `${ROOM_ROW_PX - 6}px`, opacity: GHOST_OPACITY })}
+                                            >
+                                                {gw > 44 && <span className="px-1.5 text-white font-bold text-[10px] truncate leading-none" style={inkOf(taskHex(t))}>{x.room}: {t.name}</span>}
+                                            </div>
+                                        );
+                                    });
                                 })}
                                 {r.blocks.map(function(b) {
                                     const t = b.t;
@@ -5529,7 +5841,7 @@ export default function App(props) {
     };
     // The Crew tab's card for a shift whose crews were built automatically: one block per room, its leader and team inside.
     const renderAutoRooms = function(w, view) {
-        const dayTag = function(n) { return n > 0 ? n + (n === 1 ? ' day' : ' days') + ' here' : 'new to it'; };
+        const dayTag = function(n, h) { return n > 0 ? n + (n === 1 ? ' shift' : ' shifts') + ' here' + (h >= 1 ? ' (' + Math.round(h) + ' h)' : '') : 'new to it'; };
         // Production rooms first, then the Support section at the bottom (folded in PBED). Inside each: the order the planner set in
         // Setup / the Gantt arrows, the rooms nobody moved as the crews were built (priority, then work).
         const manualIdx = function(r) { let best = -1; (r.labels || []).forEach(function(lb) { const i = roomOrder.indexOf(lb); if (i > -1 && (best === -1 || i < best)) best = i; }); return best; };
@@ -5567,14 +5879,16 @@ export default function App(props) {
                                         <div key={ti} data-auto-team={t.leadId || 'none'} className="rounded-lg border border-dashed border-slate-200 p-2">
                                             <div className="flex flex-wrap items-center gap-1.5 text-[12px]">
                                                 {t.lead ? <span className="font-black text-slate-800">{t.lead}<span className="ml-1 text-[9px] font-black uppercase text-sky-600">Lead</span></span> : <span className="font-black text-slate-500">No lead on this crew</span>}
-                                                {t.lead && <span className="text-[10px] font-bold text-slate-400">{dayTag(t.leadExp)}</span>}
+                                                {t.lead && <span className="text-[10px] font-bold text-slate-400">{dayTag(t.leadExp, t.leadHrs)}</span>}
+                                                {t.lead && t.usualN > 0 && <span data-auto-usual={t.usualN} className="text-[9px] font-black uppercase rounded px-1 py-0.5 bg-teal-50 text-teal-800 border border-teal-200" title={t.usualN + ' of ' + t.members.length + ' have been on ' + t.lead + "'s team for 2 or more shifts"}>{t.usualN} of {t.members.length} usual team</span>}
+                                                {t.bond && t.bond.pairs > 0 && <span data-auto-bond={t.bond.pairs} className="text-[9px] font-black uppercase rounded px-1 py-0.5 bg-slate-50 text-slate-600 border border-slate-200" title="Pairs on this team who have been on the same team in the same room for 2 or more shifts">{t.bond.pairs} of {t.bond.of} pairs worked together</span>}
                                                 {t.queued && <span className="text-[9px] font-black uppercase rounded px-1 py-0.5 bg-slate-100 text-slate-500" title="This team gets to the room after its first room">then</span>}
                                                 {t.split && <span className="text-[9px] font-black uppercase rounded px-1 py-0.5 bg-amber-50 text-amber-800 border border-amber-200" title="Rooms with the same priority level: the team divides between them">shares team</span>}
                                             </div>
                                             <div className="flex flex-wrap gap-1 mt-1.5">
                                                 {t.members.length === 0 && !t.queued && <span className="text-[11px] font-bold text-slate-400">Lead only</span>}
                                                 {t.members.map(function(m) {
-                                                    return <span key={m.id} data-auto-member={m.name} className="text-[11px] font-bold rounded px-1.5 py-0.5 bg-white border border-slate-200 text-slate-700" title={dayTag(m.exp)}>{m.name}{m.kind === 'pic' || m.kind === 'inspector' ? <span className="ml-1 text-[9px] font-black text-violet-600">PIC</span> : null}{m.exp > 0 && <span className="ml-1 text-[10px] font-black text-[#0072CE]">{m.exp}×</span>}</span>;
+                                                    return <span key={m.id} data-auto-member={m.name} className="text-[11px] font-bold rounded px-1.5 py-0.5 bg-white border border-slate-200 text-slate-700" title={dayTag(m.exp, m.hrs) + (m.usual > 0 && t.lead ? ' · ' + m.usual + (m.usual === 1 ? ' shift' : ' shifts') + ' on ' + t.lead + "'s team" : '') + (m.withs && m.withs.length ? ' · worked with ' + m.withs.map(function(w) { return w.name + ' ' + w.n + '×'; }).join(', ') : '')}>{m.name}{m.kind === 'pic' || m.kind === 'inspector' ? <span className="ml-1 text-[9px] font-black text-violet-600">PIC</span> : null}{m.exp > 0 && <span className="ml-1 text-[10px] font-black text-[#0072CE]">{m.exp}×</span>}{m.usual >= AUTO_USUAL_MIN && t.lead && <span className="ml-1 text-[9px] font-black text-teal-700" title={'Usually on ' + t.lead + "'s team"}>★</span>}</span>;
                                                 })}
                                             </div>
                                         </div>
@@ -6295,14 +6609,14 @@ export default function App(props) {
                                             <option value="autoall">Auto crews for every shift (ignore what Shift Start saved)</option>
                                             <option value="shiftstart">Shift Start only (a shift with nothing saved uses the employee table)</option>
                                         </select>
-                                        <p className="text-[11px] font-bold text-slate-500 mt-1.5">{autoCrews ? 'Each shift gets its leaders, a room for each leader (the priority rooms first, to the lead with the most days on them), and a team built for that room from the people who have worked it the most. Chemical, admin and janitorial people stay on their own area. A team only divides across rooms with the same priority.' : 'Crews come from what Shift Start saved; a future shift uses the employee table.'}</p>
+                                        <p className="text-[11px] font-bold text-slate-500 mt-1.5">{autoCrews ? "Each shift gets its leaders, a room for each leader (the priority rooms first, to the lead with the most time on them; a lead whose usual team knows the room counts for more), and a team built for that room, best fit first: who has spent the most hours in it (counted like the Manager's Hub), who usually works under that lead, and who has worked together before. Chemical, admin and janitorial people stay on their own area. A team stays together on its room and only divides across rooms with the same priority. When a team is done early, its people take cleans that are queued in other rooms (shown faded on their line in the room view)." : 'Crews come from what Shift Start saved; a future shift uses the employee table.'}</p>
                                     </div>
                                     {autoCrews && (
                                         <div data-auto-status className="flex flex-wrap items-center gap-2 text-[11px] font-bold">
                                             {expState.status === 'loading' && <span className="bg-sky-50 border border-sky-200 text-sky-800 rounded px-2 py-0.5">Reading who has worked which room… {expState.done}/{expState.total}</span>}
                                             {expAgg && <span className="bg-white border border-slate-200 text-slate-600 rounded px-2 py-0.5" title={'Shift Start rows saved in the last ' + EXP_DAYS + ' days, read ' + EXP_PIECE_DAYS + ' days at a time (newest ' + EXP_PIECE_TOP + ' rows of each read). A person counts once per room per shift day.'}>Based on {expAgg.used} saved assignments from the last {EXP_DAYS} days · {Object.keys(expAgg.own).length} people{expAgg.capped ? ' · ' + expAgg.capped + ' of ' + expAgg.total + ' reads were cut off (newest rows used)' : ''}</span>}
                                             {expState.status === 'error' && <span className="bg-amber-50 border border-amber-200 text-amber-900 rounded px-2 py-0.5">Could not read Shift Start's saved assignments, so people are matched without history (by name)</span>}
-                                            {expAgg && expState.status !== 'loading' && Object.keys(expMap).length === 0 && <span className="bg-amber-50 border border-amber-200 text-amber-900 rounded px-2 py-0.5">No history matches anyone on the roster, so people are matched by name</span>}
+                                            {expAgg && expState.status !== 'loading' && Object.keys(expMap.exp).length === 0 && <span className="bg-amber-50 border border-amber-200 text-amber-900 rounded px-2 py-0.5">No history matches anyone on the roster, so people are matched by name</span>}
                                             <button onClick={function() { loadExperience(); }} disabled={expState.status === 'loading'} className="bg-white border border-slate-300 rounded px-2 py-0.5 text-slate-700 hover:bg-slate-50 disabled:opacity-50">Reload history</button>
                                         </div>
                                     )}
@@ -6870,6 +7184,7 @@ export default function App(props) {
                             <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm ring-2 ring-rose-500 inline-block" /> Late</span>
                             <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm border-2 border-dashed border-amber-500 inline-block" /> Double-booked</span>
                             <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm border-2 border-dashed border-[#FFB81C] bg-[#FFF6E0] inline-block" /> Blank space</span>
+                            {roomView && <span data-legend-elsewhere className="flex items-center gap-1" title="A person's work in another room, shown faded on their line in this room"><span className="w-3 h-3 rounded-sm border border-dashed border-slate-600 bg-[#0072CE] inline-block" style={{ opacity: GHOST_OPACITY }} /> Working elsewhere</span>}
                         </span>
                     </div>
                     {(IS_CURRENT ? downLineList.length > 0 : timeBlocks.length > 0) && (
