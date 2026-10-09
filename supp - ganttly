@@ -7,6 +7,12 @@ const APP_MODE = 'current';   // 'current' = Ganttly, the floor app (file "supp 
 // and hides the planning controls (Setup tab, plan window, rotation, headcount, role mapping, Metrics). PBED is the whole thing.
 // A fix made in one file is copied to the other (scratchpad split/check-files.sh asserts they differ only on line 2).
 const IS_CURRENT = APP_MODE === 'current';
+// 🚨 ARCHITECTURE NOTE: PBED tabs update when clicked. The planning engine (scheduleData) is the one heavy computation. Only the
+// Gantt, Focus and Metrics tabs show its result, so PBED holds its inputs still on every other tab (Setup, Crew, Dashboard) and
+// plans once when one of those three is opened (or Print is pressed). Ganttly (the floor app) keeps planning live. The clock tick
+// and the Shift Start / production schedule re-reads also happen on a tab click, not on a timer, in PBED.
+const LAZY_ENGINE = !IS_CURRENT;
+const ENGINE_TABS = ['gantt', 'focus', 'metrics'];
 
 // ============================================================================
 // SECTION 1: INLINE SVG ICONS 
@@ -892,6 +898,132 @@ async function fetchTaskAssignmentRows(dataApi, sinceMs, untilMs) {
 function taskRowsSignature(rows) {
     return (rows || []).map(function(r) { return String(getRowField(r, 'craa5_taskassignmentid') || '') + '|' + String(getRowField(r, 'modifiedon') || ''); }).join(';');
 }
+
+// ============================================================================
+// 🚨 ARCHITECTURE NOTE: PRODUCTION SCHEDULE HANDOFFS (PBED)
+// A room can't be cleaned while its production line is running. The production schedule (craa5__aa_prd_schd, the runs the
+// "production schedule" hub keeps: area text, line number, start, end) says when each line stops, so PBED's per-room Handover
+// time (the earliest minute anyone may start that room) defaults to it. Per production line: the plan window's first
+// handoff = the end of the run that is on at the plan start, or the plan start itself when the line is already stopped; a gap
+// shorter than the "changeover" minutes (default 60) is the same stretch of production, not a handoff. A room on several
+// lines waits for the last of them. Rooms are matched to lines by name ("IBL5" = area IBL line 5, or an area named IBL5), or
+// by a line picked by hand on Setup. A Handover typed by hand wins while it falls inside the plan window.
+// Runs are read once per plan window (one filtered request), never the whole table. Maintenance runs occupy the line.
+// ============================================================================
+const PROD_TABLE = 'craa5__aa_prd_schd';
+const PROD_FIELDS = ['craa5__aa_prd_schdid', 'craa5_area', 'craa5_line', 'craa5_datestarttime', 'craa5_dateendtime', 'craa5_product', 'craa5_allergen'];
+const PROD_TOP = 2000;
+const PROD_AFTER_MS = 12 * 3600000;      // runs starting up to 12 h after the plan ends still count (a run on at the end of the window)
+const HANDOFF_GAP_DEFAULT = 60;          // minutes: a shorter gap between two runs is a changeover, not a handoff
+const PROD_AREA_ALIASES = { wj: ['waterjet', 'water jet'] };   // a guess; a line picked by hand on Setup covers anything else
+// The runs overlapping [fromMs, toMs): not cancelled, newest last. Returns the rows, or null when the table couldn't be read.
+async function fetchProductionRuns(dataApi, fromMs, toMs) {
+    const filter = 'statecode eq 0 and craa5_datestarttime lt ' + odataDate(toMs) + ' and craa5_dateendtime gt ' + odataDate(fromMs);
+    const xrm = safeGetXrm();
+    const hasXrm = !!(xrm && xrm.WebApi && typeof xrm.WebApi.retrieveMultipleRecords === 'function');
+    const hasApi = !!(dataApi && typeof dataApi === 'object' && typeof dataApi.queryTable === 'function');
+    if (!hasXrm && !hasApi) return null;
+    for (let attempt = 0; attempt < 2; attempt++) {   // the second try asks for every column, in case one of the named ones isn't there
+        const withSelect = attempt === 0;
+        if (hasXrm) {
+            try {
+                const res = await xrm.WebApi.retrieveMultipleRecords(PROD_TABLE, '?' + (withSelect ? '$select=' + PROD_FIELDS.join(',') + '&' : '') + '$filter=' + filter + '&$orderby=craa5_datestarttime asc&$top=' + PROD_TOP);
+                if (res && Array.isArray(res.entities)) return res.entities;
+            } catch (e) {}
+        }
+        if (hasApi) {
+            try {
+                const opts = { filter: filter, orderBy: 'craa5_datestarttime asc', pageSize: 250, top: PROD_TOP };
+                if (withSelect) opts.select = PROD_FIELDS;
+                let page = await dataApi.queryTable(PROD_TABLE, opts);
+                if (page && Array.isArray(page.rows)) {
+                    const rows = page.rows.slice();
+                    while (page && page.hasMoreRows && typeof page.loadMoreRows === 'function' && rows.length < PROD_TOP) {
+                        page = await page.loadMoreRows();
+                        if (page && Array.isArray(page.rows)) rows.push.apply(rows, page.rows);
+                    }
+                    return rows.slice(0, PROD_TOP);
+                }
+            } catch (e) {}
+        }
+    }
+    return null;
+}
+function prodRowsSignature(rows) {
+    return (rows || []).map(function(r) { return String(r.craa5__aa_prd_schdid || '') + '|' + String(r.craa5_datestarttime || '') + '|' + String(r.craa5_dateendtime || '') + '|' + String(r.craa5_area || '') + '|' + String(r.craa5_line || ''); }).join(';');
+}
+// Lowercase letters and digits only: "IBL 5", "ibl-5" and "IBL5" are one name.
+function compactKey(v) { return String(v === undefined || v === null ? '' : v).toLowerCase().replace(/[^a-z0-9]+/g, ''); }
+// Dates and the allergen flag are read raw (getRowField would give the formatted text, "10/9/2026 6:00 AM").
+function prodMs(v) { const t = typeof v === 'number' ? v : new Date(v).getTime(); return isNaN(t) ? NaN : t; }
+// { 'ibl|5': { key, area, line, runs: [{ s, e, maint, allergen }] } } by production line, runs oldest first.
+function buildProdLines(rows) {
+    const m = {};
+    (rows || []).forEach(function(r) {
+        const area = String(r.craa5_area === undefined || r.craa5_area === null ? '' : r.craa5_area).trim();
+        const line = parseInt(r.craa5_line, 10) || 1;
+        const s = prodMs(r.craa5_datestarttime), e = prodMs(r.craa5_dateendtime);
+        if (!area || isNaN(s) || isNaN(e) || e <= s) return;
+        const k = compactKey(area) + '|' + line;
+        const L = m[k] = m[k] || { key: k, area: area, line: line, runs: [] };
+        L.runs.push({ s: s, e: e, maint: /maint/i.test(String(r.craa5_product || '')), allergen: r.craa5_allergen === true || r.craa5_allergen === 1 || /^(yes|true)$/i.test(String(r.craa5_allergen)) });
+    });
+    Object.keys(m).forEach(function(k) { m[k].runs.sort(function(a, b) { return a.s - b.s; }); });
+    return m;
+}
+function prodLineLabel(L) { return L.area + ' · line ' + L.line; }
+// The production lines a room sits on. names = [the equipment area, the Shift Start line it belongs to, ...]; the first rule that
+// finds a line wins. pick: undefined = automatic, 'none' = the room never waits for production, 'key' = that one line.
+function linesForRoom(names, prodLines, pick) {
+    const keys = Object.keys(prodLines);
+    if (pick === 'none') return { lines: [], how: 'none picked' };
+    if (pick) return prodLines[pick] ? { lines: [prodLines[pick]], how: 'picked' } : { lines: [], how: 'picked line not in this window' };
+    const cs = names.map(compactKey).filter(Boolean);
+    const rules = [
+        ['name + line number', function(L, c) { return compactKey(L.area) + L.line === c; }],      // IBL5 = area IBL, line 5
+        ['area name', function(L, c) { return compactKey(L.area) === c; }],                         // Breading = every Breading line
+        ['alias', function(L, c) { return (PROD_AREA_ALIASES[compactKey(L.area)] || []).some(function(al) { return compactKey(al) === c || compactKey(al) + L.line === c; }); }]
+    ];
+    for (let i = 0; i < rules.length; i++) {
+        const found = [];
+        cs.forEach(function(c) { keys.forEach(function(k) { if (rules[i][1](prodLines[k], c) && found.indexOf(prodLines[k]) === -1) found.push(prodLines[k]); }); });
+        if (found.length) return { lines: found, how: rules[i][0] };
+    }
+    return { lines: [], how: 'no match' };
+}
+// When production hands this line over, at or after w0. { ms, state }: 'free' (stopped at w0 for at least minGap), 'handed' (the
+// end of the run on at w0, and of any run that follows within minGap), or 'norun' (nothing scheduled: already down).
+function firstHandoff(line, w0, minGapMs) {
+    const runs = line.runs.filter(function(r) { return r.e > w0; });
+    let cursor = null;
+    for (let i = 0; i < runs.length; i++) {
+        const r = runs[i];
+        if (cursor === null) {
+            if (r.s - w0 >= minGapMs) return { ms: w0, state: 'free', next: r.s };
+            cursor = r.e;
+            continue;
+        }
+        if (r.s - cursor >= minGapMs) break;
+        cursor = Math.max(cursor, r.e);
+    }
+    return cursor === null ? { ms: w0, state: 'norun' } : { ms: cursor, state: 'handed' };
+}
+// A room waits for the last of its lines. Returns { ms, state } or null when it has no line.
+function roomHandoff(lines, w0, minGapMs) {
+    if (!lines.length) return null;
+    let best = null;
+    lines.forEach(function(L) {
+        const h = firstHandoff(L, w0, minGapMs);
+        if (!best || h.ms > best.ms || (h.ms === best.ms && h.state === 'handed')) best = h;
+    });
+    return best;
+}
+// The value a datetime-local box shows for a moment in time (local clock).
+function msToLocalInput(ms) {
+    const d = new Date(ms);
+    const p = function(n) { return (n < 10 ? '0' : '') + n; };
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
 function rowTimeMs(v) { const t = v ? Date.parse(v) : NaN; return isNaN(t) ? 0 : t; }
 // Turns saved task-assignment rows into Shift Start boards (the same shape as a board row's JSON), one per supervisor per
 // shift in the plan. who = { idByGuid, idByName, supIds, crewById } from the employee table; lines = Shift Start's lines
@@ -1416,6 +1548,158 @@ function cadenceDaysOf(flags, types) {
     pool.forEach(function(k) { const d = CLEAN_CADENCE_DAYS[k]; if (d && d < days) days = d; });
     return days === Infinity ? 1 : days;
 }
+// ============================================================================
+// 🚨 ARCHITECTURE NOTE: OVERDUE EQUIPMENT (PBED's "Equipment to plan", see PLAN MODE)
+// The rule is the MSS calendar's frequency check, per piece of equipment: each frequency it is marked yes for (daily 1 day,
+// midweek 7, weekly 7, monthly 31, quarterly 92, annual 366) wants a log entry (craa5__log_, found by craa5_equipmentguid =
+// the equipment's id) dated within that window; a log counts when the kind of clean it records is at least the frequency's
+// (daily < weekly < monthly; a log naming no kind counts for all). Missing = overdue; any overdue frequency makes the piece
+// overdue. Never logged = overdue. Equipment with no frequency marked is not scheduled. Judged on a calendar day: the plan's
+// start day, or today when the plan started earlier.
+// The log is never bulk-read: only the ids that could be planned, 15 per request, 3 requests at a time, each limited to the
+// days its longest frequency can need. The newest log day per kind is kept in this browser for 6 hours.
+// ============================================================================
+const OD_FREQS = [
+    { code: 'D', label: 'Daily', days: 1, rank: 1, flags: ['craa5_dailyclean'] },
+    { code: 'MW', label: 'Midweek', days: 7, rank: 1, flags: ['craa5_midweek'] },
+    { code: 'W', label: 'Weekly', days: 7, rank: 2, flags: ['craa5_weeklyclean'] },
+    { code: 'M', label: 'Monthly', days: 31, rank: 3, flags: ['craa5_monthlyclean', 'craa5_month'] },
+    { code: 'Q', label: 'Quarterly', days: 92, rank: 3, flags: ['craa5_quarterly'] },
+    { code: 'A', label: 'Annual', days: 366, rank: 3, flags: ['craa5_annually'] }
+];
+const OD_WEEKLY_COLS = ['craa5_weeklyclean'];
+const OD_KIND_COLS = ['craa5_daily', 'craa5_weekly', 'craa5_monthly'];   // which kind of clean a log records (bits 1, 2, 4)
+const OD_CHUNK = 15;
+const OD_PARALLEL = 3;
+const OD_TOP = 5000;
+const OD_CACHE_KEY = 'itp_overdue_v1';
+const OD_CACHE_MS = 6 * 3600000;
+const OD_COLS = OD_FREQS.reduce(function(cols, f) { return cols.concat(f.flags); }, []);
+function odDayNo(ymd) { const p = String(ymd).split('-'); return Math.round(Date.UTC(Number(p[0]), Number(p[1]) - 1, Number(p[2])) / 86400000); }   // whole days, clock changes can't move it
+function odDayStr(n) { return new Date(n * 86400000).toISOString().slice(0, 10); }
+function odBitsRank(bits) { return !bits ? 9 : (bits & 4) ? 3 : (bits & 2) ? 2 : 1; }   // 9: no kind recorded, counts for everything
+function odTrue(v) { return v === true || v === 1 || /^(true|yes|1)$/i.test(String(v === null || v === undefined ? '' : v).trim()); }
+function normGuid(v) { return String(v === undefined || v === null ? '' : v).replace(/[{}]/g, '').trim().toLowerCase(); }
+function isGuidStr(v) { return /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(v); }
+function odTierOf(days) { return days <= 1 ? 1 : days <= 7 ? 7 : days <= 31 ? 31 : days <= 92 ? 92 : 366; }   // how far back a piece's log is read (plus a day): its longest frequency
+function odFreqsOf(flags) { return OD_FREQS.filter(function(f) { return f.flags.some(function(c) { return flags.indexOf(c) > -1; }); }); }
+// A log's date-only value is midnight UTC: read it as that calendar day, not shifted into the viewer's zone.
+function odLogDay(v) {
+    if (!v) return 0;
+    const t = String(v);
+    const m = t.match(/^(\d{4}-\d{2}-\d{2})(?:T00:00:00(?:\.0+)?Z)?$/);
+    if (m) return odDayNo(m[1]);
+    const d = new Date(v);
+    return isNaN(d.getTime()) ? 0 : odDayNo(getLocalYMD(d));
+}
+// lt = [newest log day (a number) that counts for rank 1, for rank 2, for rank 3; 0 = none]; rDay = the day judged.
+// -> { state: 'none' | 'ok' | 'overdue', letters: ['W', ...], worst: days late (9999 = never logged) }
+function overdueOf(flags, lt, rDay) {
+    const fs = odFreqsOf(flags);
+    if (!fs.length) return { state: 'none', letters: [], worst: 0, never: false, any: false, needRank: 0 };
+    const letters = [];
+    let worst = 0, never = false, needRank = 0;
+    fs.forEach(function(f) {
+        const last = lt ? lt[f.rank - 1] : 0;
+        if (last && last >= rDay - f.days) return;
+        letters.push(f.code);
+        if (!last) { never = true; worst = 9999; needRank = Math.max(needRank, f.rank); } else worst = Math.max(worst, rDay - last - f.days);
+    });
+    // any = some clean is on file (just not one of the level this frequency needs); needRank = the highest level missing (2 weekly, 3 monthly)
+    return { state: letters.length ? 'overdue' : 'ok', letters: letters, worst: worst, never: never, any: !!(lt && lt[0]), needRank: needRank };
+}
+let odDateStyle = 0;   // how a date is written in the log filter: 0 quoted ISO datetime, 1 plain date, 2 unquoted datetime (the first one Dataverse takes is kept)
+let odKindCols = OD_KIND_COLS;
+function odDateLit(ymd, style) { return style === 0 ? "'" + ymd + "T00:00:00.000Z'" : style === 1 ? ymd : ymd + 'T00:00:00Z'; }
+// The log rows of these equipment ids dated on or after floorYMD. Returns the rows, or null when they couldn't be read.
+async function fetchOverdueChunk(dataApi, ids, floorYMD) {
+    const xrm = safeGetXrm();
+    const hasXrm = !!(xrm && xrm.WebApi && typeof xrm.WebApi.retrieveMultipleRecords === 'function');
+    const hasApi = !!(dataApi && typeof dataApi === 'object' && typeof dataApi.queryTable === 'function');
+    if (!hasXrm && !hasApi) return null;
+    for (let attempt = 0; attempt < 8; attempt++) {
+        const sel = ['craa5_equipmentguid', 'craa5_lastcleaned'].concat(odKindCols);
+        const filter = '(' + ids.map(function(id) { return "craa5_equipmentguid eq '" + id + "'"; }).join(' or ') + ') and craa5_lastcleaned ge ' + odDateLit(floorYMD, odDateStyle);
+        let err = null;
+        if (hasXrm) {
+            try {
+                const res = await xrm.WebApi.retrieveMultipleRecords('craa5__log_', '?$select=' + sel.join(',') + '&$filter=' + filter + '&$top=' + OD_TOP);
+                if (res && Array.isArray(res.entities)) return res.entities;
+            } catch (e) { err = e; }
+        }
+        if (hasApi) {
+            try {
+                const page = await dataApi.queryTable('craa5__log_', { select: sel, filter: filter, pageSize: 250, top: OD_TOP });
+                if (page && Array.isArray(page.rows)) {
+                    const rows = page.rows.slice();
+                    let pg = page;
+                    while (pg && pg.hasMoreRows && typeof pg.loadMoreRows === 'function' && rows.length < OD_TOP) {
+                        pg = await pg.loadMoreRows();
+                        if (pg && Array.isArray(pg.rows)) rows.push.apply(rows, pg.rows);
+                    }
+                    return rows;
+                }
+            } catch (e) { err = e; }
+        }
+        const msg = String(err && err.message);
+        if (/could not find a property|0x80060888|does not exist|invalid property/i.test(msg) && odKindCols.length) { odKindCols = []; continue; }   // a log table without the kind columns: every log counts for everything
+        if (/date|time|literal|operand|convert|parse|invalid|filter/i.test(msg) && !/429|throttl|exceeded the limit|service protection|concurrent|too many|timed? ?out|network|failed to fetch|unauthor|forbidden|privilege/i.test(msg) && odDateStyle < 2) { odDateStyle++; continue; }
+        return null;
+    }
+    return null;
+}
+// { id: [d1, d2, d3] } for the ids asked about: the newest log day (0 = none) that counts for each rank. Rows dated after
+// `todayNo` are ignored. Reads { cands: [{ id, days }] } in chunks of OD_CHUNK ids per window (days = the longest frequency the
+// piece has), OD_PARALLEL requests at a time. `failed` lists the ids whose request failed (left out of `logs`).
+async function fetchOverdue(dataApi, cands, todayNo, onProgress, isStale) {
+    const tiers = {};
+    cands.forEach(function(c) {
+        const t = odTierOf(c.days);
+        (tiers[t] = tiers[t] || []).push(c.id);
+    });
+    const jobs = [];
+    Object.keys(tiers).forEach(function(t) {
+        const ids = tiers[t];
+        for (let i = 0; i < ids.length; i += OD_CHUNK) jobs.push({ ids: ids.slice(i, i + OD_CHUNK), floor: odDayStr(todayNo - Number(t) - 1) });
+    });
+    const logs = {}, failed = [];
+    let next = 0, done = 0;
+    const step = async function() {
+        {
+            const job = jobs[next++];
+            const rows = await fetchOverdueChunk(dataApi, job.ids, job.floor);
+            if (rows === null) failed.push.apply(failed, job.ids);
+            else {
+                job.ids.forEach(function(id) { logs[id] = [0, 0, 0]; });
+                rows.forEach(function(r) {
+                    const rawId = r.craa5_equipmentguid !== undefined ? r.craa5_equipmentguid : getRowField(r, 'craa5_equipmentguid');
+                    const id = normGuid(rawId);
+                    const lt = logs[id];
+                    if (!lt) return;
+                    const rawDate = r.craa5_lastcleaned !== undefined ? r.craa5_lastcleaned : getRowField(r, 'craa5_lastcleaned');
+                    const day = odLogDay(rawDate);
+                    if (!day || day > todayNo) return;
+                    let bits = 0;
+                    OD_KIND_COLS.forEach(function(c, i) { const v = r[c] !== undefined ? r[c] : getRowField(r, c); if (odTrue(v)) bits |= (1 << i); });
+                    const rank = odBitsRank(bits);
+                    for (let k = 1; k <= 3; k++) if (rank >= k && day > lt[k - 1]) lt[k - 1] = day;
+                });
+            }
+            done++;
+            if (onProgress) onProgress(done, jobs.length);
+        }
+    };
+    const run = async function() {
+        while (next < jobs.length && !(isStale && isStale())) await step();   // a read the planner has moved past stops asking for more
+    };
+    // The first request goes out alone: if the log table needs the other date style or has no kind columns, that is settled (it is kept
+    // in module variables) before the others go out beside it.
+    if (jobs.length) await step();
+    const workers = [];
+    for (let w = 0; w < Math.min(OD_PARALLEL, jobs.length); w++) workers.push(run());
+    await Promise.all(workers);
+    return { logs: logs, failed: failed, chunks: jobs.length };
+}
 function yesNoValue(v) {
     if (v === true || v === false) return v;
     if (typeof v === 'string') {
@@ -1580,6 +1864,10 @@ export default function App(props) {
     const initialCurrent = savedRef.current.current;
 
     const [activeTab, setActiveTab] = useState('gantt');   // opens on the Gantt chart; Crew (people) and Setup (process, PBED only) come first in the bar
+    // Print (PBED): the Crew tab's printed schedules need the plan, which PBED only keeps current on the schedule tabs, so Print asks for it.
+    const [printing, setPrinting] = useState(false);
+    const activeTabRef = useRef('gantt');
+    activeTabRef.current = activeTab;
 
     const [assets, setAssets] = useState([]);
     const [rawEmployees, setRawEmployees] = useState([]);
@@ -1598,6 +1886,20 @@ export default function App(props) {
     const [cleanTypeCols, setCleanTypeCols] = useState([]);      // yes/no columns found on the equipment table
     const [cleanTypeLabels, setCleanTypeLabels] = useState({});  // their display names, when the host can tell
     const [roomConfigured, setRoomConfigured] = useState(initialSettings.roomConfigured || {});
+    // PBED: which equipment is planned. 'overdueweekly' (default) = what is overdue in the cleaning log plus everything marked weekly;
+    // 'overdue' = only what is overdue; 'type' = the type-of-clean pick above (no pick = all equipment). Settings saved with types picked
+    // stay on 'type'. Ganttly (the floor app) always uses 'type'. A room can pick its own (roomCleanType: 'overdue', 'overdueweekly').
+    const [planMode, setPlanMode] = useState(function() {
+        if (IS_CURRENT) return 'type';
+        const m = initialSettings.planMode;
+        if (m === 'overdueweekly' || m === 'overdue' || m === 'type') return m;
+        return Array.isArray(initialSettings.cleanTypes) && initialSettings.cleanTypes.length > 0 ? 'type' : 'overdueweekly';
+    });
+    // PBED: where each room's Handover (earliest start) comes from. 'schedule' (default) = the production schedule, with a Handover typed
+    // by hand winning while it is inside the plan window; 'hand' = only the Handover typed by hand (what Ganttly always does).
+    const [handoffSource, setHandoffSource] = useState(!IS_CURRENT && initialSettings.handoffSource !== 'hand' ? 'schedule' : 'hand');
+    const [handoffGapMins, setHandoffGapMins] = useState(function() { const n = Number(initialSettings.handoffGapMins); return initialSettings.handoffGapMins === undefined || isNaN(n) ? HANDOFF_GAP_DEFAULT : Math.max(0, Math.min(600, Math.round(n))); });
+    const [roomProdLines, setRoomProdLines] = useState(initialSettings.roomProdLines && typeof initialSettings.roomProdLines === 'object' ? initialSettings.roomProdLines : {});
 
     // 🚨 ARCHITECTURE NOTE: Global Omission Filter
     // hiddenRooms tracks if a room is toggled to "Skipped".
@@ -1636,7 +1938,8 @@ export default function App(props) {
     const [shiftRotation, setShiftRotation] = useState(Array.isArray(initialSettings.shiftRotation) ? initialSettings.shiftRotation : DEFAULT_SHIFT_ROTATION);
     const [liveTime, setLiveTime] = useState(new Date());
     useEffect(function() {
-        const timerId = setInterval(function() { setLiveTime(new Date()); }, 60000);
+        // PBED: the clock only moves the screen on the schedule tabs (the NOW line, late flags); any other tab takes the time when it is clicked.
+        const timerId = setInterval(function() { if (!LAZY_ENGINE || ENGINE_TABS.indexOf(activeTabRef.current) > -1) setLiveTime(new Date()); }, 60000);
         return function() { clearInterval(timerId); };
     }, []);
     // Ganttly (current): the window is the past 12 hours and the next 24 by the clock, from the top of the hour, moving on
@@ -1678,6 +1981,22 @@ export default function App(props) {
     });
     const [expState, setExpState] = useState({ status: 'idle', done: 0, total: 0 });
     const expReqRef = useRef(0);
+    // PBED, Equipment to plan = overdue: each piece of equipment's newest cleaning-log day per kind of clean ({ equipmentId: [d1, d2, d3] }, see
+    // OVERDUE EQUIPMENT), kept in this browser for a few hours, and how the read is going.
+    const odBootRef = useRef(null);
+    if (!odBootRef.current) {
+        const c = IS_CURRENT ? null : readJson(OD_CACHE_KEY);
+        const ok = c && c.v === 1 && c.logs && typeof c.logs === 'object' && c.readDay === getLocalYMD(new Date()) && Date.now() - c.builtAt < OD_CACHE_MS;
+        odBootRef.current = { logs: ok ? c.logs : {}, builtAt: ok ? c.builtAt : 0 };
+    }
+    const [odMap, setOdMap] = useState(odBootRef.current.logs);
+    const [odState, setOdState] = useState({ status: 'idle', done: 0, total: 0, readAt: odBootRef.current.builtAt, failed: 0 });
+    const odReqRef = useRef(0);
+    const odAttemptRef = useRef(0);   // when the last read started (a tab click doesn't start another within 5 minutes)
+    const odMapRef = useRef(odMap);
+    odMapRef.current = odMap;
+    const odStateRef = useRef(odState);
+    odStateRef.current = odState;
     const [boardRows, setBoardRows] = useState([]);
     const [lineRows, setLineRows] = useState([]);
     // Shift Start boards change during the shift: re-read them every few minutes (and on demand), re-planning only when one changed.
@@ -1707,16 +2026,28 @@ export default function App(props) {
         if (sig !== taskSigRef.current) { taskSigRef.current = sig; setTaskRows(rows); }
     };
     const loadTaskRowsRef = useRef(null);   // set once the plan window is known (below)
+    // The production schedule's runs for the plan window (PBED handoffs): the rows, and how the read went ({ status: 'idle' | 'loading'
+    // | 'ready' | 'failed', readAt, truncated }).
+    const [prodRows, setProdRows] = useState([]);
+    const [prodState, setProdState] = useState({ status: 'idle', readAt: 0, truncated: false });
+    const prodSigRef = useRef('');
+    const prodReqRef = useRef(0);
+    const loadProdRunsRef = useRef(null);   // set once the plan window is known (below)
+    const ssBusyRef = useRef(false);
+    const ssAttemptRef = useRef(0);   // when the last re-read started; a tab click doesn't start another within a minute (a failed read otherwise retried on every click)
     const reloadShiftStart = async function() {
+        if (ssBusyRef.current) return;
+        ssBusyRef.current = true; ssAttemptRef.current = Date.now();
         setShiftStartLoading(true);
         try {
-            const res = await Promise.all([fetchBoardRows(props.dataApi), fetchAllActiveRecords("craa5_aa_mss_area", props.dataApi), loadTaskRowsRef.current ? loadTaskRowsRef.current() : null]);
+            const res = await Promise.all([fetchBoardRows(props.dataApi), fetchAllActiveRecords("craa5_aa_mss_area", props.dataApi), loadTaskRowsRef.current ? loadTaskRowsRef.current() : null, loadProdRunsRef.current ? loadProdRunsRef.current() : null]);
             applyShiftStartRows(res[0], res[1]);
-        } finally { setShiftStartLoading(false); }
+        } finally { ssBusyRef.current = false; setShiftStartLoading(false); }
     };
     const reloadShiftStartRef = useRef(reloadShiftStart);
     reloadShiftStartRef.current = reloadShiftStart;
     useEffect(function() {
+        if (LAZY_ENGINE) return;   // PBED re-reads when a tab is clicked (goTab) or on "Reload from Shift Start", never on a timer
         const id = setInterval(function() { reloadShiftStartRef.current(); }, 5 * 60000);
         return function() { clearInterval(id); };
     }, []);
@@ -1734,6 +2065,19 @@ export default function App(props) {
         setTailFillMins(n > 0 ? Math.max(5, Math.min(240, n)) : 30);
         setTailFillDraft(null);
     };
+    // The same for the handoff changeover minutes and the Plan Start Hour / Plan Length boxes: what's typed counts once the box is left (or Enter),
+    // so typing "12" isn't read as "1" (each reading of the plan window re-reads Shift Start and the production schedule).
+    const [handoffGapDraft, setHandoffGapDraft] = useState(null);
+    const commitHandoffGap = function() {
+        if (handoffGapDraft === null) return;
+        const n = Math.round(Number(handoffGapDraft));
+        setHandoffGapMins(handoffGapDraft === '' || isNaN(n) ? HANDOFF_GAP_DEFAULT : Math.max(0, Math.min(600, n)));
+        setHandoffGapDraft(null);
+    };
+    const [hourDraft, setHourDraft] = useState(null);
+    const [hoursDraft, setHoursDraft] = useState(null);
+    const commitHourDraft = function() { if (hourDraft === null) return; setGanttStartHour(Math.max(0, Math.min(23, Number(hourDraft) || 0))); setHourDraft(null); };
+    const commitHoursDraft = function() { if (hoursDraft === null) return; setPlanHours(Math.max(1, Math.min(336, Number(hoursDraft) || 12))); setHoursDraft(null); };
     const [expandedRosters, setExpandedRosters] = useState({});
     const [collapsedPlans, setCollapsedPlans] = useState({});
     const [rotationSource, setRotationSource] = useState(Array.isArray(initialSettings.shiftRotation) ? 'Saved' : 'Default');
@@ -1781,7 +2125,6 @@ export default function App(props) {
     const [panScrollLeft, setPanScrollLeft] = useState(0);
     const [hasDragged, setHasDragged] = useState(false);
     const [dragState, setDragState] = useState(null);
-    const [hoveredTaskId, setHoveredTaskId] = useState(null);
     const LANE_HEIGHT_PX = 46;
 
     // Auto-Save Engine (the current-shift app only reads PBED's settings; its own crew marks are saved below)
@@ -1795,6 +2138,10 @@ export default function App(props) {
             roomAllergen: roomAllergen,
             cleanTypes: cleanTypes,
             roomCleanType: roomCleanType,
+            planMode: planMode,
+            handoffSource: handoffSource,
+            handoffGapMins: handoffGapMins,
+            roomProdLines: roomProdLines,
             roomConfigured: roomConfigured,
             hiddenRooms: hiddenRooms,
             hideConfiguredRooms: hideConfiguredRooms,
@@ -1821,7 +2168,7 @@ export default function App(props) {
             liveReforecast: savedLiveReforecast
         };
         try { localStorage.setItem('itp_settings_v10', JSON.stringify(s)); } catch(e) {}
-    }, [roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, cleanTypes, roomCleanType, roomConfigured, hiddenRooms, hideConfiguredRooms, hourlyRate, savedStartDate, savedStartHour, savedPlanHours, shiftRotation, rotationSource, crewHeadcountOverrides, absentEmployees, extraPeople, jobRoleChoices, handoverMins, tailFillMins, includeBreaks, includeTransit, includeInspection, pbMode, savedLiveReforecast, savedRosterSource, savedRoomSource, crewMode, ganttView]);
+    }, [roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, cleanTypes, roomCleanType, planMode, handoffSource, handoffGapMins, roomProdLines, roomConfigured, hiddenRooms, hideConfiguredRooms, hourlyRate, savedStartDate, savedStartHour, savedPlanHours, shiftRotation, rotationSource, crewHeadcountOverrides, absentEmployees, extraPeople, jobRoleChoices, handoverMins, tailFillMins, includeBreaks, includeTransit, includeInspection, pbMode, savedLiveReforecast, savedRosterSource, savedRoomSource, crewMode, ganttView]);
     // The current-shift app's own crew marks and Live Reforecast switch.
     useEffect(function() {
         if (!IS_CURRENT) return;
@@ -2023,15 +2370,53 @@ export default function App(props) {
     // ---- Type of clean (see TYPE OF CLEAN) ----
     const cleanTypeLabel = function(k) { return cleanTypeLabels[k] || CLEAN_TYPE_LABELS[k] || humanizeColumn(k); };
     const planCleanTypes = cleanTypes.filter(function(k) { return cleanTypeCols.indexOf(k) > -1; });
-    // The types a room plans: its own pick, else the plan's ([] = every piece of equipment).
+    // Overdue modes (PBED, see OVERDUE EQUIPMENT) need the equipment table's frequency columns; without them everything is planned.
+    const odUsable = !IS_CURRENT && cleanTypeCols.some(function(c) { return OD_COLS.indexOf(c) > -1; });
+    // How a room picks its equipment: 'overdue' / 'overdueweekly' (its own pick, else the plan's) or 'type' (the types below).
+    const roomMode = function(area) {
+        if (!odUsable) return 'type';
+        const own = roomCleanType[String(area)];
+        if (own === 'overdue' || own === 'overdueweekly') return own;
+        if (own) return 'type';
+        return planMode;
+    };
+    // The day overdue is judged on: the plan's start day, or today when the plan began earlier.
+    const odTodayNo = odDayNo(getLocalYMD(liveTime));
+    const odStartNo = odDayNo(ganttStartDate);
+    const odRDay = isNaN(odStartNo) ? odTodayNo : Math.max(odTodayNo, odStartNo);
+    // Equipment not read yet counts as not planned while the log is being read (a first plan of everything would be slow, then shrink),
+    // and as planned once a read failed (never hide work because the log couldn't be read).
+    const odHold = odState.status === 'idle' || odState.status === 'loading';
+    const odStatus = useMemo(function() {
+        const out = {};
+        if (IS_CURRENT) return out;
+        assets.forEach(function(a) {
+            if (!Array.isArray(a.flags)) return;
+            if (!odFreqsOf(a.flags).length) { out[a.id] = { state: 'none', letters: [], worst: 0, never: false }; return; }
+            const id = normGuid(a.id);
+            const lt = isGuidStr(id) ? odMap[id] : null;
+            out[a.id] = lt ? overdueOf(a.flags, lt, odRDay) : { state: 'unknown', hold: isGuidStr(id) && odHold, letters: [], worst: 0, never: false };
+        });
+        return out;
+    }, [assets, odMap, odRDay, odHold]);
+    // The types a room plans: its own pick, else the plan's ([] = every piece of equipment, or the overdue modes' own rule).
     const roomCleanTypes = function(area) {
         const own = roomCleanType[String(area)];
-        if (own === 'all') return [];
+        if (own === 'all' || (odUsable && (own === 'overdue' || own === 'overdueweekly'))) return [];
         if (own && cleanTypeCols.indexOf(own) > -1) return [own];
-        return planCleanTypes;
+        return roomMode(area) === 'type' ? planCleanTypes : [];
     };
+    const isWeeklyEq = function(a) { return a.flags.some(function(c) { return OD_WEEKLY_COLS.indexOf(c) > -1; }); };
     const inCleanType = function(a) {
         if (!Array.isArray(a.flags)) return true;   // custom tasks and sample data have no yes/no columns
+        const mode = roomMode(a.area);
+        if (mode !== 'type') {
+            const st = odStatus[a.id];
+            if (!st) return true;
+            if (st.state === 'overdue') return true;
+            if (mode === 'overdueweekly' && isWeeklyEq(a)) return true;
+            return st.state === 'unknown' && !st.hold;
+        }
         const types = roomCleanTypes(a.area);
         return !types.length || types.some(function(k) { return a.flags.indexOf(k) > -1; });
     };
@@ -2064,6 +2449,64 @@ export default function App(props) {
     const taskBoards = useMemo(function() {
         return boardsFromTaskRows(taskRows, shiftWindows, globalStartMs, rosterInfo.who, lineIndex);
     }, [taskRows, shiftWindows, globalStartMs, rosterInfo, lineIndex]);
+    // ---- Production schedule handoffs (PBED, see PRODUCTION SCHEDULE HANDOFFS) ----
+    // One filtered read of the runs overlapping the plan window (plus 12 h), whenever the window moves, on "Reload" and when a schedule tab
+    // is clicked after a while. A failed read keeps the rows it had while the window is the same, and says so.
+    const prodWindowRef = useRef('');
+    const loadProdRuns = function() {
+        if (IS_CURRENT || handoffSource !== 'schedule') return Promise.resolve();
+        const req = ++prodReqRef.current;
+        const from = globalStartMs, to = globalStartMs + planHorizonMins * 60000 + PROD_AFTER_MS;
+        const win = from + '|' + to;
+        setProdState(function(prev) { return { status: 'loading', readAt: prev.readAt, truncated: prev.truncated }; });
+        return fetchProductionRuns(props.dataApi, from, to).then(function(rows) {
+            if (req !== prodReqRef.current) return;   // a slower answer for an earlier window is dropped
+            if (rows === null) {
+                if (prodWindowRef.current !== win && prodSigRef.current !== '') { prodSigRef.current = ''; setProdRows([]); }
+                setProdState(function(prev) { return { status: 'failed', readAt: prev.readAt, truncated: false }; });
+                return;
+            }
+            prodWindowRef.current = win;
+            const sig = prodRowsSignature(rows);
+            if (sig !== prodSigRef.current) { prodSigRef.current = sig; setProdRows(rows); }
+            setProdState({ status: 'ready', readAt: Date.now(), truncated: rows.length >= PROD_TOP });
+        });
+    };
+    loadProdRunsRef.current = loadProdRuns;
+    useEffect(function() { if (!isLoading) loadProdRuns(); }, [props.dataApi, isLoading, globalStartMs, planHorizonMins, handoffSource]);
+    const prodLines = useMemo(function() { return buildProdLines(prodRows); }, [prodRows]);
+    // The rooms (equipment areas), as one string so a change of equipment minutes doesn't redo the handoffs.
+    const areaSig = useMemo(function() { const seen = {}; assets.forEach(function(a) { seen[String(a.area)] = 1; }); return Object.keys(seen).sort().join('\u0001'); }, [assets]);
+    // Per room: when it may first be cleaned. { ms, src } with src 'hand' (a Handover typed in), 'schedule' (production hands it over then),
+    // 'free' / 'norun' (production is not running it: the plan start), 'nomatch' (no production line found), 'nolines' (picked: never waits).
+    const handoffInfo = useMemo(function() {
+        const out = {};
+        const w0 = globalStartMs, w1 = globalStartMs + planHorizonMins * 60000, gapMs = handoffGapMins * 60000;
+        areaSig.split('\u0001').forEach(function(area) {
+            if (!area) return;
+            const hv = roomHandovers[area] ? new Date(roomHandovers[area]).getTime() : NaN;
+            if (handoffSource !== 'schedule') { out[area] = isNaN(hv) ? { ms: null, src: 'hand-none' } : { ms: hv, src: 'hand' }; return; }   // Ganttly, and PBED set to hand: only what was typed
+            const ln = lineForArea(lineIndex, area);
+            const m = linesForRoom([area, ln ? ln.name : ''], prodLines, roomProdLines[area]);
+            const lines = m.lines.map(function(L) { return prodLineLabel(L); });
+            const stale = !isNaN(hv) && (hv < w0 || hv > w1);   // an old typed Handover from another plan: ignored
+            if (!isNaN(hv) && !stale) { out[area] = { ms: hv, src: 'hand', lines: lines, how: m.how }; return; }
+            const h = roomHandoff(m.lines, w0, gapMs);
+            if (!h) { out[area] = { ms: null, src: roomProdLines[area] === 'none' ? 'nolines' : 'nomatch', lines: lines, how: m.how, stale: stale }; return; }
+            out[area] = { ms: h.ms, src: h.state === 'handed' ? 'schedule' : h.state, lines: lines, how: m.how, next: h.next, stale: stale };
+        });
+        return out;
+    }, [areaSig, prodLines, handoffSource, handoffGapMins, roomProdLines, roomHandovers, globalStartMs, planHorizonMins, lineIndex]);
+    // What the engine needs: only the rooms that really wait ({ area: ms }), kept as the same object until a number changes, so a read that
+    // finds nothing new, or a note that changes, never re-plans.
+    const handoffNow = (function() {
+        const map = {}, parts = [];
+        Object.keys(handoffInfo).forEach(function(k) { const h = handoffInfo[k]; if (h.ms !== null && (h.src === 'hand' || h.src === 'schedule')) { map[k] = h.ms; parts.push(k + '=' + h.ms); } });
+        return { map: map, sig: parts.sort().join('|') };
+    })();
+    const handoffRef = useRef({ sig: null, map: {} });
+    if (handoffRef.current.sig !== handoffNow.sig) handoffRef.current = handoffNow;
+    const handoffMs = handoffRef.current.map;
     // ---- Auto crews (PBED, see AUTO CREWS) ----
     // Reads the last EXP_DAYS days of Shift Start's saved rows a few days at a time the first time they are needed, then keeps
     // the counts in this browser for a few hours.
@@ -2071,7 +2514,12 @@ export default function App(props) {
         const req = ++expReqRef.current;
         setExpState({ status: 'loading', done: 0, total: 0 });
         try {
-            const agg = await fetchExperience(props.dataApi, EXP_DAYS, function(d, t) { if (req === expReqRef.current) setExpState({ status: 'loading', done: d, total: t }); });
+            let shown = 0;
+            const agg = await fetchExperience(props.dataApi, EXP_DAYS, function(d, t) {
+                if (req !== expReqRef.current || (d < t && d - shown < Math.max(1, Math.ceil(t / 5)))) return;   // a few steps, not one render per piece
+                shown = d;
+                setExpState({ status: 'loading', done: d, total: t });
+            });
             if (req !== expReqRef.current) return;
             agg.v = 1; agg.days = EXP_DAYS; agg.builtAt = Date.now();
             const dead = agg.total > 0 && agg.failed >= agg.total;
@@ -2083,6 +2531,50 @@ export default function App(props) {
         if (!autoCrews || isLoading || expAgg) return;
         loadExperience();
     }, [autoCrews, isLoading]);
+    // ---- Overdue equipment (PBED, see OVERDUE EQUIPMENT) ----
+    // Reads the cleaning log for the equipment that could be planned and has no log day on file yet (all of it when forced), once the
+    // equipment is in. The days are kept in this browser; nothing is read while the plan picks equipment by type of clean.
+    const odWanted = odUsable && (planMode !== 'type' || Object.keys(roomCleanType).some(function(k) { return roomCleanType[k] === 'overdue' || roomCleanType[k] === 'overdueweekly'; }));
+    const loadOverdue = async function(force) {
+        const req = ++odReqRef.current;
+        odAttemptRef.current = Date.now();
+        const seen = {}, cands = [];
+        assets.forEach(function(a) {
+            if (!Array.isArray(a.flags) || hiddenRooms[String(a.area)] || roomMode(String(a.area)) === 'type') return;   // pieces taken out of cleaning are read too, so putting one back needs no new read
+            const id = normGuid(a.id);
+            if (!isGuidStr(id) || seen[id]) return;
+            const fs = odFreqsOf(a.flags);
+            if (!fs.length) return;
+            seen[id] = true;
+            cands.push({ id: id, days: fs.reduce(function(m, f) { return Math.max(m, f.days); }, 0) });
+        });
+        const have = force ? {} : odMapRef.current;
+        const need = cands.filter(function(c) { return !have[c.id]; });
+        const prev = odStateRef.current;
+        if (!need.length) { if (prev.status === 'idle' || prev.status === 'loading') setOdState({ status: 'ready', done: 0, total: 0, readAt: prev.readAt || Date.now(), failed: 0 }); return; }
+        setOdState({ status: 'loading', done: 0, total: 0, readAt: prev.readAt, failed: 0 });
+        try {
+            let shown = 0;
+            const res = await fetchOverdue(props.dataApi, need, odDayNo(getLocalYMD(new Date())), function(d, t) {
+                if (req !== odReqRef.current || (d < t && d - shown < Math.max(1, Math.ceil(t / 10)))) return;
+                shown = d;
+                setOdState({ status: 'loading', done: d, total: t, readAt: prev.readAt, failed: 0 });
+            }, function() { return req !== odReqRef.current; });
+            if (req !== odReqRef.current) return;
+            const dead = res.chunks > 0 && res.failed.length >= need.length;
+            const merged = Object.assign({}, have, res.logs);
+            const readAt = force || !prev.readAt || !Object.keys(have).length ? Date.now() : prev.readAt;
+            if (!dead) {
+                setOdMap(merged);
+                try { localStorage.setItem(OD_CACHE_KEY, JSON.stringify({ v: 1, readDay: getLocalYMD(new Date()), builtAt: readAt, logs: merged })); } catch (e) {}
+            }
+            setOdState({ status: dead ? 'error' : res.failed.length ? 'partial' : 'ready', done: res.chunks, total: res.chunks, readAt: dead ? prev.readAt : readAt, failed: res.failed.length });
+        } catch (e) { if (req === odReqRef.current) setOdState({ status: 'error', done: 0, total: 0, readAt: prev.readAt, failed: 0 }); }
+    };
+    useEffect(function() {
+        if (!odWanted || isLoading) return;
+        loadOverdue(false);
+    }, [odWanted, isLoading, hiddenRooms, assets.length, planMode, roomCleanType]);
     const expMap = useMemo(function() { return autoCrews ? buildExperienceMap(expAgg, rosterInfo.who, lineIndex) : {}; }, [autoCrews, expAgg, rosterInfo, lineIndex]);
     // Each shift's crews, in time order: leaders, rooms, teams. Work a shift can't get to is carried to the next one.
     const autoPlan = useMemo(function() {
@@ -2136,7 +2628,7 @@ export default function App(props) {
             }
         });
         return { boards: boards, views: views, rooms: roomList };
-    }, [autoCrews, shiftWindows, assets, hiddenRooms, roomPriority, roomAllergen, cleanTypes, roomCleanType, cleanTypeCols, lineIndex, expMap, crewRosters, leadRosters, empById, absentEmployees, absentByShift, extraPeople, crewHeadcountOverrides, globalStartMs]);
+    }, [autoCrews, shiftWindows, assets, hiddenRooms, roomPriority, roomAllergen, cleanTypes, roomCleanType, cleanTypeCols, planMode, odStatus, lineIndex, expMap, crewRosters, leadRosters, empById, absentEmployees, absentByShift, extraPeople, crewHeadcountOverrides, globalStartMs]);
     // Shift Start boards that line up with each shift in the plan (same crew, started within 90 min of the shift). A supervisor
     // with no board row gets the board built from their saved task assignments instead.
     const windowBoards = useMemo(function() {
@@ -2333,6 +2825,7 @@ export default function App(props) {
     const cleanTypeCounts = useMemo(function() {
         const byType = {}, rooms = {};
         let flagged = 0, planned = 0, inRooms = 0, removed = 0;
+        const od = { used: 0, over: 0, weekly: 0, ok: 0, none: 0, unknown: 0, byLetter: {} };   // the overdue modes, for the rooms in the plan
         assets.forEach(function(a) {
             const room = String(a.area);
             const rc = rooms[room] = rooms[room] || { total: 0, planned: 0, typed: 0, removed: 0 };
@@ -2349,15 +2842,34 @@ export default function App(props) {
             if (!Array.isArray(a.flags)) return;
             flagged++;
             a.flags.forEach(function(k) { byType[k] = (byType[k] || 0) + 1; });
+            const mode = roomMode(a.area);
+            if (mode !== 'type') {
+                const st = odStatus[a.id] || { state: 'unknown' };
+                od.used++;
+                if (st.state === 'overdue') { od.over++; st.letters.forEach(function(l) { od.byLetter[l] = (od.byLetter[l] || 0) + 1; }); }
+                else if (mode === 'overdueweekly' && isWeeklyEq(a)) od.weekly++;
+                else if (st.state === 'unknown') od.unknown++;
+                else if (st.state === 'none') od.none++;
+                else od.ok++;
+            }
         });
-        return { byType: byType, rooms: rooms, flagged: flagged, planned: planned, inRooms: inRooms, removed: removed };
-    }, [assets, cleanTypes, roomCleanType, cleanTypeCols, hiddenRooms, roomSource, shiftStartLines, areaLine, customOnlyAreas]);
+        return { byType: byType, rooms: rooms, flagged: flagged, planned: planned, inRooms: inRooms, removed: removed, od: od };
+    }, [assets, cleanTypes, roomCleanType, cleanTypeCols, planMode, odStatus, hiddenRooms, roomSource, shiftStartLines, areaLine, customOnlyAreas]);
     // The sentence under the type of clean picker on Setup.
     const cleanTypeSentence = (function() {
         const ct = cleanTypeCounts, rm = ct.removed;
         const of = `Planning ${ct.planned} of ${ct.inRooms} pieces of equipment`;
         const rmNote = rm > 0 ? ` ${rm} piece${rm === 1 ? '' : 's'} taken out of cleaning on the Dashboard ${rm === 1 ? 'is' : 'are'} left out.` : '';
         const pick = 'Pick one or more types to plan only equipment marked yes for them (the equipment table\'s yes/no columns).';
+        if (odUsable && planMode !== 'type') {
+            const od = ct.od;
+            const letters = OD_FREQS.filter(function(f) { return od.byLetter[f.code]; }).map(function(f) { return f.code + ' ' + od.byLetter[f.code]; }).join(' · ');
+            const wk = planMode === 'overdueweekly' ? ` and ${od.weekly} more marked weekly` : '';
+            const leftOut = [];
+            if (od.ok > 0) leftOut.push(od.ok + ' cleaned in time');
+            if (od.none > 0) leftOut.push(od.none + ' with no cleaning frequency marked');
+            return `${of}: ${od.over} overdue${letters ? ' (' + letters + ')' : ''}${wk}. ` + (leftOut.length ? 'Left out: ' + leftOut.join(', ') + '. ' : '') + (od.unknown > 0 ? `${od.unknown} not read yet. ` : '') + 'A room can pick its own below.' + rmNote;
+        }
         if (cleanTypeCols.length === 0) return rm > 0 ? `The equipment table has no yes/no columns to pick from, so every piece of equipment is planned except ${rm === 1 ? 'the one' : 'the ' + rm} taken out of cleaning on the Dashboard.` : 'The equipment table has no yes/no columns to pick from, so every piece of equipment is planned.';
         if (planCleanTypes.length > 0) return `${of}: those marked yes for ${planCleanTypes.map(cleanTypeLabel).join(' or ')}. A room can pick its own type below.` + rmNote;
         if (ct.planned + rm < ct.inRooms) return `${of}: all of it, except in rooms below that pick their own type.` + rmNote;
@@ -2382,14 +2894,14 @@ export default function App(props) {
             out[k] = { eq: eq, line: line, unassigned: unassigned };
         });
         return out;
-    }, [assets, cleanTypes, roomCleanType, cleanTypeCols, lineAssets, windowPlans]);
+    }, [assets, cleanTypes, roomCleanType, cleanTypeCols, planMode, odStatus, lineAssets, windowPlans]);
 
     // How many tasks fall in each kind of work, so Setup shows whether PIC / chemical / janitorial are being picked up.
     const taskKindCounts = useMemo(function() {
         const c = { general: 0, pic: 0, chemical: 0, admin: 0, janitorial: 0 };
         assets.forEach(function(a) { if (!roomHidden(a.area) && inPlan(a)) c[a.kind || taskKind(a)]++; });
         return c;
-    }, [assets, hiddenRooms, roomSource, shiftStartLines, areaLine, customOnlyAreas, cleanTypes, roomCleanType, cleanTypeCols]);
+    }, [assets, hiddenRooms, roomSource, shiftStartLines, areaLine, customOnlyAreas, cleanTypes, roomCleanType, cleanTypeCols, planMode, odStatus]);
 
     // Who works each crew, when, and which lead they sit under.
     //  - 'table': the employee table (workers by Shift, leads by Role). A lead's team = people on the same Leadership Team.
@@ -2641,6 +3153,7 @@ export default function App(props) {
 
     // Plan presets. "Weekend" = Friday 6PM through Monday 6AM (D → C → D → A → B).
     const applyPlanPreset = function(preset) {
+        setHourDraft(null); setHoursDraft(null);
         if (preset === 'shift') { setPlanHours(12); return; }
         if (preset === 'week') { setPlanHours(168); return; }
         if (preset === 'weekend') {
@@ -2708,6 +3221,8 @@ export default function App(props) {
 
     // Mutators
     const handleRoomHandoverChange = function(area, val) { setRoomHandovers(function(prev) { return Object.assign({}, prev, { [area]: val }); }); };
+    const handleRoomHandoverClear = function(area) { setRoomHandovers(function(prev) { const n = Object.assign({}, prev); delete n[area]; return n; }); };
+    const handleRoomProdLineChange = function(area, val) { setRoomProdLines(function(prev) { const n = Object.assign({}, prev); if (val) n[area] = val; else delete n[area]; return n; }); };
     const handleRoomPriorityChange = function(area, val) { setRoomPriority(function(prev) { return Object.assign({}, prev, { [area]: Math.max(1, Math.min(50, Number(val)||1)) }); }); };
     const handleRoomCleanTogetherChange = function(area, val) { setRoomCleanTogether(function(prev) { return Object.assign({}, prev, { [area]: val }); }); };
     const handleRoomAllergenChange = function(area, val) { setRoomAllergen(function(prev) { return Object.assign({}, prev, { [area]: val }); }); };
@@ -2740,7 +3255,12 @@ export default function App(props) {
     const setRemovedFromCleaning = function(assetId, on) { editAsset(assetId, { removed: !!on }); };
     const handlePriorityChange = function(assetId, newPriority) { editAsset(assetId, { priority: Math.max(1, Math.min(50, Number(newPriority)||1)) }); };
     const handleToggleRoom = function(areaName) { setHiddenRooms(function(prev) { return Object.assign({}, prev, { [areaName]: !prev[areaName] }); }); };
-    const toggleDashboardRoom = function(areaName) { setCollapsedDashboardRooms(function(prev) { return Object.assign({}, prev, { [areaName]: !prev[areaName] }); }); };
+    // PBED's Dashboard opens with every room folded (hundreds of rows to draw otherwise); Ganttly's opens unfolded.
+    const dashCollapsed = function(areaName) { return IS_CURRENT ? !!collapsedDashboardRooms[areaName] : collapsedDashboardRooms[areaName] !== false; };
+    const toggleDashboardRoom = function(areaName) { setCollapsedDashboardRooms(function(prev) { return Object.assign({}, prev, { [areaName]: !(IS_CURRENT ? prev[areaName] : prev[areaName] !== false) }); }); };
+    const setAllDashboardRooms = function(collapsed) {
+        setCollapsedDashboardRooms(function() { const n = {}; if (!collapsed || IS_CURRENT) dashboardRooms.forEach(function(r) { n[r] = collapsed; }); return n; });
+    };
 
     // Ganttly (current): a new downtime starts from today at this hour (the window's first day is usually yesterday); PBED: the plan's day.
     const defaultDtDate = function() { return IS_CURRENT ? getLocalYMD(liveTime) : ganttStartDate; };
@@ -2826,6 +3346,12 @@ export default function App(props) {
     //          rest (+ handover overhead) is queued for the next crew. With Live Reforecast on, nothing
     //          un-started is scheduled before "now". Work that can't fit in the window = overflow.
     // ============================================================================
+    // PBED keeps the plan's inputs still on every tab that doesn't show the plan: React is handed the array it had last time, so the memo
+    // below returns its last result, and the first click on Gantt, Focus or Metrics (or Print) plans once with whatever changed.
+    const engineOn = !LAZY_ENGINE || printing || ENGINE_TABS.indexOf(activeTab) > -1;
+    const engineDepsNow = [assets, cleanTypes, roomCleanType, cleanTypeCols, planMode, odStatus, roomLimits, handoffMs, roomPriority, roomCleanTogether, roomAllergen, overrides, taskStatus, targetDowntimes, allInterrupts, includeTransit, includeInspection, pbMode, hiddenRooms, roomSource, shiftStartLines, areaLine, customOnlyAreas, windowPlans, laneByEmpCrew, shiftWindows, laneRoster, maxCrewSize, planHorizonMins, handoverMins, tailFillMins, reforecastFrom, ganttStartDate, ganttStartHour, shiftRotation];
+    const engineDepsRef = useRef(null);
+    if (engineOn || engineDepsRef.current === null) engineDepsRef.current = engineDepsNow;
     const scheduleData = useMemo(function() {
         const workers = laneRoster.map(function(l) { const w = new Worker(l.lane, l.crew, l.name, l.windows); w.kind = l.kind || 'general'; w.isLead = !!l.isLead; return w; });
         const laneIndex = {};
@@ -2908,6 +3434,7 @@ export default function App(props) {
                     tasks: [],
                     limit: Infinity,
                     startOffset: Infinity,
+                    areaFloor: {},   // each room's own earliest start: a combined clean orders by the earliest, but a room's tasks never start before its own handoff
                     priority: Infinity,
                     areas: {}
                 };
@@ -2921,11 +3448,10 @@ export default function App(props) {
             if (rLimit < vRoom.limit) vRoom.limit = rLimit;
 
             let rStartMins = 0;
-            if (roomHandovers[area]) {
-                const handMs = new Date(roomHandovers[area]).getTime();
-                if (!isNaN(handMs)) rStartMins = Math.max(0, Math.round((handMs - startMs) / 60000));
-            }
+            const handMs = handoffMs[area];   // a typed Handover or the production schedule's handoff (see PRODUCTION SCHEDULE HANDOFFS)
+            if (handMs !== undefined && handMs !== null) rStartMins = Math.max(0, Math.round((handMs - startMs) / 60000));
             if (rStartMins < vRoom.startOffset) vRoom.startOffset = rStartMins;
+            vRoom.areaFloor[area] = rStartMins;
 
             const rPri = roomPriority[area] || 2;
             if (rPri < vRoom.priority) vRoom.priority = rPri;
@@ -3247,7 +3773,7 @@ export default function App(props) {
         const tailMin = Math.min(240, Math.max(5, Number(tailFillMins) || 30));
         const byStart = function(a, b) { return a.start - b.start; };
         const uniq = function(l, i, a) { return a.indexOf(l) === i; };
-        const fromOf = function(task) { return Math.max(virtualRoomsMap[task.vRoomKey].startOffset, task.earliestStart || 0, reforecastFrom); };
+        const fromOf = function(task) { const vr = virtualRoomsMap[task.vRoomKey]; return Math.max(vr.startOffset, vr.areaFloor[task.originalArea] || 0, task.earliestStart || 0, reforecastFrom); };
         // A worker's free stretches on shift, worked out again only after they get a new booking (bookings are only added here).
         const allRuns = function(w) {
             if (w.runsAt === w.schedule.length && w.runs) return w.runs;
@@ -3976,7 +4502,7 @@ export default function App(props) {
             parentById: parentById,
             taskById: taskById
         };
-    }, [assets, cleanTypes, roomCleanType, cleanTypeCols, roomLimits, roomHandovers, roomPriority, roomCleanTogether, roomAllergen, overrides, taskStatus, targetDowntimes, allInterrupts, includeTransit, includeInspection, pbMode, hiddenRooms, roomSource, shiftStartLines, areaLine, customOnlyAreas, windowPlans, laneByEmpCrew, shiftWindows, laneRoster, maxCrewSize, planHorizonMins, handoverMins, tailFillMins, reforecastFrom, ganttStartDate, ganttStartHour, shiftRotation]);
+    }, engineDepsRef.current);
 
     // ============================================================================
     // LIVE TRACKING ACTIONS (check-off, start, reassign, move)
@@ -4283,7 +4809,11 @@ export default function App(props) {
                     newLane = newLanes[0];
                 }
 
-                setDragState(function(prev) { return Object.assign({}, prev, { currentMin: newMin, currentLane: newLane, currentLanes: newLanes }); });
+                // A pointer move that lands on the same 15-minute step and lane changes nothing: no re-render.
+                setDragState(function(prev) {
+                    if (prev && prev.currentMin === newMin && prev.currentLane === newLane && JSON.stringify(prev.currentLanes || null) === JSON.stringify(newLanes || null)) return prev;
+                    return Object.assign({}, prev, { currentMin: newMin, currentLane: newLane, currentLanes: newLanes });
+                });
             }
         };
 
@@ -4315,6 +4845,16 @@ export default function App(props) {
         setIsPanning(true); setHasDragged(false); setPanStartX(e.clientX); setPanScrollLeft(scrollRef.current ? scrollRef.current.scrollLeft : 0);
         if (e.currentTarget && typeof e.currentTarget.setPointerCapture === 'function') e.currentTarget.setPointerCapture(e.pointerId);
     };
+
+    // PBED's Print button: the schedules are drawn (and the plan made) for the print, then the box opens; it goes back to normal when the
+    // box closes.
+    useEffect(function() {
+        if (!printing) return;
+        const done = function() { setPrinting(false); };
+        window.addEventListener('afterprint', done);
+        const t = setTimeout(function() { try { window.print(); } catch (e) { setPrinting(false); } }, 60);
+        return function() { window.removeEventListener('afterprint', done); clearTimeout(t); };
+    }, [printing]);
 
     if (isLoading) {
         return (
@@ -4563,10 +5103,8 @@ export default function App(props) {
                                                 key={`${t.id}-${lane}`}
                                                 data-task={t.id} data-lane={lane} data-start={Math.round(t.startMin)} data-end={Math.round(t.startMin + t.finalDuration)} data-room-block={r.g.name}
                                                 onClick={function() { setSelectedTaskEditor(t.id); }}
-                                                onPointerEnter={function() { setHoveredTaskId(t.id); }}
-                                                onPointerLeave={function() { setHoveredTaskId(null); }}
                                                 title={`${t.name} · ${t.originalArea}\n${laneRoster[lane].name}\n${timeRange(t)}`}
-                                                className={`no-pan absolute z-20 cursor-pointer rounded flex items-center overflow-hidden border border-black/20 ${getRoomColor(t.originalArea)} ${t.isComplete ? 'opacity-60 grayscale complete-stripes' : ''} ${ringCls} ${hoveredTaskId === t.id ? 'brightness-110 shadow-lg z-30' : ''}`}
+                                                className={`no-pan absolute z-20 cursor-pointer rounded flex items-center overflow-hidden border border-black/20 ${getRoomColor(t.originalArea)} ${t.isComplete ? 'opacity-60 grayscale complete-stripes' : ''} ${ringCls} hover:brightness-110 hover:shadow-lg hover:z-30`}
                                                 style={{ left: `${bl}px`, width: `${bw}px`, top: `${ROOM_HEAD_PX + q.row * ROOM_ROW_PX + 3}px`, height: `${ROOM_ROW_PX - 6}px` }}
                                             >
                                                 {bw > 30 && <span className="px-1.5 text-white font-bold text-[10px] truncate leading-none drop-shadow-sm flex items-center gap-1">{t.isComplete && <Check className="w-2.5 h-2.5 flex-shrink-0" />}{t.name}</span>}
@@ -4711,10 +5249,21 @@ export default function App(props) {
     const timeRange = function(t) {
         return formatClockTime(ganttStartDate, ganttStartHour, t.startMin) + ' – ' + formatClockTime(ganttStartDate, ganttStartHour, t.startMin + t.finalDuration).replace(/^\S+ /, '');
     };
+    // A tab updates when it is clicked. PBED takes the time and, when the Shift Start / production schedule rows are over 5 minutes old, reads
+    // them again as it opens (the Setup and Dashboard tabs don't need them). Ganttly keeps its timers.
+    const goTab = function(id) {
+        setPrinting(false);
+        setActiveTab(id);
+        if (!LAZY_ENGINE) return;
+        setLiveTime(new Date());
+        if (id === 'setup' || id === 'equipment') return;
+        if ((!shiftStartCheckedAt || Date.now() - shiftStartCheckedAt.getTime() > 5 * 60000) && !ssBusyRef.current && Date.now() - ssAttemptRef.current > 60000) reloadShiftStart();
+        if (odWanted && odState.status !== 'loading' && odState.readAt && Date.now() - odState.readAt > OD_CACHE_MS && Date.now() - odAttemptRef.current > 5 * 60000) loadOverdue(true);   // an open tab reads the cleaning log again once it is 6 hours old
+    };
     const tabBtn = function(id, label, Icon) {
         const on = activeTab === id;
         return (
-            <button key={id} onClick={function() { setActiveTab(id); }} className={`px-4 py-2 text-[11px] font-extrabold uppercase tracking-[0.08em] rounded-xl flex items-center gap-2 whitespace-nowrap flex-shrink-0 transition-colors ${on ? 'bg-[#0072CE] text-white shadow-[0_6px_14px_rgba(0,114,206,0.25)]' : 'text-slate-500 hover:bg-[#E6F1FB] hover:text-[#0072CE]'}`}>
+            <button key={id} data-tab={id} onClick={function() { goTab(id); }} className={`px-4 py-2 text-[11px] font-extrabold uppercase tracking-[0.08em] rounded-xl flex items-center gap-2 whitespace-nowrap flex-shrink-0 transition-colors ${on ? 'bg-[#0072CE] text-white shadow-[0_6px_14px_rgba(0,114,206,0.25)]' : 'text-slate-500 hover:bg-[#E6F1FB] hover:text-[#0072CE]'}`}>
                 <Icon className="w-4 h-4" /> {label}
             </button>
         );
@@ -4727,7 +5276,7 @@ export default function App(props) {
                 <div className="max-w-[1900px] mx-auto px-4 sm:px-7 h-[72px] flex items-center justify-between gap-4">
                     <div className="min-w-0">
                         <h1 className="text-lg font-black text-[#00468B] leading-tight tracking-tight truncate">{IS_CURRENT ? 'Ganttly' : 'PBED'}</h1>
-                        <p className="text-[11px] font-bold text-slate-500 truncate">{formatClockTime(ganttStartDate, ganttStartHour, 0)} → {formatClockTime(ganttStartDate, ganttStartHour, planHorizonMins)}{IS_CURRENT ? ' · live · ' + (currentWindow ? onNowCount + ' on now (' + currentWindow.crew + ' crew)' : 'no shift running now') : ' · ' + globalHeadcount + ' people'} · {progressPct}% done</p>
+                        <p className="text-[11px] font-bold text-slate-500 truncate">{formatClockTime(ganttStartDate, ganttStartHour, 0)} → {formatClockTime(ganttStartDate, ganttStartHour, planHorizonMins)}{IS_CURRENT ? ' · live · ' + (currentWindow ? onNowCount + ' on now (' + currentWindow.crew + ' crew)' : 'no shift running now') : ' · ' + globalHeadcount + ' people'}{engineOn ? ' · ' + progressPct + '% done' : ''}</p>
                     </div>
                     <BrandLogo />
                 </div>
@@ -4774,13 +5323,13 @@ export default function App(props) {
                                 <div>
                                     <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Plan Start Hour</label>
                                     <div className="flex items-center">
-                                        <input type="number" min="0" max="23" value={ganttStartHour} onChange={function(e) { setGanttStartHour(Math.max(0, Math.min(23, Number(e.target.value)||0))); }} className="w-full border border-slate-300 rounded-l p-2 text-sm font-bold outline-none no-pan text-center" />
+                                        <input type="number" min="0" max="23" value={hourDraft !== null ? hourDraft : ganttStartHour} onChange={function(e) { setHourDraft(e.target.value); }} onBlur={commitHourDraft} onKeyDown={function(e) { if (e.key === 'Enter') e.target.blur(); }} className="w-full border border-slate-300 rounded-l p-2 text-sm font-bold outline-none no-pan text-center" />
                                         <span className="bg-slate-100 border-y border-r border-slate-300 rounded-r px-3 py-2 text-sm font-bold text-slate-500">:00</span>
                                     </div>
                                 </div>
                                 <div>
                                     <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Plan Length (Hours)</label>
-                                    <input type="number" min="1" max="336" value={planHours} onChange={function(e) { setPlanHours(Math.max(1, Math.min(336, Number(e.target.value)||12))); }} className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none no-pan text-center" />
+                                    <input type="number" min="1" max="336" value={hoursDraft !== null ? hoursDraft : planHours} onChange={function(e) { setHoursDraft(e.target.value); }} onBlur={commitHoursDraft} onKeyDown={function(e) { if (e.key === 'Enter') e.target.blur(); }} className="w-full border border-slate-300 rounded p-2 text-sm font-bold outline-none no-pan text-center" />
                                 </div>
                                 <div>
                                     <label className="block text-[10px] font-black text-[#0072CE] uppercase tracking-widest mb-1.5">Workforce In Window</label>
@@ -4796,7 +5345,17 @@ export default function App(props) {
                                     {formatClockTime(ganttStartDate, ganttStartHour, 0)} → {formatClockTime(ganttStartDate, ganttStartHour, planHorizonMins)}
                                 </span>
                             </div>
-                            <div className="px-6 pt-4 pb-5 border-t border-slate-100">
+                            <div data-plan-card className="px-6 pt-4 pb-5 border-t border-slate-100">
+                                {odUsable && (
+                                    <div className="flex flex-wrap items-center gap-2 mb-3">
+                                        <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest mr-1">Equipment to plan:</span>
+                                        {[['overdueweekly', 'Overdue + weekly'], ['overdue', 'Overdue'], ['type', 'By type of clean']].map(function(o) {
+                                            const on = planMode === o[0];
+                                            return <button key={o[0]} data-plan-mode={o[0]} onClick={function() { setPlanMode(o[0]); }} className={`px-3 py-1 rounded-full text-[11px] font-extrabold border transition-colors ${on ? 'bg-[#0072CE] border-[#0072CE] text-white shadow-sm' : 'bg-white border-gray-200 text-slate-600 hover:bg-[#E6F1FB] hover:text-[#0072CE]'}`}>{o[1]}</button>;
+                                        })}
+                                    </div>
+                                )}
+                                {(!odUsable || planMode === 'type') && (
                                 <div className="flex flex-wrap items-center gap-2">
                                     <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest mr-1">Type of clean:</span>
                                     <button onClick={function() { setCleanTypes([]); }} className={`px-3 py-1 rounded-full text-[11px] font-extrabold border transition-colors ${planCleanTypes.length === 0 ? 'bg-[#0072CE] border-[#0072CE] text-white shadow-sm' : 'bg-white border-gray-200 text-slate-500 hover:bg-[#E6F1FB] hover:text-[#0072CE]'}`}>All equipment</button>
@@ -4810,8 +5369,63 @@ export default function App(props) {
                                         );
                                     })}
                                 </div>
-                                <p className="text-[11px] font-bold text-slate-500 mt-2">{cleanTypeSentence}</p>
+                                )}
+                                <p data-plan-sentence className="text-[11px] font-bold text-slate-500 mt-2">{cleanTypeSentence}</p>
+                                {odUsable && odWanted && (
+                                    <div data-od-status={odState.status} className={`flex flex-wrap items-center gap-2 mt-2 text-[11px] font-bold ${odState.status === 'error' || odState.status === 'partial' ? 'text-amber-700' : 'text-slate-500'}`}>
+                                        <span>
+                                            {odState.status === 'idle' ? 'Reading the cleaning log to find what is overdue…'
+                                                : odState.status === 'loading' ? (odState.total > 0 ? `Reading the cleaning log to find what is overdue: ${odState.done} of ${odState.total} requests…` : 'Reading the cleaning log to find what is overdue…')
+                                                : odState.status === 'error' ? (Object.keys(odMap).length > 0 ? 'Couldn\'t read the cleaning log again, so what was read earlier is kept and anything not read yet is planned until it can be.' : 'Couldn\'t read the cleaning log, so every piece of equipment is planned until it can be.')
+                                                : odState.status === 'partial' ? `${odState.failed} piece${odState.failed === 1 ? '' : 's'} of equipment couldn't be read from the cleaning log, so ${odState.failed === 1 ? 'it is' : 'they are'} planned anyway.`
+                                                : 'Overdue as of ' + new Date(odRDay * 86400000).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' }) + ' by the cleaning log (Daily 1 day, Weekly and Midweek 7, Monthly 31, Quarterly 92, Annual 366)' + (odState.readAt ? ', read ' + new Date(odState.readAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '') + '.'}
+                                        </span>
+                                        <button data-od-reload disabled={odState.status === 'loading'} onClick={function() { loadOverdue(true); }} className="text-[#0072CE] hover:text-[#00468B] underline disabled:opacity-40 disabled:no-underline">Read the log again</button>
+                                    </div>
+                                )}
                             </div>
+                            {!IS_CURRENT && (function() {
+                                const inPlanRooms = allUniqueRooms.filter(function(r) { return !roomHidden(r); });
+                                const infoOf = function(r) { return handoffInfo[r] || { ms: null, src: 'nomatch' }; };
+                                const waiting = inPlanRooms.filter(function(r) { return infoOf(r).src === 'schedule'; }).length;
+                                const unmatched = inPlanRooms.filter(function(r) { return infoOf(r).src === 'nomatch'; });
+                                const lineCount = Object.keys(prodLines).length;
+                                const readTime = prodState.readAt ? new Date(prodState.readAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
+                                return (
+                                    <div data-handoff-card className="px-6 pt-4 pb-5 border-t border-slate-100">
+                                        <div className="flex flex-wrap items-center gap-2">
+                                            <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest mr-1">Handoff times:</span>
+                                            {[['schedule', 'From the production schedule'], ['hand', 'Set by hand']].map(function(o) {
+                                                const on = handoffSource === o[0];
+                                                return <button key={o[0]} data-handoff-source={o[0]} onClick={function() { setHandoffSource(o[0]); }} className={`px-3 py-1 rounded-full text-[11px] font-extrabold border transition-colors ${on ? 'bg-[#0072CE] border-[#0072CE] text-white shadow-sm' : 'bg-white border-gray-200 text-slate-600 hover:bg-[#E6F1FB] hover:text-[#0072CE]'}`}>{o[1]}</button>;
+                                            })}
+                                            {handoffSource === 'schedule' && (
+                                                <span className="flex items-center gap-1.5 text-[11px] font-bold text-slate-600">
+                                                    <span>a gap between runs under</span>
+                                                    <input data-handoff-gap type="number" min="0" max="600" value={handoffGapDraft !== null ? handoffGapDraft : handoffGapMins} onChange={function(e) { setHandoffGapDraft(e.target.value); }} onBlur={commitHandoffGap} onKeyDown={function(e) { if (e.key === 'Enter') e.target.blur(); }} className="w-14 border border-slate-300 rounded p-1 text-xs font-bold outline-none no-pan text-center" title="Production switching to the next run inside this many minutes is one stretch of production, not a handoff to sanitation" />
+                                                    <span>minutes is a changeover</span>
+                                                </span>
+                                            )}
+                                        </div>
+                                        {handoffSource === 'schedule' ? (
+                                            <div data-handoff-status={prodState.status} className={`flex flex-wrap items-center gap-2 mt-2 text-[11px] font-bold ${prodState.status === 'failed' || prodState.truncated || (prodState.status === 'ready' && prodRows.length === 0) ? 'text-amber-700' : 'text-slate-500'}`}>
+                                                <span>
+                                                    {prodState.status === 'failed' ? (prodRows.length > 0 ? 'Couldn\'t read the production schedule again, so the runs read earlier are still used.' : 'Couldn\'t read the production schedule, so each room starts at the plan start unless a Handover is typed in.')
+                                                        : prodState.status === 'ready' && prodRows.length === 0 ? 'No production runs are scheduled for this window, so each room starts at the plan start.'
+                                                        : prodState.status === 'idle' || (prodState.status === 'loading' && !prodState.readAt) ? 'Reading the production schedule…'
+                                                        : `Production schedule read ${readTime}: ${prodRows.length} run${prodRows.length === 1 ? '' : 's'} on ${lineCount} line${lineCount === 1 ? '' : 's'} · ${inPlanRooms.length - unmatched.length} of ${inPlanRooms.length} rooms matched to a line · ${waiting} wait${waiting === 1 ? 's' : ''} for production to hand over.`}
+                                                    {prodState.truncated ? ' Only the first ' + PROD_TOP + ' runs were read.' : ''}
+                                                    {prodState.status !== 'failed' && prodState.status !== 'idle' && unmatched.length > 0 ? ' No run found on a matching line in this window for: ' + unmatched.slice(0, 6).join(', ') + (unmatched.length > 6 ? ' and ' + (unmatched.length - 6) + ' more' : '') + ' (a line with nothing scheduled starts at the plan start; or pick the line on the room below).' : ''}
+                                                </span>
+                                                <button data-handoff-reload disabled={prodState.status === 'loading'} onClick={function() { loadProdRuns(); }} className="text-[#0072CE] hover:text-[#00468B] underline disabled:opacity-40 disabled:no-underline">Read the schedule again</button>
+                                            </div>
+                                        ) : (
+                                            <p className="text-[11px] font-bold text-slate-500 mt-2">Each room starts at the Handover typed on it below (blank = the plan start).</p>
+                                        )}
+                                        {handoffSource === 'schedule' && <p className="text-[11px] font-bold text-slate-500 mt-1">A room starts when production hands it over (the end of the run on at the plan start; a room on several lines waits for the last). A Handover typed on a room wins while it is inside the plan window.</p>}
+                                    </div>
+                                );
+                            })()}
                             <div className="px-6 pt-4 pb-5 border-t border-slate-100">
                                 <div className="flex flex-wrap items-center gap-2">
                                     <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest mr-1">Filling gaps:</span>
@@ -4866,10 +5480,37 @@ export default function App(props) {
                                             
                                             {!isSkipped && (
                                                 <div className="flex flex-wrap items-center gap-3 mt-2">
-                                                    <div className="flex items-center gap-2 bg-white px-2 py-1.5 rounded border border-[#B3D4F2] shadow-sm">
-                                                        <span className="text-[10px] font-black text-slate-500 uppercase">Handover:</span>
-                                                        <input type="datetime-local" value={roomHandovers[room] || getDatetimeLocalString(0, ganttStartDate, ganttStartHour)} onChange={function(e) { handleRoomHandoverChange(room, e.target.value); }} className="w-36 md:w-40 text-center font-bold text-xs md:text-sm outline-none border-b border-slate-200 no-pan bg-transparent" />
-                                                    </div>
+                                                    {(function() {
+                                                        const hi = handoffInfo[room] || { ms: null, src: 'hand-none' };
+                                                        const shown = roomHandovers[room] ? roomHandovers[room] : hi.ms !== null && hi.ms !== undefined ? msToLocalInput(hi.ms) : getDatetimeLocalString(0, ganttStartDate, ganttStartHour);
+                                                        const fromSchedule = handoffSource === 'schedule';
+                                                        const chip = !fromSchedule ? null
+                                                            : hi.src === 'hand' ? 'typed in'
+                                                            : hi.src === 'schedule' ? 'production hands it over · ' + (hi.lines || []).slice(0, 2).join(', ') + ((hi.lines || []).length > 2 ? ' +' + ((hi.lines || []).length - 2) : '')
+                                                            : hi.src === 'free' ? 'production stopped · ' + (hi.lines || []).slice(0, 2).join(', ')
+                                                            : hi.src === 'norun' ? 'no run scheduled · ' + (hi.lines || []).slice(0, 2).join(', ')
+                                                            : hi.src === 'nolines' ? 'doesn\'t wait for production'
+                                                            : 'no run found on a matching line in this window';
+                                                        const autoLines = fromSchedule ? linesForRoom([room, (lineForArea(lineIndex, room) || { name: '' }).name], prodLines, undefined).lines : [];
+                                                        const pick = roomProdLines[room] || '';
+                                                        const lineKeys = Object.keys(prodLines).sort(function(a, b) { return prodLineLabel(prodLines[a]).localeCompare(prodLineLabel(prodLines[b]), undefined, { numeric: true }); });
+                                                        return (
+                                                            <div data-handoff-room={room} data-handoff-src={hi.src} className="flex flex-wrap items-center gap-2 bg-white px-2 py-1.5 rounded border border-[#B3D4F2] shadow-sm">
+                                                                <span className="text-[10px] font-black text-slate-500 uppercase">Handover:</span>
+                                                                <input type="datetime-local" value={shown} onChange={function(e) { handleRoomHandoverChange(room, e.target.value); }} className="w-36 md:w-40 text-center font-bold text-xs md:text-sm outline-none border-b border-slate-200 no-pan bg-transparent" />
+                                                                {chip && <span className={`text-[10px] font-bold ${hi.src === 'nomatch' ? 'text-amber-700' : 'text-slate-400'}`} title={hi.how ? 'Matched by: ' + hi.how : ''}>{chip}{hi.stale ? ' · the Handover typed here is outside this plan and ignored' : ''}</span>}
+                                                                {fromSchedule && roomHandovers[room] && <button data-handoff-clear={room} onClick={function() { handleRoomHandoverClear(room); }} className="text-[10px] font-bold text-[#0072CE] hover:text-[#00468B] underline" title="Remove the typed Handover and follow the production schedule again">use the schedule</button>}
+                                                                {fromSchedule && (
+                                                                    <select data-handoff-line={room} value={pick} onChange={function(e) { handleRoomProdLineChange(room, e.target.value); }} className="text-[10px] font-bold outline-none bg-white cursor-pointer no-pan border border-slate-200 rounded px-1 py-0.5" title="Which production line this room waits for">
+                                                                        <option value="">Line: automatic ({autoLines.length ? autoLines.map(prodLineLabel).slice(0, 2).join(', ') : 'none found'})</option>
+                                                                        <option value="none">Line: don't wait for production</option>
+                                                                        {lineKeys.map(function(k) { return <option key={k} value={k}>Line: {prodLineLabel(prodLines[k])}</option>; })}
+                                                                        {pick && pick !== 'none' && !prodLines[pick] && <option value={pick}>Line: {pick} (not in this window)</option>}
+                                                                    </select>
+                                                                )}
+                                                            </div>
+                                                        );
+                                                    })()}
                                                     <div className="flex items-center gap-2 bg-white px-2 py-1.5 rounded border border-[#B3D4F2] shadow-sm">
                                                         <span className="text-[10px] font-black text-slate-500 uppercase">Max Workers:</span>
                                                         <input type="number" min="1" value={roomLimits[room] !== undefined ? roomLimits[room] : ''} placeholder="∞" onChange={function(e) { handleRoomLimitsChange(room, e.target.value); }} className="w-10 md:w-12 text-center font-bold text-xs md:text-sm outline-none border-b border-slate-200 no-pan" title="Max people in this room at the same time. Leave blank for no cap." />
@@ -4885,8 +5526,10 @@ export default function App(props) {
                                                     {cleanTypeCols.length > 0 && (
                                                         <div className="flex items-center gap-2 bg-white px-2 py-1.5 rounded border border-[#B3D4F2] shadow-sm">
                                                             <span className="text-[10px] font-black text-slate-500 uppercase">Type of clean:</span>
-                                                            <select value={roomCleanType[room] && (roomCleanType[room] === 'all' || cleanTypeCols.indexOf(roomCleanType[room]) > -1) ? roomCleanType[room] : ''} onChange={function(e) { handleRoomCleanTypeChange(room, e.target.value); }} className="text-xs md:text-sm font-bold outline-none bg-white cursor-pointer no-pan">
-                                                                <option value="">Plan ({planCleanTypes.length ? planCleanTypes.map(cleanTypeLabel).join(' / ') : 'all equipment'})</option>
+                                                            <select value={roomCleanType[room] && (roomCleanType[room] === 'all' || (odUsable && (roomCleanType[room] === 'overdue' || roomCleanType[room] === 'overdueweekly')) || cleanTypeCols.indexOf(roomCleanType[room]) > -1) ? roomCleanType[room] : ''} onChange={function(e) { handleRoomCleanTypeChange(room, e.target.value); }} className="text-xs md:text-sm font-bold outline-none bg-white cursor-pointer no-pan">
+                                                                <option value="">Plan ({odUsable && planMode === 'overdueweekly' ? 'overdue + weekly' : odUsable && planMode === 'overdue' ? 'overdue' : planCleanTypes.length ? planCleanTypes.map(cleanTypeLabel).join(' / ') : 'all equipment'})</option>
+                                                                {odUsable && <option value="overdueweekly">Overdue + weekly</option>}
+                                                                {odUsable && <option value="overdue">Overdue</option>}
                                                                 <option value="all">All equipment</option>
                                                                 {cleanTypeCols.map(function(k) { return <option key={k} value={k}>{cleanTypeLabel(k)}</option>; })}
                                                             </select>
@@ -4916,6 +5559,12 @@ export default function App(props) {
                         <div className="bg-slate-50 border-b border-gray-200 px-6 py-5 shadow-sm z-10 flex justify-between items-center">
                             <h2 className="font-black text-slate-800 flex items-center uppercase tracking-widest"><LayoutDashboard className="w-5 h-5 mr-2 text-[#0072CE]"/> Equipment Management Dashboard</h2>
                             {IS_CURRENT && <Button variant="success" size="sm" onClick={function() { setIsCustomTaskModalOpen(true); }}>+ Add Custom Task</Button>}
+                            {!IS_CURRENT && dashboardRooms.length > 0 && (
+                                <div className="flex items-center gap-2">
+                                    <button data-dash-expand onClick={function() { setAllDashboardRooms(false); }} className="px-2 py-1.5 text-xs font-extrabold rounded-[10px] border border-slate-300 text-slate-700 hover:bg-slate-50 shadow-sm bg-white">Open all rooms</button>
+                                    <button data-dash-collapse onClick={function() { setAllDashboardRooms(true); }} className="px-2 py-1.5 text-xs font-extrabold rounded-[10px] border border-slate-300 text-slate-700 hover:bg-slate-50 shadow-sm bg-white">Fold all rooms</button>
+                                </div>
+                            )}
                         </div>
                         <div className="p-6 grid gap-6 bg-slate-50/50">
                             {activeRooms.length === 0 ? (
@@ -4930,6 +5579,16 @@ export default function App(props) {
                                     if (!p || !p.lastDoneMs || p.unscheduledWork > 0) return null;
                                     if (p.dueAgainMin === null && p.blocks.some(function(b) { return !b.isComplete; })) return null;
                                     return { doneMs: p.lastDoneMs, dueMs: p.dueMs && p.dueMs !== Infinity ? p.dueMs : null, planned: p.dueAgainMin !== null };
+                                };
+                                // PBED, overdue modes: why this piece is in the plan.
+                                const odChip = function(a) {
+                                    if (IS_CURRENT || !Array.isArray(a.flags)) return null;
+                                    const mode = roomMode(a.area);
+                                    const st = odStatus[a.id];
+                                    if (mode === 'type' || !st) return null;
+                                    if (st.state === 'overdue') return <span data-od-chip="overdue" className="block text-[10px] font-bold text-rose-700">{st.never ? 'Overdue · no ' + (st.any && st.needRank > 1 ? (st.needRank === 2 ? 'weekly-level ' : 'monthly-level ') : '') + 'clean logged in the last ' + (odTierOf(odFreqsOf(a.flags).reduce(function(m, f) { return Math.max(m, f.days); }, 0)) + 1) + ' days' : 'Overdue ' + st.worst + ' day' + (st.worst === 1 ? '' : 's')} · {st.letters.join(' + ')}</span>;
+                                    if (mode === 'overdueweekly' && isWeeklyEq(a)) return <span data-od-chip="weekly" className="block text-[10px] font-bold text-amber-700">Weekly</span>;
+                                    return null;
                                 };
                                 const typed = assets.filter(function(a) { return a.area === room && inCleanType(a); });
                                 const roomTasks = typed.filter(function(a) { return !a.removed; });
@@ -4951,14 +5610,16 @@ export default function App(props) {
                                                 </span>
                                                 {roomAllergen[room] && <span className="text-[10px] font-bold bg-rose-600 text-white px-2 py-0.5 rounded shadow-sm">ALLERGEN ACTIVE</span>}
                                                 {removedTasks.length > 0 && <span className="text-[10px] font-bold text-slate-500 bg-white px-2 py-0.5 rounded border border-slate-200">{removedTasks.length} taken out of cleaning</span>}
+                                                {!IS_CURRENT && roomMode(room) !== 'type' && (function() { const n = roomTasks.filter(function(t) { return (odStatus[t.id] || {}).state === 'overdue'; }).length; return n > 0 ? <span data-od-room-chip={room} className="text-[10px] font-bold text-rose-700 bg-rose-50 px-2 py-0.5 rounded border border-rose-200">{n} overdue</span> : null; })()}
+                                                <span className="text-[10px] font-bold text-slate-500">{roomTasks.length} piece{roomTasks.length === 1 ? '' : 's'}</span>
                                                 {IS_CURRENT && <button onClick={function(e) { e.stopPropagation(); openRoomDowntime(room); }} className="text-[10px] font-black text-rose-600 bg-white border border-rose-200 rounded px-2 py-0.5 hover:bg-rose-50">Add Room Downtime</button>}
                                             </div>
                                             <button className="text-[#0072CE] hover:text-[#00468B] transition-colors">
-                                                {collapsedDashboardRooms[room] ? <ChevronRight className="w-5 h-5"/> : <ChevronDown className="w-5 h-5"/>}
+                                                {dashCollapsed(room) ? <ChevronRight className="w-5 h-5"/> : <ChevronDown className="w-5 h-5"/>}
                                             </button>
                                         </div>
                                         
-                                        {!collapsedDashboardRooms[room] && (
+                                        {!dashCollapsed(room) && (
                                             <div className="overflow-x-auto">
                                                 <table className="w-full text-left">
                                                     <thead className="bg-slate-50 text-[10px] uppercase font-black text-slate-500 border-b border-slate-200">
@@ -4976,7 +5637,7 @@ export default function App(props) {
                                                             const di = doneInfo(task);
                                                             return (
                                                                 <tr key={task.id} className="hover:bg-slate-50">
-                                                                    <td className="p-3 font-bold text-slate-800">{task.name}{di && (
+                                                                    <td className="p-3 font-bold text-slate-800">{task.name}{odChip(task)}{di && (
                                                                         <span data-done-chip={task.id} className={`block text-[10px] font-bold ${di.planned ? 'text-amber-700' : 'text-emerald-700'}`}>✓ Cleaned {formatDayClock(di.doneMs)}{di.dueMs ? (di.planned ? ' · next clean planned (due ' + formatDayClock(di.dueMs) + ')' : ' · due again ' + formatDayClock(di.dueMs)) : ''}</span>
                                                                     )}</td>
                                                                     <td className="p-3">
@@ -5066,14 +5727,19 @@ export default function App(props) {
                                             })}
                                         </select>
                                         <span className="text-sm font-bold text-slate-600">{peopleN} people{leadsN ? ' · ' + leadsN + ' lead' + (leadsN === 1 ? '' : 's') : ''}</span>
-                                        <Button variant="primary" size="sm" onClick={function() { window.print(); }} className="ml-auto"><Printer className="w-3.5 h-3.5 mr-1" /> Print</Button>
+                                        <Button variant="primary" size="sm" onClick={function() { if (LAZY_ENGINE) { setLiveTime(new Date()); setPrinting(true); } else window.print(); }} className="ml-auto"><Printer className="w-3.5 h-3.5 mr-1" /> Print</Button>
                                     </div>
                                 ) : (
                                     <span className="text-sm font-bold text-slate-400">{IS_CURRENT ? 'No shifts fall inside the window.' : 'No shifts fall inside the plan window. Check the Setup tab.'}</span>
                                 )}
                             </div>
 
-                            {win && (
+                            {LAZY_ENGINE && !printing && (
+                                <div className="print-only" data-print-hint>
+                                    <div className="text-sm font-bold text-slate-600">The crew schedules print from the Print button at the top of the Crew tab (they are only built when it is pressed).</div>
+                                </div>
+                            )}
+                            {win && (printing || !LAZY_ENGINE) && (
                                 <div className="print-only">
                                     <div className="mb-3">
                                         <div className="text-lg font-black text-[#00468B]">{win.crew} crew · {formatClockTime(ganttStartDate, ganttStartHour, win.shiftStart)} · {win.dayLabel} {formatHourLabel(win.startHour)}</div>
@@ -5149,7 +5815,7 @@ export default function App(props) {
                                 <div className="bg-slate-50 border-b border-gray-200 px-6 py-4 flex flex-wrap items-center justify-between gap-3">
                                     <h2 className="font-black text-slate-800 uppercase tracking-widest text-sm flex items-center"><ClipboardList className="w-5 h-5 mr-2 text-[#0072CE]" /> Shift Start Link</h2>
                                     <div className="flex flex-wrap items-center gap-2">
-                                        <span className="text-[10px] font-bold normal-case tracking-normal text-slate-500 bg-white border border-slate-200 rounded px-2 py-0.5" title={'Team assignments saved for the shifts in this plan (newest ' + TASK_ROW_TOP + ', at most ' + TASK_ROW_DAYS + ' days back) and boards saved in the last ' + BOARD_DAYS + ' days. Checked again every 5 minutes.' + (taskBoards.stats.equipment ? ' ' + taskBoards.stats.equipment + ' equipment progress rows skipped.' : '') + (taskBoards.stats.unknownPerson ? ' ' + taskBoards.stats.unknownPerson + ' rows name someone not in the employee table.' : '')}>{taskRowsFailed ? "Couldn't read Shift Start's saved assignments" : (taskRows.length - taskBoards.stats.equipment) + ' saved assignment' + (taskRows.length - taskBoards.stats.equipment === 1 ? '' : 's') + (taskRows.length >= TASK_ROW_TOP ? ' (newest ' + TASK_ROW_TOP + ' only)' : '')}{boardRows.length ? ' · ' + boardRows.length + ' board' + (boardRows.length === 1 ? '' : 's') : ''} · {lineRows.length} rooms{shiftStartCheckedAt ? ' · checked ' + shiftStartCheckedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : ''}</span>
+                                        <span className="text-[10px] font-bold normal-case tracking-normal text-slate-500 bg-white border border-slate-200 rounded px-2 py-0.5" title={'Team assignments saved for the shifts in this plan (newest ' + TASK_ROW_TOP + ', at most ' + TASK_ROW_DAYS + ' days back) and boards saved in the last ' + BOARD_DAYS + ' days. Checked again ' + (IS_CURRENT ? 'every 5 minutes' : 'when a tab is clicked, if the last check is over 5 minutes old') + '.' + (taskBoards.stats.equipment ? ' ' + taskBoards.stats.equipment + ' equipment progress rows skipped.' : '') + (taskBoards.stats.unknownPerson ? ' ' + taskBoards.stats.unknownPerson + ' rows name someone not in the employee table.' : '')}>{taskRowsFailed ? "Couldn't read Shift Start's saved assignments" : (taskRows.length - taskBoards.stats.equipment) + ' saved assignment' + (taskRows.length - taskBoards.stats.equipment === 1 ? '' : 's') + (taskRows.length >= TASK_ROW_TOP ? ' (newest ' + TASK_ROW_TOP + ' only)' : '')}{boardRows.length ? ' · ' + boardRows.length + ' board' + (boardRows.length === 1 ? '' : 's') : ''} · {lineRows.length} rooms{shiftStartCheckedAt ? ' · checked ' + shiftStartCheckedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : ''}</span>
                                         <Button variant="outline" size="sm" disabled={shiftStartLoading} onClick={function() { reloadShiftStart(); }}><RefreshCw className="w-3.5 h-3.5 mr-1" /> {shiftStartLoading ? 'Reloading…' : 'Reload from Shift Start'}</Button>
                                     </div>
                                 </div>
@@ -5740,6 +6406,20 @@ export default function App(props) {
                             {countConflict > 0 && <span>{countConflict} double-booked block{countConflict === 1 ? '' : 's'}</span>}
                         </div>
                     )}
+                    {!IS_CURRENT && odWanted && (odState.status === 'idle' || odState.status === 'loading') && (
+                        <div data-od-banner="loading" className="bg-[#E6F1FB] border-b border-[#B3D4F2] px-5 py-1.5 text-[11px] font-bold text-[#00468B] flex items-center gap-2 flex-shrink-0">
+                            <Loader2 className="w-3.5 h-3.5 animate-spin flex-shrink-0" />
+                            <span>Reading the cleaning log to find what is overdue{odState.total > 0 ? ` (${odState.done} of ${odState.total} requests)` : ''}. The plan fills in when it has been read.</span>
+                        </div>
+                    )}
+                    {!IS_CURRENT && ((odWanted && (odState.status === 'error' || odState.status === 'partial')) || (handoffSource === 'schedule' && prodState.status === 'failed')) && (
+                        <div data-plan-warning className="bg-[#FFF6E0] border-b border-[#FFB81C]/60 px-5 py-1.5 text-[11px] font-bold text-[#8A5A00] flex flex-wrap items-center gap-x-4 gap-y-1 flex-shrink-0">
+                            <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
+                            {odWanted && odState.status === 'error' && <span>{Object.keys(odMap).length > 0 ? 'Couldn\'t read the cleaning log again, so what was read earlier is kept and anything not read yet is planned.' : 'Couldn\'t read the cleaning log, so every piece of equipment is planned.'}</span>}
+                            {odWanted && odState.status === 'partial' && <span>{odState.failed} piece{odState.failed === 1 ? '' : 's'} of equipment couldn't be read from the cleaning log and {odState.failed === 1 ? 'is' : 'are'} planned anyway.</span>}
+                            {handoffSource === 'schedule' && prodState.status === 'failed' && <span>{prodRows.length > 0 ? 'Couldn\'t read the production schedule again, so the runs read earlier are still used.' : 'Couldn\'t read the production schedule, so rooms start at the plan start unless a Handover is typed in.'}</span>}
+                        </div>
+                    )}
                     {activeTab === 'gantt' && visibleIdle.mins > 0 && (
                         <div className="bg-[#FFF6E0] border-b border-[#FFB81C]/60 px-5 py-1.5 text-[11px] font-bold text-[#8A5A00] flex items-center gap-2 flex-shrink-0" data-blank-total={Math.round(visibleIdle.mins)}>
                             <Clock className="w-3.5 h-3.5 flex-shrink-0" />
@@ -5997,14 +6677,11 @@ export default function App(props) {
                                                                     if (e.currentTarget && typeof e.currentTarget.releasePointerCapture === 'function') e.currentTarget.releasePointerCapture(e.pointerId);
                                                                     if (!draggedRef.current) setSelectedTaskEditor(task.id);
                                                                 }}
-                                                                onPointerEnter={function() { setHoveredTaskId(task.id); }}
-                                                                onPointerLeave={function() { setHoveredTaskId(null); }}
                                                                 title={`${task.name} · ${task.originalArea}\n${timeRange(task)}`}
                                                                 className={`absolute block-draggable flex flex-col justify-center z-20 cursor-grab rounded-md
                                                                     ${task.isComplete ? 'opacity-60 grayscale' : ''}
                                                                     ${ringCls}
                                                                     ${isDraggingMe ? 'z-50 shadow-2xl scale-[1.02] ring-2 ring-white ring-offset-2 ring-offset-[#0072CE] opacity-90 cursor-grabbing' : 'gantt-block-anim hover:z-30 hover:brightness-110 hover:shadow-md'}
-                                                                    ${hoveredTaskId === task.id && !isDraggingMe ? 'z-30 brightness-110 shadow-lg' : ''}
                                                                 `}
                                                                 style={{ left: `${leftPx}px`, width: `${Math.max(widthPx, 8)}px`, top: `${topPx + 2}px`, height: `${LANE_HEIGHT_PX - 4}px` }}
                                                             >
