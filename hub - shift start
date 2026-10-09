@@ -478,6 +478,102 @@ async function writePreset(props: any, board: PresetBoard): Promise<{ where: 'da
 }
 
 // ============================================================================
+// PRODUCTION SCHEDULE (craa5__aa_prd_schd): which rooms this shift takes
+// The runs the production schedule keeps (area text, line number, start, end). A line with no run for a stretch of an hour or more inside the shift
+// is down, and the rooms on it are the ones the crew works. Rooms are matched to lines by name ("IBL5" = area IBL line 5, a room named like the area,
+// "WJ" = waterjet), the same way Ganttly's PBED does. It is read once per shift window (a week either side only to learn which lines exist), filtered
+// and capped, never the whole table. A maintenance run occupies its line. The Everyday rooms stay on the board exactly as they always did.
+// ============================================================================
+const PROD_TABLE = "craa5__aa_prd_schd";
+const PROD_FIELDS = ['craa5__aa_prd_schdid', 'craa5_area', 'craa5_line', 'craa5_datestarttime', 'craa5_dateendtime', 'craa5_product'];
+const PROD_TOP = 5000;
+const PROD_SIDE_MS = 7 * 86400000;     // runs this far either side of the shift are read, to learn which lines exist
+const DOWN_MIN_MS = 3600000;           // no run for this long inside the shift = the line is down
+const PROD_CACHE_MS = 10 * 60000;
+const PROD_ALIASES: Record<string, string[]> = { wj: ['waterjet', 'water jet'] };
+type ProdLine = { key: string; area: string; line: number; runs: { s: number; e: number }[] };
+type DownRoom = { areaId: string; name: string; lines: string[]; from: number; to: number };
+type PrdState = { status: 'idle' | 'reading' | 'ok' | 'empty' | 'missing' | 'error'; error: string; source: string; query: string; read: number; from: number; to: number; keyOf: string; lineCount: number; planLines: number; down: DownRoom[]; matched: string[]; unmatched: string[]; hasColumns: string[] };
+const PRD_IDLE: PrdState = { status: 'idle', error: "", source: "", query: "", read: 0, from: 0, to: 0, keyOf: "", lineCount: 0, planLines: 0, down: [], matched: [], unmatched: [], hasColumns: [] };
+const compactKey = (v: any) => String(v === undefined || v === null ? '' : v).toLowerCase().replace(/[^a-z0-9]+/g, '');   // "IBL 5", "ibl-5" and "IBL5" are one name
+const prodMs = (v: any) => { if (v === null || v === undefined || v === "") return NaN; const t = typeof v === 'number' ? v : new Date(v).getTime(); return isNaN(t) ? NaN : t; };
+let PRD_CACHE: Record<string, { at: number; rows: any[]; source: string; query: string }> = {};
+
+function buildProdLines(rows: any[]): Record<string, ProdLine> {
+    const m: Record<string, ProdLine> = {};
+    (rows || []).forEach(r => {
+        const area = String(getField(r, 'craa5_area') ?? "").trim(), line = parseInt(getField(r, 'craa5_line'), 10) || 1;
+        const s = prodMs(getField(r, 'craa5_datestarttime')), e = prodMs(getField(r, 'craa5_dateendtime'));
+        if (!area || isNaN(s) || isNaN(e) || e <= s) return;
+        const k = compactKey(area) + '|' + line, L = m[k] = m[k] || { key: k, area, line, runs: [] };
+        L.runs.push({ s, e });
+    });
+    Object.keys(m).forEach(k => m[k].runs.sort((a, b) => a.s - b.s));
+    return m;
+}
+// The lines a room sits on: the first rule that finds any wins.
+function linesForArea(name: string, lines: ProdLine[]): ProdLine[] {
+    const c = compactKey(name); if (!c) return [];
+    const rules: ((L: ProdLine) => boolean)[] = [
+        L => compactKey(L.area) + L.line === c,                                                                                  // IBL5 = area IBL, line 5
+        L => compactKey(L.area) === c,                                                                                           // Breading = every Breading line
+        L => (Object.prototype.hasOwnProperty.call(PROD_ALIASES, compactKey(L.area)) ? PROD_ALIASES[compactKey(L.area)] : []).some(al => compactKey(al) === c || compactKey(al) + L.line === c),      // WJ = waterjet
+    ];
+    for (let i = 0; i < rules.length; i++) { const f = lines.filter(rules[i]); if (f.length) return f; }
+    return [];
+}
+// The longest stretch inside [w0, w1) with no run on the line, when it lasts an hour or more.
+function downStretch(L: ProdLine, w0: number, w1: number): { from: number; to: number } | null {
+    let cursor = w0, bestFrom = 0, bestTo = 0;
+    for (let i = 0; i < L.runs.length; i++) {
+        const r = L.runs[i]; if (r.e <= w0 || r.s >= w1) continue;
+        if (r.s > cursor && r.s - cursor > bestTo - bestFrom) { bestFrom = cursor; bestTo = r.s; }
+        cursor = Math.max(cursor, Math.min(r.e, w1));
+    }
+    if (w1 - cursor > bestTo - bestFrom) { bestFrom = cursor; bestTo = w1; }
+    return bestTo - bestFrom >= DOWN_MIN_MS ? { from: bestFrom, to: bestTo } : null;
+}
+// The rooms (MSS areas) with a line down inside [w0, w1). When no line has any run in the window the plan hasn't been entered for it, so nothing is claimed.
+function downRooms(areas: any[], rows: any[], w0: number, w1: number): { down: DownRoom[]; matched: string[]; unmatched: string[]; lineCount: number; planLines: number } {
+    const lines = buildProdLines(rows), list = Object.keys(lines).map(k => lines[k]);
+    const planLines = list.filter(L => L.runs.some(r => r.e > w0 && r.s < w1)).length, down: DownRoom[] = [], unmatched: string[] = [], matched: string[] = [];
+    areas.forEach(a => {
+        const name = renderSafe(getField(a, 'craa5_area')), id = String(getField(a, 'craa5_aa_mss_areaid') || "");
+        if (!id || isStatusArea(name)) return;
+        const ls = linesForArea(name, list);
+        if (!ls.length) { if (isProductionArea(a)) unmatched.push(name); return; }
+        matched.push(normText(name));
+        if (!planLines) return;
+        const ds = ls.map(L => ({ L, d: downStretch(L, w0, w1) })).filter(x => !!x.d);
+        if (!ds.length) return;
+        down.push({ areaId: id, name, lines: ds.map(x => `${x.L.area} line ${x.L.line}`), from: ds.reduce((m, x) => Math.min(m, x.d!.from), Infinity), to: ds.reduce((m, x) => Math.max(m, x.d!.to), 0) });
+    });
+    return { down, matched, unmatched, lineCount: list.length, planLines };
+}
+// The end of the shift that starts at startMs (a slot in the work schedule), or 0.
+function slotEndFor(slots: Slot[], startMs: number): number {
+    const d = new Date(startMs), s = slots.find(x => x.day === d.getDay() && x.startHour === d.getHours() && d.getMinutes() === 0);
+    return s ? slotEndMs(d, s.lengthHours) : 0;
+}
+// The runs overlapping [fromMs, toMs): not cancelled, oldest first. Each way of reading only falls through when it fails.
+async function readProductionRuns(props: any, fromMs: number, toMs: number): Promise<{ rows: any[] | null; source: string; query: string; error: string; missing: boolean }> {
+    const webApi = getWebApi(props), dataApi = props?.dataApi, problems: string[] = [];
+    const filter = `statecode eq 0 and craa5_datestarttime lt ${odataDate(toMs)} and craa5_dateendtime gt ${odataDate(fromMs)}`;
+    let lastQuery = "";
+    for (let attempt = 0; attempt < 2; attempt++) {   // the second try asks for every column, in case one of the named ones isn't there
+        const sel = attempt === 0, query = lastQuery = `${PROD_TABLE}: ${filter}, oldest first, up to ${PROD_TOP}${sel ? `, columns ${PROD_FIELDS.join(', ')}` : ', every column'}`;
+        if (webApi?.retrieveMultipleRecords) {
+            try { const res: any = await asyncRace(webApi.retrieveMultipleRecords(PROD_TABLE, `?${sel ? `$select=${PROD_FIELDS.join(',')}&` : ''}$filter=${filter}&$orderby=craa5_datestarttime asc&$top=${PROD_TOP}`), TASK_TIMEOUT_MS, "production schedule"); if (Array.isArray(res?.entities)) return { rows: res.entities, source: 'Xrm.WebApi', query, error: "", missing: false }; } catch (e: any) { problems.push(String(e?.message || e || "failed")); }
+        }
+        if (dataApi?.queryTable) {
+            try { return { rows: await queryDataApi(dataApi, PROD_TABLE, filter, { ...(sel ? { select: PROD_FIELDS } : {}), orderBy: 'craa5_datestarttime asc', top: PROD_TOP }), source: 'data API', query, error: "", missing: false }; } catch (e: any) { problems.push(String(e?.message || e || "failed")); }
+        }
+    }
+    const msg = problems.join("; ") || "no Dataverse connection";
+    return { rows: null, source: "", query: lastQuery, error: msg, missing: problems.length > 0 && problems.every(m => looksMissing(m) && !/propert|attribute|column/i.test(m)) };   // a missing column is not a missing table
+}
+
+// ============================================================================
 // SCREENS
 // ============================================================================
 const BucketColumn = ({ lead, isSupervisor, isCollapsed, onToggle, onRemoveLead, children, onDrop, onSetStatus }: any) => {
@@ -529,7 +625,7 @@ const AuthBox = ({ users, onLogin }: any) => (
 
 // What the app read and how it used it, so a wrong crew can be traced without a console: who is signed in, the shift on the clock,
 // each team's lead and crew size, and which columns were found.
-function DataCheckPanel({ onClose, msUser, currentUser, slotCount, currentShift, shiftStartMs, upNextShift, teams, teamsRead, employees, supervisors, taskStatus, areaCount, boardCrew, ownerName, presets, presetStore, presetLog }: any) {
+function DataCheckPanel({ onClose, msUser, currentUser, slotCount, currentShift, shiftStartMs, upNextShift, teams, teamsRead, employees, supervisors, taskStatus, areaCount, boardCrew, ownerName, presets, presetStore, presetLog, prd, prdWindow }: any) {
     const nameOf = (id: string) => { const e = employees.find((x: any) => empIdOf(x) === id); return e ? formatFullName(getField(e, 'craa5_name')) : ""; };
     const withLookup = employees.filter((e: any) => !!teamIdOfEmp(e)).length;
     const sample = employees[0] || {}, hasKey = (k: string) => Object.keys(sample).some(x => x.toLowerCase() === k.toLowerCase());
@@ -568,6 +664,16 @@ function DataCheckPanel({ onClose, msUser, currentUser, slotCount, currentShift,
                     {col('craa5__aa_employee._craa5_leadershipteamid_value', hasKey('_craa5_leadershipteamid_value') || hasKey('craa5_leadershipteamid'), 'lookup to the team: which crew the employee is on')}
                     {col('craa5__aa_employee.craa5_shift', hasKey('craa5_shift'), 'choice: the crew letter used when the team lookup is empty')}
                     {col('craa5_workshift (craa5_shiftcode, craa5_dayname, craa5_shiftstarthour, craa5_shiftendhour)', slotCount > 0, 'which crew is on the clock')}
+                    <div className="mt-4 mb-1"><Text size={300} weight="bold" style={{ color: BRAND.blueDark }}>Production schedule (table {PROD_TABLE})</Text></div>
+                    <Text size={200} block style={{ color: prd && (prd.status === 'missing' || prd.status === 'error') ? BRAND.red : undefined }}>
+                        {!prdWindow ? 'No shift window to read for (no shift covers this board).' : !prd || prd.status === 'idle' ? 'Not read yet (it is read when a board opens).' : prd.status === 'reading' ? 'Reading...'
+                            : prd.status === 'missing' ? `The table was not found, so no rooms are picked from it. ${String(prd.error).slice(0, 160)}` : prd.status === 'error' ? `Could not be read: ${String(prd.error).slice(0, 200)}`
+                            : `Read through ${prd.source}: ${prd.read} run${prd.read === 1 ? '' : 's'} (a week either side of ${slotLabel(prdWindow.from)} to ${clockTime(prdWindow.to)}), ${prd.lineCount} line${prd.lineCount === 1 ? '' : 's'} known, ${prd.planLines} with a run in this shift.${prd.status === 'empty' ? ' No line has a run in this shift, so the plan is not entered yet and no room is picked from it.' : ''}`}
+                    </Text>
+                    {prd && prd.status === 'ok' && <Text size={200} block className="mt-1">{prd.down.length ? `Rooms with a line down for an hour or more: ${prd.down.map((d: any) => `${d.name} (${d.lines.join(', ')}; ${clockTime(d.from)} to ${clockTime(d.to)})`).join(' · ')}` : prd.matched.length ? 'Every line that matches a room is running through the shift.' : 'No room name matches a line in the schedule.'}</Text>}
+                    {prd && (prd.status === 'ok' || prd.status === 'empty') && prd.unmatched.length > 0 && <Text size={200} block className="mt-1" style={{ color: '#8A5A00' }}>Production rooms with no line of that name in the schedule (rename the room or the schedule line to match, for example IBL5 = area IBL line 5): {prd.unmatched.join(', ')}</Text>}
+                    {prd && prd.query && <Text size={200} color="neutralSecondary" block className="mt-1" style={{ wordBreak: 'break-all' }}>Query sent: {prd.query}</Text>}
+                    {PROD_FIELDS.slice(1).map(c => col(`${PROD_TABLE}.${c}`, prd && prd.read > 0 ? prd.hasColumns.some((k: string) => k.toLowerCase() === c) : null, c === 'craa5_area' ? 'text: the production area, e.g. IBL, Breading' : c === 'craa5_line' ? 'whole number: the line number inside that area' : c === 'craa5_product' ? 'text: the product (a Maintenance run keeps the line busy)' : 'date and time: when the run starts / ends'))}
                     <div className="mt-4 mb-1"><Text size={300} weight="bold" style={{ color: BRAND.blueDark }}>Next-shift setups (table {PRESET_TABLE})</Text></div>
                     <Text size={200} block style={{ color: presetStore.remote === 'ok' ? undefined : presetStore.remote === 'unknown' ? undefined : BRAND.red }}>
                         {presetStore.remote === 'ok' ? `The table was read: ${presets.filter((b: any) => b.where === 'dataverse').length} setup${presets.filter((b: any) => b.where === 'dataverse').length === 1 ? '' : 's'} in it.` : presetStore.remote === 'missing' ? `The table ${PRESET_TABLE} was not found, so setups are kept on this computer (${presetStore.localCount} here). Create it with the columns below and save again to share setups through Dataverse.` : presetStore.remote === 'error' ? `The table could not be read (${String(presetStore.error).slice(0, 160)}); setups are kept on this computer (${presetStore.localCount} here).` : 'Not read yet.'}
@@ -629,7 +735,7 @@ function LeadSelectionScreen({ leads, selectedLeadIds, onSelectChange, onSearchC
     );
 }
 
-function AreaSelectionScreen({ areas, selectedAreaIds, onSelectChange, onAddCustomArea }: any) {
+function AreaSelectionScreen({ areas, selectedAreaIds, onSelectChange, onAddCustomArea, prd, prdReasons, prdWindowLabel }: any) {
     const [searchText, setSearchText] = useState("");
     const [customText, setCustomText] = useState("");
     const filtered = areas.filter((a: any) => renderSafe(getField(a, 'craa5_area')).toLowerCase().includes(searchText.toLowerCase()));
@@ -652,9 +758,18 @@ function AreaSelectionScreen({ areas, selectedAreaIds, onSelectChange, onAddCust
         return (
             <div key={aId} draggable={true} onDragStart={e => { GLOBAL_DRAG_PAYLOAD = aId; if (e.dataTransfer) e.dataTransfer.setData("areaId", aId); }} className="p-3 bg-white border border-slate-200 rounded-lg mb-2 cursor-grab text-sm font-semibold text-slate-700 shadow-sm hover:border-[#0072CE]">
                 {renderSafe(getField(a, 'craa5_area'))} {getAreaEmoji(a)}
+                {prdReasons && prdReasons[aId] && <div className="text-[10px] font-bold mt-0.5" style={{ color: BRAND.blue }} title="From the production schedule (craa5__aa_prd_schd)">🔻 {prdReasons[aId]}</div>}
             </div>
         );
     };
+
+    const prdMissing = prd && prd.status === 'ok' ? prd.down.filter((d: any) => !selectedAreaIds.has(d.areaId)) : [];
+    const prdLine = !prd ? null : prd.status === 'reading' ? 'Reading the production schedule...'
+        : prd.status === 'ok' ? (prd.down.length ? `Production schedule${prdWindowLabel}: ${prd.down.length} room${prd.down.length === 1 ? ' has' : 's have'} a line down (${prd.down.map((d: any) => d.name).join(', ')}).`
+            : prd.matched.length ? `Production schedule${prdWindowLabel}: every room that matches a line has it running through the shift.` : `Production schedule${prdWindowLabel}: no room name matches a line in the schedule, so nothing is picked from it (Data check lists the names).`)
+        : prd.status === 'empty' ? `Production schedule${prdWindowLabel}: no runs are entered for this shift yet, so nothing is picked from it.`
+        : prd.status === 'missing' ? `The production schedule table (${PROD_TABLE}) was not found, so nothing is picked from it.`
+        : prd.status === 'error' ? `The production schedule could not be read (${String(prd.error).slice(0, 140)}), so nothing is picked from it.` : null;
 
     const column = (title: string, list: any[], assign: boolean, cls: string, titleColor: string, empty: string) => (
         <div onDragOver={(e) => e.preventDefault()} onDrop={(e) => handleDrop(e, assign)} className={`flex-1 rounded-xl border-2 border-dashed p-4 flex flex-col box-border ${cls}`}>
@@ -669,6 +784,10 @@ function AreaSelectionScreen({ areas, selectedAreaIds, onSelectChange, onAddCust
     return (
         <div className="p-5 h-full flex flex-col box-border">
             <ScreenTitle>Select Active Areas</ScreenTitle>
+            {prdLine && <div className="mt-2 px-3 py-2 rounded-lg border text-xs font-semibold flex items-center justify-between gap-3 flex-wrap" style={{ background: prd.status === 'ok' ? BRAND.blueSoft : BRAND.yellowSoft, borderColor: prd.status === 'ok' ? BRAND.blue : BRAND.yellow, color: prd.status === 'ok' ? BRAND.blueDark : '#8A5A00' }}>
+                <span>{prdLine}</span>
+                {prdMissing.length > 0 && <Button size="small" appearance="primary" onClick={() => { const next = new Set(selectedAreaIds); prdMissing.forEach((d: any) => next.add(d.areaId)); onSelectChange(next); }}>Add {prdMissing.length} from the production schedule</Button>}
+            </div>}
             <div className="flex justify-between my-4 flex-wrap gap-3">
                 <div className="flex gap-2 flex-wrap">
                     <Input placeholder="Filter areas..." value={searchText} onChange={(e: any, d: any) => setSearchText(getInputValue(e, d))} />
@@ -700,6 +819,9 @@ export function MainComponent(props: any) {
     const [msUser, setMsUser] = useState<any>(null);
     const [presetsApplied, setPresetsApplied] = useState(false);
     const [hasAutoAssignedEveryday, setHasAutoAssignedEveryday] = useState(false);
+    const [prd, setPrd] = useState<PrdState>(PRD_IDLE);                  // what the production schedule says about this shift's window
+    const [prdApplied, setPrdApplied] = useState(false);                 // the prd rooms were added (or decided against) for this board
+    const prdSeq = useRef(0), prdInFlight = useRef("");
     const [collapsedBuckets, setCollapsedBuckets] = useState<Set<string>>(new Set());
     const [currentStep, setCurrentStep] = useState(0);
     const [currentShift, setCurrentShift] = useState("");          // from craa5_workshift
@@ -798,7 +920,7 @@ export function MainComponent(props: any) {
 
     // Empties the board (and the rows it was built from) so the next supervisor's saved rows can be rebuilt into it.
     const resetBoard = useCallback(() => {
-        setPresetsApplied(false); setHasAutoAssignedEveryday(false); setPresetRecords([]); setBoardNote(null); setPresetsReady(false); setSaveSuccess(false); setSaveWarning(""); setSubmissionError(null);
+        setPresetsApplied(false); setHasAutoAssignedEveryday(false); setPrdApplied(false); setPrd(PRD_IDLE); prdInFlight.current = ""; prdSeq.current++; setPresetRecords([]); setBoardNote(null); setPresetsReady(false); setSaveSuccess(false); setSaveWarning(""); setSubmissionError(null);
         setSelectedLeadIds(new Set()); setSelectedAreaIds(new Set()); setAreaAssignments({}); setAssignments({}); setAreaDetails({}); setEmployeeStartTimes({}); setCustomLeads([]); setCustomAreas([]); setCustomEmployees([]); setCurrentStep(0);
     }, []);
 
@@ -1146,6 +1268,64 @@ export function MainComponent(props: any) {
         }
     }, [areas, selectedSupervisorId, hasAutoAssignedEveryday]);
 
+    // The window the production schedule is read for: the shift on the board (today's, the one about to start, or the setup's).
+    const prdWindow = useMemo(() => {
+        if (boardMode === 'next') return nextSlot ? { from: nextSlot.startMs, to: nextSlot.endMs } : null;
+        const start = boardCrew && boardCrew === clockCrew ? shiftStartMs : boardCrew && boardCrew === upNextCrew ? upNextStartMs : 0, end = start ? slotEndFor(GLOBAL_DATA_CACHE?.slots || [], start) : 0;
+        return start && end ? { from: start, to: end } : null;
+    }, [boardMode, nextSlot, boardCrew, clockCrew, upNextCrew, shiftStartMs, upNextStartMs]);
+    const prdKey = prdWindow ? `${prdWindow.from}-${prdWindow.to}` : "";
+    const roomAreas = useMemo(() => [...areas, ...customAreas].filter((a: any) => !String(getField(a, 'craa5_aa_mss_areaid') || "").match(/^(c_|status_|pa_)/)), [areas, customAreas]);
+
+    // Read the schedule once for this window (a good read is kept for ten minutes), then work out which rooms have a line down. The read waits a moment so the
+    // shift changing over (several state changes in a row) settles first.
+    useEffect(() => {
+        if (!prdKey || !prdWindow || !selectedSupervisorId || areas.length === 0 || isLoading) return;
+        if (prd.keyOf === prdKey && prd.status !== 'idle' && prd.status !== 'reading') return;   // this window was already read for this board
+        if (prdInFlight.current === prdKey) return;
+        const key = prdKey, w = prdWindow;
+        const timer = setTimeout(() => {
+            if (prdInFlight.current === key) return;
+            const seq = ++prdSeq.current; prdInFlight.current = key;
+            setPrd({ ...PRD_IDLE, status: 'reading', keyOf: key, from: w.from, to: w.to });
+            (async () => {
+                try {
+                    const hit = PRD_CACHE[key];
+                    let got: { rows: any[] | null; source: string; query: string; error: string; missing: boolean };
+                    if (hit && Date.now() - hit.at < PROD_CACHE_MS) got = { rows: hit.rows, source: hit.source + ' (kept from a minute ago)', query: hit.query, error: "", missing: false };
+                    else got = await readProductionRuns(propsRef.current, w.from - PROD_SIDE_MS, w.to + PROD_SIDE_MS);
+                    if (seq !== prdSeq.current) return;
+                    if (prdInFlight.current === key) prdInFlight.current = "";
+                    if (!got.rows) { setPrd({ ...PRD_IDLE, status: got.missing ? 'missing' : 'error', error: got.error, query: got.query, keyOf: key, from: w.from, to: w.to }); return; }
+                    if (got.rows.length >= PROD_TOP) { setPrd({ ...PRD_IDLE, status: 'error', error: `${got.rows.length} runs came back, the most that is read at once, so some of this shift's runs may be missing and nothing is picked from the schedule`, source: got.source, query: got.query, read: got.rows.length, keyOf: key, from: w.from, to: w.to }); return; }
+                    const r = downRooms(roomAreas, got.rows, w.from, w.to);
+                    if (r.planLines > 0 && !hit) PRD_CACHE[key] = { at: Date.now(), rows: got.rows, source: got.source, query: got.query };   // only a schedule that covers the shift is kept
+                    setPrd({ status: r.planLines > 0 ? 'ok' : 'empty', error: "", source: got.source, query: got.query, read: got.rows.length, from: w.from, to: w.to, keyOf: key, lineCount: r.lineCount, planLines: r.planLines, down: r.down, matched: r.matched, unmatched: r.unmatched, hasColumns: got.rows.length ? Object.keys(got.rows[0]) : [] });
+                } catch (e: any) {
+                    if (seq !== prdSeq.current) return;
+                    if (prdInFlight.current === key) prdInFlight.current = "";
+                    logError('Production schedule failed', e?.message || e);
+                    setPrd({ ...PRD_IDLE, status: 'error', error: String(e?.message || e || "failed"), keyOf: key, from: w.from, to: w.to });
+                }
+            })();
+        }, 350);
+        return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [prdKey, selectedSupervisorId, areas, isLoading, roomAreas, prd.keyOf, prd.status]);
+
+    // A board that starts empty gets the rooms with a line down added to the Everyday rooms. A restored or set-up board, one that was already touched, and one
+    // whose saved rows could not be read are left exactly as they are (the Areas step still offers the rooms).
+    const prdFresh = presetsReady && !isLoading && ((presetsApplied && boardNote?.tone === 'none') || (!presetsApplied && boardMode === 'live' && presetRecords.length === 0 && !liveSetupFor() && taskStatus?.ok !== false));
+    useEffect(() => {
+        if (prdApplied || prd.status !== 'ok' || prd.keyOf !== prdKey || !prdFresh || !selectedSupervisorId || !hasAutoAssignedEveryday) return;
+        const touched = Object.keys(areaAssignments).length > 0 || Object.keys(assignments).length > 0 || selectedLeadIds.size > 0 || Array.from(selectedAreaIds).some(id => !isEverydayArea(areaMap.get(id)));
+        setPrdApplied(true);
+        if (touched || prd.down.length === 0) return;
+        setSelectedAreaIds(prev => { const next = new Set(prev); prd.down.forEach(d => next.add(d.areaId)); return next; });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [prd, prdKey, prdFresh, prdApplied, selectedSupervisorId, hasAutoAssignedEveryday]);
+    const prdReasons = useMemo(() => { const m: Record<string, string> = {}; if (prd.status === 'ok' && prd.keyOf === prdKey) prd.down.forEach(d => { m[d.areaId] = `line down ${clockTime(d.from)} to ${clockTime(d.to)}`; }); return m; }, [prd, prdKey]);
+
     // ============================================================================
     // INTERACTION HANDLERS
     // ============================================================================
@@ -1418,7 +1598,7 @@ export function MainComponent(props: any) {
     );
     else if (!selectedSupervisorId) SC = <SupervisorSelectionScreen supervisors={supervisors} selectedSupervisorId={selectedSupervisorId} onSelect={switchBoard} note={currentShift ? `The work schedule has shift ${currentShift} on now${shiftStartMs ? ` (since ${clockTime(shiftStartMs)})` : ''}${supervisorOnClock ? '' : ', but no supervisor in the employee list is on that shift'}. Pick who is running it.` : 'No shift in the work schedule covers the current time. Pick the supervisor whose board you want.'} />;
     else if (currentStep === 0) SC = <LeadSelectionScreen leads={[...leads, ...customLeads]} selectedLeadIds={selectedLeadIds} onSelectChange={setSelectedLeadIds} onSearchCustom={handleSearchCustomLead} crewNote={boardMode === 'next' && nextSlot ? `Setting up shift ${viewCrew} for ${slotLabel(nextSlot.startMs)}: leads and employees on shift ${boardCrew || viewCrew}. Nothing here is live until that shift starts` : !currentShift ? (boardCrew ? `Leads and employees on shift ${boardCrew} (no shift in the work schedule covers now, so the supervisor's own shift is used)` : 'Everyone is listed (no shift in the work schedule covers now)') : boardCrew ? `Leads and employees on shift ${boardCrew}${boardCrew !== currentShift ? ` (work schedule shift ${currentShift})` : ' (from the work schedule)'}` : `Everyone is listed: no employee has the shift letter the work schedule has on now (${currentShift})`} />;
-    else if (currentStep === 1) SC = <AreaSelectionScreen areas={[...areas, ...customAreas]} selectedAreaIds={selectedAreaIds} onSelectChange={setSelectedAreaIds} onAddCustomArea={(n: string) => setCustomAreas(p => [...p, { craa5_aa_mss_areaid: `c_${Date.now()}`, craa5_area: n, craa5_production: true }])} />;
+    else if (currentStep === 1) SC = <AreaSelectionScreen areas={[...areas, ...customAreas]} selectedAreaIds={selectedAreaIds} onSelectChange={setSelectedAreaIds} onAddCustomArea={(n: string) => setCustomAreas(p => [...p, { craa5_aa_mss_areaid: `c_${Date.now()}`, craa5_area: n, craa5_production: true }])} prd={prd.keyOf === prdKey ? prd : PRD_IDLE} prdReasons={prdReasons} prdWindowLabel={prdWindow ? ` (${slotLabel(prdWindow.from)} to ${clockTime(prdWindow.to)})` : ''} />;
     else if (currentStep === 2 || currentStep === 3) SC = (
         <div className="flex flex-col h-full p-5 overflow-x-auto box-border">
             <div className="flex gap-6 flex-1 items-stretch min-h-0">
@@ -1465,7 +1645,7 @@ export function MainComponent(props: any) {
                                     const a = areaMap.get(aid);
                                     return (
                                         <div key={aid} draggable={true} onDragStart={ev => { GLOBAL_DRAG_PAYLOAD = aid; if (ev.dataTransfer) ev.dataTransfer.setData("areaId", aid); }} className={`p-2 bg-white rounded-lg border border-slate-200 border-l-4 relative shadow-sm cursor-grab flex flex-col ${isProductionArea(a) ? 'border-l-[#FFB81C]' : 'border-l-[#0072CE]'}`}>
-                                            <div className="flex justify-between mb-2"><Text weight="bold" size={200}>{renderSafe(getField(a, 'craa5_area'))}{getAreaEmoji(a)}</Text><Button appearance="subtle" size="small" className="min-w-0 px-1" onClick={() => setAreaAssignments(p => { const n = { ...p }; delete n[aid]; return n; })}>✖</Button></div>
+                                            <div className="flex justify-between mb-2"><div><Text weight="bold" size={200}>{renderSafe(getField(a, 'craa5_area'))}{getAreaEmoji(a)}</Text>{prdReasons[aid] && <div className="text-[10px] font-bold" style={{ color: BRAND.blue }} title="From the production schedule">🔻 {prdReasons[aid]}</div>}</div><Button appearance="subtle" size="small" className="min-w-0 px-1" onClick={() => setAreaAssignments(p => { const n = { ...p }; delete n[aid]; return n; })}>✖</Button></div>
                                             <div onDragOver={e => e.preventDefault()} onDrop={e => { const eid = e.dataTransfer.getData("empId"); if (!eid) return; e.stopPropagation(); setAssignments(p => { const x = { ...p }; Object.keys(x).forEach(k => x[k] = x[k].filter(i => i !== eid)); if (!x[aid]) x[aid] = []; if (!x[aid].includes(eid)) x[aid] = [...x[aid], eid]; return x; }); setEmployeeStartTimes(s => ({ ...s, [eid]: new Date().toISOString() })); }} className="min-h-[40px] bg-slate-50 border border-dashed border-slate-300 rounded p-1 w-full">
                                                 {(assignments[aid] || []).map(eid => (
                                                     <div key={eid} draggable={true} onDragStart={ev => { ev.dataTransfer.setData("empId", eid); ev.stopPropagation(); }} className="text-xs bg-white px-2 py-1 rounded mt-1 cursor-grab border border-slate-300 flex justify-between items-center shadow-sm">
@@ -1610,7 +1790,7 @@ export function MainComponent(props: any) {
                     </nav>
                 )}
 
-                {showData && <DataCheckPanel onClose={() => setShowData(false)} msUser={msUser} currentUser={currentUser} slotCount={(GLOBAL_DATA_CACHE?.slots || []).length} currentShift={currentShift} shiftStartMs={shiftStartMs} upNextShift={upNextShift} teams={GLOBAL_DATA_CACHE?.teams || []} teamsRead={GLOBAL_DATA_CACHE?.teamsRead || 0} employees={allEmployees} supervisors={supervisors} taskStatus={taskStatus} areaCount={areas.length} boardCrew={boardCrew} ownerName={ownerLabel} presets={presets} presetStore={presetStore} presetLog={presetLog} />}
+                {showData && <DataCheckPanel onClose={() => setShowData(false)} msUser={msUser} currentUser={currentUser} slotCount={(GLOBAL_DATA_CACHE?.slots || []).length} currentShift={currentShift} shiftStartMs={shiftStartMs} upNextShift={upNextShift} teams={GLOBAL_DATA_CACHE?.teams || []} teamsRead={GLOBAL_DATA_CACHE?.teamsRead || 0} employees={allEmployees} supervisors={supervisors} taskStatus={taskStatus} areaCount={areas.length} boardCrew={boardCrew} ownerName={ownerLabel} presets={presets} presetStore={presetStore} presetLog={presetLog} prd={prd.keyOf === prdKey ? prd : PRD_IDLE} prdWindow={prdWindow} />}
                 <main style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", position: 'relative' }}>{SC}</main>
             </div>
         </FluentProvider>
