@@ -46,7 +46,7 @@ LEARNINGS & CHAT CONTEXT LOG
     open / remove (their own requests). Saves send only the changed columns with the row's etag (If-Match), so someone else's newer change
     is never overwritten silently ("Save mine anyway" overrides). Unsaved edits are never dropped without asking; the Assets tab stays
     alive (hidden) when another tab is opened, so its edits are still there on the way back. Fields are locked while a save runs.
-- Entry 20 (Current): Box snap, a map you can turn and pop out, and the equipment table.
+- Entry 20: Box snap, a map you can turn and pop out, and the equipment table.
   * Assets has two sub-tabs, Map and Equipment table (the last one used is remembered). Both stay alive once opened, so nothing
     typed in one is lost by looking at the other; a save in one shows in the other (pins, list, card, table row).
   * Map: drag a box around something and smart snap fits it to the black lines inside it (enclosed areas plus the lines around
@@ -66,6 +66,21 @@ LEARNINGS & CHAT CONTEXT LOG
   * A cell typed back to its old value is no change; a copy of a row older than the one on screen (by etag version) is ignored.
     Moving the map by drag follows the pointer at any app zoom, and zooming keeps the point under the pointer still.
     On a short screen (a phone turned sideways) the table page scrolls, so the rows and Show more can be reached.
+- Entry 21 (Current): SOP and picture uploads fixed, and a Bulk upload sub-tab.
+  * Why uploads could not be done: Dataverse reports File columns (SSOP) as not valid for create or update, because their
+    bytes only go in through uploads. The app took that as "read-only" and hid every Upload button. File and Image columns
+    now always offer Upload; Dataverse checks the user's rights when the file is sent.
+  * Uploads try one PATCH with the whole file first; if that is refused (or the file is over 128 MB) the same file goes again
+    through Dataverse's block messages (InitializeFileBlocksUpload, 4 MB UploadBlock parts, CommitFileBlocksUpload). A failure
+    shows what both ways answered.
+  * Bulk upload (Assets, third sub-tab): drop or choose many pictures and documents. Each gets a column (pictures to the Image
+    column, documents to the SOP column, or chosen) and a piece of equipment: a suggestion from its file name (the equipment
+    named exactly so, else the only one holding all its words; "Use all suggestions"), or a search by name, room, area or id
+    (8 at most; the exact name first). Two files for the same equipment and column are stopped. "Upload ready" sends them one
+    at a time; each card says where it went and what was sent, and the table, the map card and the pins follow at once.
+  * The columns the tab can use are listed (found / missing). Without an Image column, pictures wait for a column choice,
+    because a File column holds one file and would take the SOP's place: add an Image column named "Picture".
+  * Pictures for an Image column are shrunk to a JPEG first; iPhone HEIC photos that the browser cannot open say how to get JPG.
 =======================================================================
 */
 
@@ -2948,14 +2963,18 @@ async function loadAssetMetadata(logEvent) {
     const kind = ASSET_KIND_BY_TYPENAME[typeName] || ASSET_KIND_BY_TYPE[a.AttributeType] || null;
     if (!kind) return;
     const required = a.RequiredLevel && (a.RequiredLevel.Value === 'ApplicationRequired' || a.RequiredLevel.Value === 'SystemRequired');
+    // Dataverse reports File columns as not valid for create or update, because their bytes never go in a row save: they
+    // take an upload of their own once the row exists. So File and Image columns always offer Upload, and Dataverse
+    // checks the user's rights when the upload is sent.
+    const upload = kind === 'file' || kind === 'image';
     const field = {
       name: a.LogicalName,
       label: metaLabel(a.DisplayName) || a.LogicalName,
       description: metaLabel(a.Description),
       kind,
       required: !!required && kind !== 'id' && kind !== 'status',
-      canCreate: a.IsValidForCreate !== false,
-      canUpdate: a.IsValidForUpdate !== false,
+      canCreate: upload ? false : a.IsValidForCreate !== false,
+      canUpdate: upload ? true : a.IsValidForUpdate !== false,
       isPrimaryName: !!a.IsPrimaryName || a.LogicalName === (entity.PrimaryNameAttribute || ASSET_NAME_COLUMN),
       isPrimaryId: !!a.IsPrimaryId || a.LogicalName === (entity.PrimaryIdAttribute || ASSET_ID_COLUMN),
       info: ASSET_INFO_COLUMNS.indexOf(a.LogicalName) !== -1
@@ -3141,17 +3160,142 @@ async function createAsset(set, payload, logEvent) {
 // File and Image columns take the bytes in their own request (up to 128 MB at once)
 // The x-ms-file-name header only takes plain ASCII
 const headerFileName = (name) => (String(name || 'file').replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_').trim() || 'file');
+const FILE_BLOCK_SIZE = 4 * 1024 * 1024; // the most one UploadBlock takes
 
-async function uploadAssetFile(set, id, column, body, rawName, logEvent) {
-  const fileName = headerFileName(rawName);
-  const path = `${set}(${id})/${column}`;
-  logEvent(`Uploading "${fileName}" to ${column} of asset ${id}`, 'data', { column, id, fileName, bytes: body.size || body.length || 0 }, { method: 'PATCH', path, contentType: 'application/octet-stream' });
-  const res = await fetch(apiUrl(path), {
-    method: 'PATCH',
-    headers: { ...ODATA_HEADERS, 'Content-Type': 'application/octet-stream', 'x-ms-file-name': fileName },
-    body
+// The part after "base64," of a piece of a file
+const blobToBase64 = (blob) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onload = () => { const s = String(reader.result || ''); resolve(s.slice(s.indexOf(',') + 1)); };
+  reader.onerror = () => reject(new Error('the file could not be read'));
+  reader.readAsDataURL(blob);
+});
+
+async function postDataverseMessage(name, payload) {
+  const res = await fetch(apiUrl(name), {
+    method: 'POST',
+    headers: { ...ODATA_HEADERS, 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify(payload)
   });
-  if (!res.ok) throw new Error(await readApiError(res));
+  if (!res.ok) {
+    const err = new Error(await readApiError(res));
+    err.status = res.status;
+    throw err;
+  }
+  if (res.status === 204) return {};
+  try { return await res.json(); } catch (e) { return {}; }
+}
+
+// Dataverse's other way in, which works for File and Image columns of any size: start, send 4 MB parts, commit
+async function uploadAssetFileInBlocks(id, column, blob, fileName, mimeType, onProgress) {
+  const started = await postDataverseMessage('InitializeFileBlocksUpload', {
+    Target: { [ASSET_ID_COLUMN]: id, '@odata.type': `Microsoft.Dynamics.CRM.${ASSET_LOGICAL_NAME}` },
+    FileAttributeName: column,
+    FileName: fileName
+  });
+  const token = started.FileContinuationToken;
+  if (!token) throw new Error('Dataverse did not start the upload');
+  const parts = Math.max(1, Math.ceil(blob.size / FILE_BLOCK_SIZE));
+  const blockIds = [];
+  for (let n = 0; n < parts; n += 1) {
+    // Every block id of one upload has the same length
+    const blockId = btoa(`block-${(`00000${n}`).slice(-6)}`);
+    const data = await blobToBase64(blob.slice(n * FILE_BLOCK_SIZE, (n + 1) * FILE_BLOCK_SIZE));
+    await postDataverseMessage('UploadBlock', { BlockId: blockId, BlockData: data, FileContinuationToken: token });
+    blockIds.push(blockId);
+    if (onProgress) onProgress((n + 1) / parts);
+  }
+  await postDataverseMessage('CommitFileBlocksUpload', { FileName: fileName, MimeType: mimeType || 'application/octet-stream', BlockList: blockIds, FileContinuationToken: token });
+}
+
+// One PATCH with the whole file first. If that is refused (or the file is over 128 MB), the same file goes again in parts.
+// Resolves { route: 'single' | 'blocks', fileName, bytes }; a failure says what both ways answered.
+async function uploadAssetFile(set, id, column, body, rawName, logEvent, opts) {
+  const o = opts || {};
+  const fileName = headerFileName(rawName);
+  const blob = body instanceof Blob ? body : new Blob([body]);
+  const mimeType = o.mimeType || blob.type || 'application/octet-stream';
+  const path = `${set}(${id})/${column}`;
+  const sent = { column, id, fileName, bytes: blob.size, mimeType };
+  let first = null;
+  if (blob.size <= FILE_SINGLE_UPLOAD_MAX) {
+    logEvent(`Uploading "${fileName}" to ${column} of asset ${id}`, 'data', sent, { method: 'PATCH', path, contentType: 'application/octet-stream' });
+    try {
+      const res = await fetch(apiUrl(path), {
+        method: 'PATCH',
+        headers: { ...ODATA_HEADERS, 'Content-Type': 'application/octet-stream', 'x-ms-file-name': fileName },
+        body: blob
+      });
+      if (res.ok) return { route: 'single', fileName, bytes: blob.size };
+      first = new Error(await readApiError(res));
+      first.status = res.status;
+    } catch (e) {
+      first = e;
+    }
+    // Signed out, or the asset is gone: the other way would answer the same
+    if (first.status === 401 || first.status === 404) throw first;
+    logEvent(`The one-request upload of "${fileName}" was refused (${first.message}). Sending it in parts instead.`, 'warn');
+  }
+  const parts = Math.max(1, Math.ceil(blob.size / FILE_BLOCK_SIZE));
+  logEvent(`Uploading "${fileName}" to ${column} of asset ${id} in ${parts} part${parts === 1 ? '' : 's'}`, 'data', { ...sent, parts },
+    { method: 'POST', path: 'InitializeFileBlocksUpload, UploadBlock, CommitFileBlocksUpload', contentType: 'application/json' });
+  try {
+    await uploadAssetFileInBlocks(id, column, blob, fileName, mimeType, o.onProgress);
+    return { route: 'blocks', fileName, bytes: blob.size };
+  } catch (e) {
+    if (!first) throw e;
+    const both = new Error(`${first.message}. Sending it in parts failed too: ${e.message}`);
+    both.status = e.status;
+    throw both;
+  }
+}
+
+const formatBytes = (n) => (n >= 1024 * 1024 ? `${(n / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.ceil(n / 1024))} KB`);
+const PICTURE_FILE_NAME = /\.(jpe?g|jfif|png|gif|bmp|webp|heic|heif|tiff?|avif)$/i;
+const HEIC_FILE_NAME = /\.(heic|heif)$/i;
+const isPictureFile = (file) => /^image\//i.test((file && file.type) || '') || PICTURE_FILE_NAME.test((file && file.name) || '');
+const isHeicFile = (file) => /hei[cf]/i.test((file && file.type) || '') || HEIC_FILE_NAME.test((file && file.name) || '');
+const HEIC_HELP = 'this is an iPhone HEIC photo, which this browser cannot open. Upload it to a File column, or set the iPhone to save JPG (Settings > Camera > Formats > Most Compatible)';
+const MIME_BY_EXTENSION = {
+  pdf: 'application/pdf', doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ppt: 'application/vnd.ms-powerpoint', pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  txt: 'text/plain', csv: 'text/csv', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', bmp: 'image/bmp',
+  webp: 'image/webp', tif: 'image/tiff', tiff: 'image/tiff', heic: 'image/heic', heif: 'image/heif', mp4: 'video/mp4', mov: 'video/quicktime'
+};
+const mimeFromName = (name) => {
+  const m = /\.([a-z0-9]+)$/i.exec(String(name || ''));
+  return (m && MIME_BY_EXTENSION[m[1].toLowerCase()]) || 'application/octet-stream';
+};
+
+// What goes up for one picked file. A picture for an Image column is shrunk to a JPEG first (as observation pictures are);
+// a file for a File column goes as it is, unless it is a picture too big for the column, which is shrunk instead.
+async function prepareAssetUpload(file, f) {
+  if (!file || !file.size) throw new Error('the file is empty');
+  const limit = f.maxKB ? f.maxKB * 1024 : 0;
+  const tooBig = (n) => `the file is ${formatBytes(n)} and ${f.label} takes at most ${formatBytes(limit)}`;
+  const stem = String(file.name || '').replace(/\.[^.]+$/, '') || (f.kind === 'image' ? 'picture' : 'file');
+  const heic = isHeicFile(file);
+  const shrink = async () => {
+    try {
+      return dataUrlToBytes(await compressImage(file));
+    } catch (e) {
+      throw new Error(heic ? HEIC_HELP : e.message);
+    }
+  };
+  if (f.kind === 'image') {
+    if (!isPictureFile(file)) throw new Error(`${f.label} only takes pictures`);
+    const bytes = await shrink();
+    if (limit && bytes.length > limit) throw new Error(tooBig(bytes.length));
+    return { body: bytes, name: `${stem}.jpg`, mimeType: 'image/jpeg', bytes: bytes.length, shrunk: true };
+  }
+  if (limit && file.size > limit) {
+    if (isPictureFile(file) && !heic) {
+      const bytes = await shrink();
+      if (bytes.length <= limit) return { body: bytes, name: `${stem}.jpg`, mimeType: 'image/jpeg', bytes: bytes.length, shrunk: true };
+    }
+    throw new Error(tooBig(file.size));
+  }
+  return { body: file, name: file.name || 'file', mimeType: file.type || mimeFromName(file.name), bytes: file.size, shrunk: false };
 }
 
 async function deleteAssetFile(set, id, column, logEvent) {
@@ -3897,8 +4041,9 @@ function RegionOverlay({ region, fill, edge, testId }) {
 }
 
 // ==========================================
-// TAB: ASSETS. Two views of the equipment table (craa5_aa_assets): the map (smart snap, pins) and the equipment table
-// (every column, uploads). Both stay alive once opened, so nothing typed in one is lost by looking at the other.
+// TAB: ASSETS. Three views of the equipment table (craa5_aa_assets): the map (smart snap, pins), the equipment table
+// (every column, uploads) and bulk upload (many pictures and files, each matched to equipment by a search). Each stays alive
+// once opened, so nothing typed in one is lost by looking at another.
 // ==========================================
 const ASSET_VIEW_PREF = 'stillwell.assets.view';
 const ASSET_ROTATION_PREF = 'stillwell.assets.rotation';
@@ -3916,10 +4061,12 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
   const meta = assetMeta;
   const set = meta.entitySet || ASSET_SET;
   const mapColumn = meta.mapColumn ? meta.mapColumn.name : null;
-  const [view, setView] = useState(() => (readPref(ASSET_VIEW_PREF, 'map') === 'table' ? 'table' : 'map'));
+  const [view, setView] = useState(() => { const v = readPref(ASSET_VIEW_PREF, 'map'); return v === 'table' || v === 'bulk' ? v : 'map'; });
   useEffect(() => { writePref(ASSET_VIEW_PREF, view); }, [view]);
   const [tableOpened, setTableOpened] = useState(view === 'table');
   useEffect(() => { if (view === 'table') setTableOpened(true); }, [view]);
+  const [bulkOpened, setBulkOpened] = useState(view === 'bulk');
+  useEffect(() => { if (view === 'bulk') setBulkOpened(true); }, [view]);
 
   // 1. The table's columns (once per session)
   useEffect(() => {
@@ -3985,7 +4132,7 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
       role="tab"
       aria-selected={view === key}
       onClick={() => setView(key)}
-      className={`px-3.5 py-1.5 rounded-t-lg text-sm font-bold border-b-2 transition-colors ${view === key ? 'border-[#0072CE] text-[#00468B] bg-white' : 'border-transparent text-slate-500 hover:text-[#00468B] hover:bg-white/60'}`}
+      className={`shrink-0 whitespace-nowrap px-2.5 sm:px-3.5 py-1.5 rounded-t-lg text-sm font-bold border-b-2 transition-colors ${view === key ? 'border-[#0072CE] text-[#00468B] bg-white' : 'border-transparent text-slate-500 hover:text-[#00468B] hover:bg-white/60'}`}
     >
       {label}
     </button>
@@ -3993,9 +4140,10 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
 
   return (
     <div className="h-full flex flex-col bg-slate-100">
-      <div className="shrink-0 px-4 md:px-6 pt-2 flex items-end gap-1 border-b border-slate-200" role="tablist" aria-label="Asset views">
+      <div className="shrink-0 px-2 sm:px-4 md:px-6 pt-2 flex items-end gap-0.5 sm:gap-1 border-b border-slate-200 overflow-x-auto" role="tablist" aria-label="Asset views">
         {subTab('map', 'Map')}
         {subTab('table', 'Equipment table')}
+        {subTab('bulk', 'Bulk upload')}
       </div>
       <div className="flex-1 min-h-0">
         <div className={view === 'map' ? 'h-full' : 'hidden'}>
@@ -4033,6 +4181,20 @@ function AssetsTab({ mapImage, setMainMapImage, mapKey, assetMeta, loadAssetMeta
               focus={tableFocus}
               onAssetSaved={onAssetSaved}
               onShowOnMap={showOnMap}
+              logEvent={logEvent}
+            />
+          </div>
+        )}
+        {bulkOpened && (
+          <div className={view === 'bulk' ? 'h-full' : 'hidden'}>
+            <AssetsBulkUpload
+              meta={meta}
+              set={set}
+              mapColumn={mapColumn}
+              metaDone={metaDone}
+              loadAssetMeta={loadAssetMeta}
+              onAssetSaved={onAssetSaved}
+              onEditInTable={editInTable}
               logEvent={logEvent}
             />
           </div>
@@ -6726,18 +6888,10 @@ function AssetFileField({ f, row, set, assetId, isNew, canWrite, onChanged, logE
     e.target.value = '';
     if (!file) return;
     run('upload', async () => {
-      let body = file;
-      let name = file.name || (isImage ? 'picture.jpg' : 'file');
-      if (isImage) {
-        // Phone photos are shrunk to a JPEG first, as for observation pictures
-        body = dataUrlToBytes(await compressImage(file));
-        name = `${name.replace(/\.[^.]+$/, '') || 'picture'}.jpg`;
-      }
-      const size = typeof body.size === 'number' ? body.size : body.length;
-      if (f.maxKB && size > f.maxKB * 1024) throw new Error(`the file is ${Math.ceil(size / 1024)} KB and this column takes at most ${f.maxKB} KB`);
-      if (size > FILE_SINGLE_UPLOAD_MAX) throw new Error('the file is over 128 MB, too big to upload in one go');
-      await uploadAssetFile(set, assetId, f.name, body, name, logEvent);
-      logEvent(`Uploaded "${name}" to ${f.name} of asset ${assetId}.`, 'success');
+      // Phone photos for a picture column are shrunk to a JPEG first, as for observation pictures
+      const up = await prepareAssetUpload(file, f);
+      const done = await uploadAssetFile(set, assetId, f.name, up.body, up.name, logEvent, { mimeType: up.mimeType });
+      logEvent(`Uploaded "${done.fileName}" to ${f.name} of asset ${assetId}${done.route === 'blocks' ? ' (sent in parts)' : ''}.`, 'success');
     });
   };
 
@@ -6826,6 +6980,741 @@ function AssetFileField({ f, row, set, assetId, isNew, canWrite, onChanged, logE
         </div>
       )}
       {error && <p className="text-xs text-[#C4001F] mt-0.5" role="alert">Not done: {error}</p>}
+    </div>
+  );
+}
+
+// ==========================================
+// ASSETS: BULK UPLOAD. Many pictures and documents at once. Each file is matched to a piece of equipment by a search (or by
+// the suggestion its file name gives) and goes into one of the equipment table's File or Image columns. Uploads run one at a
+// time; each asks Dataverse for its own row only, never the whole table.
+// ==========================================
+const FileDocIcon = createIcon(<><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /><line x1="8" y1="13" x2="16" y2="13" /><line x1="8" y1="17" x2="13" y2="17" /></>);
+const endSentence = (s) => { const t = String(s || '').trim(); return /[.!?)]$/.test(t) ? t : `${t}.`; };
+const BULK_SEARCH_TOP = 8;          // equipment shown for one search
+const BULK_SUGGEST_AT_ONCE = 2;     // file-name lookups running together
+const BULK_PICTURE_COLUMN = /pic|photo|image|img/i;
+const BULK_DOC_COLUMN = /sop|procedure|doc|manual|instruction/i;
+// Words in a file name that never name equipment
+const BULK_NOISE_WORDS = ['img', 'image', 'images', 'dsc', 'dscn', 'dcim', 'pxl', 'photo', 'photos', 'pic', 'pics', 'picture', 'pictures',
+  'scan', 'scanned', 'screenshot', 'whatsapp', 'sop', 'sops', 'ssop', 'ssops', 'final', 'draft', 'copy', 'rev', 'new', 'old', 'the', 'of', 'for'];
+
+// A file name without its type and copy marks: "Mixer 7 (2).jpg" -> "Mixer 7"
+const bulkStem = (fileName) => String(fileName || '').replace(/\.[^.]*$/, '').replace(/\s*\(\d+\)\s*$/, '').replace(/\s*-\s*copy\s*$/i, '').trim();
+
+// "Mixer7_SOP (2).pdf" -> ['Mixer', '7']: the words of a file name that could be in an equipment name, room or area
+function bulkNameWords(fileName) {
+  const stem = bulkStem(fileName);
+  const words = stem.replace(/([a-z])([0-9])/gi, '$1 $2').replace(/([0-9])([a-z])/gi, '$1 $2').split(/[^A-Za-z0-9]+/).filter(Boolean);
+  const kept = words.filter(w => BULK_NOISE_WORDS.indexOf(w.toLowerCase()) === -1 && !/^v\d+$/i.test(w) && !/^\d{5,}$/.test(w));
+  // A camera's own name (IMG_1234, 20240101_101500) says nothing about the equipment
+  if (!kept.some(w => /[a-z]/i.test(w))) return [];
+  return kept.slice(0, 4);
+}
+
+// The column a file goes to until the user picks another: pictures to an Image column (else a File column named like a
+// picture), documents to the SOP column (else the only other File column). '' = the user chooses.
+function bulkDefaultColumn(fields, picture) {
+  const text = (f) => `${f.name} ${f.label}`;
+  const images = fields.filter(f => f.kind === 'image');
+  const files = fields.filter(f => f.kind === 'file');
+  if (picture) {
+    const image = images.filter(f => BULK_PICTURE_COLUMN.test(text(f)))[0] || images[0];
+    if (image) return image.name;
+    const pictureFile = files.filter(f => BULK_PICTURE_COLUMN.test(text(f)))[0];
+    return pictureFile ? pictureFile.name : '';
+  }
+  const docs = files.filter(f => !BULK_PICTURE_COLUMN.test(text(f)));
+  const sop = docs.filter(f => BULK_DOC_COLUMN.test(text(f)))[0];
+  if (sop) return sop.name;
+  return docs.length === 1 ? docs[0].name : '';
+}
+
+// A piece of equipment from a search, with what it already holds in each upload column (when Dataverse said)
+function bulkAssetOf(row, uploadFields) {
+  const current = {};
+  uploadFields.forEach(f => {
+    if (f.kind === 'file') {
+      const name = f.nameColumn ? row[f.nameColumn] : undefined;
+      if (row[f.name] !== undefined || name !== undefined) current[f.name] = { has: !!(row[f.name] || name), name: name || '' };
+    } else if (f.stampColumn && row[f.stampColumn] !== undefined) {
+      current[f.name] = { has: !!row[f.stampColumn], name: '' };
+    }
+  });
+  return {
+    id: cleanGuid(row[ASSET_ID_COLUMN]),
+    name: String(row[ASSET_NAME_COLUMN] || '').trim() || '(no name)',
+    room: row.craa5_roomname || '',
+    area: row.craa5_areaname || '',
+    current
+  };
+}
+
+// Equipment for a search: typed words (the equipment named exactly so first, then every one whose name, room or area holds
+// all the words), an asset id, or a ready-made filter. At most BULK_SEARCH_TOP rows, with what each holds in the upload
+// columns; if Dataverse refuses those extra columns, once more without them.
+async function searchBulkAssets(set, text, uploadFields, opts) {
+  const o = opts || {};
+  const trimmed = String(text || '').trim();
+  const id = cleanGuid(trimmed);
+  const base = [ASSET_ID_COLUMN, ASSET_NAME_COLUMN, 'craa5_roomname', 'craa5_areaname'];
+  const extra = [];
+  uploadFields.forEach(f => {
+    (f.kind === 'file' ? [f.name, f.nameColumn] : [f.stampColumn]).forEach(c => { if (c && extra.indexOf(c) === -1) extra.push(c); });
+  });
+  const query = async (filter) => {
+    const ask = (cols) => getJson(`${set}?$select=${cols.join(',')}&$filter=${encodeURIComponent(filter)}&$orderby=${encodeURIComponent(`${ASSET_NAME_COLUMN} asc,${ASSET_ID_COLUMN}`)}&$top=${BULK_SEARCH_TOP}`);
+    try {
+      return (await ask(base.concat(extra))).value || [];
+    } catch (e) {
+      if (e.status !== 400 || !extra.length) throw e;
+      return (await ask(base)).value || [];
+    }
+  };
+  let rows;
+  if (o.filter) rows = await query(o.filter);
+  else if (GUID_PATTERN.test(id)) rows = await query(`${ASSET_ID_COLUMN} eq ${id}`);
+  else {
+    const words = assetWordFilter(trimmed.split(/\s+/).filter(Boolean).slice(0, 4)).join(' and ');
+    if (!words) return [];
+    // Sorted by name, "Conveyor 3" would come after "Conveyor 1023" and drop off the list: so the exact name is asked for too
+    const lists = await Promise.all([o.exactFirst === false ? Promise.resolve([]) : query(`${ASSET_NAME_COLUMN} eq '${escOData(trimmed)}'`), query(words)]);
+    rows = lists[0].concat(lists[1]);
+  }
+  const seen = {};
+  return rows.map(r => bulkAssetOf(r, uploadFields)).filter(a => GUID_PATTERN.test(a.id) && !seen[a.id] && (seen[a.id] = true)).slice(0, BULK_SEARCH_TOP);
+}
+
+// What a file's name suggests: the equipment named exactly like the file (or its words), else the only one whose name, room
+// or area holds all its words. { state: 'one', asset } | { state: 'many', count, text } | { state: 'none', text }
+async function suggestBulkAsset(set, fileName, words, uploadFields) {
+  const text = words.join(' ');
+  const names = [bulkStem(fileName), text].filter((n, i, all) => n && all.indexOf(n) === i);
+  const exact = await searchBulkAssets(set, '', uploadFields, { filter: names.map(n => `${ASSET_NAME_COLUMN} eq '${escOData(n)}'`).join(' or ') });
+  if (exact.length === 1) return { state: 'one', asset: exact[0] };
+  const rows = exact.length > 1 ? exact : await searchBulkAssets(set, text, uploadFields, { exactFirst: false });
+  if (rows.length === 1) return { state: 'one', asset: rows[0] };
+  return rows.length ? { state: 'many', count: rows.length, text } : { state: 'none', text };
+}
+
+// Why a file cannot go up yet ('' = ready). `places` counts the files of the list per equipment and column.
+function bulkProblem(it, byName, places) {
+  if (it.status === 'done' || it.status === 'uploading') return '';
+  if (!it.file.size) return 'This file is empty.';
+  const f = byName[it.column];
+  if (!f) return 'Choose the column it goes in.';
+  if (f.kind === 'image' && !it.picture) return `${f.label} only takes pictures. Choose a File column.`;
+  if (f.kind === 'file' && f.maxKB && it.file.size > f.maxKB * 1024 && !(it.picture && !it.heic)) {
+    return `Too big: ${formatBytes(it.file.size)}, and ${f.label} takes at most ${formatBytes(f.maxKB * 1024)}.`;
+  }
+  if (!it.asset) return 'Find the equipment it belongs to.';
+  if ((places[`${it.asset.id}|${it.column}`] || 0) > 1) {
+    return `Another file in this list also goes to ${f.label} of ${it.asset.name}. Each column holds one file: choose another column, or remove one of them.`;
+  }
+  return '';
+}
+
+function AssetsBulkUpload({ meta, set, mapColumn, metaDone, loadAssetMeta, onAssetSaved, onEditInTable, logEvent }) {
+  const ready = meta.status === 'ready';
+  const uploadFields = useMemo(() => (meta.fields || []).filter(f => f.kind === 'file' || f.kind === 'image'), [meta.fields]);
+  const byName = useMemo(() => { const o = {}; uploadFields.forEach(f => { o[f.name] = f; }); return o; }, [uploadFields]);
+  const hasImageColumn = uploadFields.some(f => f.kind === 'image');
+  const hasFileColumn = uploadFields.some(f => f.kind === 'file');
+  const canAdd = ready && uploadFields.length > 0;
+  // After an upload the row is read again with the equipment table's columns, so the table, the map card and the pins follow
+  const rowSelect = useMemo(() => (ready ? assetTableSelect(meta.fields, mapColumn) : ''), [ready, meta.fields, mapColumn]);
+
+  const [items, setItems] = useState([]);
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const seq = useRef(0);
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  // Previews are object URLs: they are let go when their file leaves the list, and all of them when the app closes
+  useEffect(() => () => { itemsRef.current.forEach(it => { if (it.preview) URL.revokeObjectURL(it.preview); }); }, []);
+  const [note, setNote] = useState('');
+  const [running, setRunning] = useState(false);
+  const runningRef = useRef(false);
+  const stopRef = useRef(false);
+  const [stopping, setStopping] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [viewing, setViewing] = useState(null); // key of the picture shown large
+  const [confirmClear, setConfirmClear] = useState(false);
+  const inputRef = useRef(null);
+
+  const patchItem = useCallback((key, changes) => {
+    setItems(prev => prev.map(it => (it.key === key ? { ...it, ...(typeof changes === 'function' ? changes(it) : changes) } : it)));
+  }, []);
+
+  // --- adding files ---
+  const addFiles = (fileList) => {
+    if (!canAdd || !fileList || !fileList.length) return;
+    const added = [];
+    const same = (a, b) => a.name === b.name && a.size === b.size && a.lastModified === b.lastModified;
+    let skipped = 0;
+    for (let i = 0; i < fileList.length; i += 1) {
+      const file = fileList[i];
+      if (!file) continue;
+      // The same file picked twice is listed once
+      if (itemsRef.current.some(it => it.status !== 'done' && same(it.file, file)) || added.some(it => same(it.file, file))) { skipped += 1; continue; }
+      seq.current += 1;
+      const picture = isPictureFile(file);
+      const heic = isHeicFile(file);
+      const words = bulkNameWords(file.name);
+      added.push({
+        key: `bulk${seq.current}`,
+        file,
+        picture,
+        heic,
+        preview: picture && !heic ? URL.createObjectURL(file) : '',
+        column: bulkDefaultColumn(uploadFields, picture),
+        asset: null,
+        words,
+        suggestion: words.length ? null : { state: 'none' },
+        status: 'waiting',
+        message: '',
+        progress: null,
+        sent: null
+      });
+    }
+    if (added.length) setItems(prev => prev.concat(added));
+    setNote(`${added.length} file${added.length === 1 ? '' : 's'} added${skipped ? `; ${skipped} already in the list` : ''}.`);
+    if (added.length) logEvent(`Bulk upload: ${added.length} file${added.length === 1 ? '' : 's'} added to the list.`, 'info');
+  };
+  const onPick = (e) => {
+    const files = e.target.files;
+    // Copied out before the input is cleared (clearing empties the list the browser handed over)
+    const list = [];
+    for (let i = 0; files && i < files.length; i += 1) list.push(files[i]);
+    e.target.value = '';
+    addFiles(list);
+  };
+  const dragHasFiles = (e) => {
+    const types = e.dataTransfer && e.dataTransfer.types;
+    if (!types) return false;
+    for (let i = 0; i < types.length; i += 1) if (types[i] === 'Files') return true;
+    return false;
+  };
+  const onDragOver = (e) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = canAdd ? 'copy' : 'none';
+    if (!dragging) setDragging(true);
+  };
+  const onDragLeave = (e) => {
+    // Only when the pointer leaves the whole view, not when it moves between its parts
+    if (e.currentTarget.contains && e.relatedTarget && e.currentTarget.contains(e.relatedTarget)) return;
+    setDragging(false);
+  };
+  const onDrop = (e) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    setDragging(false);
+    const files = e.dataTransfer.files;
+    const list = [];
+    for (let i = 0; files && i < files.length; i += 1) list.push(files[i]);
+    addFiles(list);
+  };
+
+  const removeItem = (key) => {
+    const it = itemsRef.current.find(x => x.key === key);
+    if (!it || it.status === 'uploading') return;
+    if (it.preview) URL.revokeObjectURL(it.preview);
+    if (viewing === key) setViewing(null);
+    setItems(prev => prev.filter(x => x.key !== key));
+  };
+  const clearWhere = (test) => {
+    const gone = itemsRef.current.filter(it => it.status !== 'uploading' && test(it));
+    gone.forEach(it => { if (it.preview) URL.revokeObjectURL(it.preview); });
+    const keys = gone.map(it => it.key);
+    if (viewing && keys.indexOf(viewing) !== -1) setViewing(null);
+    setItems(prev => prev.filter(it => keys.indexOf(it.key) === -1));
+  };
+
+  // --- suggestions from file names, a few lookups at a time ---
+  const suggesting = useRef(0);
+  const [suggestTick, setSuggestTick] = useState(0);
+  useEffect(() => {
+    if (!ready) return;
+    const waiting = items.filter(it => it.suggestion === null);
+    const free = BULK_SUGGEST_AT_ONCE - suggesting.current;
+    if (!waiting.length || free <= 0) return;
+    waiting.slice(0, free).forEach(it => {
+      suggesting.current += 1;
+      patchItem(it.key, { suggestion: { state: 'looking' } });
+      suggestBulkAsset(set, it.file.name, it.words, uploadFields)
+        .then(suggestion => { if (mounted.current) patchItem(it.key, { suggestion }); })
+        .catch(error => {
+          if (mounted.current) patchItem(it.key, { suggestion: { state: 'error', text: it.words.join(' '), message: error.message } });
+        })
+        .then(() => {
+          suggesting.current -= 1;
+          if (mounted.current) setSuggestTick(t => t + 1);
+        });
+    });
+  }, [items, ready, suggestTick, set, uploadFields, patchItem]);
+
+  // --- what is ready ---
+  const places = useMemo(() => {
+    const o = {};
+    items.forEach(it => { if (it.asset && it.column) { const k = `${it.asset.id}|${it.column}`; o[k] = (o[k] || 0) + 1; } });
+    return o;
+  }, [items]);
+  const problems = useMemo(() => {
+    const o = {};
+    items.forEach(it => { o[it.key] = bulkProblem(it, byName, places); });
+    return o;
+  }, [items, byName, places]);
+  const readyItems = items.filter(it => (it.status === 'waiting' || it.status === 'error') && !problems[it.key]);
+  const needItems = items.filter(it => it.status !== 'done' && it.status !== 'uploading' && problems[it.key]);
+  const doneItems = items.filter(it => it.status === 'done');
+  const suggestedItems = items.filter(it => !it.asset && it.status !== 'done' && it.suggestion && it.suggestion.state === 'one');
+
+  const useAllSuggestions = () => {
+    setItems(prev => prev.map(it => ((!it.asset && it.status !== 'done' && it.status !== 'uploading' && it.suggestion && it.suggestion.state === 'one')
+      ? { ...it, asset: it.suggestion.asset, status: it.status === 'error' ? 'waiting' : it.status, message: '' } : it)));
+  };
+
+  // --- uploading, one file at a time ---
+  const readRow = async (id) => {
+    try {
+      return await getJson(`${set}(${id})${rowSelect ? `?$select=${rowSelect}` : ''}`, ANNOTATIONS);
+    } catch (error) {
+      if (error.status !== 400 || !rowSelect) throw error;
+      return getJson(`${set}(${id})`, ANNOTATIONS);
+    }
+  };
+  const uploadAll = async () => {
+    if (runningRef.current) return;
+    const queue = readyItems.map(it => it.key);
+    if (!queue.length) return;
+    runningRef.current = true;
+    stopRef.current = false;
+    setRunning(true);
+    setStopping(false);
+    setConfirmClear(false);
+    setNote(`Uploading ${queue.length} file${queue.length === 1 ? '' : 's'}...`);
+    let done = 0;
+    let failed = 0;
+    for (let k = 0; k < queue.length; k += 1) {
+      if (stopRef.current || !mounted.current) break;
+      // As the list is now: a file removed or changed since Upload was pressed is checked again
+      const now = itemsRef.current;
+      const it = now.find(x => x.key === queue[k]);
+      if (!it || (it.status !== 'waiting' && it.status !== 'error')) continue;
+      const counts = {};
+      now.forEach(x => { if (x.asset && x.column) { const c = `${x.asset.id}|${x.column}`; counts[c] = (counts[c] || 0) + 1; } });
+      if (bulkProblem(it, byName, counts)) continue;
+      const f = byName[it.column];
+      const asset = it.asset;
+      patchItem(it.key, { status: 'uploading', message: '', progress: null, sent: null });
+      try {
+        const up = await prepareAssetUpload(it.file, f);
+        const result = await uploadAssetFile(set, asset.id, f.name, up.body, up.name, logEvent, {
+          mimeType: up.mimeType,
+          onProgress: (p) => { if (mounted.current) patchItem(it.key, { progress: p }); }
+        });
+        done += 1;
+        if (mounted.current) {
+          patchItem(it.key, {
+            status: 'done',
+            progress: null,
+            message: '',
+            sent: { route: result.route, fileName: result.fileName, bytes: result.bytes, shrunk: up.shrunk, column: f.name, label: f.label, path: `${set}(${asset.id})/${f.name}` }
+          });
+        }
+        logEvent(`Bulk upload: "${result.fileName}" went to ${f.label} of ${asset.name}.`, 'success');
+        // The equipment table, the map card and the pins show it straight away
+        try {
+          const row = await readRow(asset.id);
+          if (mounted.current) onAssetSaved(row, 'bulk', false);
+        } catch (error) {
+          logEvent(`${asset.name} could not be read again after the upload: ${error.message}`, 'warn');
+        }
+      } catch (error) {
+        failed += 1;
+        logEvent(`Bulk upload of "${it.file.name}" to ${f.label} of ${asset.name} failed: ${error.message}`, 'error');
+        if (mounted.current) patchItem(it.key, { status: 'error', progress: null, message: error.message });
+      }
+    }
+    runningRef.current = false;
+    if (!mounted.current) return;
+    setRunning(false);
+    setStopping(false);
+    const left = queue.length - done - failed;
+    setNote(`${done} uploaded${failed ? `, ${failed} not done (the red notes say why)` : ''}${left > 0 ? `, ${left} not started` : ''}.`);
+  };
+  const stop = () => { stopRef.current = true; setStopping(true); };
+
+  // --- the picture shown large ---
+  const viewed = viewing ? items.find(it => it.key === viewing) : null;
+  useEffect(() => {
+    if (!viewing) return undefined;
+    const onKey = (e) => { if (e.key === 'Escape') setViewing(null); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [viewing]);
+
+  const columnChip = (f) => (
+    <li key={f.name} className="inline-flex items-center gap-1 rounded-full border border-green-200 bg-green-50 text-green-900 px-2 py-0.5">
+      <CheckCircle className="w-3 h-3" />
+      <span className="font-bold">{f.label}</span>
+      <span className="font-mono text-[10px] text-green-800/80">{f.name}</span>
+      <span>{f.kind === 'image' ? 'Image' : 'File'}{f.maxKB ? `, up to ${formatBytes(f.maxKB * 1024)}` : ''}</span>
+    </li>
+  );
+
+  return (
+    <div
+      className="h-full flex flex-col bg-slate-100 overflow-hidden relative"
+      data-testid="assets-bulk-view"
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
+      <div className="flex-1 min-h-0 overflow-y-auto p-3 md:p-6 pt-3 md:pt-4 flex flex-col gap-3" data-bulk-scroll="">
+        <div className="shrink-0">
+          <h2 className="text-2xl font-black text-[#00468B]">Bulk upload</h2>
+          <p className="text-sm text-slate-500">Add pictures and documents, find the equipment each one belongs to, then upload them all at once.</p>
+        </div>
+
+        {!metaDone && <p className="text-sm text-slate-500" role="status">Reading the equipment table's columns...</p>}
+        {metaDone && !ready && (
+          <div className="shrink-0 text-sm text-[#C4001F] bg-white rounded-lg border border-slate-200 p-3" role="alert">
+            The Assets table's columns could not be read{meta.error ? `: ${meta.error}` : '.'}
+            <button type="button" onClick={loadAssetMeta} className="ml-2 text-[#0072CE] underline">Try again</button>
+          </div>
+        )}
+
+        {ready && (
+          <div className="shrink-0 rounded-lg border border-slate-200 bg-white p-3 text-xs text-slate-700" data-testid="bulk-columns">
+            <p className="font-bold text-slate-800">Where files can go on the equipment table ({ASSET_LOGICAL_NAME})</p>
+            <ul className="flex flex-wrap gap-1.5 mt-1.5">
+              {uploadFields.map(columnChip)}
+              {!hasImageColumn && (
+                <li className="inline-flex items-center gap-1 rounded-full border border-[#FFB81C] bg-[#FFF6E0] text-[#7A5200] px-2 py-0.5" data-missing="image">
+                  <span className="font-bold">Missing:</span> an Image column for pictures (for example "Picture")
+                </li>
+              )}
+              {!hasFileColumn && (
+                <li className="inline-flex items-center gap-1 rounded-full border border-[#FFB81C] bg-[#FFF6E0] text-[#7A5200] px-2 py-0.5" data-missing="file">
+                  <span className="font-bold">Missing:</span> a File column for documents (for example "SOP")
+                </li>
+              )}
+            </ul>
+            {uploadFields.length === 0 ? (
+              <p className="mt-1.5">Nothing can be uploaded until the equipment table has a picture or file column. In Dataverse, add an <b>Image</b> column named "Picture" and a <b>File</b> column named "SOP" to the table, then reload this app.</p>
+            ) : !hasImageColumn ? (
+              <p className="mt-1.5">Pictures can only go in a File column for now, and a File column holds one file per piece of equipment (a picture there would take the place of the SOP). To keep pictures apart, add an <b>Image</b> column named "Picture" to the equipment table in Dataverse, then reload this app.</p>
+            ) : null}
+          </div>
+        )}
+
+        <div
+          className={`shrink-0 rounded-xl border-2 border-dashed p-4 flex flex-col sm:flex-row items-center justify-center gap-3 text-center transition-colors ${dragging && canAdd ? 'border-[#0072CE] bg-[#E6F1FB]' : 'border-[#B3D4F2] bg-white'}`}
+          data-testid="bulk-drop"
+        >
+          <ImageIcon className="w-8 h-8 text-[#0072CE] shrink-0" />
+          <p className="text-sm text-slate-600">{canAdd ? 'Drop pictures and documents here, or' : 'Files can be added once the columns above are known.'}</p>
+          <input ref={inputRef} type="file" multiple onChange={onPick} className="hidden" aria-label="Choose pictures and documents to upload" data-testid="bulk-input" />
+          <button
+            type="button"
+            disabled={!canAdd}
+            onClick={() => inputRef.current && inputRef.current.click()}
+            className="bg-[#0072CE] text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-[#00468B] disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+          >
+            Choose files
+          </button>
+        </div>
+
+        {items.length > 0 && (
+          <div className="shrink-0 flex flex-wrap items-center gap-2 text-xs">
+            <span className="font-bold text-slate-700">{items.length} file{items.length === 1 ? '' : 's'}</span>
+            {suggestedItems.length > 0 && (
+              <button type="button" onClick={useAllSuggestions} className="px-2.5 py-1 rounded-md font-bold border border-[#B3D4F2] bg-white text-[#00468B] hover:bg-[#E6F1FB]" data-testid="bulk-use-all">
+                Use all suggestions ({suggestedItems.length})
+              </button>
+            )}
+            {!running && (
+              confirmClear ? (
+                <span className="inline-flex items-center gap-1.5 bg-[#FFF6E0] border border-[#FFB81C] rounded-md px-2 py-1">
+                  Take every file off this list? Nothing is deleted from Dataverse.
+                  <button type="button" onClick={() => { clearWhere(() => true); setConfirmClear(false); setNote(''); }} className="font-bold text-[#C4001F] underline">Clear list</button>
+                  <button type="button" onClick={() => setConfirmClear(false)} className="font-bold text-slate-600 underline">Keep</button>
+                </span>
+              ) : (
+                <button type="button" onClick={() => setConfirmClear(true)} className="px-2.5 py-1 rounded-md font-bold border border-slate-300 bg-white text-slate-600 hover:bg-slate-100">Clear list</button>
+              )
+            )}
+          </div>
+        )}
+
+        {items.length > 0 && (
+          <ul className="grid gap-2 xl:grid-cols-2 pb-2" aria-label="Files to upload">
+            {items.map(it => (
+              <BulkFileCard
+                key={it.key}
+                it={it}
+                problem={problems[it.key]}
+                fields={uploadFields}
+                byName={byName}
+                set={set}
+                onChange={patchItem}
+                onRemove={removeItem}
+                onView={setViewing}
+                onEditInTable={onEditInTable}
+              />
+            ))}
+          </ul>
+        )}
+      </div>
+
+      {items.length > 0 && (
+        <div className="shrink-0 border-t border-slate-200 bg-white px-3 md:px-6 py-2 flex flex-wrap items-center gap-2 text-xs" data-testid="bulk-bar">
+          <span className="text-slate-700" role="status">
+            <b>{readyItems.length}</b> ready, <b>{needItems.length}</b> need something, <b>{doneItems.length}</b> uploaded
+          </span>
+          <span className="flex-1" />
+          {note && <span className="text-slate-600" data-testid="bulk-note">{note}</span>}
+          {running ? (
+            <button type="button" onClick={stop} disabled={stopping} className="px-3 py-1.5 rounded-md font-bold border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-60">
+              {stopping ? 'Stopping after this file...' : 'Stop after this file'}
+            </button>
+          ) : (
+            <button type="button" onClick={uploadAll} disabled={readyItems.length === 0} className="px-3 py-1.5 rounded-md font-bold bg-[#0072CE] text-white hover:bg-[#00468B] disabled:opacity-50 disabled:cursor-not-allowed" data-testid="bulk-upload">
+              Upload ready ({readyItems.length})
+            </button>
+          )}
+          <button type="button" onClick={() => clearWhere(it => it.status === 'done')} disabled={doneItems.length === 0} className="px-3 py-1.5 rounded-md font-bold border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-50 disabled:cursor-not-allowed">
+            Clear uploaded ({doneItems.length})
+          </button>
+        </div>
+      )}
+
+      {dragging && canAdd && (
+        <div className="absolute inset-0 pointer-events-none border-4 border-[#0072CE] rounded-lg bg-[#0072CE]/5 flex items-center justify-center">
+          <span className="bg-white text-[#00468B] font-bold text-sm rounded-lg px-4 py-2 shadow">Drop to add</span>
+        </div>
+      )}
+
+      {viewed && viewed.preview && (
+        <div className="fixed inset-0 z-50 bg-black/80 flex flex-col p-3 md:p-6" role="dialog" aria-modal="true" aria-label={`Picture ${viewed.file.name}`} onClick={() => setViewing(null)}>
+          <div className="shrink-0 flex items-center gap-2 text-white mb-2">
+            <span className="font-bold truncate flex-1 min-w-0">{viewed.file.name}</span>
+            <button type="button" onClick={() => setViewing(null)} className="px-3 py-1.5 rounded-md text-sm font-bold bg-white text-[#00468B] hover:bg-slate-100">Close</button>
+          </div>
+          <div className="flex-1 min-h-0 flex items-center justify-center">
+            <img src={viewed.preview} alt={viewed.file.name} className="max-w-full max-h-full object-contain" onClick={e => e.stopPropagation()} />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// One file of the bulk list: what it is, where it goes, the equipment it belongs to, and how its upload went
+function BulkFileCard({ it, problem, fields, byName, set, onChange, onRemove, onView, onEditInTable }) {
+  const f = byName[it.column] || null;
+  const busy = it.status === 'uploading';
+  const done = it.status === 'done';
+  const locked = busy || done;
+  const [searching, setSearching] = useState(false);
+  const [seed, setSeed] = useState({ text: '', n: 0 });
+  const sug = it.suggestion;
+  const current = it.asset && f && it.asset.current ? it.asset.current[f.name] : null;
+  const where = (a) => [a.room, a.area].filter(Boolean).join(', ');
+  const choose = (asset) => { onChange(it.key, { asset, status: it.status === 'error' ? 'waiting' : it.status, message: '' }); setSearching(false); };
+  const openSearch = (text) => { setSeed(s => ({ text: text || '', n: s.n + 1 })); setSearching(true); };
+
+  let state = null;
+  if (done && it.sent) {
+    state = (
+      <div className="text-xs text-green-800" role="status">
+        <p className="font-bold">Uploaded to {it.sent.label} of {it.asset.name}.</p>
+        <p className="text-[11px] text-slate-500 [overflow-wrap:anywhere]">
+          Sent: {it.sent.route === 'blocks' ? 'InitializeFileBlocksUpload, UploadBlock, CommitFileBlocksUpload for' : `PATCH ${it.sent.path},`} "{it.sent.fileName}", {formatBytes(it.sent.bytes)}{it.sent.shrunk ? ' (shrunk to a JPEG)' : ''}
+        </p>
+        <button type="button" onClick={() => onEditInTable(it.asset.id)} className="mt-0.5 font-bold text-[#0072CE] underline">Open in the equipment table</button>
+      </div>
+    );
+  } else if (busy) {
+    state = (
+      <p className="text-xs font-bold text-[#00468B]" role="status">
+        Uploading{it.progress !== null && it.progress !== undefined ? ` in parts, ${Math.round(it.progress * 100)}%` : '...'}
+      </p>
+    );
+  } else if (it.status === 'error') {
+    state = <p className="text-xs text-[#C4001F]" role="alert">Not uploaded: {endSentence(it.message)}{problem ? ` ${problem}` : ' Press Upload ready to try again.'}</p>;
+  } else if (problem) {
+    state = <p className="text-xs text-[#7A5200]">{problem}</p>;
+  } else {
+    state = (
+      <p className="text-xs text-green-800">
+        Ready.{current && current.has ? ` It replaces the ${f.kind === 'image' ? 'picture' : `file${current.name ? ` "${current.name}"` : ''}`} now in ${f.label}.` : ''}
+      </p>
+    );
+  }
+
+  return (
+    <li className={`bg-white rounded-lg border p-2.5 flex gap-2.5 min-w-0 ${done ? 'border-green-300' : it.status === 'error' ? 'border-[#E4002B]/50' : 'border-slate-200'}`} data-bulk-item={it.file.name}>
+      <div className="shrink-0">
+        {it.preview ? (
+          <button type="button" onClick={() => onView(it.key)} title="Show the picture large" aria-label={`Show ${it.file.name} large`} className="block w-16 h-16 sm:w-20 sm:h-20 rounded-md border border-slate-200 bg-slate-50 overflow-hidden">
+            <img src={it.preview} alt="" loading="lazy" className="w-full h-full object-cover" />
+          </button>
+        ) : (
+          <div className="w-16 h-16 sm:w-20 sm:h-20 rounded-md border border-slate-200 bg-slate-50 flex flex-col items-center justify-center text-[10px] font-bold text-slate-500 uppercase">
+            {it.picture ? <ImageIcon className="w-6 h-6 text-slate-400" /> : <FileDocIcon className="w-6 h-6 text-slate-400" />}
+            <span className="mt-0.5 max-w-full truncate px-1">{(/\.([a-z0-9]+)$/i.exec(it.file.name) || ['', 'file'])[1]}</span>
+          </div>
+        )}
+      </div>
+      <div className="flex-1 min-w-0 flex flex-col gap-1.5">
+        <div className="flex items-start gap-2 min-w-0">
+          <p className="flex-1 min-w-0 text-sm font-bold text-slate-800 [overflow-wrap:anywhere]">{it.file.name}</p>
+          <span className="shrink-0 text-[11px] text-slate-500">{formatBytes(it.file.size || 0)}</span>
+          {!busy && (
+            <button type="button" onClick={() => onRemove(it.key)} title="Take this file off the list" aria-label={`Take ${it.file.name} off the list`} className="shrink-0 p-0.5 rounded text-slate-400 hover:text-[#E4002B] hover:bg-slate-100">
+              <X className="w-4 h-4" />
+            </button>
+          )}
+        </div>
+
+        <label className="flex items-center gap-1.5 text-xs text-slate-600 min-w-0">
+          <span className="shrink-0 font-bold">Goes in</span>
+          <select
+            value={it.column}
+            disabled={locked}
+            onChange={e => onChange(it.key, { column: e.target.value, status: it.status === 'error' ? 'waiting' : it.status, message: '' })}
+            aria-label={`Column for ${it.file.name}`}
+            className="min-w-0 flex-1 sm:flex-none border border-slate-300 rounded-md px-2 py-1 text-xs bg-white disabled:bg-slate-50"
+          >
+            <option value="">Choose a column...</option>
+            {fields.map(c => (
+              <option key={c.name} value={c.name} disabled={c.kind === 'image' && !it.picture}>
+                {c.label} ({c.kind === 'image' ? 'picture' : 'file'}){c.kind === 'image' && !it.picture ? ', pictures only' : ''}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <div className="text-xs min-w-0">
+          {it.asset && !searching ? (
+            <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+              <span className="font-bold text-slate-600 shrink-0">Equipment</span>
+              <span className="inline-flex items-center gap-1 rounded-md bg-[#E6F1FB] text-[#00468B] px-2 py-0.5 min-w-0 max-w-full">
+                <span className="font-bold truncate">{it.asset.name}</span>
+                {where(it.asset) && <span className="text-[11px] text-slate-600 truncate">{where(it.asset)}</span>}
+              </span>
+              {!locked && <button type="button" onClick={() => openSearch('')} className="font-bold text-[#0072CE] underline">Change</button>}
+            </div>
+          ) : !searching ? (
+            <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+              {!locked && (
+                <button type="button" onClick={() => openSearch('')} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md font-bold border border-[#B3D4F2] bg-white text-[#00468B] hover:bg-[#E6F1FB]">
+                  <Search className="w-3 h-3" /> Find equipment
+                </button>
+              )}
+              {sug && sug.state === 'looking' && <span className="text-slate-500">Looking for "{it.words.join(' ')}"...</span>}
+              {sug && sug.state === 'one' && (
+                <span className="inline-flex flex-wrap items-center gap-1 min-w-0">
+                  <span className="text-slate-500">From the name:</span>
+                  <span className="font-bold text-slate-800 [overflow-wrap:anywhere]">{sug.asset.name}</span>
+                  {where(sug.asset) && <span className="text-[11px] text-slate-500">{where(sug.asset)}</span>}
+                  {!locked && <button type="button" onClick={() => choose(sug.asset)} className="font-bold text-[#0072CE] underline" data-testid="bulk-use">Use</button>}
+                </span>
+              )}
+              {sug && sug.state === 'many' && !locked && (
+                <button type="button" onClick={() => openSearch(sug.text)} className="text-[#0072CE] underline">
+                  {sug.count >= BULK_SEARCH_TOP ? `${BULK_SEARCH_TOP} or more` : sug.count} possible matches for "{sug.text}"
+                </button>
+              )}
+              {sug && sug.state === 'error' && <span className="text-slate-500">The name lookup failed ({sug.message}); use Find equipment.</span>}
+            </div>
+          ) : null}
+          {searching && !locked && (
+            <BulkAssetSearch
+              key={seed.n}
+              initialText={seed.text}
+              set={set}
+              fields={fields}
+              column={f}
+              onPick={choose}
+              onCancel={() => setSearching(false)}
+              label={it.file.name}
+            />
+          )}
+        </div>
+
+        {state}
+      </div>
+    </li>
+  );
+}
+
+// The equipment search of one bulk file: typed words (name, room, area) or an asset id; at most BULK_SEARCH_TOP results
+function BulkAssetSearch({ initialText, set, fields, column, onPick, onCancel, label }) {
+  const [text, setText] = useState(initialText || '');
+  const [found, setFound] = useState({ rows: [], loading: false, error: '', asked: '' });
+  const req = useRef(0);
+  const inputRef = useRef(null);
+  useEffect(() => { if (inputRef.current) inputRef.current.focus(); }, []);
+  useEffect(() => {
+    const t = text.trim();
+    const n = req.current + 1;
+    req.current = n;
+    if (t.length < 2) { setFound({ rows: [], loading: false, error: '', asked: '' }); return undefined; }
+    const timer = setTimeout(() => {
+      setFound(s => ({ ...s, loading: true, error: '' }));
+      searchBulkAssets(set, t, fields)
+        .then(rows => { if (req.current === n) setFound({ rows, loading: false, error: '', asked: t }); })
+        .catch(error => { if (req.current === n) setFound({ rows: [], loading: false, error: error.message, asked: t }); });
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [text, set, fields]);
+  const where = (a) => [a.room, a.area].filter(Boolean).join(', ');
+  return (
+    <div className="mt-0.5 rounded-md border border-[#B3D4F2] bg-[#F7FBFF] p-2 flex flex-col gap-1.5" data-testid="bulk-search">
+      <div className="flex items-center gap-1.5">
+        <div className="relative flex-1 min-w-0">
+          <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2 top-1/2 -translate-y-1/2 pointer-events-none" />
+          <input
+            ref={inputRef}
+            type="search"
+            value={text}
+            onChange={e => setText(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Escape') { e.preventDefault(); onCancel(); }
+              if (e.key === 'Enter' && found.rows.length === 1) { e.preventDefault(); onPick(found.rows[0]); }
+            }}
+            placeholder="Equipment name, room or area..."
+            aria-label={`Find the equipment for ${label}`}
+            className="w-full pl-7 pr-2 py-1 text-xs border border-slate-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-[#0072CE]/40 focus:border-[#0072CE]"
+          />
+        </div>
+        <button type="button" onClick={onCancel} className="shrink-0 font-bold text-slate-600 underline">Cancel</button>
+      </div>
+      {text.trim().length < 2 && <p className="text-[11px] text-slate-500">Type at least 2 letters.</p>}
+      {found.loading && <p className="text-[11px] text-slate-500" role="status">Searching...</p>}
+      {found.error && <p className="text-[11px] text-[#C4001F]" role="alert">The search failed: {found.error}</p>}
+      {!found.loading && !found.error && found.asked && found.rows.length === 0 && <p className="text-[11px] text-slate-500">No equipment matches "{found.asked}".</p>}
+      {found.rows.length > 0 && (
+        <ul className="flex flex-col gap-0.5 max-h-56 overflow-y-auto" aria-label="Matching equipment">
+          {found.rows.map(a => {
+            const cur = column && a.current ? a.current[column.name] : null;
+            return (
+              <li key={a.id}>
+                <button type="button" onClick={() => onPick(a)} className="w-full text-left rounded px-2 py-1 hover:bg-[#E6F1FB] focus:bg-[#E6F1FB] focus:outline-none">
+                  <span className="font-bold text-slate-800">{a.name}</span>
+                  {where(a) && <span className="text-[11px] text-slate-500"> {where(a)}</span>}
+                  {cur && cur.has && <span className="block text-[11px] text-[#7A5200]">Has {column.kind === 'image' ? 'a picture' : (cur.name ? `"${cur.name}"` : 'a file')} in {column.label} already</span>}
+                </button>
+              </li>
+            );
+          })}
+          {found.rows.length >= BULK_SEARCH_TOP && <li className="text-[11px] text-slate-500 px-2">Only the first {BULK_SEARCH_TOP} are shown; type more to narrow it down.</li>}
+        </ul>
+      )}
     </div>
   );
 }
