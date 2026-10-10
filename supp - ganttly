@@ -1378,6 +1378,241 @@ function roomHandoff(lines, w0, minGapMs) {
     });
     return best;
 }
+// ============================================================================
+// STOP AND RESTART TIMES (PBED)
+// 🚨 ARCHITECTURE NOTE: Every start and stop time PBED plans around lives in the production schedule (Gerald, Oct 10). Nothing is
+// typed into PBED. A room's production stop and restart come first from the Clean Plan the production schedule publishes (table
+// craa5_cleanplan, read with the CLEAN PLAN READER pasted below) and, when the Clean Plan has no stop for the room's line, from the
+// runs themselves (fetchProductionRuns / roomHandoff / roomRestart). The cleaning has to be done CLEAN_DONE_BEFORE_MINS before the
+// next run: that is the deadline the room chip on the Gantt and the department steps measure against. To change a time, change the
+// run in the production schedule, then press "Read the schedule again" on Setup. Ganttly (the floor app) is untouched: it still
+// waits only for what was typed on it and for its down lines.
+// ============================================================================
+const CLEAN_DONE_BEFORE_MINS = 120;   // the cleaning is done this long before production restarts (Gerald, Oct 10: "roughly 2 hours")
+/* ============================================================================
+ * CLEAN PLAN READER  (paste this whole block into an app that reads the Clean Plan)
+ * ----------------------------------------------------------------------------
+ * `hub - production schedule` works out, from the runs, what every line needs cleaned and which days each MSS area needs a
+ * Daily clean, and publishes it to the optional Dataverse table craa5_cleanplan ("Clean Plan"). Only that page writes it.
+ * This block reads it for the MSS calendar, the Ganttly / PBED, Shift Start and the Manager hub. Guide: clean-plan-spec.md.
+ *
+ * Host rule: the host compiles to ES5 with no iterable support. This block uses only arrays, plain objects and Promises.
+ *
+ *   readCleanPlan(dataApi, fromMs, toMs)  -> Promise of a plan (below). Reads [fromMs - 8 days, toMs) so a stop that started
+ *                                            before fromMs is there too. Never throws: plan.found is false when there is no table
+ *                                            (or no permission), plan.why says why. Fall back to your own rules then.
+ *   plan.weekDone(ymd)                    -> true when the week of that plant day was published completely (its stamp says done)
+ *   plan.mssDay(area or MSS area id, ymd) -> the MSS answer for one area and day, or null (use your own rule): see MSS below
+ *   plan.windowsFor(lineKey)              -> the stops of one line in time order (lineKey = cleanPlanLineKey(area, line))
+ *   plan.cleansBetween(fromMs, toMs)      -> allergen and full cleans whose stop overlaps [from, to), each with overlapMin
+ *   plan.lineStateAt(lineKey, ms)         -> 'down-clean' | 'down' | 'idle' | null (null: no stop at that moment, i.e. running
+ *                                            or not planned)
+ *   plan.hangups(fromMs)                  -> stops from fromMs on whose clean does not fit: short, overlap, nocrew (tight last)
+ * ============================================================================ */
+var CLEAN_PLAN_TABLE = 'craa5_cleanplan';
+var CLEAN_PLAN_RULES = 'lr14|D60|W60|WE720|I60|stretch|1111111|pad10|max31|maint';   // the MSS LINE RULES (r14) the day rows follow
+var CLEAN_PLAN_COLS = ['craa5_cleanplanid', 'craa5_plankey', 'craa5_rowtype', 'craa5_linekey', 'craa5_start', 'craa5_end', 'craa5_day',
+    'craa5_cleankind', 'craa5_minutes', 'craa5_status', 'craa5_details', 'createdon'];
+var CLEAN_PLAN_OPTIONAL_COLS = ['craa5_reason', 'craa5_area', 'craa5_line', 'craa5_mssareaguid'];
+var CLEAN_PLAN_LIMIT = 2000;   // rows per query; a longer range is split in halves
+
+function cleanPlanCanon(s) { return String(s === undefined || s === null ? '' : s).toLowerCase().replace(/[^a-z0-9]+/g, ''); }
+// The line key the Clean Plan uses: area in letters and digits, plus the line number when it is 2 or more ("IBL 4" line 1 = "ibl4").
+function cleanPlanLineKey(area, line) { return cleanPlanCanon(area) + (Number(line) > 1 ? String(Math.floor(Number(line))) : ''); }
+function cleanPlanIso(ms) { return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z'); }
+// The Monday (YYYY-MM-DD) of a plant day YYYY-MM-DD, by the calendar alone (no time zone involved).
+function cleanPlanMonday(ymd) {
+    var m = /^(\d{4})-(\d\d)-(\d\d)$/.exec(String(ymd || ''));
+    if (!m) return '';
+    var d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+    d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
+    return d.toISOString().slice(0, 10);
+}
+// The fixed row id the publisher gives a plan key (FNV-1a, four seeds): used to pick the right row if a key ever has two.
+function cleanPlanFnv(s, seed) {
+    var h = (0x811c9dc5 ^ seed) >>> 0;
+    for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+    return ('0000000' + h.toString(16)).slice(-8);
+}
+function cleanPlanGuid(key) {
+    var s = String(key).toLowerCase();
+    var h = cleanPlanFnv(s, 1) + cleanPlanFnv(s, 2) + cleanPlanFnv(s, 3) + cleanPlanFnv(s, 4);
+    return h.slice(0, 8) + '-' + h.slice(8, 12) + '-4' + h.slice(13, 16) + '-' + '89ab'[parseInt(h[16], 16) % 4] + h.slice(17, 20) + '-' + h.slice(20, 32);
+}
+function cleanPlanXrm() { try { return (typeof Xrm !== 'undefined' && Xrm && Xrm.WebApi) ? Xrm.WebApi : null; } catch (e) { return null; } }
+
+// One query: Xrm.WebApi first, then the page's dataApi. Resolves { rows } or { rows: null, err }.
+function cleanPlanQuery(dataApi, filter, select) {
+    var web = cleanPlanXrm();
+    var odata = '?$select=' + select.join(',') + '&$filter=' + filter + '&$orderby=craa5_start asc&$top=' + CLEAN_PLAN_LIMIT;
+    var viaData = function (firstErr) {
+        if (!dataApi || !dataApi.queryTable) return Promise.resolve({ rows: null, err: firstErr || 'No data API on this page.' });
+        return Promise.resolve(dataApi.queryTable(CLEAN_PLAN_TABLE, { filter: filter, select: select, orderBy: 'craa5_start asc', pageSize: 500 })).then(function (page) {
+            var rows = (page && page.rows) ? page.rows.slice() : [];
+            var more = function (p) {
+                if (!p || !p.hasMoreRows || typeof p.loadMoreRows !== 'function' || rows.length >= CLEAN_PLAN_LIMIT) return Promise.resolve({ rows: rows });
+                return Promise.resolve(p.loadMoreRows()).then(function (q) { (q && q.rows ? q.rows : []).forEach(function (r) { rows.push(r); }); return more(q); });
+            };
+            return more(page);
+        }).catch(function (e) { return { rows: null, err: String(e && e.message || e) }; });
+    };
+    if (web && web.retrieveMultipleRecords) {
+        return Promise.resolve(web.retrieveMultipleRecords(CLEAN_PLAN_TABLE, odata)).then(function (res) { return { rows: res && res.entities ? res.entities : [] }; })
+            .catch(function (e) { return viaData(String(e && e.message || e)); });
+    }
+    return viaData('');
+}
+// Every active row with craa5_start in [a, b), split in halves while a query comes back full.
+function cleanPlanReadAll(dataApi, a, b, select, depth) {
+    var filter = 'statecode eq 0 and craa5_start ge ' + cleanPlanIso(a) + ' and craa5_start lt ' + cleanPlanIso(b);
+    return cleanPlanQuery(dataApi, filter, select).then(function (res) {
+        if (res.rows === null) return res;
+        if (res.rows.length >= CLEAN_PLAN_LIMIT && b - a > 3600000 && depth < 12) {
+            var mid = a + Math.floor((b - a) / 2);
+            return cleanPlanReadAll(dataApi, a, mid, select, depth + 1).then(function (x) {
+                if (x.rows === null) return x;
+                return cleanPlanReadAll(dataApi, mid, b, select, depth + 1).then(function (y) { return y.rows === null ? y : { rows: x.rows.concat(y.rows) }; });
+            });
+        }
+        return res;
+    });
+}
+function cleanPlanJson(s) { try { var o = JSON.parse(s || 'null'); return o && typeof o === 'object' ? o : null; } catch (e) { return null; } }
+function cleanPlanMs(v) { var t = Date.parse(v || ''); return isNaN(t) ? 0 : t; }
+
+function readCleanPlan(dataApi, fromMs, toMs) {
+    var a = fromMs - 8 * 86400000;
+    var all = CLEAN_PLAN_COLS.concat(CLEAN_PLAN_OPTIONAL_COLS);
+    return cleanPlanReadAll(dataApi, a, toMs, all, 0).then(function (res) {
+        // an optional column may not exist: read the required ones only
+        return res.rows === null ? cleanPlanReadAll(dataApi, a, toMs, CLEAN_PLAN_COLS, 0) : res;
+    }).then(function (res) {
+        return cleanPlanBuild(res.rows, res.rows === null ? (res.err || 'The Clean Plan table could not be read.') : '');
+    });
+}
+
+// Turns the rows into the plan object (also usable on rows read some other way).
+function cleanPlanBuild(rows, why) {
+    var plan = { found: rows !== null && rows !== undefined, why: why || '', weeks: {}, windows: [], days: [], byLine: {}, byAreaDay: {}, byAreaIdDay: {} };
+    if (!plan.found) rows = [];
+    // one row per plan key: the fixed id first, else the oldest (the publisher keeps the same one and removes the rest)
+    var byKey = {};
+    rows.forEach(function (r) {
+        var k = String(r.craa5_plankey || '');
+        if (!k) return;
+        var cur = byKey[k], id = String(r.craa5_cleanplanid || '').toLowerCase();
+        if (!cur) { byKey[k] = r; return; }
+        var curId = String(cur.craa5_cleanplanid || '').toLowerCase(), fixed = cleanPlanGuid(k);
+        if (curId === fixed) return;
+        if (id === fixed || String(r.createdon || '') < String(cur.createdon || '')) byKey[k] = r;
+    });
+    Object.keys(byKey).forEach(function (k) {
+        var r = byKey[k], type = String(r.craa5_rowtype || ''), det = cleanPlanJson(r.craa5_details) || {};
+        if (type === 'week') {
+            plan.weeks[String(r.craa5_day || k.slice(2))] = { status: String(r.craa5_status || ''), rules: det.v || '', cfg: det.cfg || '', at: det.at || '', rows: det.rows || 0 };
+        } else if (type === 'day') {
+            var d = { key: k, areaKey: String(r.craa5_linekey || ''), area: r.craa5_area || det.area || '', mssAreaId: String(r.craa5_mssareaguid || det.areaId || '').toLowerCase(),
+                day: String(r.craa5_day || ''), kind: String(r.craa5_cleankind || ''), prodMin: Number(r.craa5_minutes) || 0, week: String(r.craa5_status || ''),
+                weekOn: det.weekOn ? 1 : 0, job: det.job || null, lines: det.lines || [], reason: r.craa5_reason || '' };
+            plan.days.push(d);
+            (plan.byAreaDay[d.areaKey] = plan.byAreaDay[d.areaKey] || {})[d.day] = d;
+            if (d.mssAreaId) (plan.byAreaIdDay[d.mssAreaId] = plan.byAreaIdDay[d.mssAreaId] || {})[d.day] = d;
+        } else if (type === 'window') {
+            var w = { key: k, lineKey: String(r.craa5_linekey || ''), area: r.craa5_area || det.area || '', line: Number(r.craa5_line || det.line) || 1,
+                start: cleanPlanMs(r.craa5_start), end: cleanPlanMs(r.craa5_end), day: String(r.craa5_day || ''), kind: String(r.craa5_cleankind || ''),
+                minutes: Number(r.craa5_minutes) || 0, status: String(r.craa5_status || ''), reason: r.craa5_reason || '',
+                stop: det.stop || 'between', open: det.open || '', idle: !!det.idle, gapMin: det.gapMin === undefined ? null : det.gapMin,
+                prev: det.prev || null, next: det.next || null, allergen: det.allergen || '', cleanStart: cleanPlanMs(det.cleanStart), cleanEnd: cleanPlanMs(det.cleanEnd),
+                shortMin: det.shortMin || 0, spareMin: det.spareMin === undefined ? null : det.spareMin, crew: det.crew || null, mssAreaId: String(r.craa5_mssareaguid || det.areaId || '').toLowerCase() };
+            plan.windows.push(w);
+            (plan.byLine[w.lineKey] = plan.byLine[w.lineKey] || []).push(w);
+        }
+    });
+    plan.windows.sort(function (x, y) { return x.start - y.start; });
+    Object.keys(plan.byLine).forEach(function (k) { plan.byLine[k].sort(function (x, y) { return x.start - y.start; }); });
+    // a row counts only when its week was published completely
+    plan.weekDone = function (ymd) { var w = plan.weeks[cleanPlanMonday(ymd)]; return !!w && w.status === 'done'; };
+    var trusted = function (x) { return plan.weekDone(x.day); };
+    // MSS: { kind: 'due' | 'stretch' | 'covered' | 'none' | 'unplanned', weekOn (0/1), job, prodMin } or null (use your own rule)
+    plan.mssDay = function (areaOrId, ymd) {
+        var id = String(areaOrId || '').toLowerCase();
+        var d = (plan.byAreaIdDay[id] || {})[ymd] || (plan.byAreaDay[cleanPlanCanon(areaOrId)] || {})[ymd];
+        if (!d || !plan.weekDone(ymd) || plan.weeks[cleanPlanMonday(ymd)].rules !== CLEAN_PLAN_RULES || d.kind === 'unplanned') return null;
+        return d;
+    };
+    plan.windowsFor = function (lineKey) { return (plan.byLine[lineKey] || []).filter(trusted); };
+    plan.cleansBetween = function (from, to) {
+        var out = [];
+        plan.windows.forEach(function (w) {
+            if (!trusted(w) || (w.kind !== 'allergen' && w.kind !== 'full')) return;
+            var e = w.end > w.start ? w.end : w.start + Math.max(60, w.minutes) * 60000;
+            var a = Math.max(from, w.start), b = Math.min(to, e);
+            if (b > a) out.push({ w: w, overlapMin: Math.round((b - a) / 60000) });
+        });
+        return out;
+    };
+    plan.lineStateAt = function (lineKey, ms) {
+        var list = plan.windowsFor(lineKey);
+        for (var i = 0; i < list.length; i++) {
+            var w = list[i], e = w.end > w.start ? w.end : (w.stop === 'last' ? Infinity : w.start);
+            if (ms >= w.start && ms < e) return w.idle ? 'idle' : (w.kind === 'allergen' || w.kind === 'full') ? 'down-clean' : 'down';
+        }
+        return null;
+    };
+    var rank = { short: 0, overlap: 1, nocrew: 2, tight: 3 };
+    plan.hangups = function (from) {
+        return plan.windows.filter(function (w) { return trusted(w) && rank[w.status] !== undefined && (w.stop === 'last' ? w.start : w.end) >= from; })
+            .sort(function (x, y) { return (rank[x.status] === 3) - (rank[y.status] === 3) || x.start - y.start; });
+    };
+    return plan;
+}
+// The Clean Plan line keys a room may sit on. From the production lines matched to the room (area + line number) when there are any;
+// otherwise from the room's own name, the Shift Start line it belongs to and the aliases (both ways), widened to every key the plan
+// has for that area ("breading" also takes "breading2"), so a room can take its stop from the Clean Plan even when no run for its
+// line was read.
+function cleanPlanKeysFor(plan, lines, area, lineName) {
+    const keys = [];
+    const add = function(k) { if (k && keys.indexOf(k) === -1) keys.push(k); };
+    (lines || []).forEach(function(L) { add(cleanPlanLineKey(L.area, L.line)); });
+    if (keys.length) return keys;
+    const names = [];
+    [area, lineName].forEach(function(nm) {
+        const c = cleanPlanCanon(nm);
+        if (!c || names.indexOf(c) > -1) return;
+        names.push(c);
+        (PROD_AREA_ALIASES[c] || []).forEach(function(al) { const a = cleanPlanCanon(al); if (a && names.indexOf(a) === -1) names.push(a); });   // wj -> waterjet
+        Object.keys(PROD_AREA_ALIASES).forEach(function(k) { if (PROD_AREA_ALIASES[k].some(function(al) { return cleanPlanCanon(al) === c; }) && names.indexOf(k) === -1) names.push(k); });   // waterjet -> wj
+    });
+    const planKeys = Object.keys(plan && plan.byLine ? plan.byLine : {});
+    names.forEach(function(c) {
+        add(c);
+        planKeys.forEach(function(k) { if (k.indexOf(c) === 0 && /^[0-9]*$/.test(k.slice(c.length))) add(k); });
+    });
+    return keys;
+}
+// The Clean Plan stop a room is in, or waits for, at w0. Per key: the first trusted stop (its week published completely) whose production
+// restart is after w0 (a last stop with no restart counts as open), starting before toMs; a changeover shorter than the gap is one stretch
+// of production, not a stop. A room on several lines waits for the last line to stop and is wanted back by the first to restart.
+// Returns { window, key, keys, restart: ms | null } or null when the plan has no stop for any key.
+function cleanPlanWindowFor(plan, keys, w0, toMs, gapMs) {
+    const picks = [];
+    (keys || []).forEach(function(k) {
+        const list = plan.windowsFor(k);
+        for (let i = 0; i < list.length; i++) {
+            const w = list[i];
+            if (w.stop === 'overlap') continue;
+            const end = w.stop === 'last' || !(w.end > w.start) ? Infinity : w.end;
+            if (end <= w0 || w.start >= toMs) continue;
+            if ((w.kind === 'changeover' || w.kind === 'none') && w.gapMin !== null && w.gapMin !== undefined && w.gapMin * 60000 < gapMs) continue;
+            picks.push({ window: w, key: k, end: end });
+            break;
+        }
+    });
+    if (!picks.length) return null;
+    let best = picks[0], restart = Infinity;
+    picks.forEach(function(p) { if (p.window.start > best.window.start) best = p; if (p.end < restart) restart = p.end; });
+    return { window: best.window, key: best.key, keys: picks.map(function(p) { return p.key; }), restart: restart === Infinity ? null : restart };
+}
 // The value a datetime-local box shows for a moment in time (local clock).
 function msToLocalInput(ms) {
     const d = new Date(ms);
@@ -2446,6 +2681,305 @@ const MOCK_ASSETS = [
 ];
 
 // ============================================================================
+// SAVE TO DATAVERSE (PBED)
+// 🚨 ARCHITECTURE NOTE: "Save to Dataverse" on the Gantt tab writes the plan on screen to two optional tables Gerald creates by hand:
+// craa5_pbedplan (one row per plan window, the whole plan as JSON) and craa5_pbedplanstep (one row per planned block). The column
+// names below are assumed, as in every app (Gerald, Oct 10): the Columns card on Setup lists them, "Check" asks Dataverse for each
+// one (three tries, with waits) and marks it FOUND / MISSING, and a table or column that was created under another name can be typed
+// in and is used from then on (kept in the browser under the shared key stillwell.columnPicks, with the other apps' picks). A save
+// waits out a busy server, drops an optional column it cannot write and sends the row again, stops with the name of a required one
+// that is missing, and shows every payload it sent. Saving the same plan window again updates the rows it wrote (ids kept in the
+// browser) and removes the blocks no longer planned. Ganttly has none of this.
+// ============================================================================
+const PBED_PLAN_TABLE = 'craa5_pbedplan';
+const PBED_STEP_TABLE = 'craa5_pbedplanstep';
+const PBED_TABLES = [
+    { key: 'pbedplan', table: PBED_PLAN_TABLE, title: 'PBED Plan', what: 'one row per plan window: the whole plan as JSON, plus a summary' },
+    { key: 'pbedplanstep', table: PBED_STEP_TABLE, title: 'PBED Plan Step', what: 'one row per planned block: who cleans what, where, from when to when' }
+];
+// t = table key, key = what a column is picked under, name = the assumed logical name, type = what to create it as, need = 'required'
+// (a missing one stops the save) | 'optional' (a missing one is dropped from the row and the row is sent again).
+const PBED_COLS = [
+    { t: 'pbedplan', key: 'name', name: 'craa5_name', label: 'Name', type: 'Text, primary column (200)', need: 'required', why: 'the plan\'s name: "PBED plan <start> to <end>"' },
+    { t: 'pbedplan', key: 'plankey', name: 'craa5_plankey', label: 'Plan key', type: 'Text (200)', need: 'required', why: 'start date, start hour and hours; the same plan saved again updates its row' },
+    { t: 'pbedplan', key: 'planstart', name: 'craa5_planstart', label: 'Plan start', type: 'Date and time', need: 'required', why: 'when the plan window starts' },
+    { t: 'pbedplan', key: 'planend', name: 'craa5_planend', label: 'Plan end', type: 'Date and time', need: 'required', why: 'when the plan window ends' },
+    { t: 'pbedplan', key: 'savedat', name: 'craa5_savedat', label: 'Saved at', type: 'Date and time', need: 'required', why: 'when Save was pressed' },
+    { t: 'pbedplan', key: 'stepcount', name: 'craa5_stepcount', label: 'Step count', type: 'Whole number', need: 'required', why: 'how many blocks the plan has (its rows in PBED Plan Step)' },
+    { t: 'pbedplan', key: 'planjson', name: 'craa5_planjson', label: 'Plan JSON', type: 'Multiline text (max length, 1048576)', need: 'required', why: 'the whole plan: rules, each room\'s stop / restart / done-by, every block' },
+    { t: 'pbedplan', key: 'summary', name: 'craa5_summary', label: 'Summary', type: 'Multiline text (4000)', need: 'optional', why: 'one line per room: stop, restart, done by, spare or late' },
+    { t: 'pbedplan', key: 'savedby', name: 'craa5_savedby', label: 'Saved by', type: 'Text (200)', need: 'optional', why: 'who pressed Save (when the page knows the signed-in user)' },
+    { t: 'pbedplanstep', key: 'name', name: 'craa5_name', label: 'Name', type: 'Text, primary column (200)', need: 'required', why: '"<room> · <equipment> · <who>"' },
+    { t: 'pbedplanstep', key: 'plankey', name: 'craa5_plankey', label: 'Plan key', type: 'Text (200)', need: 'required', why: 'the plan this block belongs to (the same key as PBED Plan)' },
+    { t: 'pbedplanstep', key: 'stepkey', name: 'craa5_stepkey', label: 'Step key', type: 'Text (200)', need: 'required', why: 'the block\'s own id inside the plan; saving again updates the same row' },
+    { t: 'pbedplanstep', key: 'area', name: 'craa5_area', label: 'Area', type: 'Text (100)', need: 'required', why: 'the room' },
+    { t: 'pbedplanstep', key: 'equipment', name: 'craa5_equipment', label: 'Equipment', type: 'Text (200)', need: 'required', why: 'what is cleaned' },
+    { t: 'pbedplanstep', key: 'start', name: 'craa5_start', label: 'Start', type: 'Date and time', need: 'required', why: 'when the block starts' },
+    { t: 'pbedplanstep', key: 'end', name: 'craa5_end', label: 'End', type: 'Date and time', need: 'required', why: 'when the block ends' },
+    { t: 'pbedplanstep', key: 'minutes', name: 'craa5_minutes', label: 'Minutes', type: 'Whole number', need: 'required', why: 'its length' },
+    { t: 'pbedplanstep', key: 'heads', name: 'craa5_heads', label: 'Heads', type: 'Whole number', need: 'required', why: 'how many people are on it' },
+    { t: 'pbedplanstep', key: 'crew', name: 'craa5_crew', label: 'Crew', type: 'Text (10)', need: 'required', why: 'the shift letter (A to D)' },
+    { t: 'pbedplanstep', key: 'people', name: 'craa5_people', label: 'People', type: 'Text (2000)', need: 'required', why: 'the names on it, comma separated' },
+    { t: 'pbedplanstep', key: 'equipmentguid', name: 'craa5_equipmentguid', label: 'Equipment GUID', type: 'Text (100)', need: 'optional', why: 'the id of the equipment row (ties the block to the asset table)' },
+    { t: 'pbedplanstep', key: 'status', name: 'craa5_status', label: 'Status', type: 'Text (20)', need: 'optional', why: 'planned, started or done' }
+];
+const PBED_PICKS_KEY = 'stillwell.columnPicks';     // shared by every app: { 'pbedplan.table': 'craa5_x', 'pbedplan.<column key>': 'craa5_y', ... }
+const PBED_SAVE_KEY = 'itp_pbed_save_v1';            // the last save: { planKey, planTable, stepTable, planId, stepIds: { stepKey: id }, savedAt }
+const PBED_MISSING_RE = /could not find a property named '([^']+)'|property '([^']+)' does not exist|'([^']+)' .{0,30}(not found|does not exist|is not a valid property)|invalid property '([^']+)'|undeclared property/i;
+const PBED_TABLE_GONE_RE = /resource not found for the segment|could not find.{0,40}entity|entity.{0,40}(does not exist|not found)|0x80060888|\b404\b/i;
+const PBED_BUSY_RE = /\b429\b|too many requests|0x80072322|service unavailable|\b503\b|\b502\b|timed? ?out|timeout|network|failed to fetch|0x8004431a|\bbusy\b/i;
+const PBED_PRIV_RE = /privilege|not have permission|access denied|unauthori[sz]ed|\b403\b|0x80040220|0x8004d24b/i;
+const PBED_GONE_ROW_RE = /with id.{0,45}does not exist|0x80040217/i;
+const PBED_CHECK_WAITS = [0, 1500, 4000];           // "Check": three tries per column, waiting this long before each
+const PBED_SAVE_BUSY_WAITS = [5000, 15000, 30000];  // a busy server during a save: wait, then send the same row again
+const PBED_POOL = 3;                                 // rows (or probes) in flight at once
+const PBED_TIMEOUT_MS = 20000;
+const PBED_PAYLOAD_KEEP = 40;                        // payloads kept for the Columns card
+function pbedSleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+function pbedErrText(e) {
+    if (!e) return '';
+    if (typeof e === 'string') return e;
+    const m = e.message || (e.error && e.error.message) || e.errorMessage || e.statusText || '';
+    if (m) return String(m);
+    try { return JSON.stringify(e); } catch (x) { return String(e); }
+}
+function pbedTimeout(p, ms) {
+    return new Promise(function(res, rej) {
+        const t = setTimeout(function() { rej(new Error('No answer from Dataverse in ' + Math.round(ms / 1000) + ' s (timeout)')); }, ms);
+        Promise.resolve(p).then(function(v) { clearTimeout(t); res(v); }, function(e) { clearTimeout(t); rej(e); });
+    });
+}
+function pbedReadPicks() { try { const o = JSON.parse(localStorage.getItem(PBED_PICKS_KEY) || '{}'); return o && typeof o === 'object' && !Array.isArray(o) ? o : {}; } catch (e) { return {}; } }
+// Merged into the shared object, so another app's picks are kept; an empty value removes the pick.
+function pbedWritePicks(mine) {
+    try {
+        const all = pbedReadPicks();
+        Object.keys(mine).forEach(function(k) { if (mine[k]) all[k] = mine[k]; else delete all[k]; });
+        localStorage.setItem(PBED_PICKS_KEY, JSON.stringify(all));
+    } catch (e) {}
+}
+function pbedTableName(tkey, picks) { const t = PBED_TABLES.filter(function(x) { return x.key === tkey; })[0]; const v = picks && picks[tkey + '.table']; return v && String(v).trim() ? String(v).trim() : (t ? t.table : tkey); }
+function pbedColName(c, picks) { const v = picks && picks[c.t + '.' + c.key]; return v && String(v).trim() ? String(v).trim() : c.name; }
+function pbedColsOf(tkey) { return PBED_COLS.filter(function(c) { return c.t === tkey; }); }
+// The column names an error message names (only those, as whole names: craa5_equipment is not blamed by a message about craa5_equipmentguid).
+function pbedBlamed(msg, names) {
+    const low = String(msg || '').toLowerCase();
+    return (names || []).filter(function(n) {
+        if (!n) return false;
+        const t = String(n).toLowerCase();
+        let at = low.indexOf(t);
+        while (at > -1) {
+            const before = at > 0 ? low.charAt(at - 1) : '', after = low.charAt(at + t.length);
+            if (!/[a-z0-9_]/.test(before) && !/[a-z0-9_]/.test(after)) return true;
+            at = low.indexOf(t, at + 1);
+        }
+        return false;
+    });
+}
+function pbedXrmWeb() {
+    const x = safeGetXrm();
+    if (x && x.WebApi) return x.WebApi;
+    try { if (typeof window !== 'undefined' && window.top && window.top !== window && window.top.Xrm && window.top.Xrm.WebApi) return window.top.Xrm.WebApi; } catch (e) {}
+    return null;
+}
+// The id a create returned: a string, { id }, { <table>id } or { entityId }, braces removed.
+function pbedIdOf(res, table) {
+    if (!res) return '';
+    if (typeof res === 'string') return res.replace(/[{}]/g, '');
+    const v = res.id || res[table + 'id'] || res.entityId || (res.data && (res.data.id || res.data[table + 'id'])) || '';
+    return String(v || '').replace(/[{}]/g, '');
+}
+// The write API of this page: Xrm.WebApi (the Dataverse host) first, else the page's dataApi (createRow / updateRow / deleteRow). null = none.
+function pbedWriteApi(dataApi) {
+    const web = pbedXrmWeb();
+    if (web && typeof web.createRecord === 'function' && typeof web.updateRecord === 'function') {
+        return {
+            kind: 'Xrm.WebApi',
+            create: function(table, body) { return web.createRecord(table, body); },
+            update: function(table, id, body) { return web.updateRecord(table, id, body); },
+            remove: typeof web.deleteRecord === 'function' ? function(table, id) { return web.deleteRecord(table, id); } : null
+        };
+    }
+    if (dataApi && typeof dataApi === 'object' && typeof dataApi.createRow === 'function') {
+        return {
+            kind: 'dataApi',
+            create: function(table, body) { return dataApi.createRow(table, body); },
+            update: typeof dataApi.updateRow === 'function' ? function(table, id, body) { return dataApi.updateRow(table, id, body); } : null,
+            remove: typeof dataApi.deleteRow === 'function' ? function(table, id) { return dataApi.deleteRow(table, id); } : null
+        };
+    }
+    return null;
+}
+// Asks Dataverse for one column of one table (a $select of that column, one row), three tries. { s: 'found' | 'missing' | 'table' | 'noaccess' | 'unknown', why }
+async function pbedProbeColumn(dataApi, table, name) {
+    const web = pbedXrmWeb();
+    const hasWeb = !!(web && typeof web.retrieveMultipleRecords === 'function');
+    const hasApi = !!(dataApi && typeof dataApi === 'object' && typeof dataApi.queryTable === 'function');
+    if (!hasWeb && !hasApi) return { s: 'unknown', why: 'This page has no Dataverse connection to ask.' };
+    let lastErr = '';
+    for (let i = 0; i < PBED_CHECK_WAITS.length; i++) {
+        if (PBED_CHECK_WAITS[i]) await pbedSleep(PBED_CHECK_WAITS[i]);
+        try {
+            if (hasWeb) await pbedTimeout(web.retrieveMultipleRecords(table, '?$select=' + name + '&$top=1'), PBED_TIMEOUT_MS);
+            else await pbedTimeout(dataApi.queryTable(table, { select: [name], pageSize: 1, top: 1 }), PBED_TIMEOUT_MS);
+            return { s: 'found', why: '' };
+        } catch (e) {
+            const msg = pbedErrText(e);
+            lastErr = msg;
+            const named = pbedBlamed(msg, [name]).length > 0;
+            if (PBED_TABLE_GONE_RE.test(msg) && !named) return { s: 'table', why: msg };
+            if (PBED_PRIV_RE.test(msg)) return { s: 'noaccess', why: msg };
+            if (named || PBED_MISSING_RE.test(msg)) return { s: 'missing', why: msg };
+            // anything else (busy, network, timeout): try again after the next wait
+        }
+    }
+    return { s: 'unknown', why: lastErr || 'No answer.' };
+}
+// Writes one row: create (no id) or update. Waits out a busy server; a saved row that no longer exists is created again; an optional column
+// the message names is dropped and the row sent again (state.missing[table] remembers it for the rest of the save); a required one stops
+// the save with its name. cols = [{ sentName, need }]. Returns { id, op: 'created' | 'updated', body, dropped }.
+async function pbedPut(w, table, cols, body, id, state) {
+    const b = Object.assign({}, body), dropped = [];
+    let curId = id || '', busy = 0;
+    const drop = function(n) { if (n in b) { delete b[n]; dropped.push(n); } if (!state.missing[table]) state.missing[table] = []; if (state.missing[table].indexOf(n) === -1) state.missing[table].push(n); };
+    (state.missing[table] || []).slice().forEach(drop);
+    for (let attempt = 0; attempt < 12; attempt++) {
+        try {
+            if (curId) {
+                if (!w.update) throw new Error('This page cannot update rows (no updateRow), so the plan saved before cannot be changed.');
+                await pbedTimeout(w.update(table, curId, b), PBED_TIMEOUT_MS);
+                return { id: curId, op: 'updated', body: b, dropped: dropped };
+            }
+            const res = await pbedTimeout(w.create(table, b), PBED_TIMEOUT_MS);
+            return { id: pbedIdOf(res, table), op: 'created', body: b, dropped: dropped };
+        } catch (e) {
+            const msg = pbedErrText(e);
+            if (curId && PBED_GONE_ROW_RE.test(msg)) { curId = ''; continue; }   // the row saved before was deleted: make a new one
+            if (PBED_PRIV_RE.test(msg)) { state.noWrite = msg; throw new Error('Dataverse refused the write to ' + table + ' (no permission): ' + msg); }
+            const blamed = pbedBlamed(msg, cols.map(function(c) { return c.sentName; }));
+            if (blamed.length && PBED_MISSING_RE.test(msg)) {
+                const req = blamed.filter(function(n) { return cols.some(function(c) { return c.sentName === n && c.need === 'required'; }); });
+                if (req.length) {
+                    req.forEach(function(n) { if (state.reqMissing.indexOf(n) === -1) state.reqMissing.push(n); });
+                    throw new Error('Column ' + req.join(', ') + ' is missing on ' + table + '. Create it, or type the name it has on the Columns card (Setup), then save again.');
+                }
+                blamed.forEach(drop);
+                continue;
+            }
+            if (PBED_TABLE_GONE_RE.test(msg) && !blamed.length) throw new Error('Table ' + table + ' was not found. Create it, or type its name on the Columns card (Setup).');
+            if (PBED_BUSY_RE.test(msg) && busy < PBED_SAVE_BUSY_WAITS.length) { await pbedSleep(PBED_SAVE_BUSY_WAITS[busy++]); continue; }
+            throw new Error(msg || 'Dataverse refused the row.');
+        }
+    }
+    throw new Error('Gave up on ' + table + ' after too many tries.');
+}
+// Removes a row written before (delete, else deactivate). 'removed' | 'deactivated' | 'gone' (already deleted) | 'kept' (this page cannot).
+async function pbedRemove(w, table, id) {
+    try {
+        if (w.remove) { await pbedTimeout(w.remove(table, id), PBED_TIMEOUT_MS); return 'removed'; }
+        if (w.update) { await pbedTimeout(w.update(table, id, { statecode: 1, statuscode: 2 }), PBED_TIMEOUT_MS); return 'deactivated'; }
+    } catch (e) { if (PBED_GONE_ROW_RE.test(pbedErrText(e))) return 'gone'; throw e; }
+    return 'kept';
+}
+// The Columns card on Setup (PBED): both tables and every column the save writes, Check (FOUND / MISSING per column), a box per table and
+// column for the name it has in Dataverse when it was created under another one, the last save's result and the payloads sent.
+function PbedColumnsCard(props) {
+    const picks = props.picks || {}, check = props.check || { status: 'idle', tables: {}, cols: {}, at: 0 }, save = props.save || { status: 'idle', last: null };
+    const [open, setOpen] = useState(true);
+    const [copied, setCopied] = useState(false);
+    const [payOpen, setPayOpen] = useState(false);
+    const [drafts, setDrafts] = useState({});
+    const clockOf = function(ms) { return new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); };
+    const setPick = function(k, v) {
+        const t = String(v || '').trim();
+        const one = {}; one[k] = t;
+        pbedWritePicks(one);
+        props.setPicks(function(prev) { const n = Object.assign({}, prev); if (t) n[k] = t; else delete n[k]; return n; });
+    };
+    const draftOf = function(k, fallback) { return drafts[k] !== undefined ? drafts[k] : fallback; };
+    const setDraft = function(k, v) { setDrafts(function(d) { const n = Object.assign({}, d); if (v === undefined) delete n[k]; else n[k] = v; return n; }); };
+    const listText = function() {
+        const lines = [];
+        PBED_TABLES.forEach(function(t) {
+            lines.push(t.title + ' - table ' + pbedTableName(t.key, picks) + ' (' + t.what + ')');
+            pbedColsOf(t.key).forEach(function(c) { lines.push('  ' + pbedColName(c, picks) + ' - ' + c.label + ' - ' + c.type + ' - ' + c.need + ' - ' + c.why); });
+        });
+        return lines.join('\n');
+    };
+    const copyList = function() {
+        const txt = listText();
+        const done = function() { setCopied(true); setTimeout(function() { setCopied(false); }, 1500); };
+        const fallback = function() { try { const ta = document.createElement('textarea'); ta.value = txt; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); done(); } catch (e) {} };
+        try { if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') { navigator.clipboard.writeText(txt).then(done, fallback); return; } } catch (e) {}
+        fallback();
+    };
+    const PILLS = { found: ['FOUND', 'bg-emerald-100 text-emerald-800 border-emerald-200'], missing: ['MISSING', 'bg-[#FDE8EC] text-[#E4002B] border-[#F7B7C3]'], table: ['NO TABLE', 'bg-[#FDE8EC] text-[#E4002B] border-[#F7B7C3]'], noaccess: ['NO ACCESS', 'bg-[#FFF6E0] text-[#8A5A00] border-[#FFD27A]'], unknown: ['COULD NOT CHECK', 'bg-slate-100 text-slate-600 border-slate-200'], checking: ['CHECKING…', 'bg-[#E6F1FB] text-[#00468B] border-[#B3D4F2]'] };
+    const pill = function(st) { const p = PILLS[st]; return p ? <span data-pbed-pill={st} className={`px-1.5 py-0.5 rounded border text-[9px] font-black tracking-wide ${p[1]}`}>{p[0]}</span> : null; };
+    const nameBox = function(k, assumed, title) {
+        return (
+            <span className="ml-auto flex items-center gap-1.5 text-[10px] font-bold text-slate-500">
+                <span>{picks[k] ? 'Using' : 'Or use'}</span>
+                <input data-pbed-name={k} value={draftOf(k, picks[k] || '')} placeholder={assumed} onChange={function(e) { setDraft(k, e.target.value); }} onBlur={function(e) { setPick(k, e.target.value); setDraft(k, undefined); }} onKeyDown={function(e) { if (e.key === 'Enter') e.target.blur(); }} className="w-44 border border-slate-300 rounded px-1.5 py-0.5 text-[11px] font-bold outline-none no-pan" title={title} />
+                {picks[k] ? <button data-pbed-name-reset={k} onClick={function() { setPick(k, ''); }} className="text-[#0072CE] underline">back to {assumed}</button> : null}
+            </span>
+        );
+    };
+    const last = save.last, payloads = props.payloads || [];
+    return (
+        <div data-pbed-columns className="px-6 pt-4 pb-5 border-t border-slate-100">
+            <div className="flex flex-wrap items-center gap-2">
+                <button data-pbed-fold onClick={function() { setOpen(!open); }} className="text-[10px] font-black text-slate-500 uppercase tracking-widest mr-1 hover:text-[#0072CE]">{open ? '▾' : '▸'} Save to Dataverse: the columns it uses</button>
+                <Button variant="outline" size="sm" onClick={copyList} className="px-2 py-1 text-[10px]">{copied ? 'Copied' : 'Copy this list'}</Button>
+                <span data-pbed-check className="inline-flex"><Button variant="primary" size="sm" disabled={check.status === 'checking'} onClick={props.onCheck} className="px-2 py-1 text-[10px]">{check.status === 'checking' ? 'Checking…' : 'Check'}</Button></span>
+                {check.at ? <span data-pbed-check-at className="text-[10px] font-bold text-slate-400">checked {clockOf(check.at)}</span> : null}
+            </div>
+            <p className="text-[11px] font-bold text-slate-500 mt-1">Save to Dataverse (on the Gantt tab) writes the plan on screen to these two tables. The names are assumed: create them as listed or, when a table or column was created under another name, type that name in its box and it is used from then on. Check asks Dataverse for each one (three tries). A save waits out a busy server, drops an optional column it cannot write and sends the row again, stops on a required one that is missing and names it, and shows every payload it sent below.</p>
+            {open && PBED_TABLES.map(function(t) {
+                const ts = check.tables[t.key] || '';
+                return (
+                    <div key={t.key} data-pbed-table={t.key} data-pbed-table-state={ts} className="mt-3 rounded-lg border border-slate-200 overflow-hidden">
+                        <div className="flex flex-wrap items-center gap-2 bg-slate-50 px-3 py-2">
+                            <span className="text-[11px] font-black text-slate-700">{t.title}</span>
+                            <code className="text-[11px] font-bold text-slate-600">{pbedTableName(t.key, picks)}</code>
+                            <span className="text-[10px] font-bold text-slate-500">{t.what}</span>
+                            {pill(ts)}
+                            {nameBox(t.key + '.table', t.table, 'The table\'s logical name in Dataverse. Blank = the assumed name.')}
+                        </div>
+                        <div className="divide-y divide-slate-100">
+                            {pbedColsOf(t.key).map(function(c) {
+                                const k = c.t + '.' + c.key, cs = check.cols[k] || '';
+                                return (
+                                    <div key={k} data-pbed-col={k} data-pbed-col-state={cs} className="flex flex-wrap items-center gap-2 px-3 py-1.5 text-[11px]">
+                                        <span className="font-black text-slate-700 w-28">{c.label}</span>
+                                        <code className="font-bold text-slate-600">{pbedColName(c, picks)}</code>
+                                        <span className="text-slate-500">{c.type}</span>
+                                        <span className={`font-black text-[9px] uppercase ${c.need === 'required' ? 'text-slate-600' : 'text-slate-400'}`}>{c.need}</span>
+                                        {pill(cs)}
+                                        <span className="text-slate-400">{c.why}</span>
+                                        {nameBox(k, c.name, 'The column\'s logical name in Dataverse. Blank = the assumed name.')}
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </div>
+                );
+            })}
+            {last && (
+                <div data-pbed-save-result={last.ok ? 'ok' : 'failed'} className={`mt-3 text-[11px] font-bold ${last.ok ? 'text-emerald-700' : 'text-[#E4002B]'}`}>
+                    {last.ok
+                        ? 'Saved ' + clockOf(last.at) + ': ' + last.created + ' row' + (last.created === 1 ? '' : 's') + ' created, ' + last.updated + ' updated' + (last.removed ? ', ' + last.removed + ' removed' : '') + ' (' + last.blocks + ' block' + (last.blocks === 1 ? '' : 's') + ').' + (last.dropped && last.dropped.length ? ' Not written, column missing: ' + last.dropped.join(', ') + '.' : '')
+                        : 'Save failed ' + clockOf(last.at) + ': ' + last.error}
+                </div>
+            )}
+            <div className="mt-2">
+                <button data-pbed-payloads onClick={function() { setPayOpen(!payOpen); }} className="text-[10px] font-bold text-[#0072CE] underline">{payOpen ? 'Hide' : 'Show'} the payloads sent ({payloads.length})</button>
+                {payOpen && <pre data-pbed-payload-list className="mt-1 max-h-60 overflow-auto bg-slate-50 border border-slate-200 rounded p-2 text-[10px] leading-snug text-slate-700 whitespace-pre-wrap">{payloads.length ? payloads.map(function(p) { return p.at + ' ' + p.op + ' ' + p.table + (p.id ? ' ' + p.id : '') + (p.err ? ' ✗ ' + p.err : ' ✓') + '\n' + p.body; }).join('\n\n') : 'Nothing sent yet.'}</pre>}
+            </div>
+        </div>
+    );
+}
+
+// ============================================================================
 // COMPANY THEME (same blue / yellow / red as the Sanitation Scheduler 2.0)
 // ============================================================================
 // Optional: URL of the official company logo (for example a Dataverse web resource).
@@ -2576,6 +3110,12 @@ export default function App(props) {
     const [assets, setAssets] = useState([]);
     const [rawEmployees, setRawEmployees] = useState([]);
     const [dataDiag, setDataDiag] = useState({ source: 'Loading', assetCount: 0, employeeTable: '', shiftRows: 0 });
+    // PBED: Save to Dataverse (see SAVE TO DATAVERSE): the table / column names typed in, the last Check, the save under way and its result,
+    // and the payloads sent (shown on the Columns card).
+    const [pbedPicks, setPbedPicks] = useState(function() { return IS_CURRENT ? {} : pbedReadPicks(); });
+    const [pbedCheck, setPbedCheck] = useState({ status: 'idle', tables: {}, cols: {}, at: 0 });
+    const [pbedSave, setPbedSave] = useState({ status: 'idle', done: 0, total: 0, last: null });
+    const pbedPayloadsRef = useRef([]);
 
     const [collapsedDashboardRooms, setCollapsedDashboardRooms] = useState({});
 
@@ -2599,9 +3139,9 @@ export default function App(props) {
         if (m === 'overdueweekly' || m === 'overdue' || m === 'type') return m;
         return Array.isArray(initialSettings.cleanTypes) && initialSettings.cleanTypes.length > 0 ? 'type' : 'overdueweekly';
     });
-    // PBED: where each room's Handover (earliest start) comes from. 'schedule' (default) = the production schedule, with a Handover typed
-    // by hand winning while it is inside the plan window; 'hand' = only the Handover typed by hand (what Ganttly always does).
-    const [handoffSource, setHandoffSource] = useState(!IS_CURRENT && initialSettings.handoffSource !== 'hand' ? 'schedule' : 'hand');
+    // Where each room's stop (earliest start) comes from. PBED: always the production schedule (its Clean Plan, then the runs; nothing is
+    // typed in, see STOP AND RESTART TIMES). Ganttly: 'hand', only what was typed on the room and its down lines.
+    const [handoffSource, setHandoffSource] = useState(IS_CURRENT ? 'hand' : 'schedule');
     const [handoffGapMins, setHandoffGapMins] = useState(function() { const n = Number(initialSettings.handoffGapMins); return initialSettings.handoffGapMins === undefined || isNaN(n) ? HANDOFF_GAP_DEFAULT : Math.max(0, Math.min(600, Math.round(n))); });
     const [roomProdLines, setRoomProdLines] = useState(initialSettings.roomProdLines && typeof initialSettings.roomProdLines === 'object' ? initialSettings.roomProdLines : {});
     // Production first, support below (see lineIsProduction). roomGroups = a room's own pick ('production' | 'support') over what the MSS
@@ -2782,6 +3322,10 @@ export default function App(props) {
     // | 'ready' | 'failed', readAt, truncated }).
     const [prodRows, setProdRows] = useState([]);
     const [prodState, setProdState] = useState({ status: 'idle', readAt: 0, truncated: false });
+    // PBED: the Clean Plan the production schedule published (see STOP AND RESTART TIMES), read with the runs; null until read or when
+    // the table could not be read. cpState = how that read went ({ status: 'idle' | 'loading' | 'ready' | 'failed', readAt, why, windows }).
+    const [cleanPlan, setCleanPlan] = useState(null);
+    const [cpState, setCpState] = useState({ status: 'idle', readAt: 0, why: '', windows: 0 });
     const prodSigRef = useRef('');
     const prodReqRef = useRef(0);
     const loadProdRunsRef = useRef(null);   // set once the plan window is known (below)
@@ -3289,6 +3833,17 @@ export default function App(props) {
         const from = globalStartMs - (IS_CURRENT ? PROD_BACK_MS : 0), to = globalStartMs + planHorizonMins * 60000 + Math.max(PROD_AFTER_MS, PROD_RESTART_AHEAD_MS);   // far enough to see the restart
         const win = from + '|' + to;
         setProdState(function(prev) { return { status: 'loading', readAt: prev.readAt, truncated: prev.truncated }; });
+        if (!IS_CURRENT) {   // PBED: the Clean Plan too (readCleanPlan never throws; found false = no table or no permission)
+            setCpState(function(prev) { return { status: 'loading', readAt: prev.readAt, why: prev.why, windows: prev.windows }; });
+            const cpFail = function(why) { if (req !== prodReqRef.current) return; setCleanPlan(null); setCpState({ status: 'failed', readAt: Date.now(), why: why, windows: 0 }); };
+            Promise.resolve().then(function() { return readCleanPlan(props.dataApi, globalStartMs, to); }).then(function(plan) {
+                if (req !== prodReqRef.current) return;
+                if (!plan || !plan.found) { cpFail(plan && plan.why ? String(plan.why) : 'The Clean Plan table could not be read.'); return; }
+                const n = (plan.windows || []).filter(function(w) { return w.stop !== 'overlap' && plan.weekDone(w.day); }).length;
+                setCleanPlan(plan);
+                setCpState({ status: 'ready', readAt: Date.now(), why: '', windows: n });
+            }, function(e) { cpFail(String(e && e.message || e)); });
+        }
         return fetchProductionRuns(props.dataApi, from, to).then(function(rows) {
             if (req !== prodReqRef.current) return;   // a slower answer for an earlier window is dropped
             if (rows === null) {
@@ -3316,20 +3871,21 @@ export default function App(props) {
     const downLinePlan = useMemo(function() { return IS_CURRENT ? expandDownLines(downLineList, globalStartMs, planHorizonMins) : { handoff: {}, blocks: {}, bands: [] }; }, [downLineList, globalStartMs, planHorizonMins]);
     // The rooms (equipment areas), as one string so a change of equipment minutes doesn't redo the handoffs.
     const areaSig = useMemo(function() { const seen = {}; assets.forEach(function(a) { seen[String(a.area)] = 1; }); return Object.keys(seen).sort().join('\u0001'); }, [assets]);
-    // Per room: when it may first be cleaned. { ms, src } with src 'hand' (a Handover typed in), 'schedule' (production hands it over then),
-    // 'free' / 'norun' (production is not running it: the plan start), 'nomatch' (no production line found), 'nolines' (picked: never waits).
+    // Per room: when it may first be cleaned. { ms, src } with src 'plan' (PBED: the Clean Plan's stop for its line; stopped = already stopped
+    // at the plan start), 'hand' (Ganttly: a Handover typed in), 'schedule' (production hands it over then), 'free' / 'norun' (production is
+    // not running it: the plan start), 'nomatch' (no production line found), 'nolines' (picked: never waits). PBED entries also carry restart,
+    // restartSrc and deadline (restart - CLEAN_DONE_BEFORE_MINS); a 'plan' entry carries the Clean Plan window as plan.
     const handoffInfo = useMemo(function() {
         const out = {};
         const w0 = globalStartMs, w1 = globalStartMs + planHorizonMins * 60000, gapMs = handoffGapMins * 60000;
         const wideOf = function(lines) { return (lines || []).map(function(L) { return prodLinesWide[L.key] || L; }); };   // the same lines, with every run read
-        // PBED: when the room's production runs again (restart). A restart typed on the room wins while it is after the stop and not far
-        // past the plan; otherwise the next run on the room's lines after the stop. { restart: ms | null, restartSrc: 'typed' | 'schedule' | 'none' }.
+        // PBED: when the room's production runs again (restart): the next run on the room's lines after the stop, from the production
+        // schedule. { restart: ms | null, restartSrc: 'schedule' | 'none', deadline: restart - CLEAN_DONE_BEFORE_MINS | null }.
         const withRestart = function(area, entry, roomLines) {
             const known = entry.ms !== null && entry.ms !== undefined && (entry.src === 'hand' || entry.src === 'schedule' || entry.src === 'free' || entry.src === 'norun');
-            const rv = !IS_CURRENT && roomRestarts[area] ? new Date(roomRestarts[area]).getTime() : NaN;
-            if (!isNaN(rv) && rv > (known ? entry.ms : w0) && rv <= w1 + PROD_RESTART_AHEAD_MS) { entry.restart = rv; entry.restartSrc = 'typed'; return entry; }
             const rs = known && !IS_CURRENT ? roomRestart(roomLines, entry.ms) : null;
             entry.restart = rs; entry.restartSrc = rs !== null ? 'schedule' : 'none';
+            entry.deadline = rs !== null ? rs - CLEAN_DONE_BEFORE_MINS * 60000 : null;
             return entry;
         };
         areaSig.split('\u0001').forEach(function(area) {
@@ -3355,11 +3911,20 @@ export default function App(props) {
             const ln = lineForArea(lineIndex, area);
             const m = linesForRoom([area, ln ? ln.name : ''], prodLines, roomProdLines[area]);
             const lines = m.lines.map(function(L) { return prodLineLabel(L); });
-            const stale = !isNaN(hv) && (hv < w0 || hv > w1);   // an old typed Handover from another plan: ignored
-            if (!isNaN(hv) && !stale) { out[area] = withRestart(area, { ms: hv, src: 'hand', lines: lines, how: m.how }, wideOf(m.lines)); return; }
+            // The Clean Plan first (see STOP AND RESTART TIMES): the stop the production schedule published for the room's line(s).
+            if (cleanPlan && roomProdLines[area] !== 'none') {
+                const keys = cleanPlanKeysFor(cleanPlan, m.lines.length ? wideOf(m.lines) : [], area, ln ? ln.name : '');
+                const cw = cleanPlanWindowFor(cleanPlan, keys, w0, w1 + PROD_RESTART_AHEAD_MS, gapMs);
+                if (cw) {
+                    const w = cw.window;
+                    out[area] = { ms: Math.max(w0, w.start), src: 'plan', lines: lines.length ? lines : cw.keys, how: 'Clean Plan ' + cw.keys.join(', ') + (m.lines.length ? ' (' + m.how + ')' : ' (by name)'), next: cw.restart, restart: cw.restart, restartSrc: cw.restart !== null ? 'plan' : 'none', deadline: cw.restart !== null ? cw.restart - CLEAN_DONE_BEFORE_MINS * 60000 : null, plan: w, stopped: w.start <= w0 };
+                    return;
+                }
+            }
+            // Then the runs themselves: the room is handed over when the run on at the plan start ends (a room on several lines waits for the last).
             const h = roomHandoff(m.lines, w0, gapMs);
-            if (!h) { out[area] = withRestart(area, { ms: null, src: roomProdLines[area] === 'none' ? 'nolines' : 'nomatch', lines: lines, how: m.how, stale: stale }, wideOf(m.lines)); return; }
-            out[area] = withRestart(area, { ms: h.ms, src: h.state === 'handed' ? 'schedule' : h.state, lines: lines, how: m.how, next: h.next, stale: stale }, wideOf(m.lines));
+            if (!h) { out[area] = withRestart(area, { ms: null, src: roomProdLines[area] === 'none' ? 'nolines' : 'nomatch', lines: lines, how: m.how }, wideOf(m.lines)); return; }
+            out[area] = withRestart(area, { ms: h.ms, src: h.state === 'handed' ? 'schedule' : h.state, lines: lines, how: m.how, next: h.next }, wideOf(m.lines));
         });
         // A line that is down frees its rooms from the time it went down; that wins over a Handover typed on the room.
         // Its startup is the down line's restart when one is typed in, else what the production schedule says (Ganttly).
@@ -3370,12 +3935,12 @@ export default function App(props) {
             out[area] = { ms: dl.ms, src: 'down', lines: dl.lines, typed: prev.src === 'hand', restart: dl.restart !== null && dl.restart !== undefined ? dl.restart : sched, restartSrc: dl.restart !== null && dl.restart !== undefined ? 'down' : sched !== null ? 'schedule' : 'none', noRestart: !!dl.noRestart, schedLines: prev.lines || [], how: prev.how };
         });
         return out;
-    }, [areaSig, prodLines, prodLinesWide, handoffSource, handoffGapMins, roomProdLines, roomHandovers, roomRestarts, globalStartMs, planHorizonMins, lineIndex, downLinePlan]);
+    }, [areaSig, prodLines, prodLinesWide, handoffSource, handoffGapMins, roomProdLines, roomHandovers, cleanPlan, globalStartMs, planHorizonMins, lineIndex, downLinePlan]);
     // What the engine needs: only the rooms that really wait ({ area: ms }), kept as the same object until a number changes, so a read that
     // finds nothing new, or a note that changes, never re-plans.
     const handoffNow = (function() {
         const map = {}, parts = [];
-        Object.keys(handoffInfo).forEach(function(k) { const h = handoffInfo[k]; if (h.ms !== null && (h.src === 'hand' || h.src === 'schedule' || h.src === 'down')) { map[k] = h.ms; parts.push(k + '=' + h.ms); } });
+        Object.keys(handoffInfo).forEach(function(k) { const h = handoffInfo[k]; if (h.ms !== null && (h.src === 'hand' || h.src === 'schedule' || h.src === 'down' || h.src === 'plan')) { map[k] = h.ms; parts.push(k + '=' + h.ms); } });
         return { map: map, sig: parts.sort().join('|') };
     })();
     const handoffRef = useRef({ sig: null, map: {} });
@@ -4178,8 +4743,9 @@ export default function App(props) {
         areaSig.split('\u0001').forEach(function(area) {
             if (!area) return;
             const hi = handoffInfo[area] || {};
-            const stop = hi.ms !== null && hi.ms !== undefined && (hi.src === 'hand' || hi.src === 'schedule') ? Math.max(0, toMin(hi.ms)) : null;
+            const stop = hi.ms !== null && hi.ms !== undefined && (hi.src === 'hand' || hi.src === 'schedule' || (hi.src === 'plan' && !hi.stopped)) ? Math.max(0, toMin(hi.ms)) : null;
             const restart = hi.restart !== null && hi.restart !== undefined ? toMin(hi.restart) : null;
+            const deadline = restart !== null ? restart - CLEAN_DONE_BEFORE_MINS : null;   // the cleaning is done by then (see STOP AND RESTART TIMES)
             const steps = resolveDeptSteps(deptStepsFor(deptSteps, area), stop, restart, 0).map(function(x) { return Object.assign(x, { src: 'recipe' }); });
             tbWide.forEach(function(b, bi) {
                 if (b.room !== area || (b.kind !== 'maintenance' && b.kind !== 'inspection')) return;
@@ -4188,7 +4754,7 @@ export default function App(props) {
             if (!steps.length && stop === null && restart === null) return;
             const lanes = DEPTS.map(function(d) { return d.id; }).filter(function(d) { return steps.some(function(x) { return x.dept === d; }); });
             steps.forEach(function(x) { if (x.end > out.maxEnd) out.maxEnd = x.end; });
-            out.byRoom[area] = { stop: stop, restart: restart, restartSrc: hi.restartSrc || 'none', steps: steps, lanes: lanes };
+            out.byRoom[area] = { stop: stop, restart: restart, restartSrc: hi.restartSrc || 'none', deadline: deadline, plan: hi.plan || null, steps: steps, lanes: lanes };
         });
         return out;
     }, [areaSig, handoffInfo, deptSteps, timeBlocks, globalStartMs, planHorizonMins]);
@@ -7118,7 +7684,7 @@ export default function App(props) {
                 const hi = handoffInfo[room] || {};
                 const raw = rawHandoff(room);
                 const blk = e.info.floor > raw + 0.5 ? (planBlocks.byRoom[room] || []).concat(planBlocks.plant).find(function(q) { return q.start <= raw + 0.01 && raw < q.end; }) : null;
-                const src = blk ? ' (then ' + blk.label + ' is under way)' : hi.src === 'hand' ? ' (the Handover typed on the room)' : hi.src === 'schedule' && hi.lines && hi.lines.length ? ' (' + (hi.lines.length > 1 ? 'the last of production on ' : 'production on ') + hi.lines.join(', ') + ' runs until then)' : '';
+                const src = blk ? ' (then ' + blk.label + ' is under way)' : hi.src === 'hand' ? ' (the Handover typed on the room)' : hi.src === 'plan' ? ' (the production schedule\'s Clean Plan: ' + (hi.lines && hi.lines.length ? (hi.lines.length > 1 ? 'the last of production on ' : 'production on ') + hi.lines.join(', ') : 'production on its line') + ' runs until then)' : hi.src === 'schedule' && hi.lines && hi.lines.length ? ' (' + (hi.lines.length > 1 ? 'the last of production on ' : 'production on ') + hi.lines.join(', ') + ' runs until then)' : '';
                 text = room + ' isn\'t handed over until ' + clock(e.info.floor) + src + '. ' + jobs(e) + (e.info.planned ? (e.n === 1 ? ' waits' : ' wait') + ' for it.' : waits(e) + '.') + later(e);
             }
             else if (e.code === 'PART_WAIT') text = 'The rest of ' + names(e) + ' can\'t start until its first part ends at ' + clock(e.info.floor) + '.';
@@ -7215,16 +7781,156 @@ export default function App(props) {
             return { dept: x.id, label: x.label, color: x.color, steps: d.steps.filter(function(st) { return st.dept === x.id; }) };
         });
     };
-    // The room's restart check for its header: how long before the first inspection / maintenance step that hangs on the restart the cleaning
-    // is done (spare), or how far into it the cleaning runs (late). With no such step it is measured against the restart itself.
+    // The room's restart check for its header: the cleaning has to be done CLEAN_DONE_BEFORE_MINS before production restarts (the restart
+    // comes from the production schedule: the Clean Plan, else the next run). Spare = how long before that deadline the cleaning is done;
+    // late = how far past it the cleaning runs. Nothing when the room has no restart.
     const restartChipOf = function(area, cleanEnd, leftOver) {
         const d = deptPlan.byRoom[area];
-        if (!d || d.restart === null || !Object.keys(deptShow).some(function(k) { return deptShow[k]; })) return null;
-        if (leftOver) return { late: true, text: 'not all planned', title: 'Production restarts ' + formatClockTime(ganttStartDate, ganttStartHour, d.restart) + (d.restartSrc === 'typed' ? ' (typed in)' : ' (production schedule)') + '\nSome of this room\'s cleaning does not fit in the plan, so the room is not clean before production restarts.' };
-        let gate = d.restart, what = 'the restart';
-        d.steps.forEach(function(st) { if (st.src === 'recipe' && st.anchor === 'restart' && st.start < gate && (d.stop === null || st.start >= d.stop)) { gate = st.start; what = st.name; } });
-        const diff = gate - cleanEnd;
-        return { late: diff < 0, text: fmtMins(Math.abs(diff)) + (diff < 0 ? ' late' : ' spare'), title: 'Production restarts ' + formatClockTime(ganttStartDate, ganttStartHour, d.restart) + (d.restartSrc === 'typed' ? ' (typed in)' : ' (production schedule)') + '\nThe cleaning is done at ' + formatClockTime(ganttStartDate, ganttStartHour, cleanEnd) + '; the next step that waits for it is ' + what + ' at ' + formatClockTime(ganttStartDate, ganttStartHour, gate) + (diff < 0 ? '\nThe cleaning runs ' + fmtMins(-diff) + ' into it.' : '\n' + fmtMins(diff) + ' to spare.') };
+        if (!d || d.restart === null || d.restart === undefined || d.deadline === null || d.deadline === undefined) return null;
+        const srcText = d.restartSrc === 'plan' ? ' (production schedule, Clean Plan)' : d.restartSrc === 'down' ? ' (down line)' : ' (production schedule)';
+        const head = 'Production restarts ' + formatClockTime(ganttStartDate, ganttStartHour, d.restart) + srcText + '\nThe cleaning has to be done by ' + formatClockTime(ganttStartDate, ganttStartHour, d.deadline) + ', ' + fmtMins(CLEAN_DONE_BEFORE_MINS) + ' before the next run.';
+        const why = d.plan && d.plan.reason ? '\nClean Plan: ' + d.plan.reason : '';
+        if (leftOver) return { late: true, text: 'not all planned', title: head + '\nSome of this room\'s cleaning does not fit in the plan, so the room is not clean before production restarts.' + why };
+        const diff = d.deadline - cleanEnd;
+        return { late: diff < 0, text: fmtMins(Math.abs(diff)) + (diff < 0 ? ' late' : ' spare'), title: head + '\nThe cleaning is done at ' + formatClockTime(ganttStartDate, ganttStartHour, cleanEnd) + (diff < 0 ? ': ' + fmtMins(-diff) + ' past the deadline.' : ': ' + fmtMins(diff) + ' to spare.') + why };
+    };
+    // ---- Save to Dataverse (PBED, see SAVE TO DATAVERSE) ----
+    const pbedLogPayload = function(op, table, id, body, err) {
+        const list = pbedPayloadsRef.current;
+        let txt = ''; try { txt = JSON.stringify(body); } catch (e) { txt = String(body); }
+        list.unshift({ at: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' }), op: op, table: table, id: id || '', body: txt.length > 1500 ? txt.slice(0, 1500) + '… (' + txt.length + ' chars)' : txt, err: err || '' });
+        if (list.length > PBED_PAYLOAD_KEEP) list.length = PBED_PAYLOAD_KEEP;
+    };
+    // Check: asks Dataverse for every column of both tables (PBED_POOL at a time, three tries each), then marks each one FOUND / MISSING /
+    // NO TABLE / NO ACCESS / COULD NOT CHECK, and each table from its columns.
+    const runPbedCheck = async function() {
+        if (IS_CURRENT || pbedCheck.status === 'checking') return;
+        const cols = {};
+        PBED_COLS.forEach(function(c) { cols[c.t + '.' + c.key] = 'checking'; });
+        setPbedCheck({ status: 'checking', tables: {}, cols: cols, at: 0 });
+        const results = {}, jobs = PBED_COLS.slice();
+        const worker = async function() {
+            while (jobs.length) {
+                const c = jobs.shift(), k = c.t + '.' + c.key;
+                const r = await pbedProbeColumn(props.dataApi, pbedTableName(c.t, pbedPicks), pbedColName(c, pbedPicks));
+                results[k] = r.s;
+                setPbedCheck(function(prev) { const n = Object.assign({}, prev.cols); n[k] = r.s; return Object.assign({}, prev, { cols: n }); });
+            }
+        };
+        const pool = [];
+        for (let i = 0; i < PBED_POOL; i++) pool.push(worker());
+        await Promise.all(pool);
+        const tables = {};
+        PBED_TABLES.forEach(function(t) {
+            const ss = pbedColsOf(t.key).map(function(c) { return results[c.t + '.' + c.key] || 'unknown'; });
+            tables[t.key] = ss.indexOf('table') > -1 ? 'table' : (ss.indexOf('found') > -1 || ss.indexOf('missing') > -1) ? 'found' : ss.indexOf('noaccess') > -1 ? 'noaccess' : 'unknown';
+        });
+        setPbedCheck({ status: 'done', tables: tables, cols: results, at: Date.now() });
+    };
+    // Save to Dataverse: the plan on screen as one PBED Plan row (the whole plan as JSON) and one PBED Plan Step row per block. Saving the
+    // same plan window again updates the rows written before (ids kept in the browser) and removes the blocks no longer planned.
+    const savePlanToDataverse = async function() {
+        if (IS_CURRENT || pbedSave.status === 'saving') return;
+        const w = pbedWriteApi(props.dataApi);
+        const prevLast = pbedSave.last;
+        const fail = function(msg, done, total) { setPbedSave({ status: 'idle', done: done || 0, total: total || 0, last: { at: Date.now(), ok: false, error: msg, created: 0, updated: 0, removed: 0, dropped: [], blocks: 0 } }); };
+        if (!w) { fail('This page has no Dataverse connection that can write (no Xrm.WebApi and no dataApi.createRow).'); return; }
+        const planKey = String(ganttStartDate) + '|' + String(ganttStartHour) + '|' + String(planHours);
+        const planStart = globalStartMs, planEnd = globalStartMs + planHorizonMins * 60000;
+        const planTable = pbedTableName('pbedplan', pbedPicks), stepTable = pbedTableName('pbedplanstep', pbedPicks);
+        const colOf = function(tkey) { const o = {}; pbedColsOf(tkey).forEach(function(c) { o[c.key] = pbedColName(c, pbedPicks); }); return o; };
+        const pc = colOf('pbedplan'), sc = colOf('pbedplanstep');
+        const sentCols = function(tkey) { return pbedColsOf(tkey).map(function(c) { return { sentName: pbedColName(c, pbedPicks), need: c.need }; }); };
+        const iso = function(ms) { return new Date(ms).toISOString(); };
+        const dvById = {};
+        assets.forEach(function(a) { if (a && a.id !== undefined) dvById[a.id] = a.dvId || ''; });
+        // the blocks on the Gantt
+        const blocks = [];
+        scheduleData.groups.forEach(function(g) {
+            g.tasks.forEach(function(t) {
+                const lanes = (t.assignedLanes || []).map(function(i) { return laneRoster[i]; }).filter(Boolean);
+                const start = planStart + Math.round(t.startMin) * 60000, mins = Math.max(1, Math.round(t.finalDuration));
+                const stRec = taskStatus[t.id], st = stRec && stRec.status === 'done' ? 'done' : stRec && stRec.status === 'started' ? 'started' : 'planned';
+                blocks.push({ stepKey: String(t.id), area: String(t.originalArea || g.name), equipment: String(t.baseName || t.name || ''), start: start, end: start + mins * 60000, minutes: mins, heads: lanes.length || Number(t.appliedHeads) || Number(t.heads) || 1, crew: lanes.length ? String(lanes[0].crew || '') : '', people: lanes.map(function(l) { return l.name; }).join(', '), equipmentGuid: String(t.dvId || dvById[t.parentId] || ''), status: st });
+            });
+        });
+        // one line per room: stop, restart, done-by, spare or late (from the production schedule, see STOP AND RESTART TIMES)
+        const rooms = [];
+        Object.keys(handoffInfo).sort().forEach(function(area) {
+            if (!scheduleData.groups.some(function(g) { return g.name === area; })) return;
+            const hi = handoffInfo[area];
+            const roomBlocks = blocks.filter(function(b) { return b.area === area; });
+            const cleanEnd = roomBlocks.reduce(function(m, b) { return Math.max(m, b.end); }, 0);
+            const restart = hi.restart !== null && hi.restart !== undefined ? hi.restart : null;
+            const doneBy = restart !== null ? restart - CLEAN_DONE_BEFORE_MINS * 60000 : null;
+            rooms.push({ area: area, stop: hi.ms !== null && hi.ms !== undefined ? iso(hi.ms) : null, stopSrc: hi.src, lines: hi.lines || [], restart: restart !== null ? iso(restart) : null, restartSrc: hi.restartSrc || 'none', doneBy: doneBy !== null ? iso(doneBy) : null, cleanEnd: cleanEnd ? iso(cleanEnd) : null, spareMins: doneBy !== null && cleanEnd ? Math.round((doneBy - cleanEnd) / 60000) : null, blocks: roomBlocks.length, cleanKind: hi.plan ? hi.plan.kind : '', planStatus: hi.plan ? hi.plan.status : '' });
+        });
+        const unplanned = scheduleData.unscheduled.map(function(t) { return { area: t.originalArea, equipment: t.name, minutes: Math.round(t.rawWorkloadMins) }; });
+        const now = Date.now();
+        const planJson = { v: 1, app: 'PBED', planKey: planKey, planStart: iso(planStart), planEnd: iso(planEnd), hours: Math.round(planHorizonMins / 60 * 100) / 100, savedAt: iso(now), rules: { doneBeforeMins: CLEAN_DONE_BEFORE_MINS, handoffGapMins: handoffGapMins, stopSource: 'production schedule: Clean Plan, then the runs' }, rooms: rooms, blocks: blocks, unplanned: unplanned };
+        const summary = rooms.map(function(r) {
+            return r.area + ': stops ' + (r.stop ? formatDayClock(Date.parse(r.stop)) : 'not known') + ', restarts ' + (r.restart ? formatDayClock(Date.parse(r.restart)) : 'not known') + ', done by ' + (r.doneBy ? formatDayClock(Date.parse(r.doneBy)) : 'not known') + (r.spareMins === null ? '' : r.spareMins >= 0 ? ', ' + fmtMins(r.spareMins) + ' spare' : ', ' + fmtMins(-r.spareMins) + ' late') + (r.blocks ? '' : ', nothing planned');
+        }).join('\n');
+        const planBody = {};
+        planBody[pc.name] = ('PBED plan ' + formatDayClock(planStart) + ' to ' + formatDayClock(planEnd)).slice(0, 200);
+        planBody[pc.plankey] = planKey; planBody[pc.planstart] = iso(planStart); planBody[pc.planend] = iso(planEnd); planBody[pc.savedat] = iso(now);
+        planBody[pc.stepcount] = blocks.length; planBody[pc.planjson] = JSON.stringify(planJson); planBody[pc.summary] = summary.slice(0, 4000);
+        const who = (function() { try { const x = safeGetXrm(); const u = x && x.Utility && typeof x.Utility.getGlobalContext === 'function' ? x.Utility.getGlobalContext().userSettings : null; return u && u.userName ? String(u.userName).slice(0, 200) : ''; } catch (e) { return ''; } })();
+        if (who) planBody[pc.savedby] = who;
+        // the rows written last time for this plan window
+        let saved = null; try { saved = JSON.parse(localStorage.getItem(PBED_SAVE_KEY) || 'null'); } catch (e) { saved = null; }
+        const same = !!(saved && saved.planKey === planKey && saved.planTable === planTable && saved.stepTable === stepTable);
+        const oldStepIds = same && saved.stepIds && typeof saved.stepIds === 'object' ? saved.stepIds : {};
+        const state = { missing: {}, reqMissing: [], noWrite: '', stop: false };
+        const total = 1 + blocks.length, dropped = [], stepIds = {};
+        let done = 0, created = 0, updated = 0, removed = 0, planId = same ? String(saved.planId || '') : '';
+        pbedPayloadsRef.current = [];
+        setPbedSave({ status: 'saving', done: 0, total: total, last: prevLast });
+        const noteDropped = function(list) { (list || []).forEach(function(n) { if (dropped.indexOf(n) === -1) dropped.push(n); }); };
+        const tick = function() { if (!state.stop) setPbedSave({ status: 'saving', done: done, total: total, last: prevLast }); };
+        const remember = function() { try { localStorage.setItem(PBED_SAVE_KEY, JSON.stringify({ planKey: planKey, planTable: planTable, stepTable: stepTable, planId: planId, stepIds: Object.assign({}, oldStepIds, stepIds), savedAt: Date.now() })); } catch (e) {} };
+        try {
+            const pr = await pbedPut(w, planTable, sentCols('pbedplan'), planBody, planId, state).catch(function(e) { pbedLogPayload('plan', planTable, planId, planBody, pbedErrText(e)); throw e; });
+            pbedLogPayload(pr.op, planTable, pr.id, pr.body, '');
+            noteDropped(pr.dropped); if (pr.op === 'created') created++; else updated++;
+            planId = pr.id; done++; tick();
+            const jobs = blocks.slice();
+            const stepWorker = async function() {
+                while (jobs.length && !state.stop) {
+                    const b = jobs.shift(), oldId = oldStepIds[b.stepKey] || '';
+                    const body = {};
+                    body[sc.name] = (b.area + ' · ' + b.equipment + ' · ' + (b.people || 'nobody yet')).slice(0, 200);
+                    body[sc.plankey] = planKey; body[sc.stepkey] = b.stepKey; body[sc.area] = b.area.slice(0, 100); body[sc.equipment] = b.equipment.slice(0, 200);
+                    body[sc.start] = iso(b.start); body[sc.end] = iso(b.end); body[sc.minutes] = b.minutes; body[sc.heads] = b.heads;
+                    body[sc.crew] = String(b.crew || '').slice(0, 10); body[sc.people] = b.people.slice(0, 2000); body[sc.status] = b.status;
+                    if (b.equipmentGuid) body[sc.equipmentguid] = b.equipmentGuid.slice(0, 100);
+                    const r = await pbedPut(w, stepTable, sentCols('pbedplanstep'), body, oldId, state).catch(function(e) { pbedLogPayload('step', stepTable, oldId, body, pbedErrText(e)); throw e; });
+                    pbedLogPayload(r.op, stepTable, r.id, r.body, '');
+                    noteDropped(r.dropped); if (r.op === 'created') created++; else updated++;
+                    stepIds[b.stepKey] = r.id; done++; tick();
+                }
+            };
+            const pool = [];
+            for (let i = 0; i < PBED_POOL; i++) pool.push(stepWorker());
+            await Promise.all(pool);
+            // blocks saved last time that are no longer in the plan
+            const gone = Object.keys(oldStepIds).filter(function(k) { return !stepIds[k] && oldStepIds[k]; });
+            for (let gi = 0; gi < gone.length; gi++) {
+                const gid = oldStepIds[gone[gi]];
+                try {
+                    const how = await pbedRemove(w, stepTable, gid);
+                    if (how === 'removed' || how === 'deactivated') removed++;
+                    pbedLogPayload(how, stepTable, gid, {}, '');
+                    if (how !== 'kept') delete oldStepIds[gone[gi]];
+                } catch (e) { pbedLogPayload('remove', stepTable, gid, {}, pbedErrText(e)); }
+            }
+            remember();
+            setPbedSave({ status: 'idle', done: done, total: total, last: { at: Date.now(), ok: true, planId: planId, created: created, updated: updated, removed: removed, dropped: dropped, error: '', blocks: blocks.length } });
+        } catch (e) {
+            state.stop = true;   // the other rows in flight stop after the one they are on
+            remember();          // what was written is remembered, so saving again updates those rows
+            fail(pbedErrText(e) + (done ? ' (' + done + ' of ' + total + ' rows were written before it stopped; press Save again to finish.)' : ''), done, total);
+        }
     };
     // The left-hand names of a room's lanes, then the bars. top0 = where the first lane starts inside the room's row.
     const renderDeptNames = function(area, lanes) {
@@ -8516,44 +9222,43 @@ export default function App(props) {
                                 )}
                             </div>
                             {!IS_CURRENT && (function() {
+                                // STOP AND RESTART TIMES: nothing is typed here; the production schedule (its Clean Plan, then the runs) decides every stop and restart.
                                 const inPlanRooms = allUniqueRooms.filter(function(r) { return !roomHidden(r); });
                                 const infoOf = function(r) { return handoffInfo[r] || { ms: null, src: 'nomatch' }; };
-                                const waiting = inPlanRooms.filter(function(r) { return infoOf(r).src === 'schedule'; }).length;
+                                const fromPlan = inPlanRooms.filter(function(r) { return infoOf(r).src === 'plan'; }).length;
+                                const waiting = inPlanRooms.filter(function(r) { const h = infoOf(r); return h.src === 'schedule' || (h.src === 'plan' && !h.stopped); }).length;
                                 const unmatched = inPlanRooms.filter(function(r) { return infoOf(r).src === 'nomatch'; });
                                 const lineCount = Object.keys(prodLines).length;
-                                const readTime = prodState.readAt ? new Date(prodState.readAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
+                                const clockOf = function(ms) { return ms ? new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : ''; };
+                                const readTime = clockOf(prodState.readAt);
                                 return (
                                     <div data-handoff-card className="px-6 pt-4 pb-5 border-t border-slate-100">
                                         <div className="flex flex-wrap items-center gap-2">
-                                            <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest mr-1">Handoff times:</span>
-                                            {[['schedule', 'From the production schedule'], ['hand', 'Set by hand']].map(function(o) {
-                                                const on = handoffSource === o[0];
-                                                return <button key={o[0]} data-handoff-source={o[0]} onClick={function() { setHandoffSource(o[0]); }} className={`px-3 py-1 rounded-full text-[11px] font-extrabold border transition-colors ${on ? 'bg-[#0072CE] border-[#0072CE] text-white shadow-sm' : 'bg-white border-gray-200 text-slate-600 hover:bg-[#E6F1FB] hover:text-[#0072CE]'}`}>{o[1]}</button>;
-                                            })}
-                                            {handoffSource === 'schedule' && (
-                                                <span className="flex items-center gap-1.5 text-[11px] font-bold text-slate-600">
-                                                    <span>a gap between runs under</span>
-                                                    <input data-handoff-gap type="number" min="0" max="600" value={handoffGapDraft !== null ? handoffGapDraft : handoffGapMins} onChange={function(e) { setHandoffGapDraft(e.target.value); }} onBlur={commitHandoffGap} onKeyDown={function(e) { if (e.key === 'Enter') e.target.blur(); }} className="w-14 border border-slate-300 rounded p-1 text-xs font-bold outline-none no-pan text-center" title="Production switching to the next run inside this many minutes is one stretch of production, not a handoff to sanitation" />
-                                                    <span>minutes is a changeover</span>
-                                                </span>
-                                            )}
+                                            <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest mr-1">Stop and restart times:</span>
+                                            <span data-handoff-source="schedule" className="px-3 py-1 rounded-full text-[11px] font-extrabold border bg-[#0072CE] border-[#0072CE] text-white shadow-sm">From the production schedule</span>
+                                            <span className="flex items-center gap-1.5 text-[11px] font-bold text-slate-600">
+                                                <span>a gap between runs under</span>
+                                                <input data-handoff-gap type="number" min="0" max="600" value={handoffGapDraft !== null ? handoffGapDraft : handoffGapMins} onChange={function(e) { setHandoffGapDraft(e.target.value); }} onBlur={commitHandoffGap} onKeyDown={function(e) { if (e.key === 'Enter') e.target.blur(); }} className="w-14 border border-slate-300 rounded p-1 text-xs font-bold outline-none no-pan text-center" title="Production switching to the next run inside this many minutes is one stretch of production, not a stop" />
+                                                <span>minutes is a changeover</span>
+                                            </span>
                                         </div>
-                                        {handoffSource === 'schedule' ? (
-                                            <div data-handoff-status={prodState.status} className={`flex flex-wrap items-center gap-2 mt-2 text-[11px] font-bold ${prodState.status === 'failed' || prodState.truncated || (prodState.status === 'ready' && prodRows.length === 0) ? 'text-amber-700' : 'text-slate-500'}`}>
-                                                <span>
-                                                    {prodState.status === 'failed' ? (prodRows.length > 0 ? 'Couldn\'t read the production schedule again, so the runs read earlier are still used.' : 'Couldn\'t read the production schedule, so each room starts at the plan start unless a Handover is typed in.')
-                                                        : prodState.status === 'ready' && prodRows.length === 0 ? 'No production runs are scheduled for this window, so each room starts at the plan start.'
-                                                        : prodState.status === 'idle' || (prodState.status === 'loading' && !prodState.readAt) ? 'Reading the production schedule…'
-                                                        : `Production schedule read ${readTime}: ${prodRows.length} run${prodRows.length === 1 ? '' : 's'} on ${lineCount} line${lineCount === 1 ? '' : 's'} · ${inPlanRooms.length - unmatched.length} of ${inPlanRooms.length} rooms matched to a line · ${waiting} wait${waiting === 1 ? 's' : ''} for production to hand over.`}
-                                                    {prodState.truncated ? ' Only the first ' + PROD_TOP + ' runs were read.' : ''}
-                                                    {prodState.status !== 'failed' && prodState.status !== 'idle' && unmatched.length > 0 ? ' No run found on a matching line in this window for: ' + unmatched.slice(0, 6).join(', ') + (unmatched.length > 6 ? ' and ' + (unmatched.length - 6) + ' more' : '') + ' (a line with nothing scheduled starts at the plan start; or pick the line on the room below).' : ''}
-                                                </span>
-                                                <button data-handoff-reload disabled={prodState.status === 'loading'} onClick={function() { loadProdRuns(); }} className="text-[#0072CE] hover:text-[#00468B] underline disabled:opacity-40 disabled:no-underline">Read the schedule again</button>
-                                            </div>
-                                        ) : (
-                                            <p className="text-[11px] font-bold text-slate-500 mt-2">Each room starts at the Handover typed on it below (blank = the plan start).</p>
-                                        )}
-                                        {handoffSource === 'schedule' && <p className="text-[11px] font-bold text-slate-500 mt-1">A room starts when production hands it over (the end of the run on at the plan start; a room on several lines waits for the last). A Handover typed on a room wins while it is inside the plan window.</p>}
+                                        <div data-handoff-status={prodState.status} className={`flex flex-wrap items-center gap-2 mt-2 text-[11px] font-bold ${prodState.status === 'failed' || prodState.truncated || (prodState.status === 'ready' && prodRows.length === 0) ? 'text-amber-700' : 'text-slate-500'}`}>
+                                            <span>
+                                                {prodState.status === 'failed' ? (prodRows.length > 0 ? 'Couldn\'t read the production schedule again, so the runs read earlier are still used.' : 'Couldn\'t read the production schedule, so each room with no Clean Plan stop starts at the plan start.')
+                                                    : prodState.status === 'ready' && prodRows.length === 0 ? 'No production runs are scheduled for this window, so each room with no Clean Plan stop starts at the plan start.'
+                                                    : prodState.status === 'idle' || (prodState.status === 'loading' && !prodState.readAt) ? 'Reading the production schedule…'
+                                                    : `Production schedule read ${readTime}: ${prodRows.length} run${prodRows.length === 1 ? '' : 's'} on ${lineCount} line${lineCount === 1 ? '' : 's'} · ${inPlanRooms.length - unmatched.length} of ${inPlanRooms.length} rooms matched to a line · ${waiting} wait${waiting === 1 ? 's' : ''} for production to stop.`}
+                                                {prodState.truncated ? ' Only the first ' + PROD_TOP + ' runs were read.' : ''}
+                                                {prodState.status !== 'failed' && prodState.status !== 'idle' && unmatched.length > 0 ? ' No run found on a matching line in this window for: ' + unmatched.slice(0, 6).join(', ') + (unmatched.length > 6 ? ' and ' + (unmatched.length - 6) + ' more' : '') + ' (a line with nothing scheduled starts at the plan start; or pick the line on the room below).' : ''}
+                                            </span>
+                                            <button data-handoff-reload disabled={prodState.status === 'loading'} onClick={function() { loadProdRuns(); }} className="text-[#0072CE] hover:text-[#00468B] underline disabled:opacity-40 disabled:no-underline">Read the schedule again</button>
+                                        </div>
+                                        <div data-cleanplan-status={cpState.status} className={`mt-1 text-[11px] font-bold ${cpState.status === 'failed' ? 'text-amber-700' : 'text-slate-500'}`}>
+                                            {cpState.status === 'ready' ? `Clean Plan read ${clockOf(cpState.readAt)}: ${cpState.windows} published stop${cpState.windows === 1 ? '' : 's'} · ${fromPlan} of ${inPlanRooms.length} rooms take their stop and restart from it; the rest follow the runs.`
+                                                : cpState.status === 'failed' ? 'Clean Plan not read (' + String(cpState.why || '').slice(0, 160) + '), so the runs decide every stop and restart.'
+                                                : 'Reading the Clean Plan…'}
+                                        </div>
+                                        <p className="text-[11px] font-bold text-slate-500 mt-1">Nothing is typed here: every stop and restart comes from the production schedule, its Clean Plan first (the stops it published for each line), then the runs themselves (a room starts when the run on at the plan start ends; a room on several lines waits for the last). The cleaning has to be done {Math.round(CLEAN_DONE_BEFORE_MINS / 60)} h before the next run. To change a time, change the run in the production schedule, then press Read the schedule again.</p>
                                     </div>
                                 );
                             })()}
@@ -8567,6 +9272,7 @@ export default function App(props) {
                                 <p className="text-[11px] font-bold text-slate-500 mt-2">Each shift, a piece of equipment goes to the person Shift Start gave it to, then anyone else on that room, then the rest of that team, then anyone on the shift whose role allows it. People fill their own room first (whole cleans, then parts of cleans) before they help their team, and their team before the rest of the shift.{focusK > 0 ? ' The rooms a shift is asked to finish first (Crew tab) come before all of this: everyone who can work them takes them before their own room.' : ''} When a shift has more work than its Tech 1s and 2s can do, Tech 3s and Inspectors get the PIC work first, and Tech 1s and 2s do regular cleaning first, taking PIC when they run out of it or when no Tech 3 or Inspector has time left for it. Shorter jobs fill the gaps between longer ones, and a job longer than a shift starts at clock-in. Any blank space left is outlined in yellow on the Gantt. {leadKind === 'leadership' ? 'Leads take no tasks (set on the Crew tab).' : leadKind === 'pic' ? 'Leads (set on the Crew tab) are given the PIC items (Subcategory "1 - pic"): a lead takes the PIC in their own team\'s rooms, then the shift\'s, as whole cleans, after any Tech 3 or Inspector who could take it (PIC is all they can do) and before a Tech 1 or 2, who keeps to regular cleaning while a lead can take the PIC and picks up PIC only when no lead, Tech 3 or Inspector has time for it. On a 2-person PIC clean the lead pairs with someone on the room or shift; a PIC clean too long for one shift starts with the lead at clock-in. PIC Shift Start hand-placed on someone stays with them. The rest of a lead\'s shift shows as Leadership.' : 'Leads (set on the Crew tab) keep what Shift Start gave them. Otherwise they come last, after the crew is planned: a lead takes PIC nobody on this or a later shift can get to, their own team\'s first, then regular cleaning nobody can get to. The rest of their shift shows as Leadership.'}</p>
                             </div>
                         </div>
+                        {!IS_CURRENT && <PbedColumnsCard dataApi={props.dataApi} picks={pbedPicks} setPicks={setPbedPicks} check={pbedCheck} onCheck={runPbedCheck} save={pbedSave} payloads={pbedPayloadsRef.current} />}
 
                         {/* ROOM CONFIGURATION CANVAS */}
                         <div className="bg-white rounded-xl shadow-lg border border-gray-200 flex flex-col h-fit overflow-hidden flex-shrink-0">
@@ -8631,6 +9337,37 @@ export default function App(props) {
                                                 <div className="flex flex-wrap items-center gap-3 mt-2">
                                                     {(function() {
                                                         const hi = handoffInfo[room] || { ms: null, src: 'hand-none' };
+                                                        if (!IS_CURRENT) {
+                                                            // PBED: nothing is typed here; the stop and restart come from the production schedule (see STOP AND RESTART TIMES)
+                                                            const ls = (hi.lines || []).slice(0, 2).join(', ') + ((hi.lines || []).length > 2 ? ' +' + ((hi.lines || []).length - 2) : '');
+                                                            const pw = hi.plan || null;
+                                                            const chipP = hi.src === 'plan' ? 'Clean Plan: production ' + (hi.stopped ? 'already stopped' : 'stops') + ' · ' + ls + (pw && pw.kind && pw.kind !== 'none' ? ' · ' + pw.kind + ' clean' : '') + (pw && pw.status && pw.status !== 'ok' && pw.status !== 'none' ? ' · ' + pw.status : '')
+                                                                : hi.src === 'schedule' ? 'production hands it over · ' + ls
+                                                                : hi.src === 'free' ? 'production stopped · ' + ls
+                                                                : hi.src === 'norun' ? 'no run scheduled · ' + ls
+                                                                : hi.src === 'nolines' ? 'doesn\'t wait for production'
+                                                                : 'no run found on a matching line in this window';
+                                                            const warnP = hi.src === 'nomatch' || !!(pw && (pw.status === 'short' || pw.status === 'overlap' || pw.status === 'nocrew'));
+                                                            const autoP = linesForRoom([room, (lineForArea(lineIndex, room) || { name: '' }).name], prodLines, undefined).lines;
+                                                            const pickP = roomProdLines[room] || '';
+                                                            const keysP = Object.keys(prodLines).sort(function(a, b) { return prodLineLabel(prodLines[a]).localeCompare(prodLineLabel(prodLines[b]), undefined, { numeric: true }); });
+                                                            const hasRestart = hi.restart !== null && hi.restart !== undefined;
+                                                            const tipP = (hi.how ? 'Matched by: ' + hi.how : '') + (pw && pw.reason ? '\nClean Plan: ' + pw.reason : '') + '\nStop and restart times live in the production schedule: change the run there, then Read the schedule again.';
+                                                            return (
+                                                                <div data-handoff-room={room} data-handoff-src={hi.src} className="flex flex-wrap items-center gap-2 bg-white px-2 py-1.5 rounded border border-[#B3D4F2] shadow-sm" title={tipP}>
+                                                                    <span className="text-[10px] font-black text-slate-500 uppercase">Stops:</span>
+                                                                    <span data-handoff-stop className="font-bold text-xs md:text-sm text-slate-800">{hi.ms !== null && hi.ms !== undefined ? (hi.src === 'plan' && hi.stopped ? 'before the plan start' : formatDayClock(hi.ms)) : '—'}</span>
+                                                                    <span className={`text-[10px] font-bold ${warnP ? 'text-amber-700' : 'text-slate-400'}`}>{chipP}</span>
+                                                                    <span data-handoff-restart className={`text-[10px] font-bold ${hasRestart ? 'text-slate-600' : 'text-slate-400'}`}>{hasRestart ? 'restarts ' + formatDayClock(hi.restart) + ' · done by ' + formatDayClock(hi.restart - CLEAN_DONE_BEFORE_MINS * 60000) : 'restart not known'}</span>
+                                                                    <select data-handoff-line={room} value={pickP} onChange={function(e) { handleRoomProdLineChange(room, e.target.value); }} className="text-[10px] font-bold outline-none bg-white cursor-pointer no-pan border border-slate-200 rounded px-1 py-0.5" title="Which production line this room waits for">
+                                                                        <option value="">Line: automatic ({autoP.length ? autoP.map(prodLineLabel).slice(0, 2).join(', ') : 'none found'})</option>
+                                                                        <option value="none">Line: don't wait for production</option>
+                                                                        {keysP.map(function(k) { return <option key={k} value={k}>Line: {prodLineLabel(prodLines[k])}</option>; })}
+                                                                        {pickP && pickP !== 'none' && !prodLines[pickP] && <option value={pickP}>Line: {pickP} (not in this window)</option>}
+                                                                    </select>
+                                                                </div>
+                                                            );
+                                                        }
                                                         const shown = hi.src === 'down' ? msToLocalInput(hi.ms) : roomHandovers[room] ? roomHandovers[room] : hi.ms !== null && hi.ms !== undefined ? msToLocalInput(hi.ms) : getDatetimeLocalString(0, ganttStartDate, ganttStartHour);
                                                         const fromSchedule = handoffSource === 'schedule';
                                                         const chip = hi.src === 'down' ? 'line down · ' + (hi.lines || []).join(', ') + (hi.typed || roomHandovers[room] ? ' · a Handover typed here is overridden' : '')
@@ -9772,7 +10509,7 @@ export default function App(props) {
                             <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
                             {odWanted && odState.status === 'error' && <span>{Object.keys(odMap).length > 0 ? 'Couldn\'t read the cleaning log again, so what was read earlier is kept and anything not read yet is planned.' : 'Couldn\'t read the cleaning log, so every piece of equipment is planned.'}</span>}
                             {odWanted && odState.status === 'partial' && <span>{odState.failed} piece{odState.failed === 1 ? '' : 's'} of equipment couldn't be read from the cleaning log and {odState.failed === 1 ? 'is' : 'are'} planned anyway.</span>}
-                            {handoffSource === 'schedule' && prodState.status === 'failed' && <span>{prodRows.length > 0 ? 'Couldn\'t read the production schedule again, so the runs read earlier are still used.' : 'Couldn\'t read the production schedule, so rooms start at the plan start unless a Handover is typed in.'}</span>}
+                            {handoffSource === 'schedule' && prodState.status === 'failed' && <span>{prodRows.length > 0 ? 'Couldn\'t read the production schedule again, so the runs read earlier are still used.' : 'Couldn\'t read the production schedule, so rooms with no Clean Plan stop start at the plan start.'}</span>}
                         </div>
                     )}
                     {genericView && (
@@ -9861,6 +10598,14 @@ export default function App(props) {
                                         <Button variant="success" size="sm" onClick={genericView ? handleExportGeneric : handleExportExcel} className="shadow-sm px-2 py-1 text-[10px]">
                                             <Download className="w-3.5 h-3.5 mr-1" /> Export CSV
                                         </Button>
+                                        {!IS_CURRENT && (
+                                            <span data-pbed-save className="inline-flex items-center gap-1.5">
+                                                <Button variant="primary" size="sm" disabled={pbedSave.status === 'saving'} onClick={savePlanToDataverse} className="shadow-sm px-2 py-1 text-[10px]" title="Write this plan to Dataverse: one PBED Plan row and one PBED Plan Step row per block (the columns are listed on Setup)">
+                                                    {pbedSave.status === 'saving' ? 'Saving ' + pbedSave.done + ' of ' + pbedSave.total + '…' : 'Save to Dataverse'}
+                                                </Button>
+                                                {pbedSave.last && <span data-pbed-save-state={pbedSave.last.ok ? 'ok' : 'failed'} className={`text-[10px] font-bold ${pbedSave.last.ok ? 'text-emerald-700' : 'text-[#E4002B]'}`} title={pbedSave.last.ok ? pbedSave.last.blocks + ' blocks saved' : pbedSave.last.error}>{pbedSave.last.ok ? 'saved ' + new Date(pbedSave.last.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : 'save failed: ' + String(pbedSave.last.error).slice(0, 90) + (String(pbedSave.last.error).length > 90 ? '…' : '')}</span>}
+                                            </span>
+                                        )}
                                         {Object.keys(overrides).length > 0 && (
                                             <Button variant="danger" size="sm" onClick={function() { setOverrides({}); }} className="bg-white border border-slate-300 text-slate-600 hover:bg-slate-50 shadow-sm px-2 py-1 text-[10px]" title="Drop all manual moves (check-offs are kept)">
                                                 <RefreshCw className="w-3.5 h-3.5 mr-1" /> Clear Moves ({Object.keys(overrides).length})
@@ -10316,11 +11061,11 @@ export default function App(props) {
                             </div>
                             {room !== '*' && (
                                 <div data-dept-times className="flex flex-wrap items-center gap-x-4 gap-y-2 mb-3 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-[11px] font-bold text-slate-600">
-                                    <span>Production stops: {dp && dp.stop !== null ? formatClockTime(ganttStartDate, ganttStartHour, dp.stop) : <span className="text-slate-400">{hi && hi.src === 'free' ? 'already stopped at the start of the plan' : hi && hi.src === 'norun' ? 'nothing scheduled' : 'not known'}</span>}</span>
+                                    <span>Production stops: {dp && dp.stop !== null ? formatClockTime(ganttStartDate, ganttStartHour, dp.stop) : <span className="text-slate-400">{hi && (hi.src === 'free' || (hi.src === 'plan' && hi.stopped)) ? 'already stopped at the start of the plan' : hi && hi.src === 'norun' ? 'nothing scheduled' : 'not known'}</span>}</span>
                                     <span className="flex items-center gap-2">Production restarts:
-                                        <input data-restart-input type="datetime-local" value={roomRestarts[room] || (hi && hi.restart !== null && hi.restart !== undefined ? msToLocalInput(hi.restart) : '')} onChange={function(e) { const v = e.target.value; setRoomRestarts(function(prev) { const n = Object.assign({}, prev); if (v) n[room] = v; else delete n[room]; return n; }); }} className="w-40 text-center font-bold text-xs outline-none border-b border-slate-300 bg-transparent no-pan" />
-                                        <span className={`text-[10px] ${(hi && hi.restartSrc === 'none') || (hi && hi.restartSrc !== 'typed' && roomRestarts[room]) ? 'text-amber-700' : 'text-slate-400'}`}>{hi && hi.restartSrc === 'typed' ? 'typed in' : roomRestarts[room] ? 'ignored: it has to be after the stop and within 4 days of the end of the plan' : hi && hi.restartSrc === 'schedule' ? 'from the production schedule' : 'not known: type it to place the steps that count back from it'}</span>
-                                        {roomRestarts[room] && <button data-restart-clear onClick={function() { setRoomRestarts(function(prev) { const n = Object.assign({}, prev); delete n[room]; return n; }); }} className="text-[10px] font-bold text-[#0072CE] hover:text-[#00468B] underline" title="Remove the typed restart and follow the production schedule again">use the schedule</button>}
+                                        <span data-restart-input className="font-bold text-xs text-slate-800">{hi && hi.restart !== null && hi.restart !== undefined ? clk(hi.restart) : <span className="text-slate-400">not known</span>}</span>
+                                        <span className={`text-[10px] ${hi && hi.restartSrc && hi.restartSrc !== 'none' ? 'text-slate-400' : 'text-amber-700'}`}>{hi && hi.restartSrc === 'plan' ? 'from the production schedule (Clean Plan)' : hi && hi.restartSrc === 'schedule' ? 'from the production schedule (next run)' : 'no run after the stop in the production schedule: add it there, then Read the schedule again on Setup'}</span>
+                                        {dp && dp.deadline !== null && dp.deadline !== undefined && <span data-restart-deadline className="text-[10px] text-slate-500">· cleaning done by {formatClockTime(ganttStartDate, ganttStartHour, dp.deadline)} ({fmtMins(CLEAN_DONE_BEFORE_MINS)} before)</span>}
                                     </span>
                                 </div>
                             )}
