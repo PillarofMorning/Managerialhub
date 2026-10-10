@@ -26,6 +26,7 @@ V. Shift Table (SST): craa5_workshift
 - Restored missing `AuthBox` and `Diagnostics` components.
 - Converted all components to hoisted `function` syntax to eliminate Webpack `ReferenceErrors`.
 - Implemented Reassignment Interceptor for 1:1 uniqueness mapping.
+- Every picture upload (before/after cleaning, completion photo) is converted to a JPG (HEIC through a converter loaded on first use).
 */
 // ============================================================================
 
@@ -225,12 +226,159 @@ function formatDuration(startTimeIso, endTimeIso = null, currentNowMs = Date.now
 function getLocalTimeString() { const now = new Date(); return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`; }
 function getCleanBase64(dataUrl) { return dataUrl ? (dataUrl.split(',').length > 1 ? dataUrl.split(',')[1] : dataUrl) : null; }
 
-function handleFileUpload(e, type, taskId, updateTask) {
-    const file = e.target.files[0];
-    if (!file) return;
+// ===== PICTURE TO JPG (every picture upload goes through this; the same block is in each app that uploads pictures) =====
+// Whatever picture is picked (PNG, WebP, GIF, BMP, TIFF, an iPhone HEIC photo ...) goes up as a JPG, as large as maxSide px on
+// its long side (default 1600). Chrome and Edge cannot open HEIC (Safari can), so a HEIC photo is turned into a JPG by a small
+// converter that is loaded from a CDN the first time one is picked. A photo that fails says why, in plain words.
+const PICTURE_MAX_SIDE = 1600;
+const HEIC_CONVERTER_URLS = [
+  'https://cdnjs.cloudflare.com/ajax/libs/heic2any/0.0.4/heic2any.min.js',
+  'https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js',
+  'https://unpkg.com/heic2any@0.0.4/dist/heic2any.min.js'
+];
+const HEIC_FILE_NAME = /\.(heic|heif)$/i;
+const looksLikeHeic = (file) => /hei[cf]/i.test((file && file.type) || '') || HEIC_FILE_NAME.test((file && file.name) || '');
+const isJpegFile = (file) => /^image\/(p?jpe?g)$/i.test((file && file.type) || '') || /\.(jpe?g|jfif)$/i.test((file && file.name) || '');
+const HEIC_HELP = 'this is an iPhone HEIC photo and the converter that turns it into a JPG could not be loaded (is the network blocked?). It can be tried again, or save or share the photo as a JPG first (for new photos, set the iPhone to Settings > Camera > Formats > Most Compatible)';
+
+// heic2any 0.0.4 leaves one "message" listener on its worker for every photo it converts, and each one keeps that photo's bytes in
+// memory until the page is reloaded. Each listener answers a single request, so it is taken off again once its answer has come.
+function tidyHeicWorker() {
+  try {
+    const w = window.__heic2any__worker;
+    if (!w || w.__tidy) return;
+    w.__tidy = true;
+    let lastId = null;
+    const post = w.postMessage.bind(w);
+    const add = w.addEventListener.bind(w);
+    w.postMessage = function (msg) { lastId = msg && msg.id; return post.apply(null, arguments); };
+    w.addEventListener = function (type, fn, opts) {
+      if (type !== 'message' || typeof fn !== 'function' || lastId === null) return add(type, fn, opts);
+      const id = lastId;
+      lastId = null;
+      const wrapped = function (ev) {
+        fn.call(this, ev);
+        if (ev && ev.data && ev.data.id === id) w.removeEventListener('message', wrapped);
+      };
+      return add(type, wrapped, opts);
+    };
+  } catch (e) { /* only a tidy-up: the conversion works without it */ }
+}
+
+let heicConverterLoading = null;
+function loadHeicConverter() {
+  if (typeof window !== 'undefined' && typeof window.heic2any === 'function') return Promise.resolve(window.heic2any);
+  if (heicConverterLoading) return heicConverterLoading;
+  const tryUrl = (url) => new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = url;
+    s.onload = () => { if (typeof window.heic2any === 'function') { tidyHeicWorker(); resolve(window.heic2any); } else reject(new Error('empty')); };
+    s.onerror = () => { if (s.parentNode) s.parentNode.removeChild(s); reject(new Error('blocked')); };
+    document.head.appendChild(s);
+  });
+  heicConverterLoading = (async () => {
+    for (let i = 0; i < HEIC_CONVERTER_URLS.length; i += 1) {
+      try { return await tryUrl(HEIC_CONVERTER_URLS[i]); } catch (e) { /* try the next address */ }
+    }
+    heicConverterLoading = null; // a later try may work
+    const err = new Error(HEIC_HELP);
+    err.retry = true; // not the photo's fault: it can be tried again
+    throw err;
+  })();
+  return heicConverterLoading;
+}
+
+// The first bytes of a HEIC / HEIF file: a "ftyp" box that names one of its brands (a photo renamed to .jpg still counts)
+function sniffHeic(file) {
+  return new Promise((resolve) => {
+    if (!file || typeof FileReader === 'undefined' || !file.slice) { resolve(false); return; }
     const reader = new FileReader();
-    reader.onloadend = () => updateTask(taskId, { [type]: reader.result });
-    reader.readAsDataURL(file);
+    reader.onerror = () => resolve(false);
+    reader.onload = () => {
+      try {
+        const b = new Uint8Array(reader.result);
+        const tag = (o) => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
+        if (b.length < 12 || tag(4) !== 'ftyp') { resolve(false); return; }
+        const brands = [tag(8)];
+        for (let o = 16; o + 4 <= b.length; o += 4) brands.push(tag(o));
+        resolve(brands.some(x => /^(heic|heix|hevc|hevx|heim|heis|hevm|hevs|mif1|msf1|heif)$/.test(x)));
+      } catch (e) { resolve(false); }
+    };
+    try { reader.readAsArrayBuffer(file.slice(0, 64)); } catch (e) { resolve(false); }
+  });
+}
+
+// A HEIC photo as a JPEG blob; one picked file is converted once, however many parts of the app ask
+const heicJpegs = typeof WeakMap === 'function' ? new WeakMap() : null;
+function heicToJpegBlob(file) {
+  if (heicJpegs && heicJpegs.has(file)) return heicJpegs.get(file);
+  const p = loadHeicConverter().then(heic2any => heic2any({ blob: file, toType: 'image/jpeg', quality: 0.92 }).then(
+    out => (Array.isArray(out) ? out[0] : out),
+    err => { throw new Error(`this HEIC photo could not be converted (${(err && (err.message || err.code)) || 'unknown reason'}). Save or share it as a JPG first, then add it again`); }
+  ));
+  if (heicJpegs) {
+    heicJpegs.set(file, p);
+    p.catch(() => { heicJpegs.delete(file); });
+  }
+  return p;
+}
+
+const decodePicture = (blob) => new Promise((resolve, reject) => {
+  const url = URL.createObjectURL(blob);
+  const img = new Image();
+  img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+  img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('not a picture this browser can open')); };
+  img.src = url;
+});
+
+// Resolves the picture as a JPEG data URL. opts.maxSide: long side in px (default 1600; 0 keeps the size, up to 4096);
+// opts.quality: 0 to 1 (default 0.8). Rejects with a plain sentence.
+async function pictureToJpegDataUrl(file, opts) {
+  const o = opts || {};
+  const maxSide = o.maxSide === undefined ? PICTURE_MAX_SIDE : (o.maxSide || 4096);
+  const quality = o.quality || 0.8;
+  let img;
+  try {
+    img = await decodePicture(file);
+  } catch (e) {
+    if (!(looksLikeHeic(file) || await sniffHeic(file))) throw new Error('That file is not a picture this browser can open. Try a JPG or PNG.');
+    const jpeg = await heicToJpegBlob(file); // throws a plain sentence of its own
+    try { img = await decodePicture(jpeg); } catch (e2) { throw new Error('this HEIC photo could not be converted. Save or share it as a JPG first, then add it again'); }
+  }
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  if (!w || !h) throw new Error('That picture has no size this browser can read.');
+  try {
+    const scale = Math.min(1, maxSide / Math.max(w, h));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(w * scale));
+    canvas.height = Math.max(1, Math.round(h * scale));
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#FFFFFF'; // JPEG has no transparency: see-through parts would turn black
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/jpeg', quality);
+  } catch (err) {
+    throw new Error('The picture could not be prepared for upload.');
+  }
+}
+// ===== END PICTURE TO JPG =====
+
+// A picked picture (PNG, WebP, an iPhone HEIC ...) goes up as a JPG; one that cannot be used is explained, not dropped silently.
+// Resolves when it is done, so the photo box can show that it is working.
+function pictureFromInput(e, onJpg) {
+    const input = e.target;
+    const file = input.files && input.files[0];
+    if (!file) return Promise.resolve();
+    input.value = ''; // so the same photo can be picked again if it did not work
+    return pictureToJpegDataUrl(file).then(onJpg, (err) => {
+        const why = String((err && err.message) || 'that picture could not be read').replace(/\.$/, '');
+        alert(`Could not use ${file.name}: ${why.charAt(0).toLowerCase()}${why.slice(1)}. It was not attached.`);
+    });
+}
+
+function handleFileUpload(e, type, taskId, updateTask) {
+    return pictureFromInput(e, (jpg) => updateTask(taskId, { [type]: jpg }));
 }
 
 // Resolves a name/ID against the employee table
@@ -303,21 +451,29 @@ function Badge({ children, status, className = '' }) {
 
 function PhotoUploader({ label, imageBase64, onUpload }) {
     const { t } = useTranslation();
+    const [converting, setConverting] = useState(false);
+    // The picture is turned into a JPG first (an iPhone HEIC photo takes a few seconds): say so while it works
+    const pick = (e) => {
+        const done = () => setConverting(false);
+        const r = onUpload(e);
+        if (r && r.then) { setConverting(true); r.then(done, done); }
+    };
     return (
         <div className="border border-gray-200 rounded-lg p-3 flex flex-col items-center justify-center bg-gray-50 relative group h-48 w-full">
             <h4 className="text-sm font-semibold text-gray-700 mb-2 w-full text-center border-b border-gray-200 pb-1">{t(label)}</h4>
+            {converting && <div className="absolute inset-0 z-10 bg-white/80 flex items-center justify-center rounded-lg text-sm font-semibold text-blue-700">Converting to JPG...</div>}
             {imageBase64 ? (
                 <div className="relative w-full h-full flex items-center justify-center overflow-hidden rounded-md bg-black">
                     <img src={imageBase64} alt={label} className="max-w-full max-h-full object-contain" />
                     <label className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 flex items-center justify-center text-white cursor-pointer transition-opacity font-medium text-sm">
-                        {t("Change Photo")}<input type="file" accept="image/*" className="hidden" onChange={onUpload} />
+                        {t("Change Photo")}<input type="file" accept="image/*,.heic,.heif" className="hidden" onChange={pick} />
                     </label>
                 </div>
             ) : (
                 <label className="cursor-pointer flex flex-col items-center justify-center w-full h-full border-2 border-dashed border-gray-300 rounded-md hover:border-blue-500 hover:bg-blue-50 transition-colors">
                     <Camera className="w-6 h-6 text-gray-400 mb-1" />
                     <span className="text-xs font-medium text-gray-500">{t("Upload Photo")}</span>
-                    <input type="file" accept="image/*" className="hidden" onChange={onUpload} />
+                    <input type="file" accept="image/*,.heic,.heif" className="hidden" onChange={pick} />
                 </label>
             )}
         </div>
@@ -561,7 +717,7 @@ function AssignTaskForm({ users, onSubmit }) {
 
 function SupervisorTodoCard({ todo, updateTask }) {
     const { t } = useTranslation();
-    const handleUpload = (e) => { const file = e.target.files[0]; if (!file) return; const reader = new FileReader(); reader.onloadend = () => updateTask(todo.id, { photo: reader.result }); reader.readAsDataURL(file); };
+    const handleUpload = (e) => pictureFromInput(e, (jpg) => updateTask(todo.id, { photo: jpg }));
     return (
         <div className="border border-gray-200 rounded-lg p-5 flex flex-col gap-4 shadow-sm bg-white transition-colors hover:border-purple-300">
             <div className="flex justify-between items-start"><h4 className="font-bold text-gray-800 text-lg leading-tight">{todo.taskName}</h4>{todo.dueDate && <Badge status="assigned" className="whitespace-nowrap ml-2">{t("Due:")} {todo.dueDate}</Badge>}</div>
