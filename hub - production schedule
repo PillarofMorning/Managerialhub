@@ -972,11 +972,11 @@ function planGaps(rows, existing, gapCtx) {
     Object.keys(byLine).forEach(k => {
         const l = byLine[k], mine = l.filter(x => rowOf[x.id]);
         if (!mine.length) return;
-        judgeStops(lineStops(l), lineCtxOf(gapCtx, mine[0].area, mine[0].line)).forEach(g => {
+        judgeStops(lineStops(l), lineCtxOf(ctxCovering(gapCtx, l), mine[0].area, mine[0].line)).forEach(g => {
             const row = g.next && rowOf[g.next.id];
             if (!row || row.gap) return;
             row.gap = g;
-            if (g.status === 'short' || g.status === 'overlap') bad++;
+            if (g.status === 'short' || g.status === 'overlap' || g.status === 'nocrew') bad++;
         });
     });
     return bad;
@@ -1332,11 +1332,19 @@ function planChanges(form, existing, recallMap, opts) {
             const moved = {}; row.pushes.forEach(p => { moved[p.run.id] = { start: p.start, end: p.end }; });
             const around = (cand, pushed) => gapsAround(cand, lineRunsOf(run.area, run.line).filter(r => r.id !== run.id).map(r => pushed && moved[r.id] ? { ...r, ...moved[r.id] } : r).map(r => ({ ...r, area: run.area, line: run.line })), o.gapCtx);
             const g = around({ ...run, start, end }, true), g0 = was ? around({ ...run, start: was.start, end: was.end }, false) : null;
+            // how bad a stop is: overlap, then short or no crew, by the minutes of clean left undone
+            const level = (x) => x.status === 'overlap' ? 2 : x.status === 'short' || x.status === 'nocrew' ? 1 : 0;
+            const undone = (x) => x.status === 'overlap' ? (x.overlapMs || 0) / 60000 : x.status === 'nocrew' ? (x.mins || 0) : (x.shortMins || 0);
             [['before', 'Before'], ['after', 'After']].forEach(k => {
                 const x = g[k[0]], x0 = g0 && g0[k[0]];
-                if (!x || !(x.status === 'short' || x.status === 'overlap')) return;
-                if (x0 && x0.prevId === x.prevId && x0.nextId === x.nextId && x0.gapMs <= x.gapMs) return;   // it was this short before the request
+                if (!x || !level(x)) return;
+                if (x0 && x0.prevId === x.prevId && x0.nextId === x.nextId && (level(x0) > level(x) || (level(x0) === level(x) && undone(x0) >= undone(x) - 0.5 && x0.gapMs <= x.gapMs))) return;   // it was this bad (and this short) before the request
                 row.gaps.push(x); warn(`${k[1]}: ${gapText(x)}`, true);
+            });
+            // overlaps the stops leave out (a maintenance run, a run over 31 days), when the request makes them
+            (g.clash || []).forEach(c => {
+                if (g0 && (g0.clash || []).some(c0 => c0.run.id === c.run.id && c0.ms >= c.ms)) return;
+                warn(`Overlaps ${runTitle(c.run)} (${fmtDT(c.run.start)} to ${fmtDT(c.run.end)}) by ${fmtHrs(c.ms)}`, true);
             });
         };
 
@@ -2023,11 +2031,11 @@ function cpBuild(runs, o) {
     return { windows, groups, rows, weeks, needBack, needAhead, long: model.long, weekHas: model.weekHas, calDays: n };
 }
 // The stamp of one week: 'writing' while a publish changes it, 'done' after (readers use a week's rows only when it says done).
-function cpWeekRow(mon, status, count, cfgHash, nowMs) {
+function cpWeekRow(mon, status, count, cfgHash, nowMs, readMs) {
     const s = parseYMD(mon), e = new Date(s.getFullYear(), s.getMonth(), s.getDate() + 7);
     return { craa5_name: `Week of ${cpDayText(mon)} · ${status}`, craa5_plankey: `k|${mon}`, craa5_rowtype: 'week', craa5_linekey: '*', craa5_start: isoZ(s.getTime()), craa5_end: isoZ(e.getTime()),
         craa5_day: mon, craa5_cleankind: 'week', craa5_minutes: count, craa5_status: status,
-        craa5_details: JSON.stringify({ v: CP_RULES, cfg: cfgHash, rows: count, at: isoZ(nowMs) }),
+        craa5_details: JSON.stringify({ v: CP_RULES, cfg: cfgHash, rows: count, at: isoZ(nowMs), read: readMs ? isoZ(readMs) : null }),
         craa5_reason: status === 'done' ? `Published ${cpWhen(nowMs)}: ${count} rows for this week.` : `Being written since ${cpWhen(nowMs)}: readers use their own rules until it says done.` };
 }
 // The settings a publish uses, as the config row keeps them; their fingerprint goes on every week stamp.
@@ -2105,17 +2113,33 @@ function allergenCleanNeeded(prev, next) {
 }
 // The settings of a line on the Cleaning Times tab, however its area is spelled ("IBL 4" line 1, "IBL" line 4): the exact line first.
 function cleanCfgOf(clean, area, line) {
-    const c = clean || {};
-    const exact = c[lineKeyOf(area, line)];
-    if (exact) return exact;
-    const want = canonLine(area, line), keys = Object.keys(c).sort();
-    for (let i = 0; i < keys.length; i++) { const k = splitKey(keys[i]); if (k.area && canonLine(k.area, k.line) === want) return c[keys[i]] || {}; }
-    return {};
+    const k = cleanCfgKey(clean, area, line);
+    return (k && (clean || {})[k]) || {};
 }
-// The line key whose own shifts a line uses (exact spelling first, then any spelling of the same line), or '*' for the 'every line' ones.
+// Which key of the Cleaning Times settings a line uses (the one cleanCfgOf reads), or '' when it has none. One key per line whatever
+// the spelling of the run asking ("IBL 4" line 1 = "IBL" line 4), so every view judges the line the same way: the key with equipment
+// chosen, else one with minutes typed, else any; ties go to the first in sorted order.
+const CLEAN_CFG_FIELDS = ['baseMins', 'allergenMins', 'crumbMins', 'changeMins'];
+function cleanCfgKey(clean, area, line) {
+    const c = clean || {}, want = canonLine(area, line), keys = Object.keys(c).sort();
+    let best = '', score = -1;
+    for (let i = 0; i < keys.length; i++) {
+        const k = splitKey(keys[i]), v = c[keys[i]];
+        if (!k.area || !v || canonLine(k.area, k.line) !== want) continue;
+        const sc = ((v.areas || []).length ? 2 : 0) + (CLEAN_CFG_FIELDS.some(f => v[f] !== undefined && v[f] !== null && v[f] !== '') ? 1 : 0);
+        if (sc > score) { best = keys[i]; score = sc; }
+    }
+    return best;
+}
+// The other keys of the same line that hold settings, which cleanCfgKey leaves unused.
+function cleanCfgUnused(clean, area, line) {
+    const c = clean || {}, want = canonLine(area, line), used = cleanCfgKey(c, area, line);
+    return Object.keys(c).sort().filter(key => { const k = splitKey(key), v = c[key]; return key !== used && k.area && v && canonLine(k.area, k.line) === want && ((v.areas || []).length || CLEAN_CFG_FIELDS.some(f => v[f] !== undefined && v[f] !== null && v[f] !== '')); });
+}
+// The line key whose own shifts a line uses (one per line whatever the spelling: the first in sorted order), or '*' for the
+// 'every line' ones.
 function shiftLineKey(own, area, line, group) {
-    const o = own || {}, lk = lineKeyOf(area, line);
-    if (o[`${lk}|${group}`]) return lk;
+    const o = own || {};
     const want = canonLine(area, line), keys = Object.keys(o).sort();
     for (let i = 0; i < keys.length; i++) {
         const j = keys[i].lastIndexOf('|'), base = keys[i].slice(0, j);
@@ -2437,16 +2461,42 @@ function swapPlan(first, second) {
 // ============================================================================
 const gapText = (g) => g ? g.reason || '' : '';
 // the stop right before and right after a candidate run, judged with every other run of its line (any spelling of the line)
+// The shift times must cover the stops being judged: a context worked out for other dates (the Schedule's loaded weeks) gets the shift
+// times of these runs' dates, so a stop past them is never called 'no crew' for want of shift times.
+function ctxCovering(ctx, runs) {
+    if (!ctx || !ctx.occFor) return ctx;
+    let lo = Infinity, hi = -Infinity;
+    runs.forEach(r => { if (r && r.start > 0 && r.end > r.start && r.end - r.start <= CR_MAX_RUN_MS) { if (r.start < lo) lo = r.start; if (r.end > hi) hi = r.end; } });
+    if (!(hi > lo)) return ctx;
+    const from = lo - DAY, to = hi + DAY;
+    if (ctx.occFrom <= from && ctx.occTo >= to) return ctx;
+    return { ...ctx, occ: ctx.occFor(from, to), occFrom: from, occTo: to };
+}
+// The stops either side of a run (a new or changed one) on its line, judged, and the runs it overlaps that the stops leave out
+// (a maintenance run, a run over 31 days): { before, after, clash: [{ run, ms }] }.
 function gapsAround(cand, runs, ctx) {
     const cl = canonLine(cand.area, cand.line);
     const c = { ...cand, id: cand.id || 'candidate' };
-    const seq = runs.filter(r => r.id !== c.id && canonLine(r.area, r.line) === cl).concat([c]);
+    const others = runs.filter(r => r.id !== c.id && canonLine(r.area, r.line) === cl);
+    const seq = others.concat([c]);
     let before = null, after = null;
-    judgeStops(lineStops(seq), lineCtxOf(ctx, cand.area, cand.line)).forEach(g => {
+    judgeStops(lineStops(seq), lineCtxOf(ctxCovering(ctx, seq), cand.area, cand.line)).forEach(g => {
         if (g.next && g.next.id === c.id && !before) before = g;
         if (g.prev.id === c.id && !after) after = g;
     });
-    return { before, after };
+    const odd = (r) => isMaint(r) || r.end - r.start > CR_MAX_RUN_MS;
+    const clash = !(c.start > 0 && c.end > c.start) ? [] : others.filter(r => r.start > 0 && r.end > r.start && r.start < c.end && c.start < r.end && (odd(r) || odd(c)))
+        .sort(byStart).map(r => ({ run: r, ms: Math.min(r.end, c.end) - Math.max(r.start, c.start) }));
+    return { before, after, clash };
+}
+// Overlaps the stops leave out, on one line: a run with a maintenance run, or with a run over 31 days. [{ a, b (starts later), ms }]
+function oddOverlaps(runs) {
+    const odd = (r) => isMaint(r) || r.end - r.start > CR_MAX_RUN_MS;
+    const l = runs.filter(r => r.start > 0 && r.end > r.start).sort(byStart), out = [];
+    for (let i = 0; i < l.length; i++) for (let j = i + 1; j < l.length && l[j].start < l[i].end; j++) {
+        if (odd(l[i]) || odd(l[j])) out.push({ a: l[i], b: l[j], ms: Math.min(l[i].end, l[j].end) - l[j].start });
+    }
+    return out;
 }
 
 // ============================================================================
@@ -2658,8 +2708,8 @@ function RunDialog({ draft: initial, areaOptions, lineChoices, mssNames, recall,
     const problem = !d.area.trim() ? 'Pick a line.' : s === null || e === null ? 'Enter a start and a stop.' : !(e > s) ? 'Stop must be after start.'
         : d.code !== '' && !/^\d{1,9}$/.test(String(d.code)) ? 'Product code must be a whole number.' : !d.product.trim() ? 'Enter the product.' : null;
     const gaps = useMemo(() => (s === null || e === null || !(e > s) || !d.area) ? null
-        : gapsAround({ id: d.id, area: d.area, line: lineNum, code: d.code === '' ? null : Number(d.code), start: s, end: e, allergen: d.allergen, allergenType: d.allergenType, crumb: d.crumb }, allRuns, gapCtx),
-        [d.id, d.area, lineNum, d.code, s, e, d.allergen, d.allergenType, d.crumb, allRuns, gapCtx]);
+        : gapsAround({ id: d.id, area: d.area, line: lineNum, code: d.code === '' ? null : Number(d.code), product: d.product, start: s, end: e, allergen: d.allergen, allergenType: d.allergenType, crumb: d.crumb }, allRuns, gapCtx),
+        [d.id, d.area, lineNum, d.code, d.product, s, e, d.allergen, d.allergenType, d.crumb, allRuns, gapCtx]);
     const doRecall = async () => {
         if (!isNew || !/^\d{1,9}$/.test(String(d.code))) return;
         const code = d.code, r = await recall(code);
@@ -2719,6 +2769,11 @@ function RunDialog({ draft: initial, areaOptions, lineChoices, mssNames, recall,
                 <div className="col-span-6 grid grid-cols-2 gap-2">
                     <GapPill g={gaps && gaps.before} label="Before this run" />
                     <GapPill g={gaps && gaps.after} label="After this run" />
+                    {gaps && gaps.clash.map(c => (
+                        <div key={c.run.id} className="col-span-2 rounded-lg border px-2.5 py-1.5 text-[11px] leading-snug" style={{ background: GAP_STYLE.overlap.bg, borderColor: GAP_STYLE.overlap.border, color: GAP_STYLE.overlap.text }} data-testid="run-clash">
+                            <div className="font-black uppercase tracking-wider text-[10px]">Overlaps another run</div>
+                            <div>{runTitle(c.run)} ({fmtDT(c.run.start)} to {fmtDT(c.run.end)}) overlaps this run by {fmtHrs(c.ms)}</div>
+                        </div>))}
                 </div>
                 {!isNew && canSwap && (
                     <div className="col-span-6 flex items-center gap-2 text-xs text-slate-600">
@@ -2784,7 +2839,7 @@ const GanttRow = memo(function GanttRow({ row, vis, rowGaps, occProd, occSan, ra
                     return <div key={g.prevId + g.nextId} data-gap="1" className="absolute rounded-sm border text-[9px] font-black overflow-hidden whitespace-nowrap flex items-center justify-center z-[5]"
                         style={{ left: `${pct(l)}%`, width: `${((r2 - l) / rangeMs) * 100}%`, top: 6, height: 34, background: st.bg, borderColor: st.border, color: st.text, backgroundImage: 'repeating-linear-gradient(45deg, transparent, transparent 5px, rgba(0,0,0,0.04) 5px, rgba(0,0,0,0.04) 10px)' }}
                         title={`${st.label}\n${gapText(g)}`}>
-                        {w > 34 && (g.status === 'overlap' ? 'OVERLAP' : !(g.mins > 0) ? fmtHrs(g.gapMs) : w > 120 ? `${CLEAN_KINDS[g.kind].short} ${fmtMins(g.mins)} / ${fmtHrs(g.gapMs)}` : w > 60 ? `${fmtMins(g.mins)}/${fmtHrs(g.gapMs)}` : fmtHrs(g.gapMs))}
+                        {w > 34 && (g.status === 'overlap' ? 'OVERLAP' : g.status === 'nocrew' ? (w > 120 ? `${CLEAN_KINDS[g.kind].short} · NO CREW` : 'NO CREW') : !(g.mins > 0) ? fmtHrs(g.gapMs) : w > 120 ? `${CLEAN_KINDS[g.kind].short} ${fmtMins(g.mins)} / ${fmtHrs(g.gapMs)}` : w > 60 ? `${fmtMins(g.mins)}/${fmtHrs(g.gapMs)}` : fmtHrs(g.gapMs))}
                     </div>;
                 })}
                 {/* runs */}
@@ -3206,7 +3261,7 @@ function RunRow({ r, ed, onInclude, onEdit, onReset, onFlag }) {
                     <label title="Crumb clean"><input type="checkbox" checked={r.crumb} onChange={(e) => onFlag({ crumb: e.target.checked })} /> C</label>
                 </span>
                 <span className="text-[11px] text-slate-500 whitespace-nowrap">{p.cases !== null && p.cases !== undefined ? `${fmtNum(p.cases)} cases` : ''}{p.order ? ` · order # ${p.order}` : ''}{p.orderWarn && <span className="ml-1 text-[#B27B00]" title="This does not look like an order number. It is saved as typed.">⚠</span>}</span>
-                {r.gap && <span className="inline-block px-1.5 py-0.5 rounded border text-[10px] font-black whitespace-nowrap" style={{ background: GAP_STYLE[r.gap.status].bg, borderColor: GAP_STYLE[r.gap.status].border, color: GAP_STYLE[r.gap.status].text }} title={gapText(r.gap)}>{r.gap.status === 'overlap' ? 'OVERLAP' : r.gap.kind === 'none' ? 'same product' : !(r.gap.mins > 0) ? `${CLEAN_KINDS[r.gap.kind].short.toLowerCase()} ${fmtHrs(r.gap.gapMs)}, not timed` : `${r.gap.kind === 'allergen' ? 'allergen ' : ''}clean ${fmtHrs(r.gap.gapMs)} / needs ${fmtMins(r.gap.mins)}`}</span>}
+                {r.gap && <span className="inline-block px-1.5 py-0.5 rounded border text-[10px] font-black whitespace-nowrap" style={{ background: GAP_STYLE[r.gap.status].bg, borderColor: GAP_STYLE[r.gap.status].border, color: GAP_STYLE[r.gap.status].text }} title={gapText(r.gap)}>{r.gap.status === 'overlap' ? 'OVERLAP' : r.gap.status === 'nocrew' ? `${r.gap.kind === 'allergen' ? 'allergen ' : ''}clean ${fmtHrs(r.gap.gapMs)}, no crew` : r.gap.kind === 'none' ? 'same product' : !(r.gap.mins > 0) ? `${CLEAN_KINDS[r.gap.kind].short.toLowerCase()} ${fmtHrs(r.gap.gapMs)}, not timed` : `${r.gap.kind === 'allergen' ? 'allergen ' : ''}clean ${fmtHrs(r.gap.gapMs)} / needs ${fmtMins(r.gap.mins)}`}</span>}
             </div>
             {notes.length > 0 && <div className="mt-1 pl-6 text-[10px] flex flex-wrap gap-x-3">{notes.map((n, i) => <span key={i} className={n.c} title={n.title}>{n.t}</span>)}</div>}
         </div>
@@ -3566,7 +3621,7 @@ function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, g
             if (idx[sid] === undefined) { idx[sid] = w.length; w.push({ id: sid, sheet: sheetById[sid], lines: [], lidx: {}, counts: { new: 0, update: 0, same: 0, clash: 0 }, apply: 0, attention: 0, hours: 0, runs: 0 }); }
             const W = w[idx[sid]], k = r.p.lineKey;
             if (W.lidx[k] === undefined) { W.lidx[k] = W.lines.length; W.lines.push({ key: `${sid}|${k}`, lk: k, label: r.p.lineLabel, area: r.p.area, line: r.p.line, rows: [], hours: 0, apply: 0, attention: 0 }); }
-            const G = W.lines[W.lidx[k]], attn = r.status === 'clash' || r.selfOverlap || r.p.bad || (r.include && r.gap && (r.gap.status === 'short' || r.gap.status === 'overlap'));
+            const G = W.lines[W.lidx[k]], attn = r.status === 'clash' || r.selfOverlap || r.p.bad || (r.include && r.gap && (r.gap.status === 'short' || r.gap.status === 'overlap' || r.gap.status === 'nocrew'));
             G.rows.push(r); G.hours += r.p.hours; W.hours += r.p.hours; W.runs++; W.counts[r.status]++;
             if (r.include) { G.apply++; W.apply++; }
             if (attn) { G.attention++; W.attention++; }
@@ -3662,7 +3717,7 @@ function ImportView({ areaOptions, lineChoices, settings, updateSettings, api, g
                     right={!pending && (
                         <div className="flex flex-wrap gap-1.5 text-[10px] font-black">
                             {['new', 'update', 'same', 'clash'].map(k => <span key={k} className={`px-2 py-0.5 rounded border ${STATUS_LOOK[k].cls}`}>{view.counts[k]} {STATUS_LOOK[k].label}</span>)}
-                            {view.shortClean > 0 && <span className="px-2 py-0.5 rounded border bg-[#FDE8EC] text-[#B00020] border-[#E4002B]">{view.shortClean} without enough clean time</span>}
+                            {view.shortClean > 0 && <span className="px-2 py-0.5 rounded border bg-[#FDE8EC] text-[#B00020] border-[#E4002B]">{view.shortClean} without enough clean time or crew</span>}
                         </div>
                     )}>
                     {failed && <div className="mb-2 p-2 rounded-lg bg-[#FDE8EC] border border-[#E4002B]/40 text-xs font-bold text-[#B00020]">Could not read what is already scheduled around some of these weeks, so duplicates cannot be ruled out. Press Reload (top right) and try again.</div>}
@@ -4536,11 +4591,16 @@ function CleaningView({ rows, assets, assetsByArea, settings, updateSettings, ga
     const [people, setPeople] = useState('');
     useEffect(() => { if (!lineKey && rows.length) setLineKey(rows[0].key); }, [rows.length]);
     const areaNames = useMemo(() => Object.keys(assetsByArea).sort(), [assetsByArea]);
-    const cfg = settings.clean[lineKey] || {};
-    const setCfg = (patch) => updateSettings(s => ({ ...s, clean: { ...s.clean, [lineKey]: { ...(s.clean[lineKey] || {}), ...patch } } }));
+    // the settings this line uses: its own spelling's, else another spelling of the same line ("IBL 4" line 1 = "IBL" line 4); edits go there too
+    const lk = splitKey(lineKey), cfgKey = cleanCfgKey(settings.clean, lk.area, lk.line) || lineKey;
+    const cfg = settings.clean[cfgKey] || {};
+    const setCfg = (patch) => updateSettings(s => { const key = cleanCfgKey(s.clean, lk.area, lk.line) || lineKey; return { ...s, clean: { ...s.clean, [key]: { ...(s.clean[key] || {}), ...patch } } }; });
     const toggleArea = (a) => { const cur = cfg.areas || []; setCfg({ areas: cur.indexOf(a) >= 0 ? cur.filter(x => x !== a) : cur.concat([a]) }); };
+    const labelOfKey = (key) => (rows.find(r => r.key === key) || { label: `${splitKey(key).area} - Line ${splitKey(key).line}` }).label;
+    const sharedWith = cfgKey !== lineKey ? labelOfKey(cfgKey) : '';
+    const unused = cleanCfgUnused(settings.clean, lk.area, lk.line).map(key => key === lineKey ? 'this spelling' : labelOfKey(key));
     // Typical sanitation crew for the line: the average headcount of its sanitation shifts (or the fallback), changeable here.
-    const effDefs = settings.shifts.filter(x => x.group === 'sanitation' && x.lineKey === (own[`${lineKey}|sanitation`] ? lineKey : '*'));
+    const effDefs = settings.shifts.filter(x => x.group === 'sanitation' && x.lineKey === shiftLineKey(own, lk.area, lk.line, 'sanitation'));
     const resolved = effDefs.map(x => x.heads !== '' && x.heads !== undefined ? Number(x.heads) : (x.crew ? rosterCount(x.crew, 'sanitation') : 0)).filter(h => h > 0);
     const typical = resolved.length ? Math.max(1, Math.round(resolved.reduce((a, b) => a + b, 0) / resolved.length)) : settings.cleanHeads;
     const ctxHeads = people !== '' ? Math.max(1, parseInt(people, 10) || 1) : typical;
@@ -4557,6 +4617,8 @@ function CleaningView({ rows, assets, assetsByArea, settings, updateSettings, ga
             <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm space-y-3">
                 <h2 className="text-base font-black text-[#00468B] uppercase tracking-widest">Cleaning time for a line</h2>
                 <Field label="Line"><select className={inputCls} value={lineKey} onChange={(e) => setLineKey(e.target.value)}>{rows.map(r => <option key={r.key} value={r.key}>{r.label}</option>)}</select></Field>
+                {sharedWith && <p className="text-xs text-slate-600" data-testid="clean-shared-with">Another spelling of this line: these settings are shared with <b>{sharedWith}</b>, and changes here change both.</p>}
+                {unused.length > 0 && <p className="text-xs text-[#B27B00] font-semibold" data-testid="clean-unused">Settings saved under {unused.join(', ')} are not used: a line has one set whatever its spelling, the one shown here.</p>}
                 <div>
                     <div className="text-[10px] font-black uppercase tracking-wider text-slate-500 mb-1">Equipment areas cleaned on this line {assetsLoaded ? '' : '(loading...)'}</div>
                     {areaNames.length === 0 && <p className="text-xs text-slate-500">No equipment was read from the equipment table. The manual minutes below are used instead.</p>}
@@ -4605,10 +4667,10 @@ function CleaningView({ rows, assets, assetsByArea, settings, updateSettings, ga
 // the days the MSS needs a Daily clean, and the publishing to the shared table the other apps read.
 // ============================================================================
 const CP_HANG = { short: 0, overlap: 1, nocrew: 2, tight: 3 };
-function CleanPlanView({ engine, cp, tick, cfgState, auto, setAuto, apiReady, onJump, onOpenCheck, nowMs, active }) {
+function CleanPlanView({ engine, cp, tick, cfgState, auto, setAuto, apiReady, ready, onJump, onOpenCheck, nowMs, active }) {
     const [from, setFrom] = useState(() => cpMondayYmd(Date.now()));
     const [weeks, setWeeks] = useState(2);
-    const [data, setData] = useState(null);
+    const [got, setData] = useState(null);
     const [loading, setLoading] = useState(false);
     const [err, setErr] = useState('');
     const [moreCleans, setMoreCleans] = useState(false);
@@ -4621,17 +4683,20 @@ function CleanPlanView({ engine, cp, tick, cfgState, auto, setAuto, apiReady, on
         let alive = true;
         setLoading(true); setErr('');
         const t = setTimeout(async () => {
-            try { const b = await engine.preview(F, T); if (!alive) return; if (!b) setErr('The runs could not be read for these weeks. Press Refresh.'); else setData(b); }
-            catch (e) { if (alive) setErr(errText(e)); }
+            try { const b = await engine.preview(F, T); if (!alive) return; if (!b) { setData(null); setErr('The runs could not be read for these weeks. Press Reload (top right) to try again.'); } else setData({ ...b, rangeKey: `${F}|${T}` }); }
+            catch (e) { if (alive) { setData(null); setErr(errText(e)); } }
             if (alive) setLoading(false);
         }, 250);
         return () => { alive = false; clearTimeout(t); };
     }, [active, F, T, epoch, cfgState, engine]);
     const shiftWeeks = (n) => setFrom(cpAddDaysYmd(getLocalYMD(new Date(F)), 7 * n));
+    const data = got && got.rangeKey === `${F}|${T}` ? got : null;   // the plan of other weeks is never shown under these dates
     const wins = data ? data.windows : [];
-    const hang = wins.filter(g => CP_HANG[g.status] !== undefined && (g.stopKind === 'last' ? g.start : g.end) >= nowMs - HOUR)
-        .sort((a, b) => (CP_HANG[a.status] === 3) - (CP_HANG[b.status] === 3) || a.start - b.start);
-    const red = hang.filter(g => g.status !== 'tight'), amber = hang.filter(g => g.status === 'tight');
+    // hangups still ahead first (red, then tight), then the ones already past in these weeks
+    const ahead = (g) => (g.stopKind === 'last' ? g.start : g.end) >= nowMs - HOUR;
+    const hang = wins.filter(g => CP_HANG[g.status] !== undefined)
+        .sort((a, b) => ahead(b) - ahead(a) || (CP_HANG[a.status] === 3) - (CP_HANG[b.status] === 3) || a.start - b.start);
+    const red = hang.filter(g => g.status !== 'tight' && ahead(g)), amber = hang.filter(g => g.status === 'tight' && ahead(g)), past = hang.filter(g => g.status !== 'tight' && !ahead(g));
     const cleans = wins.filter(g => g.kind === 'allergen' || g.kind === 'full' || (g.kind === 'changeover' && g.need.basis !== 'untimed'));
     const count = (k) => wins.filter(g => g.kind === k).length;
     const groups = data ? data.groups : [];
@@ -4640,7 +4705,8 @@ function CleanPlanView({ engine, cp, tick, cfgState, auto, setAuto, apiReady, on
     const busy = cp.busy, last = cp.last;
     const tableText = { found: 'Clean Plan table found', missing: 'Clean Plan table not created yet', noaccess: 'No permission to read the Clean Plan table', error: 'The Clean Plan table could not be read', unknown: 'Looking for the Clean Plan table...', preview: 'Preview mode: nothing is written' }[cp.table] || cp.table;
     const tz = browserTz(), plantTz = (cp.shared && cp.shared.tz) || CP_PLANT_TZ, tzOk = tz === plantTz;
-    const canPublish = apiReady && cp.table === 'found' && tzOk && cfgState !== 'differ' && !busy;
+    const reqMissing = cp.reqMissing && cp.reqMissing.length > 0;
+    const canPublish = apiReady && cp.table === 'found' && tzOk && cfgState !== 'differ' && !busy && ready && !reqMissing && !cp.noWrite;
     const pill = (ok, warn) => `px-2 py-1 rounded-lg border text-[11px] font-bold ${ok ? 'bg-[#DCFCE7] text-[#166534] border-[#16A34A]' : warn ? 'bg-[#FFF6E0] text-slate-800 border-[#FFB81C]' : 'bg-[#FDE8EC] text-[#B00020] border-[#E4002B]'}`;
     const line = (g) => `${g.prev.area} L${g.prev.line}`;
     const card = 'bg-white border border-slate-200 rounded-xl p-4 shadow-sm';
@@ -4658,6 +4724,8 @@ function CleanPlanView({ engine, cp, tick, cfgState, auto, setAuto, apiReady, on
                 {cp.table === 'missing' && <p className="text-xs text-[#B00020] font-semibold mt-1">Create the Clean Plan table to share it: <button type="button" className="underline" onClick={() => onOpenCheck('columns')}>see what to create</button>. The plan below works without it.</p>}
                 {(cp.table === 'noaccess' || cp.table === 'error') && <p className="text-xs text-[#B00020] font-semibold mt-1 break-words">{cp.tableWhy}</p>}
                 {cp.reqMissing && cp.reqMissing.length > 0 && <p className="text-xs text-[#B00020] font-semibold mt-1">The Clean Plan table needs {cp.reqMissing.join(', ')}: <button type="button" className="underline" onClick={() => onOpenCheck('columns')}>see what to create</button>, then Check again.</p>}
+                {cp.noWrite && <p className="text-xs text-[#B00020] font-semibold mt-1 break-words" data-testid="cp-nowrite">This account can read the Clean Plan table but not write it, so it does not publish. Ask for Create and Write on the Clean Plan table, then Check again.</p>}
+                {!ready && apiReady && cp.table === 'found' && <p className="text-xs text-slate-600 font-semibold mt-1" data-testid="cp-notready">Waiting for the equipment and the roster to be read before publishing. If this stays, press Reload (top right).</p>}
                 <div className="flex flex-wrap items-center gap-2 mt-3">
                     {cfgState !== 'same' && cp.table === 'found' && <Btn kind="yellow" onClick={() => engine.share()} disabled={busy} title="Saves this browser's Cleaning Times and Shifts settings in the Clean Plan table: every page that publishes then uses the same ones">Share these settings</Btn>}
                     {cfgState === 'differ' && (confirmUse
@@ -4677,7 +4745,8 @@ function CleanPlanView({ engine, cp, tick, cfgState, auto, setAuto, apiReady, on
                 {last && !busy && (
                     <div className={`mt-3 text-xs rounded-lg border px-3 py-2 ${last.errors.length || last.failed ? 'bg-[#FDE8EC] border-[#E4002B]/40 text-[#B00020]' : last.skipped ? 'bg-[#FFF6E0] border-[#FFB81C] text-slate-800' : 'bg-[#F0FDF4] border-[#86EFAC] text-[#166534]'}`} data-testid="cp-last">
                         {last.skipped ? <>Not published ({last.why}): {last.skipped}</>
-                            : <>Published {fmtDT(last.at)} ({last.why}): {last.weeks} week{last.weeks === 1 ? '' : 's'} from {fmtDay(last.from)}, {last.created} new, {last.updated} changed, {last.removed} removed, {last.same} unchanged{last.failed ? `, ${last.failed} failed` : ''}{last.stopped ? ', stopped' : ''}.{last.dropped && last.dropped.length ? ` Not stored (column missing): ${last.dropped.join(', ')}.` : ''}</>}
+                            : last.errors.length && !last.weeks && !last.created && !last.updated && !last.removed ? <>Not published {fmtDT(last.at)} ({last.why}).</>
+                            : <>{last.errors.length || last.failed ? 'Published with problems' : 'Published'} {fmtDT(last.at)} ({last.why}): {last.weeks} week{last.weeks === 1 ? '' : 's'} from {fmtDay(last.from)}, {last.created} new, {last.updated} changed, {last.removed} removed, {last.same} unchanged{last.failed ? `, ${last.failed} failed` : ''}{last.stopped ? ', stopped' : ''}.{last.dropped && last.dropped.length ? ` Not stored (column missing): ${last.dropped.join(', ')}.` : ''}</>}
                         {last.errors.length > 0 && <div className="font-semibold break-words">{last.errors[0]}</div>}
                     </div>
                 )}
@@ -4693,7 +4762,7 @@ function CleanPlanView({ engine, cp, tick, cfgState, auto, setAuto, apiReady, on
                     <select className="border border-slate-300 rounded-lg px-1.5 py-1 text-xs normal-case font-bold" value={weeks} onChange={(e) => setWeeks(Number(e.target.value))}>{[1, 2, 3, 4, 6, 8].map(n => <option key={n} value={n}>{n}</option>)}</select></label>
                 <span className="text-sm font-black text-[#00468B] whitespace-nowrap">{fmtDay(F)} to {fmtDay(T - 1)}</span>
                 {loading && <span className="text-xs text-slate-500">Working it out...</span>}
-                {data && !loading && <span className="text-xs text-slate-500" data-testid="cp-summary">{count('allergen')} allergen clean{count('allergen') === 1 ? '' : 's'} · {count('full')} full clean{count('full') === 1 ? '' : 's'} · {count('changeover')} product change{count('changeover') === 1 ? '' : 's'} · <b className={red.length ? 'text-[#B00020]' : 'text-[#166534]'}>{red.length} hangup{red.length === 1 ? '' : 's'}</b> · {noneDays} line-day{noneDays === 1 ? '' : 's'} with no Daily clean needed</span>}
+                {data && !loading && <span className="text-xs text-slate-500" data-testid="cp-summary">{count('allergen')} allergen clean{count('allergen') === 1 ? '' : 's'} · {count('full')} full clean{count('full') === 1 ? '' : 's'} · {count('changeover')} product change{count('changeover') === 1 ? '' : 's'} · <b className={red.length ? 'text-[#B00020]' : 'text-[#166534]'}>{red.length} hangup{red.length === 1 ? '' : 's'} ahead</b>{past.length ? ` (${past.length} already past)` : ''} · {noneDays} line-day{noneDays === 1 ? '' : 's'} with no Daily clean needed</span>}
             </div>
             {err && <div className="px-3 py-2 rounded-lg bg-[#FDE8EC] border border-[#E4002B]/40 text-xs font-bold text-[#B00020]">{err}</div>}
             {data && data.long > 0 && <div className="px-3 py-2 rounded-lg bg-[#FFF6E0] border border-[#FFB81C] text-xs text-slate-800">{data.long} run{data.long === 1 ? ' is' : 's are'} longer than {CP_MAX_RUN_DAYS} days (a mistyped end date?) and left out, as the MSS does. The Run check on Data Check finds them.</div>}
@@ -4701,11 +4770,11 @@ function CleanPlanView({ engine, cp, tick, cfgState, auto, setAuto, apiReady, on
             <div className={card} data-testid="cp-hangups">
                 <h3 className={h2}>Hangups for directors</h3>
                 <p className="text-[11px] text-slate-500 mb-2">Cleans that do not fit: not enough crew time before the next run, runs that overlap, or no sanitation shift in the stop. Click one to see it on the Schedule.</p>
-                {data && !red.length && <p className="text-sm text-[#166534] font-semibold">No hangups in these weeks: every clean fits the time and the crew on shift.</p>}
+                {data && !red.length && <p className="text-sm text-[#166534] font-semibold" data-testid="cp-nohang">{past.length ? 'No hangups from now on in these weeks. The ones marked past below have already happened.' : amber.length ? 'Every clean in these weeks fits; the tight ones are below.' : 'No hangups in these weeks: every clean fits the time and the crew on shift.'}</p>}
                 <div className="space-y-1.5">
-                    {red.concat(amber).map(g => { const st = GAP_STYLE[g.status]; return (
-                        <button key={`${g.prevId}|${g.nextId}|${g.stopKind}`} type="button" onClick={() => onJump(g.start)} className="w-full text-left rounded-lg border px-2.5 py-1.5 text-[11px]" style={{ background: st.bg, borderColor: st.border, color: st.text }} data-hang={g.status}>
-                            <div className="font-black">{line(g)} · {fmtDT(g.start)}{g.stopKind !== 'last' && g.end > g.start ? ` to ${fmtDT(g.end)}` : g.stopKind === 'overlap' ? ' (the next run starts before this one ends)' : g.stopKind !== 'last' ? ' (no time between the runs)' : ''} · {CLEAN_KINDS[g.kind].label} · {st.label}{g.shortMins > 0 ? ` by ${cpHrs(g.shortMins)}` : ''}</div>
+                    {red.concat(amber, past).map(g => { const st = GAP_STYLE[g.status], was = !ahead(g); return (
+                        <button key={`${g.prevId}|${g.nextId}|${g.stopKind}`} type="button" onClick={() => onJump(g.start)} className={`w-full text-left rounded-lg border px-2.5 py-1.5 text-[11px] ${was ? 'opacity-60' : ''}`} style={{ background: st.bg, borderColor: st.border, color: st.text }} data-hang={g.status} data-past={was ? '1' : undefined}>
+                            <div className="font-black">{was ? 'Past · ' : ''}{line(g)} · {fmtDT(g.start)}{g.stopKind !== 'last' && g.end > g.start ? ` to ${fmtDT(g.end)}` : g.stopKind === 'overlap' ? ' (the next run starts before this one ends)' : g.stopKind !== 'last' ? ' (no time between the runs)' : ''} · {CLEAN_KINDS[g.kind].label} · {st.label}{g.shortMins > 0 ? ` by ${cpHrs(g.shortMins)}` : ''}</div>
                             <div className="opacity-90">{g.reason}</div>
                         </button>); })}
                 </div>
@@ -4725,8 +4794,8 @@ function CleanPlanView({ engine, cp, tick, cfgState, auto, setAuto, apiReady, on
                                 <td className="pr-3 whitespace-nowrap">{g.next ? fmtDT(g.end) : g.open === 'unplanned' ? 'not planned yet' : 'no run after it'}</td>
                                 <td className="pr-3 whitespace-nowrap">{CLEAN_KINDS[g.kind].label}{g.kind === 'allergen' && g.prev.allergenType ? ` (${g.prev.allergenType})` : ''}</td>
                                 <td className="pr-3 whitespace-nowrap">{g.mins > 0 ? cpHrs(g.mins) : ''}</td>
-                                <td className="pr-3 whitespace-nowrap">{g.kind === 'changeover' ? 'line crew' : g.assumed ? `${g.heads} assumed` : g.heads ? `${Math.round(g.heads * 10) / 10} on shift` : ''}</td>
-                                <td className="pr-3 whitespace-nowrap"><span className="px-1.5 py-0.5 rounded border text-[10px] font-black" style={{ background: st.bg, borderColor: st.border, color: st.text }}>{g.status === 'ok' ? (g.cleanEnd ? `done ${fmtTime(g.cleanEnd)}` : 'ok') : STATUS_WORDS[g.status]}</span></td>
+                                <td className="pr-3 whitespace-nowrap">{g.kind === 'changeover' ? 'line crew' : !g.cleanStart ? 'none' : g.assumed ? `${Math.round(g.heads * 10) / 10} assumed` : g.heads ? `${Math.round(g.heads * 10) / 10} on shift` : ''}</td>
+                                <td className="pr-3 whitespace-nowrap"><span className="px-1.5 py-0.5 rounded border text-[10px] font-black" style={{ background: st.bg, borderColor: st.border, color: st.text }}>{g.status === 'ok' ? (g.cleanEnd ? `done ${getLocalYMD(new Date(g.cleanEnd)) === getLocalYMD(new Date(g.start)) ? fmtTime(g.cleanEnd) : fmtDT(g.cleanEnd)}` : 'ok') : STATUS_WORDS[g.status]}</span></td>
                             </tr>); })}</tbody>
                     </table>
                     {cleans.length > 150 && !moreCleans && <button type="button" className="mt-1 text-xs font-bold text-[#0072CE] underline" onClick={() => setMoreCleans(true)}>Show all {cleans.length}</button>}
@@ -4987,14 +5056,15 @@ function RunCheckPanel({ A, startAudit, cancelAudit, fixRuns, deleteRuns, undoFi
     );
 }
 
-function ColumnsPanel({ colStatus, probeColumns, probing, resetRefused, apiReady, refusedCols }) {
+function ColumnsPanel({ colStatus, probeColumns, probing, resetRefused, apiReady, refusedCols, tablesFound }) {
     const [copied, setCopied] = useState('');
     const rowsOf = (t) => t.cols.map(c => ({ c, st: colStatus(t.key, c) }));
     const toCreate = [];
     const untested = [];
     COLUMN_GUIDE.forEach(t => { if (t.key !== 'runs') return; rowsOf(t).forEach(x => { if (x.c.need !== 'optional' || x.st.s === 'found') return; (x.st.s === 'missing' ? toCreate : untested).push(x); }); });
     const missing = COLUMN_GUIDE.reduce((n, t) => n + (t.optionalTable ? 0 : rowsOf(t).filter(x => x.st.s === 'missing').length), 0);
-    const tablesToCreate = COLUMN_GUIDE.filter(t => t.optionalTable && !rowsOf(t).some(x => x.st.s === 'found'));
+    // a table that was read (even empty, when its columns cannot be tested) is not offered for creation
+    const tablesToCreate = COLUMN_GUIDE.filter(t => t.optionalTable && !(tablesFound && tablesFound[t.key]) && !rowsOf(t).some(x => x.st.s === 'found'));
     const tablesWithGaps = COLUMN_GUIDE.filter(t => t.optionalTable && rowsOf(t).some(x => x.st.s === 'found') && rowsOf(t).some(x => x.st.s === 'missing'));
     const copyTable = async (t, only) => {
         const cols = only || t.cols;
@@ -5109,7 +5179,7 @@ function PayloadsPanel({ payloadsRef, clearPayloads, tick }) {
     );
 }
 
-function DataCheckView({ sub, setSub, auditRef, subscribe, startAudit, cancelAudit, fixRuns, deleteRuns, undoFix, openRun, mssIdx, payloadsRef, payloadTick, colStatus, refusedCols, probeColumns, probing, resetRefused, clearPayloads, apiReady }) {
+function DataCheckView({ sub, setSub, auditRef, subscribe, startAudit, cancelAudit, fixRuns, deleteRuns, undoFix, openRun, mssIdx, payloadsRef, payloadTick, colStatus, refusedCols, probeColumns, probing, resetRefused, clearPayloads, apiReady, tablesFound }) {
     const [, force] = useState(0);
     useEffect(() => subscribe(() => force(n => n + 1)), [subscribe]);
     const probedOnce = useRef(false);
@@ -5128,7 +5198,7 @@ function DataCheckView({ sub, setSub, auditRef, subscribe, startAudit, cancelAud
                 <div className="flex gap-1.5">{SUBS.map(s => <Chip key={s.id} on={sub === s.id} onClick={() => setSub(s.id)}>{s.label}{s.badge !== '' && <span className="ml-1.5 px-1.5 rounded-full bg-white/25 text-[10px]">{s.badge}</span>}</Chip>)}</div>
             </div>
             {sub === 'run' && <RunCheckPanel A={A} startAudit={startAudit} cancelAudit={cancelAudit} fixRuns={fixRuns} deleteRuns={deleteRuns} undoFix={undoFix} openRun={openRun} mssIdx={mssIdx} apiReady={apiReady} />}
-            {sub === 'columns' && <ColumnsPanel colStatus={colStatus} probeColumns={probeColumns} probing={probing} resetRefused={resetRefused} apiReady={apiReady} refusedCols={refusedCols} />}
+            {sub === 'columns' && <ColumnsPanel colStatus={colStatus} probeColumns={probeColumns} probing={probing} resetRefused={resetRefused} apiReady={apiReady} refusedCols={refusedCols} tablesFound={tablesFound} />}
             {sub === 'payloads' && <PayloadsPanel payloadsRef={payloadsRef} clearPayloads={clearPayloads} tick={payloadTick} />}
         </div>
     );
@@ -5491,11 +5561,12 @@ export default function ProductionScheduleApp({ dataApi }) {
     }, [runs, view.from, rangeTo]);
     const rosterSig = JSON.stringify(rosterTable);
     const occ = useMemo(() => shiftOccurrences(settings.shifts, span[0] - DAY, span[1] + DAY, rosterCount), [settings.shifts, span[0], span[1], rosterSig]);
-    const gapCtx = useMemo(() => ({ occ, own, clean: settings.clean, assetsByArea, fallbackHeads: settings.cleanHeads }), [occ, own, settings.clean, assetsByArea, settings.cleanHeads]);
+    const gapCtx = useMemo(() => ({ occ, occFrom: span[0] - DAY, occTo: span[1] + DAY, occFor: (a, b) => shiftOccurrences(settings.shifts, a, b, rosterCount),
+        own, clean: settings.clean, assetsByArea, fallbackHeads: settings.cleanHeads }), [occ, own, settings.clean, assetsByArea, settings.cleanHeads]);
     const analysis = useMemo(() => {
         const byLine = {}, exact = {};
         runs.forEach(r => { const c = canonLine(r.area, r.line), k = lineKeyOf(r.area, r.line); (byLine[c] = byLine[c] || []).push(r); (exact[k] = exact[k] || []).push(r); });
-        const gaps = [], issueMap = {}, uncoveredMap = {};
+        const gaps = [], issueMap = {}, uncoveredMap = {}, odd = [];
         // the stops of each line (however its area is spelled), judged by the cleaning rules
         Object.keys(byLine).forEach(c => {
             const l = byLine[c], latest = l.reduce((a, b) => b.start > a.start ? b : a, l[0]);
@@ -5503,6 +5574,7 @@ export default function ProductionScheduleApp({ dataApi }) {
                 gaps.push(g);
                 if (g.status === 'overlap') { issueMap[g.nextId] = 'overlap'; issueMap[g.prevId] = 'overlap'; }
             });
+            oddOverlaps(l).forEach(o => { issueMap[o.a.id] = 'overlap'; issueMap[o.b.id] = 'overlap'; odd.push(o); });
         });
         Object.keys(exact).forEach(k => {
             const l = exact[k];
@@ -5513,7 +5585,7 @@ export default function ProductionScheduleApp({ dataApi }) {
                 if (c.any !== false && c.uncovered > 15 * 60000) uncoveredMap[r.id] = c.uncovered;
             });
         });
-        return { gaps, issueMap, uncoveredMap };
+        return { gaps, issueMap, uncoveredMap, odd };
     }, [runs, gapCtx, own]);
     const issueList = useMemo(() => {
         const list = [];
@@ -5522,6 +5594,7 @@ export default function ProductionScheduleApp({ dataApi }) {
             if (g.status === 'overlap') list.push({ key: `o${g.prevId}${g.nextId}`, kind: 'overlap', ms: g.next.start, runId: g.nextId, text: `${lineLabelOf(g.prev.area, g.prev.line)}: ${runTitle(g.prev)} and ${runTitle(g.next)} overlap by ${fmtHrs(g.overlapMs)}` });
             else if (g.status === 'short' || g.status === 'nocrew' || g.status === 'tight') list.push({ key: `${g.status[0]}${g.prevId}${g.nextId}`, kind: g.status, ms: g.start, runId: g.nextId, text: `${lineLabelOf(g.prev.area, g.prev.line)}: ${gapText(g)}` });
         });
+        analysis.odd.forEach(o => { if (o.b.start <= rangeTo && Math.min(o.a.end, o.b.end) >= view.from) list.push({ key: `x${o.a.id}${o.b.id}`, kind: 'overlap', ms: o.b.start, runId: o.b.id, text: `${lineLabelOf(o.a.area, o.a.line)}: ${runTitle(o.a)} and ${runTitle(o.b)} overlap by ${fmtHrs(o.ms)}` }); });
         runs.forEach(r => { if (analysis.uncoveredMap[r.id] && r.start < rangeTo && r.end > view.from) list.push({ key: `u${r.id}`, kind: 'shift', ms: r.start, runId: r.id, text: `${lineLabelOf(r.area, r.line)}: ${runTitle(r)} has no production shift for ${fmtHrs(analysis.uncoveredMap[r.id])}` }); });
         return list.sort((a, b) => a.ms - b.ms);
     }, [analysis, runs, view.from, rangeTo]);
@@ -5531,7 +5604,7 @@ export default function ProductionScheduleApp({ dataApi }) {
     // CLEAN PLAN blocks above). The settings it uses are the shared ones (the config row), so every page publishes the same answer.
     // ------------------------------------------------------------------------
     const cpRef = useRef({ table: 'unknown', tableWhy: '', shared: null, sharedAt: '', busy: false, progress: null, last: null, timer: null, lastStart: 0, pending: [],
-        hashCol: true, idsOk: true, missing: {}, reqMissing: [], stop: false, epoch: 0, visitFull: 0, previewCache: {} });
+        hashCol: true, idsOk: true, noWrite: '', missing: {}, reqMissing: [], stop: false, epoch: 0, visitFull: 0, previewCache: {} });
     const [cpTick, setCpTick] = useState(0);
     const cpEmitTimer = useRef(null);
     const cpEmit = (soon) => { if (soon) { if (cpEmitTimer.current) return; cpEmitTimer.current = setTimeout(() => { cpEmitTimer.current = null; setCpTick(n => n + 1); }, 1000); } else setCpTick(n => n + 1); };
@@ -5549,7 +5622,11 @@ export default function ProductionScheduleApp({ dataApi }) {
         return { rows, err: rows === null ? (errs[errs.length - 1] || 'The Clean Plan table could not be read.') : '' };
     };
     const cpClassify = (e) => TABLE_GONE_RE.test(e) ? 'missing' : CP_PRIV_RE.test(e) ? 'noaccess' : 'error';
-    const cpAdopt = (cfg) => updateSettings(s => ({ ...s, clean: cfg.clean || {}, shifts: cfg.shifts || [], cleanHeads: numOr(cfg.cleanHeads, s.cleanHeads), rosterOverrides: cfg.rosterOverrides || {} }));
+    const cpAdopt = (cfg) => {
+        const take = (s) => ({ ...s, clean: cfg.clean || {}, shifts: cfg.shifts || [], cleanHeads: numOr(cfg.cleanHeads, s.cleanHeads), rosterOverrides: cfg.rosterOverrides || {} });
+        settingsRef.current = take(settingsRef.current);   // a publish right after uses them before the next draw
+        updateSettings(take);
+    };
     // Is the table there, and what settings are shared? A browser with no cleaning or shift settings of its own takes the shared ones.
     const cpLoadConfig = async () => {
         const C = cpRef.current;
@@ -5577,40 +5654,50 @@ export default function ProductionScheduleApp({ dataApi }) {
         Object.keys(fields).forEach(c => { if (!C.missing[c]) body[c] = fields[c]; });
         let op = id ? 'update' : 'create', tries = 0, revive = false;
         const rid = id || cpGuid(key);
+        // only a column the message names is blamed (a vague "property" message blames none, and the row fails instead)
+        const named = (msg, cols) => { const m = msg.toLowerCase(); return cols.filter(c => m.indexOf(c.toLowerCase()) >= 0); };
         for (;;) {
             try {
-                if (op === 'update') await w.update(TABLE_CLEAN, rid, revive ? { ...body, statecode: 0, statuscode: 1 } : body);
-                else { const b = C.idsOk ? { ...body, [CP_ID]: rid } : body; const got = await w.create(TABLE_CLEAN, b); Object.keys(body).forEach(c => cpMark(c, { s: 'found' })); return { id: got || rid, op }; }
+                if (op === 'update') await withTimeout(w.update(TABLE_CLEAN, rid, revive ? { ...body, statecode: 0, statuscode: 1 } : body), API_TIMEOUT_MS, 'Clean Plan write');
+                else { const b = C.idsOk ? { ...body, [CP_ID]: rid } : body; const got = await withTimeout(w.create(TABLE_CLEAN, b), API_TIMEOUT_MS, 'Clean Plan write'); Object.keys(body).forEach(c => cpMark(c, { s: 'found' })); return { id: got || rid, op }; }
                 Object.keys(body).forEach(c => cpMark(c, { s: 'found' }));
                 return { id: rid, op };
             } catch (e) {
                 const msg = errText(e);
                 if (++tries > 8) throw e;
-                if (CP_BUSY_RE.test(msg)) { await cpSleep(30000); continue; }
-                if (op === 'update' && !revive && /does not exist|0x80040217/i.test(msg) && !badColumns(msg, Object.keys(body)).length) { op = 'create'; continue; }   // removed since it was read: make it again
+                if (CP_BUSY_RE.test(msg)) { if (C.stop) { const er = new Error('Stopped'); er.stopped = true; throw er; } await cpSleep(30000); continue; }
+                const cols = named(msg, Object.keys(body));
+                if (op === 'update' && !revive && /does not exist|0x80040217/i.test(msg) && !cols.length) {
+                    if (key.slice(0, 2) === 'k|') { op = 'create'; continue; }   // a week stamp: make it again
+                    return { id: rid, op: 'gone' };   // removed since it was read, by a newer publish: not made again
+                }
                 if (op === 'create' && C.idsOk && CP_DUP_RE.test(msg)) { op = 'update'; revive = true; continue; }
-                if (revive && badColumns(msg, ['statecode', 'statuscode']).length) { revive = false; continue; }
-                if (op === 'create' && C.idsOk && badColumns(msg, [CP_ID]).length) { C.idsOk = false; continue; }
-                const bad = badColumns(msg, Object.keys(body));
-                const opt = bad.filter(c => CP_OPTIONAL.indexOf(c) >= 0), req = bad.filter(c => CP_OPTIONAL.indexOf(c) < 0);
-                if (req.length && msg.toLowerCase().indexOf(req[0].toLowerCase()) >= 0) {
+                if (revive && named(msg, ['statecode', 'statuscode']).length) { revive = false; continue; }
+                if (op === 'create' && C.idsOk && !cols.length && named(msg, [CP_ID]).length) { C.idsOk = false; continue; }
+                if (CP_PRIV_RE.test(msg) && !cols.length) { C.noWrite = msg; const er = new Error(`This account cannot write to the Clean Plan table: ${msg}`); er.priv = true; throw er; }
+                const opt = cols.filter(c => CP_OPTIONAL.indexOf(c) >= 0), req = cols.filter(c => CP_OPTIONAL.indexOf(c) < 0);
+                if (req.length) {
                     req.forEach(c => cpMark(c, { s: 'missing', why: msg }));
                     C.reqMissing = req.map(c => (CP_COLS.filter(x => x.name === c)[0] || { label: c }).label);
                     const err = new Error(`The Clean Plan table has no ${C.reqMissing.join(', ')} column: create it (Data Check > Columns lists it), then Check again.`); err.required = true; throw err;
                 }
-                if (opt.length) { opt.forEach(c => { C.missing[c] = msg; cpMark(c, { s: 'missing', why: msg }); delete body[c]; }); continue; }
+                if (opt.length && NOT_FOUND_RE.test(msg.toLowerCase())) { opt.forEach(c => { C.missing[c] = msg; cpMark(c, { s: 'missing', why: msg }); delete body[c]; }); continue; }
                 throw e;
             }
         }
     };
     const cpRemove = async (w, id) => {
+        const C = cpRef.current;
         for (let tries = 0; ; tries++) {
-            try { await w.remove(TABLE_CLEAN, id); return 'removed'; }
+            try { await withTimeout(w.remove(TABLE_CLEAN, id), API_TIMEOUT_MS, 'Clean Plan remove'); return 'removed'; }
             catch (e) {
                 const msg = errText(e);
-                if (CP_BUSY_RE.test(msg) && tries < 5) { await cpSleep(30000); continue; }
+                if (CP_BUSY_RE.test(msg) && tries < 5) { if (C.stop) { const er = new Error('Stopped'); er.stopped = true; throw er; } await cpSleep(30000); continue; }
                 if (/does not exist|not found|0x80040217/i.test(msg)) return 'removed';
-                if (CP_PRIV_RE.test(msg)) { await w.update(TABLE_CLEAN, id, { statecode: 1, statuscode: 2 }); return 'deactivated'; }   // no Delete permission: switched off, which readers skip
+                if (CP_PRIV_RE.test(msg)) {   // no Delete permission: switched off, which readers skip
+                    try { await withTimeout(w.update(TABLE_CLEAN, id, { statecode: 1, statuscode: 2 }), API_TIMEOUT_MS, 'Clean Plan write'); return 'deactivated'; }
+                    catch (e2) { if (CP_PRIV_RE.test(errText(e2))) { C.noWrite = errText(e2); const er = new Error(`This account cannot write to the Clean Plan table: ${errText(e2)}`); er.priv = true; throw er; } throw e2; }
+                }
                 throw e;
             }
         }
@@ -5663,6 +5750,7 @@ export default function ProductionScheduleApp({ dataApi }) {
         if (tz !== want) return `this computer is set to ${tz || 'an unknown time zone'} and the plant runs on ${want}, so its days would be wrong`;
         if (!cpReadyRef.current) return 'the equipment and the roster are not read yet (or could not be read)';
         if (C.reqMissing.length) return `the Clean Plan table needs ${C.reqMissing.join(', ')}`;
+        if (C.noWrite) return 'this account cannot write to the Clean Plan table (it can still read it)';
         if (!C.shared && !manual) return 'the cleaning settings are not shared yet (Share these settings)';
         if (C.shared && cpCfgSig(C.shared) !== cpCfgSig(cpCfgOf(settingsRef.current))) return 'this browser\'s cleaning settings differ from the shared ones (use the shared ones or share yours)';
         return '';
@@ -5700,20 +5788,28 @@ export default function ProductionScheduleApp({ dataApi }) {
             if (q) { q.F = Math.min(q.F, F); q.T = Math.max(q.T, T); q.why = why; } else if (C.pending.length < 6) C.pending.push({ F, T, why, manual: !!manual });
             return;
         }
-        const no = cpCan(manual);
-        if (no) { C.last = { at: Date.now(), why, skipped: no, errors: [], from: F, to: T }; if (manual) notify(`Not published: ${no}.`, 'warn'); cpEmit(); return; }
-        if (manual && !C.shared && !(await cpShare(true))) return;
+        const first = cpCan(manual);
+        if (first) { C.last = { at: Date.now(), why, skipped: first, errors: [], from: F, to: T }; if (manual) notify(`Not published: ${first}.`, 'warn'); cpEmit(); return; }
         const w = writer();
-        C.busy = true; C.stop = false; C.lastStart = Date.now(); C.progress = { what: 'Reading the runs', done: 0, total: 0 }; cpEmit();
-        const sum = { at: Date.now(), why, from: F, to: T, weeks: 0, created: 0, updated: 0, removed: 0, same: 0, failed: 0, errors: [], samples: [], dropped: [], stopped: false };
+        C.busy = true; C.stop = false; C.lastStart = Date.now(); C.progress = { what: 'Reading the shared settings', done: 0, total: 0 }; cpEmit();
+        const epoch0 = C.epoch;
+        const sum = { at: Date.now(), why, from: F, to: T, weeks: 0, created: 0, updated: 0, removed: 0, same: 0, failed: 0, gone: 0, newer: 0, errors: [], samples: [], dropped: [], stopped: false };
+        let skipped = '';
         try {
+            // the shared settings may have changed on another page since this one read them: read them again first
+            await cpLoadConfig();
+            if (manual && !C.shared && C.table === 'found' && !(await cpShare(true))) { skipped = 'the settings could not be shared'; return; }
+            skipped = cpCan(manual);
+            if (skipped) return;
             const cfg = C.shared;
             const sig = cpCfgSig(cfg);
             C.progress = { what: 'Reading what is already published', done: 0, total: 0 }; cpEmit(true);
             // what the table holds for these weeks (the rows this publish owns: craa5_start in [F, T))
             const range = `statecode eq 0 and craa5_start ge ${isoZ(F)} and craa5_start lt ${isoZ(T)}`;
-            const avail = CP_COLS.filter(c => !C.missing[c.name] && c.name !== 'craa5_publishbatch' && c.name !== 'craa5_contenthash').map(c => c.name);
-            const hashOf = (f) => cpHash(avail.map(c => { const v = f[c]; return v === undefined || v === null ? '' : String(v); }).join('\u0001'));
+            const HASH_COLS = CP_COLS.filter(c => c.name !== 'craa5_publishbatch' && c.name !== 'craa5_contenthash').map(c => c.name);
+            const normv = (v) => v === undefined || v === null ? '' : String(v);
+            // the fingerprint covers a fixed list of columns, so it does not change with what this page has learned is missing
+            const hashOf = (f) => cpHash(HASH_COLS.map(c => normv(f[c])).join('\u0001'));
             let have = null;
             const readHave = async (sel) => {
                 const all = [];
@@ -5731,9 +5827,11 @@ export default function ProductionScheduleApp({ dataApi }) {
                 catch (e) { if (badColumns(errText(e), ['craa5_contenthash']).length) { C.hashCol = false; C.missing.craa5_contenthash = errText(e); cpMark('craa5_contenthash', { s: 'missing', why: errText(e) }); } else throw e; }
             }
             if (have === null) have = await readHave(null);   // no Content Hash column: every column is read and compared
+            const hashMode = C.hashCol && !C.missing.craa5_contenthash;
             noteKeys('cleanplan', have);
             const must = [];
             have.forEach(r => { const k = String(rv(r, 'craa5_linekey') || ''); if (String(rv(r, 'craa5_rowtype') || '') === 'day' && k && must.indexOf(k) < 0) must.push(k); });
+            const readAt = Date.now();
             const built = await cpCompute(F, T, cfg, (what) => { C.progress = { what, done: 0, total: 0 }; cpEmit(true); }, must);
             if (!built) throw new Error('The runs could not be read, so nothing was changed. It is tried again on the next change.');
             // the week stamps with their details (which rules and settings wrote the week)
@@ -5746,7 +5844,8 @@ export default function ProductionScheduleApp({ dataApi }) {
             have.forEach(r => { const k = String(rv(r, 'craa5_plankey') || ''); (byKey[k] = byKey[k] || []).push(r); });
             const idOfRow = (r) => String(rv(r, CP_ID) || '').toLowerCase();
             const keep = (k) => { const l = byKey[k] || []; const fixed = l.filter(r => idOfRow(r) === cpGuid(k))[0]; return fixed || l.slice().sort((a, b) => String(a.createdon || '').localeCompare(String(b.createdon || '')) || (idOfRow(a) < idOfRow(b) ? -1 : 1))[0] || null; };
-            const storedHash = (r) => C.hashCol && !C.missing.craa5_contenthash ? String(rv(r, 'craa5_contenthash') || '') : hashOf(CP_COLS.reduce((o, c) => { o[c.name] = rv(r, c.name); return o; }, {}));
+            // unchanged: the same fingerprint, or (no Content Hash column) the same value in every column the row came back with
+            const unchanged = (cur, f, h) => hashMode ? String(rv(cur, 'craa5_contenthash') || '') === h : HASH_COLS.every(c => { const v = rv(cur, c); return v === undefined || normv(v) === normv(f[c]); });
             const batch = clipText(`${cpWhen(sum.at)} · ${why} · weeks of ${cpDayText(getLocalYMD(new Date(F)))} to ${cpDayText(cpAddDaysYmd(getLocalYMD(new Date(T)), -7))}`, 200);
             const plan = {};   // week -> { put: [{ key, f, id }], del: [ids], same, want, stamp }
             built.weeks.forEach(m => { plan[m] = { put: [], del: [], same: 0, want: 0, stamp: null }; });
@@ -5755,7 +5854,8 @@ export default function ProductionScheduleApp({ dataApi }) {
                 const p = plan[r.week]; if (!p) return;
                 wanted[r.key] = true; p.want++;
                 const h = hashOf(r.f), cur = keep(r.key);
-                if (cur && storedHash(cur) === h) { p.same++; return; }
+                if (cur && unchanged(cur, r.f, h)) { p.same++; return; }
+                // a row that moves to a later week is moved in its old week's step, so a stopped publish never leaves it behind in a week stamped done
                 const was = cur ? cpMondayYmd(Date.parse(rv(cur, 'craa5_start') || '') || F) : r.week;
                 (was < r.week && plan[was] ? plan[was] : p).put.push({ key: r.key, f: { ...r.f, craa5_contenthash: h, craa5_publishbatch: batch }, id: cur ? idOfRow(cur) : null });
             });
@@ -5772,50 +5872,62 @@ export default function ProductionScheduleApp({ dataApi }) {
             });
             const weeksList = built.weeks.filter(m => plan[m]);
             const total = weeksList.reduce((n, m) => n + plan[m].put.length + plan[m].del.length, 0);
-            let done = 0;
+            let done = 0, abortErr = null;
+            const parseDet = (r) => { try { return r ? JSON.parse(rv(r, 'craa5_details') || 'null') : null; } catch (e) { return null; } };
             for (let wi = 0; wi < weeksList.length; wi++) {
                 if (C.stop) { sum.stopped = true; break; }
                 const m = weeksList[wi], p = plan[m];
                 sum.weeks++; sum.same += p.same;
-                let stampDet = null;
-                const sr = p.stamp ? stamps[idOfRow(p.stamp)] || p.stamp : null;
-                try { stampDet = sr ? JSON.parse(rv(sr, 'craa5_details') || 'null') : null; } catch (e) { stampDet = null; }
+                const sr = p.stamp ? stamps[idOfRow(p.stamp)] || p.stamp : null, stampDet = parseDet(sr);
                 const stampOk = sr && String(rv(sr, 'craa5_status') || '') === 'done' && stampDet && stampDet.v === CP_RULES && stampDet.cfg === sig;
                 if (!p.put.length && !p.del.length && stampOk) continue;
+                // another page may have published this week from a newer read of the runs since this one read them: that one stands
+                const now = await cpRead(`statecode eq 0 and craa5_rowtype eq 'week' and craa5_plankey eq 'k|${m}'`, [CP_ID, 'craa5_status', 'craa5_details'], null, 5);
+                if ((now.rows || []).some(r => { const d = parseDet(r); return d && d.read && Date.parse(d.read) > readAt; })) { sum.newer++; continue; }
                 const stampId = p.stamp ? idOfRow(p.stamp) : null;
                 C.progress = { what: `Week of ${fmtDay(parseYMD(m).getTime())}`, done, total }; cpEmit(true);
                 let failed = 0, sid = stampId;
-                try { sid = (await cpPut(w, `k|${m}`, cpWeekRow(m, 'writing', p.want, sig, Date.now()), stampId)).id; }
-                catch (e) { if (e.required) throw e; sum.errors.push(`Week of ${m}: ${errText(e)}`); failed++; }
-                await poolRun(p.put, CP_CONC, async (x) => {
-                    if (C.stop) return;
-                    try { const r = await cpPut(w, x.key, x.f, x.id); if (r.op === 'create') sum.created++; else sum.updated++; if (sum.samples.length < 3) sum.samples.push(clipFields(x.f)); }
-                    catch (e) { if (e.required) throw e; failed++; if (sum.errors.length < 5) sum.errors.push(`${x.key}: ${errText(e)}`); }
+                try { sid = (await cpPut(w, `k|${m}`, cpWeekRow(m, 'writing', p.want, sig, Date.now(), readAt), stampId)).id; }
+                catch (e) { if (e.required || e.priv || e.stopped) throw e; sum.errors.push(`Week of ${m}: ${errText(e)}`); failed++; }
+                const step = async (fn) => {
+                    try { await fn(); }
+                    catch (e) { if (e.required || e.priv) { abortErr = abortErr || e; return; } if (e.stopped) return; failed++; if (sum.errors.length < 5) sum.errors.push(errText(e)); }
                     done++; C.progress = { what: `Week of ${fmtDay(parseYMD(m).getTime())}`, done, total }; cpEmit(true);
-                });
-                await poolRun(p.del, CP_CONC, async (id) => {
-                    if (C.stop) return;
-                    try { await cpRemove(w, id); sum.removed++; }
-                    catch (e) { failed++; if (sum.errors.length < 5) sum.errors.push(`remove ${id}: ${errText(e)}`); }
-                    done++; C.progress = { what: `Week of ${fmtDay(parseYMD(m).getTime())}`, done, total }; cpEmit(true);
-                });
+                };
+                await poolRun(p.put, CP_CONC, (x) => C.stop || abortErr ? null : step(async () => {
+                    const r = await cpPut(w, x.key, x.f, x.id);
+                    if (r.op === 'gone') sum.gone++; else if (r.op === 'create') sum.created++; else sum.updated++;
+                    if (sum.samples.length < 3) sum.samples.push(clipFields(x.f));
+                }));
+                if (abortErr) throw abortErr;
+                await poolRun(p.del, CP_CONC, (id) => C.stop || abortErr ? null : step(async () => { await cpRemove(w, id); sum.removed++; }));
+                if (abortErr) throw abortErr;
                 sum.failed += failed;
                 if (!failed && !C.stop) {
-                    try { await cpPut(w, `k|${m}`, cpWeekRow(m, 'done', p.want, sig, Date.now()), sid); }
-                    catch (e) { sum.failed++; sum.errors.push(`Week of ${m}: ${errText(e)}`); }
+                    try { await cpPut(w, `k|${m}`, cpWeekRow(m, 'done', p.want, sig, Date.now(), readAt), sid); }
+                    catch (e) { if (e.required || e.priv) throw e; sum.failed++; sum.errors.push(`Week of ${m}: ${errText(e)}`); }
                 }
             }
+            if (C.stop) sum.stopped = true;
             sum.dropped = Object.keys(C.missing).map(c => (CP_COLS.filter(x => x.name === c)[0] || { label: c }).label);
             const horizon = F <= cpWeekStart(Date.now(), -CP_AUTO_BACK_WEEKS) && T >= cpWeekStart(Date.now(), CP_AUTO_AHEAD_WEEKS + 1);
-            if (!sum.failed && !sum.stopped && !sum.errors.length && horizon) { cpLsSet({ lastFull: Date.now(), dirty: false }); C.visitFull = Date.now(); }
+            if (!sum.failed && !sum.stopped && !sum.errors.length && horizon) {
+                // a change made while this publish ran (here or in another tab) is not in it: it stays waiting
+                const ls = cpLs(), touched = C.epoch !== epoch0 || (ls.dirtyAt || 0) >= readAt;
+                cpLsSet(touched ? { lastFull: Date.now() } : { lastFull: Date.now(), dirty: false }); C.visitFull = Date.now();
+            }
         } catch (e) { sum.errors.unshift(errText(e)); }
         finally {
-            C.busy = false; C.progress = null; C.last = sum;
-            logPayload({ op: 'publish', table: TABLE_CLEAN, id: '', what: `Clean Plan (${why})`, fields: { weeks: sum.weeks, from: getLocalYMD(new Date(F)), created: sum.created, updated: sum.updated, removed: sum.removed, unchanged: sum.same, failed: sum.failed, stopped: sum.stopped, first: sum.samples[0] || null }, sent: [], dropped: Object.keys(C.missing), ok: !sum.failed && !sum.errors.length, error: sum.errors.join(' | '), preview: false });
+            C.busy = false; C.progress = null;
+            if (skipped) { C.last = { at: Date.now(), why, skipped, errors: [], from: F, to: T }; if (manual) notify(`Not published: ${skipped}.`, 'warn'); }
+            else {
+                C.last = sum;
+                logPayload({ op: 'publish', table: TABLE_CLEAN, id: '', what: `Clean Plan (${why})`, fields: { weeks: sum.weeks, from: getLocalYMD(new Date(F)), created: sum.created, updated: sum.updated, removed: sum.removed, unchanged: sum.same, failed: sum.failed, stopped: sum.stopped, first: sum.samples[0] || null }, sent: [], dropped: Object.keys(C.missing), ok: !sum.failed && !sum.errors.length, error: sum.errors.join(' | '), preview: false });
+                if (manual) notify(sum.errors.length || sum.failed ? `Clean Plan: ${sum.errors[0] || `${sum.failed} rows failed`}` : `Clean Plan published: ${sum.created} new, ${sum.updated} changed, ${sum.removed} removed, ${sum.same} unchanged.`, sum.errors.length || sum.failed ? 'error' : 'success');
+            }
             cpEmit();
-            if (manual) notify(sum.errors.length || sum.failed ? `Clean Plan: ${sum.errors[0] || `${sum.failed} rows failed`}` : `Clean Plan published: ${sum.created} new, ${sum.updated} changed, ${sum.removed} removed, ${sum.same} unchanged.`, sum.errors.length || sum.failed ? 'error' : 'success');
             const nx = C.pending.shift();
-            if (nx) setTimeout(() => cpPublish(nx.F, nx.T, nx.why, nx.manual), nx.manual ? 50 : Math.max(50, CP_MIN_GAP_MS - (Date.now() - C.lastStart)));
+            if (nx) setTimeout(() => cpLatest.current.publish(nx.F, nx.T, nx.why, nx.manual), nx.manual ? 50 : Math.max(50, CP_MIN_GAP_MS - (Date.now() - C.lastStart)));
         }
     };
     // 'Publish by itself': last week to 8 weeks ahead, a few seconds after the last change (at most once a minute)
@@ -5831,11 +5943,13 @@ export default function ProductionScheduleApp({ dataApi }) {
         C.epoch++; C.previewCache = {};
         cpEmit(true);
         if (!apiReady) return;
-        cpLsSet({ dirty: true });
+        cpLsSet({ dirty: true, dirtyAt: Date.now() });
         if (C.table === 'found') cpSchedule(CP_DEBOUNCE_MS, 'runs changed');
     };
     cpTouchRef.current = cpTouched;
     useEffect(() => () => { clearTimeout(cpRef.current.timer); clearTimeout(cpEmitTimer.current); }, []);
+    // the plan on the Clean Plan tab is worked out again when the equipment or the roster arrive or change, and on Reload
+    useEffect(() => { const C = cpRef.current; C.epoch++; C.previewCache = {}; cpEmit(); }, [assetsByArea, employees, reloadTick]);
     // once the table, the equipment and the roster are known: catch up on a change left unpublished, or refresh twice a day
     const cpReadyNow = cpRef.current.table === 'found' && cpReadyRef.current;
     useEffect(() => {
@@ -5847,22 +5961,37 @@ export default function ProductionScheduleApp({ dataApi }) {
         if (tab !== 'cleanplan' || !cpReadyNow || !cpAuto) return;
         if (Date.now() - cpRef.current.visitFull > 10 * 60000) cpSchedule(1500, 'Clean Plan tab opened');
     }, [tab, cpReadyNow, cpAuto]);
+    // a page left open: every half hour, a change still waiting (or a failed publish) and the twice-a-day refresh are caught up
+    useEffect(() => {
+        if (!cpReadyNow || !cpAuto) return;
+        const id = setInterval(() => {
+            const C = cpRef.current, ls = cpLs();
+            if (C.busy || C.timer || C.pending.length) return;
+            if (ls.dirty || !(Date.now() - (ls.lastFull || 0) < CP_REFRESH_MS)) cpLatest.current.schedule(1000, ls.dirty ? 'a change not published yet' : 'twice-a-day refresh');
+        }, 30 * 60000);
+        return () => clearInterval(id);
+    }, [cpReadyNow, cpAuto]);
     const cpEngine = useMemo(() => ({
         preview: (F, T) => {
             const C = cpRef.current, s = settingsRef.current;
             const cfg = C.shared && cpCfgSig(C.shared) === cpCfgSig(cpCfgOf(s)) ? C.shared : cpCfgOf(s);
             const key = `${F}|${T}|${C.epoch}|${cpCfgSig(cfg)}|${runsRef.current.length}`;
-            if (!C.previewCache[key]) C.previewCache = { [key]: cpLatest.current.compute(F, T, cfg, null).catch(e => { C.previewCache = {}; throw e; }) };
+            if (!C.previewCache[key]) C.previewCache = { [key]: cpLatest.current.compute(F, T, cfg, null).then(b => { if (!b) C.previewCache = {}; return b; }, e => { C.previewCache = {}; throw e; }) };   // a failed read is not kept
             return C.previewCache[key];
         },
         publish: (F, T) => cpLatest.current.publish(F, T, 'by hand', true),
-        stop: () => { cpRef.current.stop = true; cpEmit(); },
+        stop: () => { const C = cpRef.current; C.stop = true; C.pending = []; clearTimeout(C.timer); C.timer = null; cpEmit(); },   // the queued and scheduled publishes go too
         share: () => cpLatest.current.share(false),
         useShared: () => { const C = cpRef.current; if (C.shared) { cpAdopt(C.shared); notify('This browser now uses the shared cleaning and shift settings.', 'success'); cpEmit(); } },
-        recheck: () => { const C = cpRef.current; C.missing = {}; C.reqMissing = []; C.hashCol = true; C.idsOk = true; C.previewCache = {}; C.epoch++; cpLatest.current.load(); },
+        recheck: () => { const C = cpRef.current; C.missing = {}; C.reqMissing = []; C.noWrite = ''; C.hashCol = true; C.idsOk = true; C.previewCache = {}; C.epoch++; cpLatest.current.load(); },
     }), []);
-    const cpLatest = useRef(null); cpLatest.current = { publish: cpPublish, share: cpShare, load: cpLoadConfig, compute: cpCompute };
-    const setCpAuto = (on) => { updateSettings(s => ({ ...s, cpAuto: on })); if (on) setTimeout(() => cpSchedule(1500, 'Publish by itself switched on'), 0); else clearTimeout(cpRef.current.timer); };
+    const cpLatest = useRef(null); cpLatest.current = { publish: cpPublish, share: cpShare, load: cpLoadConfig, compute: cpCompute, schedule: cpSchedule };
+    const setCpAuto = (on) => {
+        updateSettings(s => ({ ...s, cpAuto: on }));
+        const C = cpRef.current;
+        if (on) setTimeout(() => cpLatest.current.schedule(1500, 'Publish by itself switched on'), 0);
+        else { clearTimeout(C.timer); C.timer = null; C.pending = C.pending.filter(x => x.manual); }
+    };
 
     // ------------------------------------------------------------------------
     // API handed to the import view
@@ -6441,9 +6570,9 @@ export default function ProductionScheduleApp({ dataApi }) {
                     </div>
                     {tab === 'check' && <DataCheckView sub={checkSub} setSub={setCheckSub} auditRef={auditRef} subscribe={auditSubscribe} startAudit={startAudit} cancelAudit={cancelAudit} fixRuns={fixRuns} deleteRuns={deleteRuns}
                         undoFix={undoFix} openRun={openRunFromCheck} mssIdx={mssIdx} payloadsRef={payloadsRef} payloadTick={payloadTick} colStatus={colStatus} refusedCols={refusedCols} probeColumns={probeColumns} probing={probing}
-                        resetRefused={resetRefused} clearPayloads={clearPayloads} apiReady={apiReady} />}
+                        resetRefused={resetRefused} clearPayloads={clearPayloads} apiReady={apiReady} tablesFound={{ cleanplan: cpRef.current.table === 'found' }} />}
                     {tab === 'shifts' && <ShiftsView rows={allRows} settings={settings} updateSettings={updateSettings} employees={employees} empLoaded={empLoaded} rosterCount={rosterCount} own={own} />}
-                    {tab === 'cleanplan' && <CleanPlanView engine={cpEngine} cp={cpRef.current} tick={cpTick} cfgState={cpCfgState} auto={cpAuto} setAuto={setCpAuto} apiReady={apiReady}
+                    {tab === 'cleanplan' && <CleanPlanView engine={cpEngine} cp={cpRef.current} tick={cpTick} cfgState={cpCfgState} auto={cpAuto} setAuto={setCpAuto} apiReady={apiReady} ready={cpReadyRef.current}
                         onJump={(ms) => { setTab('schedule'); jumpTo(ms); }} onOpenCheck={openCheck} nowMs={nowMs} active={tab === 'cleanplan'} />}
                     {tab === 'cleaning' && <CleaningView rows={allRows} assets={assetList} assetsByArea={assetsByArea} settings={settings} updateSettings={updateSettings} gaps={analysis.gaps} own={own} rosterCount={rosterCount} assetsLoaded={assetsLoaded}
                         onJump={(ms) => { setTab('schedule'); jumpTo(ms); }} />}
