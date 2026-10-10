@@ -57,6 +57,17 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
  *                      claims a row (status "applying") before it applies it by itself, and writes applied / review / failed back to
  *                      the row. Rows left in review or failed come back on the next visit and wait for a person.
  *
+ *   8. CLEAN PLAN    - what every line needs cleaned, worked out from the runs with ONE set of rules (the CLEANING RULES block,
+ *                      also behind the Gantt, the Checks, the Run dialog and the previews): an allergen clean after an allergen
+ *                      run, each line's daily (full) clean in its longest stop of the day, product changes, the crew on shift
+ *                      walked through the stop, and the days the MSS needs a Daily clean (the MSS line rules, copied exactly).
+ *                      Directors get the hangups first (short, no crew, overlaps). It is published to the optional table
+ *                      craa5_cleanplan for the MSS calendar, the Ganttly / PBED, Shift Start and the Manager hub to read:
+ *                      a few seconds after any run change on this page ("Publish by itself", last week to 8 weeks ahead,
+ *                      only rows that changed) or by hand. The cleaning and shift settings it uses are shared in that table
+ *                      ("Share these settings"), so every page that publishes gives the same answer. The reader guide is in
+ *                      the project files (production-schedule/clean-plan).
+ *
  * SCROLLING: the host canvas never scrolls the page, so the app is one screen tall (h-screen) and the area under the
  * header scrolls on its own (<main>), the same shell as the Manager hub.
  *
@@ -69,6 +80,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
  * | craa5__aa_employee   | Roster (name, craa5_shift = crew A-D, role, job-role lookup).                  |
  * | craa5_schedulechange | OPTIONAL inbox for change request forms: craa5_name, craa5_formjson (the form's cells as JSON), |
  * |                      | craa5_status (new / applied / review / failed / dismissed), craa5_result, craa5_sender. |
+ * | craa5_cleanplan      | OPTIONAL Clean Plan written by this page for the other apps (columns: Data Check > Columns). |
  *
  * OPTIONAL COLUMNS on craa5__aa_prd_schd (add them so nothing stays only in the browser; Data Check > Columns lists them):
  *     craa5_ordernumber (Single line of text)    craa5_cases (Whole number)    craa5_notes (Multiple lines of text, 2000)
@@ -78,7 +90,8 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
  * "I added them, check again" (or Reload) tries them again.
  *
  * BROWSER STORAGE: line mapping, start times, shifts, cleaning settings and roster overrides are kept in this
- * browser (localStorage), like the Ganttly. Runs themselves always live in Dataverse.
+ * browser (localStorage), like the Ganttly. Runs themselves always live in Dataverse. The cleaning and shift settings can also
+ * be shared through the Clean Plan table (Clean Plan tab); a browser with none of its own takes the shared ones.
  * ============================================================================
  */
 
@@ -150,6 +163,36 @@ const AUDIT_MAX_RUNS = 30000;  // the run check stops here and says so
 const SPECIAL_READ = 1000;     // the blank-date / far-date reads; a read that fills this is said to be cut off
 const HOUR = 3600000, DAY = 86400000;
 
+// The optional Clean Plan table (see CLEAN PLAN further down): written only by this page, read by the MSS calendar, the Ganttly,
+// Shift Start and the Manager hub.
+const TABLE_CLEAN = 'craa5_cleanplan', CP_ID = 'craa5_cleanplanid';
+// the columns of the Clean Plan table: required ones stop a publish when missing, optional ones are left out and named
+const CP_COLS = [
+    { name: 'craa5_name', label: 'Name', type: 'Single line of text (the table\'s primary column, 100)', need: 'required', why: 'What the row is, for people: "IBL4 · Sat Oct 24 06:00 · Allergen clean"' },
+    { name: 'craa5_plankey', label: 'Plan Key', type: 'Single line of text (200)', need: 'required', why: 'The row\'s key: w|previous run|next run (a stop), d|area|day, k|Monday (a week), config' },
+    { name: 'craa5_rowtype', label: 'Row Type', type: 'Single line of text (20)', need: 'required', why: 'window, day, week or config' },
+    { name: 'craa5_linekey', label: 'Line Key', type: 'Single line of text (100)', need: 'required', why: 'The line in letters and digits ("ibl4", "breading2"); for day rows the MSS area ("breading")' },
+    { name: 'craa5_start', label: 'Start', type: 'Date and time', need: 'required', why: 'Window: when the line stops. Day: local midnight. Week: Monday midnight' },
+    { name: 'craa5_end', label: 'End', type: 'Date and time', need: 'required', why: 'Window: when the next run starts (open stops: where the plan ends). Day / week: the next midnight' },
+    { name: 'craa5_day', label: 'Day', type: 'Single line of text (10)', need: 'required', why: 'The plant day, YYYY-MM-DD' },
+    { name: 'craa5_cleankind', label: 'Clean Kind', type: 'Single line of text (50)', need: 'required', why: 'Window: allergen, full, changeover or none. Day: due, stretch, covered, none or unplanned' },
+    { name: 'craa5_minutes', label: 'Minutes', type: 'Whole number', need: 'required', why: 'Window: minutes the clean takes with the crew on shift. Day: minutes of production that day' },
+    { name: 'craa5_status', label: 'Status', type: 'Single line of text (20)', need: 'required', why: 'Window: ok, tight, short, overlap, nocrew or none. Day: ran, idle or unplanned (the week). Week: writing or done' },
+    { name: 'craa5_details', label: 'Details', type: 'Multiple lines of text (maximum character count 1,048,576)', need: 'required', why: 'The rest as JSON: the runs either side, the work, the crew, the clean slot; the shared settings on the config row' },
+    { name: 'craa5_reason', label: 'Reason', type: 'Multiple lines of text (2000)', need: 'optional', why: 'One plain sentence: why this clean, how long, and what is short' },
+    { name: 'craa5_contenthash', label: 'Content Hash', type: 'Single line of text (20)', need: 'optional', why: 'A fingerprint of the row, so a publish only rewrites rows that changed (without it every row is read in full)' },
+    { name: 'craa5_area', label: 'Area', type: 'Single line of text (100)', need: 'optional', why: 'The area as the runs spell it' },
+    { name: 'craa5_line', label: 'Line', type: 'Whole number', need: 'optional', why: 'The line number (window rows)' },
+    { name: 'craa5_mssareaguid', label: 'MSS Area GUID', type: 'Single line of text (100)', need: 'optional', why: 'The id of the MSS area, so a reader can match by id' },
+    { name: 'craa5_publishbatch', label: 'Publish Batch', type: 'Single line of text (200)', need: 'optional', why: 'Which publish last changed the row' },
+];
+const CP_OPTIONAL = CP_COLS.filter(c => c.need === 'optional').map(c => c.name);
+const CP_REQUIRED = CP_COLS.filter(c => c.need === 'required').map(c => c.name);
+const LS_CP = 'prodsched_cleanplan_v1';   // this browser: when the plan was last published in full, and whether a change is waiting
+const CP_DUP_RE = /duplicate|already exists|0x80040237/i;
+const CP_BUSY_RE = /\b429\b|number of requests exceeded|too many requests|0x80072322|0x80072321|0x80072326|combined execution time/i;
+const CP_PRIV_RE = /privilege|prvdelete|prvwrite|prvcreate|prvread|not have permission|forbidden|\b403\b|0x80040220/i;
+
 // ----------------------------------------------------------------------------
 // THE DATAVERSE COLUMNS THIS APP USES (listed on the Data Check tab, "Columns", with what was found)
 //   required = the app cannot save a run without it; optional = used when the column exists. A column Dataverse refuses is named
@@ -185,6 +228,8 @@ const COLUMN_GUIDE = [
         { name: 'craa5_hoursrequired', need: 'required', why: 'Clean time (minutes)' },
         { name: 'craa5_MINALRG', need: 'optional', why: 'Clean time after an allergen run (minutes)' },
         { name: 'craa5_heads', need: 'optional', why: 'The most people that can work on it at once' },
+        { name: 'craa5_dailyclean', need: 'optional', why: 'Daily = cleaned in the line\'s daily (full) clean. When none of a line\'s equipment has a frequency set, every piece counts' },
+        { name: 'craa5_weeklyclean', need: 'optional', why: 'Weekly = cleaned in the longest full clean of each week' },
     ] },
     { key: 'employees', table: 'craa5__aa_employee', title: 'Employees', note: 'Read only. The roster behind the shift headcounts.', cols: [
         { name: 'craa5_name', need: 'required', why: 'Employee name' },
@@ -192,13 +237,14 @@ const COLUMN_GUIDE = [
         { name: 'craa5_role', need: 'optional', why: 'Lead or employee' },
         { name: 'craa5_roleid', alt: '_craa5_roleid_value', need: 'optional', why: 'Job role (sanitation or production)' },
     ] },
-    { key: 'inbox', table: TABLE_INBOX, optionalTable: true, title: 'Change request inbox', note: 'Optional table. An email flow (Power Automate) drops each schedule change request form here; the Change Requests tab reads the waiting ones every 2 minutes while it is open, shows what each would change and, if you switch it on, applies the certain ones by itself. Without this table, upload the form by hand.', cols: [
+    { key: 'inbox', table: TABLE_INBOX, optionalTable: true, displayName: 'Schedule Change', title: 'Change request inbox', note: 'Optional table. An email flow (Power Automate) drops each schedule change request form here; the Change Requests tab reads the waiting ones every 2 minutes while it is open, shows what each would change and, if you switch it on, applies the certain ones by itself. Without this table, upload the form by hand.', cols: [
         { name: 'craa5_name', label: 'Name', type: 'Single line of text (the table\'s primary column)', need: 'required', why: 'The email subject or file name' },
         { name: 'craa5_formjson', label: 'Form JSON', type: 'Multiple lines of text (maximum length)', need: 'required', why: 'The cells of the form as JSON (rows of cells). The flow\'s Excel script fills it' },
         { name: 'craa5_status', label: 'Status', type: 'Single line of text (50)', need: 'required', why: 'The flow writes "new". The app sets applying (while it works on it), applied, review (needs a look), failed or dismissed' },
         { name: 'craa5_result', label: 'Result', type: 'Multiple lines of text (2000)', need: 'optional', why: 'What the app did, or why it left the request for you to look at' },
         { name: 'craa5_sender', label: 'Sender', type: 'Single line of text (200)', need: 'optional', why: 'Who sent the email (shown on the request)' },
     ] },
+    { key: 'cleanplan', table: TABLE_CLEAN, optionalTable: true, displayName: 'Clean Plan', title: 'Clean Plan', note: 'Optional table, written only by this page (Clean Plan tab): the clean every stop of a line needs and the days the MSS needs a Daily clean, for the MSS calendar, the Ganttly, Shift Start and the Manager hub. Create it with Record ownership = Organization (it cannot be changed later), give Read to every role that uses those apps and Create, Write and Delete to the people who plan the schedule, and turn auditing off for it.', cols: CP_COLS },
 ];
 
 function safeGetXrm() {
@@ -216,22 +262,24 @@ const withTimeout = (promise, ms, label) => new Promise((resolve, reject) => {
 });
 
 // Reads rows. Returns an array, or null when EVERY attempt failed (a failed read is never mistaken for "no data").
-async function queryRecords(entityNames, dataApi, { orderby, filter = "statecode eq 0", top = QUERY_LIMIT, quiet = false } = {}) {
+//   select = the columns to read (all when left out); errs = an array that collects the error text of every failed attempt
+async function queryRecords(entityNames, dataApi, { orderby, filter = "statecode eq 0", top = QUERY_LIMIT, quiet = false, select = null, errs = null } = {}) {
     const web = safeGetXrm()?.WebApi;
     const names = Array.isArray(entityNames) ? entityNames : [entityNames];
     let emptyResult = null;
-    const odata = [filter ? `$filter=${filter}` : '', orderby ? `$orderby=${orderby}` : '', `$top=${top}`].filter(Boolean).join('&');
+    const odata = [select && select.length ? `$select=${select.join(',')}` : '', filter ? `$filter=${filter}` : '', orderby ? `$orderby=${orderby}` : '', `$top=${top}`].filter(Boolean).join('&');
     for (const en of names) {
         if (web?.retrieveMultipleRecords) {
             try {
                 const res = await withTimeout(web.retrieveMultipleRecords(en, `?${odata}`), API_TIMEOUT_MS, `Xrm.WebApi ${en}`);
                 if (Array.isArray(res?.entities)) { if (res.entities.length || names.length === 1) return res.entities; emptyResult = res.entities; continue; }
-            } catch (e) { if (!quiet) console.warn(`[ProdSchedule] ${en} via Xrm.WebApi:`, e?.message || e); }
+            } catch (e) { if (errs) errs.push(errText(e)); if (!quiet) console.warn(`[ProdSchedule] ${en} via Xrm.WebApi:`, e?.message || e); }
         }
         if (dataApi?.queryTable) {
             try {
                 const opts = { pageSize: Math.min(top, 500), filter };
                 if (orderby) opts.orderBy = orderby;
+                if (select && select.length) opts.select = select;
                 let page = await withTimeout(dataApi.queryTable(en, opts), API_TIMEOUT_MS, `dataApi ${en}`);
                 if (!Array.isArray(page?.rows)) throw new Error("no rows");
                 const rows = [...page.rows];
@@ -241,7 +289,7 @@ async function queryRecords(entityNames, dataApi, { orderby, filter = "statecode
                 }
                 if (rows.length || names.length === 1) return rows.slice(0, top);
                 emptyResult = rows;
-            } catch (e) { if (!quiet) console.warn(`[ProdSchedule] ${en} via dataApi:`, e?.message || e); }
+            } catch (e) { if (errs) errs.push(errText(e)); if (!quiet) console.warn(`[ProdSchedule] ${en} via dataApi:`, e?.message || e); }
         }
     }
     return emptyResult;
@@ -266,17 +314,17 @@ function getWriteApi(dataApi) {
 
 // Raw run rows for a window, split in halves when a slice comes back full (RANGE_LIMIT), so a busy stretch is never cut off.
 //   mode 'overlap': runs overlapping [from, to)     mode 'start': runs that start in [from, to). Null when a read failed.
-async function readRunRange(dataApi, from, to, mode, depth) {
+async function readRunRange(dataApi, from, to, mode, depth, select) {
     const filter = mode === 'start'
         ? `statecode eq 0 and craa5_datestarttime ge ${isoZ(from)} and craa5_datestarttime lt ${isoZ(to)}`
         : `statecode eq 0 and craa5_datestarttime lt ${isoZ(to)} and craa5_dateendtime gt ${isoZ(from)}`;
-    const rows = await queryRecords(TABLE_PROD, dataApi, { filter, orderby: 'craa5_datestarttime asc', top: RANGE_LIMIT });
+    const rows = await queryRecords(TABLE_PROD, dataApi, { filter, orderby: 'craa5_datestarttime asc', top: RANGE_LIMIT, select });
     if (rows === null) return null;
     const d = depth || 0;
     if (rows.length < RANGE_LIMIT || to - from <= HOUR || d >= 14) return rows;
     const mid = from + Math.floor((to - from) / 2);
-    const a = await readRunRange(dataApi, from, mid, mode, d + 1);
-    const b = a === null ? null : await readRunRange(dataApi, mid, to, mode, d + 1);
+    const a = await readRunRange(dataApi, from, mid, mode, d + 1, select);
+    const b = a === null ? null : await readRunRange(dataApi, mid, to, mode, d + 1, select);
     if (a === null || b === null) return null;
     const seen = {}, out = [];
     a.concat(b).forEach(r => { const id = runIdOf(r); if (!seen[id]) { seen[id] = true; out.push(r); } });
@@ -376,7 +424,7 @@ function badColumns(err, cols) {
 const TABLE_GONE_RE = /resource not found for the segment|(table|entity)\b.{0,60}(does not exist|doesn.t exist|not found)|could not find .{0,40}(table|entity)|0x80060891|0x80040217/i;   // a whole table that is not there (not just a column)
 const errText = (e) => String(e && e.message ? e.message : e || 'Unknown error');
 const clipFields = (b) => { const o = {}; Object.keys(b).forEach(k => { const v = b[k]; o[k] = typeof v === 'string' && v.length > 160 ? v.slice(0, 159) + '…' : v; }); return o; };
-const colLabel = (c) => ({ [F_ORDER]: 'Order Number', [F_CASES]: 'Cases', [F_NOTES]: 'Notes', [F_AREA_ID]: 'MSS Area GUID', [F_BATCH]: 'Import Batch' }[c] || c);   // the display names the Columns list tells Gerald to create
+const colLabel = (c) => ({ [F_ORDER]: 'Order Number', [F_CASES]: 'Cases', [F_NOTES]: 'Notes', [F_AREA_ID]: 'MSS Area GUID', [F_BATCH]: 'Import Batch' }[c] || (CP_COLS.filter(x => x.name === c)[0] || {}).label || c);   // the display names the Columns list tells Gerald to create
 
 // "Doe, John" -> "John Doe"
 function formatFullName(name) {
@@ -404,6 +452,7 @@ const DEFAULT_SETTINGS = {
     cleanHeads: 2,          // sanitation people assumed when no sanitation shift is defined
     crAuto: false,          // Change Requests: apply a request by itself when every line is certain
     crScale: true,          // Change Requests: a run gets shorter / longer in proportion to its cases
+    cpAuto: true,           // Clean Plan: publish by itself after a change (when the table is there and the settings are shared)
 };
 
 // ============================================================================
@@ -903,35 +952,32 @@ function statusPlan(planned, existing, recallMap, flags, inc) {
     });
     return { rows, used };
 }
-// The cleaning gap right before every ticked run, in one sorted pass per line (existing runs that are not replaced + the ticked runs).
-// Sets row.gap and returns how many gaps are short or overlap.
+// The clean right before every ticked run, judged with the line's other runs (existing runs that are not replaced + the ticked runs).
+// Sets row.gap and returns how many are short or overlap.
 function planGaps(rows, existing, gapCtx) {
-    const byLine = {};
-    const replaced = {};
+    const byLine = {}, replaced = {}, rowOf = {};
     rows.forEach(r => { r.gap = null; if (r.include && r.m) replaced[r.m.id] = true; });   // the old copy of a run that is being replaced is not a neighbour
     existing.forEach(e => {
         if (replaced[e.id]) return;
         const k = canonLine(e.area, e.line);
-        (byLine[k] = byLine[k] || []).push({ run: e, row: null });
+        (byLine[k] = byLine[k] || []).push(e);
     });
-    const lines = byLine;
-    let bad = 0;
     rows.forEach(r => {
         if (!r.include) return;
-        const p = r.p;
-        (lines[r.cl] = lines[r.cl] || []).push({ run: { id: `plan:${p.key}`, area: p.area, line: p.line, code: Number(p.item), product: p.desc, start: p.start, end: p.end, allergen: r.allergen, allergenType: r.allergenType, crumb: r.crumb }, row: r });
+        const p = r.p, run = { id: `plan:${p.key}`, area: p.area, line: p.line, code: Number(p.item), product: p.desc, start: p.start, end: p.end, allergen: r.allergen, allergenType: r.allergenType, crumb: r.crumb };
+        rowOf[run.id] = r;
+        (byLine[r.cl] = byLine[r.cl] || []).push(run);
     });
-    Object.keys(lines).forEach(k => {
-        const l = lines[k].sort((a, b) => a.run.start - b.run.start || a.run.end - b.run.end);
-        for (let i = 1; i < l.length; i++) {
-            const cur = l[i];
-            if (!cur.row) continue;
-            const prev = l[i - 1].run;
-            const pr = prev.area === cur.run.area && prev.line === cur.run.line ? prev : { ...prev, area: cur.run.area, line: cur.run.line };
-            const g = makeGap(pr, cur.run, gapCtx);
-            cur.row.gap = g;
+    let bad = 0;
+    Object.keys(byLine).forEach(k => {
+        const l = byLine[k], mine = l.filter(x => rowOf[x.id]);
+        if (!mine.length) return;
+        judgeStops(lineStops(l), lineCtxOf(gapCtx, mine[0].area, mine[0].line)).forEach(g => {
+            const row = g.next && rowOf[g.next.id];
+            if (!row || row.gap) return;
+            row.gap = g;
             if (g.status === 'short' || g.status === 'overlap') bad++;
-        }
+        });
     });
     return bad;
 }
@@ -1733,48 +1779,612 @@ function rosterGroup(emp, overrides) {
 }
 
 // ============================================================================
-// CLEANING: is there enough time (and people) between two runs?
-//   Work = sum of the equipment's cleaning minutes in the line's mapped asset areas (allergen minutes after an
-//   allergen run). Minutes are crew minutes: elapsed = work / sanitation heads, never faster than the slowest single
-//   piece with its own crew limit (craa5_heads). No mapped equipment -> the line's manual minutes (elapsed).
+// CLEAN PLAN (1 of 2): the day rules, a copy of the MSS calendar's LINE RULES (r14) for one MSS area at a time.
+// The MSS ties every plan line to the MSS area of the same name (letters and digits, any case) and judges the equipment of that
+// area on the production of ALL lines of that area together. Keep these constants equal to the MSS calendar's LR_* ones and
+// DAILY_ON: a test runs both copies on the same runs and they must agree day for day. CP_RULES names them, so a reader can tell.
 // ============================================================================
-function cleanRequirement(prev, next, cfg, assetsByArea, heads) {
-    const c = cfg || {};
-    const H = Math.max(1, Math.round(heads) || 1);
-    if (prev && next && prev.code !== null && prev.code === next.code && !(prev.allergen && !next.allergen)) return { mins: 0, basis: 'same product', heads: H, allergenClean: false, equipCount: 0 };
-    const allergenClean = !!(prev && prev.allergen && !(next && next.allergen && (prev.allergenType || '') === (next.allergenType || '')));
-    const list = [];
-    (c.areas || []).forEach(a => (assetsByArea[a] || []).forEach(x => list.push(x)));
-    if (list.length) {
-        let total = 0, slowest = 0;
-        list.forEach(x => {
-            const m = allergenClean && x.allergenMins > 0 ? x.allergenMins : x.baseMins;
-            total += m;
-            slowest = Math.max(slowest, m / Math.max(1, Math.min(x.heads || 1, H)));
-        });
-        if (prev && prev.crumb) total += Number(c.crumbMins) || 0;
-        return { mins: Math.max(total / H, slowest), basis: 'equipment', heads: H, allergenClean, equipCount: list.length, work: total };
-    }
-    const base = c.baseMins !== undefined && c.baseMins !== '' ? Number(c.baseMins) : 60;
-    const alg = c.allergenMins !== undefined && c.allergenMins !== '' ? Number(c.allergenMins) : 480;
-    let mins = allergenClean ? alg : base;
-    if (prev && prev.crumb) mins += Number(c.crumbMins) || 0;
-    return { mins, basis: 'manual', heads: H, allergenClean, equipCount: 0 };
+const CP_DOWN_MIN = 60;           // minutes of a day without production that make it a day with downtime (a Daily job falls due)
+const CP_RAN_WEEK_MIN = 60;       // minutes of production in a Monday-to-Sunday week that make it a week the line ran
+const CP_WEEKEND_RAN_MIN = 720;   // a weekend with less production than this (Saturday and Sunday together) is a down weekend
+const CP_IDLE_DAY_MIN = 60;       // a day with less production than this is an idle day; 2+ in a row share one Daily job
+const CP_MAX_RUN_DAYS = 31;       // a run longer than this is a mistyped end date: left out
+const CP_PAD_WEEKS = 10;          // weeks of runs read at most before and after the weeks published, so a long shutdown is judged whole
+const CP_DAILY_ON = [true, true, true, true, true, true, true];   // Sunday to Saturday (the MSS DAILY_ON)
+const CP_RULES = 'lr14|D60|W60|WE720|I60|stretch|1111111|pad10|max31|maint';
+const cpCollapse = (s) => String(s === undefined || s === null ? '' : s).replace(/\s+/g, ' ').trim();
+// The line a run is on, the way the MSS calendar keys it: area (spaces collapsed, any case) and line number (blank = 1)
+const cpLineKey = (area, line) => cpCollapse(area).toLowerCase() + '|' + (Number(line) >= 1 ? Math.floor(Number(line)) : 1);
+const cpMerge = (iv) => {
+    const out = [];
+    iv.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]).forEach((x) => {
+        const last = out[out.length - 1];
+        if (last && x[0] <= last[1]) { if (x[1] > last[1]) last[1] = x[1]; } else out.push([x[0], x[1]]);
+    });
+    return out;
+};
+const cpMondayYmd = (ms) => { const d = new Date(ms); return getLocalYMD(new Date(d.getFullYear(), d.getMonth(), d.getDate() - ((d.getDay() + 6) % 7))); };
+const cpAddDaysYmd = (ymd, n) => { const d = parseYMD(ymd); return d ? getLocalYMD(new Date(d.getFullYear(), d.getMonth(), d.getDate() + n)) : ''; };
+const cpMondayMs = (ms) => parseYMD(cpMondayYmd(ms)).getTime();
+// The runs as the day rules use them: per MSS area its production as merged [start, end) pieces (maintenance runs are downtime),
+// and every Monday-to-Sunday week (YYYY-MM-DD of its Monday) that has a run on any line. Runs longer than CP_MAX_RUN_DAYS are left out.
+//   groups[key] = { key (letters and digits of the area, lower case), name, lines (MSS line keys), iv, areaId }
+function cpPlanModel(runs) {
+    const groups = {}, order = [], weekHas = {};
+    let long = 0, used = 0;
+    (runs || []).forEach((r) => {
+        if (!r || !cpCollapse(r.area) || !(r.start > 0) || !(r.end > r.start)) return;
+        if (r.end - r.start > CP_MAX_RUN_DAYS * DAY) { long += 1; return; }
+        used += 1;
+        let mon = cpMondayYmd(r.start);
+        for (let guard = 0; guard < 8 && mon; guard++) {
+            weekHas[mon] = true;
+            mon = cpAddDaysYmd(mon, 7);
+            if (!mon || parseYMD(mon).getTime() >= r.end) break;
+        }
+        const key = canon(r.area);
+        if (!key) return;
+        let G = groups[key];
+        if (!G) { G = groups[key] = { key: key, name: cpCollapse(r.area), lines: [], iv: [], areaId: '' }; order.push(key); }
+        const lk = cpLineKey(r.area, r.line);
+        if (G.lines.indexOf(lk) < 0) G.lines.push(lk);
+        if (!G.areaId && r.areaId) G.areaId = r.areaId;
+        if (!isMaint(r)) G.iv.push([r.start, r.end]);
+    });
+    order.forEach((k) => { groups[k].iv = cpMerge(groups[k].iv); groups[k].lines.sort(); });
+    order.sort((a, b) => byNatural(groups[a].name, groups[b].name));
+    return { groups: groups, order: order, weekHas: weekHas, long: long, used: used };
 }
-// ok / tight (within 30 min of the need) / short / overlap
-function gapStatus(gapMs, needMins) {
-    if (gapMs < 0) return 'overlap';
-    const need = needMins * 60000;
-    if (gapMs < need) return 'short';
-    if (gapMs < need + 30 * 60000) return 'tight';
-    return 'ok';
+// Days from the Monday `fromYmd` for nWeeks weeks: [{ date, dow, t0 (local midnight ms) }], plus the end of the last day.
+function cpDays(fromYmd, nWeeks) {
+    const s = parseYMD(fromYmd), days = [], weeks = [];
+    if (!s) return { days: days, weeks: weeks, end: 0 };
+    for (let i = 0; i < nWeeks * 7; i++) {
+        const c = new Date(s.getFullYear(), s.getMonth(), s.getDate() + i);
+        days.push({ date: getLocalYMD(c), dow: c.getDay(), t0: c.getTime() });
+    }
+    for (let w = 0; w < nWeeks; w++) weeks.push({ monday: days[w * 7].date });
+    const e = new Date(s.getFullYear(), s.getMonth(), s.getDate() + nWeeks * 7);
+    return { days: days, weeks: weeks, end: e.getTime() };
+}
+// One area's calendar over days/weeks (Monday first, whole weeks), the MSS calendar's buildOne for an area of the plan:
+//   prod[i] minutes of production, len[i] minutes in the day (23 or 25 h when the clocks change), planned[w] the week has runs,
+//   kind[i] 0 no Daily job / 1 a Daily job of its own / 3 last day of 2+ days in a row that share one Daily / 2 a day that job covers,
+//   jobs [{ at, cover: [day indexes], from, to, edge }], weekOn[w] 1 when mid-week and weekly jobs count, together[i] the day shares a job.
+function cpLineCalendar(iv, weekHas, cal) {
+    const days = cal.days, weeks = cal.weeks, n = days.length;
+    const kind = [], weekOn = [], jobs = [], prod = [], planned = [], len = [], idle = [], wkDown = [], together = [];
+    if (!n) return { kind: kind, jobs: jobs, weekOn: weekOn, prod: prod, planned: planned, len: len, together: together };
+    const t0 = days.map((d) => d.t0).concat([cal.end]);
+    for (let i = 0; i < n; i++) len.push((t0[i + 1] - t0[i]) / 60000);
+    let j = 0;
+    for (let i = 0; i < n; i++) {
+        const a = t0[i], b = t0[i + 1];
+        while (j < iv.length && iv[j][1] <= a) j++;
+        let sum = 0;
+        for (let k = j; k < iv.length && iv[k][0] < b; k++) sum += Math.min(b, iv[k][1]) - Math.max(a, iv[k][0]);
+        prod.push(sum / 60000);
+        kind.push(0); idle.push(false); together.push(false);
+    }
+    for (let w = 0; w < weeks.length; w++) {
+        const base = w * 7, known = !!weekHas[weeks[w].monday];
+        planned.push(known);
+        if (!known) { weekOn.push(0); wkDown.push(false); continue; }
+        let wk = 0;
+        for (let d = 0; d < 7; d++) {
+            const i = base + d;
+            wk += prod[i];
+            kind[i] = CP_DAILY_ON[days[i].dow] && len[i] - prod[i] >= CP_DOWN_MIN ? 1 : 0;
+            idle[i] = prod[i] < CP_IDLE_DAY_MIN;
+        }
+        weekOn.push(wk >= CP_RAN_WEEK_MIN ? 1 : 0);
+        const down = prod[base + 5] + prod[base + 6] < CP_WEEKEND_RAN_MIN;
+        wkDown.push(down && kind[base + 5] === 1 && kind[base + 6] === 1);
+    }
+    // the days that share one Daily job: a down weekend, and every idle day (two or more in a row make a stretch)
+    wkDown.forEach((down, w) => { if (down) { together[w * 7 + 5] = true; together[w * 7 + 6] = true; } });
+    for (let i = 0; i < n; i++) if (idle[i] && kind[i] === 1) together[i] = true;
+    for (let i = 0; i < n; ) {
+        if (!together[i]) { i += 1; continue; }
+        let e = i;
+        while (e + 1 < n && together[e + 1]) e += 1;
+        if (e > i) {
+            const cover = [];
+            for (let k = i; k <= e; k++) { cover.push(k); kind[k] = k === e ? 3 : 2; }
+            jobs.push({ at: e, cover: cover, from: days[i].date, to: days[e].date, edge: i === 0 || e === n - 1 });
+        }
+        i = e + 1;
+    }
+    return { kind: kind, jobs: jobs, weekOn: weekOn, prod: prod, planned: planned, len: len, together: together };
+}
+
+// ============================================================================
+// CLEAN PLAN (2 of 2): the rows the other apps read, in the optional Dataverse table craa5_cleanplan ("Clean Plan").
+// Only this page writes it; the MSS calendar, the Ganttly / PBED, Shift Start and the Manager hub read it (the reader guide is in
+// the project files: production-schedule/clean-plan). Row types (craa5_rowtype):
+//   window  one per stop of a line in the weeks published: the clean it needs, its minutes and whether it fits (judgeStops)
+//   day     one per MSS area per day: does the MSS need a Daily clean that day (cpLineCalendar), and did the line run that week
+//   week    one per Monday-to-Sunday week: 'writing' while a publish changes the week, 'done' after; readers trust only 'done' weeks
+//   config  one row: the cleaning and shift settings every publishing page uses (Share these settings on the Clean Plan tab)
+// A publish of the weeks [from, to) owns exactly the rows whose craa5_start is in [from, to). Every row has a fixed id made from
+// its plan key, so two pages publishing at once update one row instead of making two.
+// ============================================================================
+const CP_PLANT_TZ = 'America/Chicago';     // days are plant days: publishing is off in a browser set to another time zone
+const CP_AUTO_BACK_WEEKS = 1, CP_AUTO_AHEAD_WEEKS = 8;   // 'Publish by itself' keeps last week to 8 weeks ahead up to date
+const CP_MANUAL_MAX_WEEKS = 8;             // weeks one Publish click can cover (each week is its own step with its own stamp)
+const CP_READ_BEFORE_DAYS = 8, CP_READ_AFTER_DAYS = 14, CP_EXTEND_DAYS = 14;   // runs read around the weeks (ending on a Monday, so every week read is whole), then 2 weeks more at a time while a stretch or a stop runs on
+const CP_DEBOUNCE_MS = 10000, CP_MIN_GAP_MS = 60000, CP_REFRESH_MS = 12 * HOUR;
+const CP_DETAILS_MAX = 1900, CP_REASON_MAX = 2000;
+const CP_CONFIG_START = '2000-01-01T00:00:00Z';   // the config row sits far outside every week, so no publish owns it
+const CP_CONC = 4;
+const CP_RUN_COLS = ['craa5__aa_prd_schdid', 'craa5_area', 'craa5_line', 'craa5_productcode', 'craa5_product', 'craa5_datestarttime', 'craa5_dateendtime', 'craa5_allergen', 'craa5_typeofallergen', 'craa5_crumbclean'];
+const DAY_KINDS = {
+    due: { label: 'Daily clean due', short: 'Clean', bg: '#E6F1FB', fg: '#00468B', border: '#B3D4F2' },
+    stretch: { label: 'One Daily clean for the idle days', short: 'Clean ×', bg: '#FFF6E0', fg: '#7A5200', border: '#FFB81C' },
+    covered: { label: 'Covered by the stretch clean', short: '·', bg: '#FFFBEF', fg: '#B27B00', border: '#FFE2A3' },
+    none: { label: 'No Daily clean needed', short: 'None', bg: '#DCFCE7', fg: '#166534', border: '#86EFAC' },
+    unplanned: { label: 'Week not planned', short: '?', bg: '#F1F5F9', fg: '#94A3B8', border: '#E2E8F0' },
+};
+const DAY_KIND_OF = ['none', 'due', 'covered', 'stretch'];
+
+// FNV-1a over a string with a seed: 8 hex digits. Four of them make a GUID-shaped id (plan key -> the same row id in every browser).
+function cpFnv(s, seed) {
+    let h = (0x811c9dc5 ^ seed) >>> 0;
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+    return ('0000000' + h.toString(16)).slice(-8);
+}
+const cpHash = (s) => cpFnv(s, 0) + cpFnv(s, 0x9e3779b9);
+function cpGuid(key) {
+    const s = String(key).toLowerCase();
+    const h = cpFnv(s, 1) + cpFnv(s, 2) + cpFnv(s, 3) + cpFnv(s, 4);
+    return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${'89ab'[parseInt(h[16], 16) % 4]}${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
+const cpRunBrief = (r) => r ? { id: r.id, code: r.code === undefined ? null : r.code, item: clipText(r.product || '', 60), allergen: !!r.allergen, type: r.allergen ? (r.allergenType || '') : '', crumb: !!r.crumb } : null;
+// Details JSON that fits the column: optional parts are dropped until it does (the JSON itself is never cut).
+function cpDetails(o, dropOrder) {
+    let s = JSON.stringify(o);
+    for (let i = 0; s.length > CP_DETAILS_MAX && i < dropOrder.length; i++) { delete o[dropOrder[i]]; s = JSON.stringify(o); }
+    return s;
+}
+const isoMs = (ms) => ms ? isoZ(ms) : null;
+
+// Works the plan out for the weeks [from, to) from the runs read (readFrom..readTo, normalised runs of every line).
+//   o = { from, to, readFrom, readTo (ms), ctx (the rules context: clean, own, occ, assetsByArea, fallbackHeads), areaIdOf(name) }
+// Returns { windows, groups (day rows per MSS area), rows (the table rows, without the week stamps), weeks, needBack, needAhead, long }
+function cpBuild(runs, o) {
+    const model = cpPlanModel(runs);
+    // the calendar covers whole weeks inside the read
+    let calFrom = cpMondayMs(o.readFrom);
+    if (calFrom < o.readFrom) calFrom = parseYMD(cpAddDaysYmd(getLocalYMD(new Date(calFrom)), 7)).getTime();
+    const calTo = cpMondayMs(o.readTo);
+    let nW = 0;
+    for (let m = getLocalYMD(new Date(calFrom)); m && parseYMD(m).getTime() < calTo && nW < 200; m = cpAddDaysYmd(m, 7)) nW++;
+    const cal = cpDays(getLocalYMD(new Date(calFrom)), nW), n = cal.days.length;
+    const fYmd = getLocalYMD(new Date(o.from)), tYmd = getLocalYMD(new Date(o.to));
+    let fi = -1, ti = n;
+    cal.days.forEach((d, i) => { if (d.date === fYmd) fi = i; if (d.date === tYmd) ti = i; });
+    if (fi < 0) fi = 0;
+    let needBack = false, needAhead = false;
+    const weeks = [];
+    for (let m = fYmd; m && parseYMD(m).getTime() < o.to && weeks.length < 60; m = cpAddDaysYmd(m, 7)) weeks.push(m);
+    const rows = [], groups = [];
+    model.order.forEach((k) => {
+        const G = model.groups[k], c = cpLineCalendar(G.iv, model.weekHas, cal);
+        // a run of shared days that reaches the edge of the read and into the weeks published: read further
+        if (c.together[0]) { let e = 0; while (e + 1 < n && c.together[e + 1]) e++; if (e >= fi) needBack = true; }
+        if (c.together[n - 1]) { let b = n - 1; while (b > 0 && c.together[b - 1]) b--; if (b < ti) needAhead = true; }
+        const jobAt = {};
+        c.jobs.forEach(j => j.cover.forEach(i => { jobAt[i] = j; }));
+        const areaId = G.areaId || (o.areaIdOf ? o.areaIdOf(G.name) : '');
+        const out = { key: G.key, name: G.name, lines: G.lines, areaId, days: [] };
+        for (let i = fi; i < ti && i < n; i++) {
+            const d = cal.days[i], w = Math.floor(i / 7), planned = !!c.planned[w], kd = planned ? DAY_KIND_OF[c.kind[i]] : 'unplanned';
+            const j = jobAt[i] || null, prod = Math.round(c.prod[i] * 10) / 10;
+            const job = j ? { from: j.from, to: j.to, at: cal.days[j.at].date, edge: !!j.edge, days: j.cover.length } : null;
+            const reason = !planned ? `Nothing is planned in the week of ${cpDayText(cal.weeks[w].monday)} yet: the MSS keeps its own rule.`
+                : kd === 'none' ? `Ran ${cpHrs(prod)}, ${cpHrs(c.len[i] - prod)} without production: no Daily clean needed.`
+                : kd === 'due' ? `${prod > 0 ? `Ran ${cpHrs(prod)}, down ${cpHrs(c.len[i] - prod)}` : 'Down all day'}: a Daily clean is due.`
+                : `${prod >= 1 ? `Ran ${cpHrs(prod)}` : 'Idle'}: one Daily clean covers ${cpDayText(j.from)} to ${cpDayText(j.to)}${kd === 'stretch' ? ', due today' : `, due ${cpDayText(j.to)}`}${j.edge ? ' (the idle stretch runs on past the weeks read)' : ''}.`;
+            const det = cpDetails({ v: CP_RULES, prod, len: c.len[i], kind: c.kind[i], weekOn: c.weekOn[w], planned, job, lines: G.lines, areaId }, ['lines']);
+            const f = { craa5_name: clipText(`${G.name} · ${cpDayText(d.date)} · ${DAY_KINDS[kd].label}`, 100), craa5_plankey: `d|${G.key}|${d.date}`, craa5_rowtype: 'day', craa5_linekey: G.key,
+                craa5_start: isoZ(d.t0), craa5_end: isoZ(i + 1 < n ? cal.days[i + 1].t0 : cal.end), craa5_day: d.date, craa5_cleankind: kd, craa5_minutes: Math.round(prod),
+                craa5_status: !planned ? 'unplanned' : c.weekOn[w] ? 'ran' : 'idle', craa5_details: det, craa5_reason: reason, craa5_area: clipText(G.name, 100), craa5_mssareaguid: areaId || null };
+            rows.push({ key: f.craa5_plankey, type: 'day', week: cpMondayYmd(d.t0), f });
+            out.days.push({ date: d.date, dow: d.dow, kind: kd, prod, len: c.len[i], weekOn: c.weekOn[w], planned, job, reason });
+        }
+        groups.push(out);
+    });
+    // the stops of every line (lines by letters and digits, so "IBL 4" and "IBL4" are one line)
+    const byLine = {};
+    (runs || []).forEach(r => { if (!r || !cpCollapse(r.area)) return; const k = canonLine(r.area, r.line); (byLine[k] = byLine[k] || []).push(r); });
+    const windows = [];
+    Object.keys(byLine).sort().forEach(k => {
+        const list = byLine[k].slice().sort(byStart);
+        const L = lineCtxOf(o.ctx, list[list.length - 1].area, list[list.length - 1].line);
+        judgeStops(lineStops(list, { last: true, weekHas: model.weekHas, horizon: o.readTo }), L).forEach(g => {
+            if (g.start < o.from || g.start >= o.to) return;
+            if (g.stopKind === 'last' && g.open === 'read') needAhead = true;
+            const area = g.prev.area, line = g.prev.line, areaId = g.prev.areaId || (o.areaIdOf ? o.areaIdOf(area) : '');
+            const key = g.stopKind === 'overlap' ? `o|${g.prevId}|${g.nextId}` : `w|${g.prevId}|${g.next ? g.nextId : 'last'}`;
+            const end = g.end || g.start;
+            const det = cpDetails({ v: 1, stop: g.stopKind, open: g.open, gapMin: g.gapMs === null ? null : Math.round(g.gapMs / 60000), idle: g.gapMs !== null && g.gapMs > CR_IDLE_MS,
+                prev: cpRunBrief(g.prev), next: cpRunBrief(g.next), allergen: g.kind === 'allergen' ? (g.prev.allergenType || '') : '',
+                need: { basis: g.need.basis, work: Math.round(g.need.work), floor: Math.round(g.need.floor), manual: Math.round(g.need.manual), pieces: g.need.count, weekly: g.need.weekly, crumb: g.need.crumb, noDaily: g.need.noDaily },
+                crew: { assumed: g.assumed, heads: Math.round(g.heads * 10) / 10 }, cleanStart: isoMs(g.cleanStart), cleanEnd: isoMs(g.cleanEnd), shortMin: Math.ceil(g.shortMins),
+                spareMin: g.spareMins === null ? null : Math.floor(g.spareMins), maint: g.maint.slice(0, 6).map(x => [isoZ(x[0]), isoZ(x[1])]), area, line, areaId }, ['maint', 'need', 'crew']);
+            const f = { craa5_name: clipText(`${area} L${line} · ${cpWhen(g.start)} · ${CLEAN_KINDS[g.kind].label}${g.status !== 'ok' && g.status !== 'none' ? ` · ${STATUS_WORDS[g.status]}` : ''}`, 100),
+                craa5_plankey: key, craa5_rowtype: 'window', craa5_linekey: g.lineCanon, craa5_start: isoZ(g.start), craa5_end: isoZ(end), craa5_day: getLocalYMD(new Date(g.start)),
+                craa5_cleankind: g.kind, craa5_minutes: Math.ceil(g.mins || 0), craa5_status: g.status, craa5_details: det, craa5_reason: clipText(g.reason, CP_REASON_MAX),
+                craa5_area: clipText(area, 100), craa5_line: line, craa5_mssareaguid: areaId || null };
+            rows.push({ key, type: 'window', week: cpMondayYmd(g.start), f });
+            windows.push(g);
+        });
+    });
+    return { windows, groups, rows, weeks, needBack, needAhead, long: model.long, weekHas: model.weekHas, calDays: n };
+}
+// The stamp of one week: 'writing' while a publish changes it, 'done' after (readers use a week's rows only when it says done).
+function cpWeekRow(mon, status, count, cfgHash, nowMs) {
+    const s = parseYMD(mon), e = new Date(s.getFullYear(), s.getMonth(), s.getDate() + 7);
+    return { craa5_name: `Week of ${cpDayText(mon)} · ${status}`, craa5_plankey: `k|${mon}`, craa5_rowtype: 'week', craa5_linekey: '*', craa5_start: isoZ(s.getTime()), craa5_end: isoZ(e.getTime()),
+        craa5_day: mon, craa5_cleankind: 'week', craa5_minutes: count, craa5_status: status,
+        craa5_details: JSON.stringify({ v: CP_RULES, cfg: cfgHash, rows: count, at: isoZ(nowMs) }),
+        craa5_reason: status === 'done' ? `Published ${cpWhen(nowMs)}: ${count} rows for this week.` : `Being written since ${cpWhen(nowMs)}: readers use their own rules until it says done.` };
+}
+// The settings a publish uses, as the config row keeps them; their fingerprint goes on every week stamp.
+const cpCfgOf = (s) => ({ clean: s.clean || {}, shifts: s.shifts || [], cleanHeads: s.cleanHeads, rosterOverrides: s.rosterOverrides || {} });
+// JSON with the keys of every object in order, so the same settings give the same fingerprint however they were edited
+const stableStr = (v) => v === null || typeof v !== 'object' ? JSON.stringify(v === undefined ? null : v) : Array.isArray(v) ? `[${v.map(stableStr).join(',')}]` : `{${Object.keys(v).sort().filter(k => v[k] !== undefined).map(k => `${JSON.stringify(k)}:${stableStr(v[k])}`).join(',')}}`;
+const cpCfgSig = (c) => cpHash(stableStr([c && c.clean || {}, c && c.shifts || [], c ? numOr(c.cleanHeads, 2) : 2, c && c.rosterOverrides || {}]));
+const cpCfgEmpty = (c) => !c || (!(c.shifts || []).length && !Object.keys(c.clean || {}).some(k => { const x = c.clean[k] || {}; return (x.areas || []).length || ['baseMins', 'allergenMins', 'crumbMins', 'changeMins'].some(f => x[f] !== undefined && x[f] !== ''); }));
+const browserTz = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) { return ''; } };
+// Monday midnight of the week `ms` is in, moved by n weeks.
+const cpWeekStart = (ms, n) => { const m = parseYMD(cpMondayYmd(ms)); return new Date(m.getFullYear(), m.getMonth(), m.getDate() + 7 * (n || 0)).getTime(); };
+
+// ============================================================================
+// CLEANING RULES: what clean each stop of a line needs, how long it takes with the crew on shift, and whether it fits.
+// ONE set of rules for the whole page: the Gantt, the Checks list, the Run dialog, the import and change request previews, the
+// Cleaning Times tab and the Clean Plan the other apps read all go through lineStops + judgeStops.
+//   A STOP is the time between two production runs of a line: from the latest end so far to the next start, so a run inside a
+//   longer run makes no stop. Maintenance runs are not production: they sit inside the stop (no cleaning while they run). A run
+//   that starts before the latest end OVERLAPS (a hangup). The stop after the last run is 'last' (open).
+//   The CLEAN a stop needs (first match wins):
+//     allergen    the run before has an allergen the next run does not carry (allergen lists compared word by word; a blank
+//                 type matches nothing). The same item number again is never an allergen clean.
+//     full        the line's daily clean: for each day, of the stops with an hour or more free of maintenance, the one with the
+//                 most such time inside that day (ties: the later one), so a night stop 22:00-06:00 is the clean of both days and
+//                 a noon product change is not. The stop after the last run is full too, and the clean of the day it starts. The
+//                 day of the first run read counts its time before that run (that day's clean was before it).
+//     none        the same item runs again (a crumb run still gets its crumb minutes only, as a product change)
+//     changeover  a different item with a shorter stop: the line's Product change minutes (blank = not timed, never short)
+//   Minutes are crew minutes of the line's equipment (Cleaning Times tab). Allergen: every piece, its allergen minutes. Full: the
+//   pieces flagged Daily on the equipment table (every piece when none of the line's pieces carries a frequency flag), and the
+//   longest full clean of each Monday-to-Sunday week also does the Weekly pieces. A crumb run adds the crumb minutes. No
+//   equipment chosen: the line's manual minutes (60, allergen 480).
+//   The CREW: the line's sanitation shifts (the 'every line' ones unless it has its own) walked through the stop; time with nobody
+//   on shift, or with maintenance on the line, does no work; never faster than the slowest piece with its own crew. No
+//   sanitation shift set at all: 'Sanitation people if no shift set' work the whole stop (assumed, and said so).
+//   STATUS: overlap (whatever the clean) > short (no time at all, or maintenance takes it all) > nocrew (shifts are set but none
+//   with people falls in the stop) > short > tight (spare under 30 min or 10 %; never for a clean of 0 min) > ok. none = nothing to clean. The clean after the last run is never short: ok, or nocrew when no crew
+//   comes within 7 days.
+// ============================================================================
+const CR_FULL_MIN = 60;                 // a stop this long can be the line's daily clean (the MSS calls this a day with downtime)
+const CR_TIGHT_MIN = 30, CR_TIGHT_SHARE = 0.1;
+const CR_IDLE_MS = 48 * HOUR;           // a stop longer than this: the line is idle (the Manager hub's rule), said in the plan
+const CR_LAST_LOOK_MS = 7 * DAY;        // the clean after the last run: the crew has this long to come
+const CR_MAX_RUN_MS = 31 * DAY;         // a run longer than this is a mistyped end date: left out (as the MSS does)
+const CLEAN_KINDS = {
+    allergen: { label: 'Allergen clean', short: 'Allergen' },
+    full: { label: 'Full clean', short: 'Clean' },
+    changeover: { label: 'Product change', short: 'Change' },
+    none: { label: 'No clean', short: '' },
+};
+const STATUS_WORDS = { ok: 'fits', tight: 'tight', short: 'short', overlap: 'runs overlap', nocrew: 'no crew', none: 'nothing to clean' };
+const FREQ_COLS = ['craa5_dailyclean', 'craa5_midweek', 'craa5_weeklyclean', 'craa5_monthlyclean', 'craa5_month', 'craa5_quarterly', 'craa5_annually'];
+// Fixed-format times for text that is saved (the Clean Plan): the same in every browser, whatever its language.
+const MON3 = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const cpWhen = (ms) => { const d = new Date(ms); return `${DOW[d.getDay()]} ${MON3[d.getMonth()]} ${d.getDate()} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
+const cpDayText = (ymd) => { const d = parseYMD(ymd); return d ? `${DOW[d.getDay()]} ${MON3[d.getMonth()]} ${d.getDate()}` : String(ymd || ''); };
+const cpHrs = (min) => { const m = Math.max(0, Number(min) || 0); return m >= 60 ? `${Math.round(m / 6) / 10} h` : `${Math.round(m)} min`; };
+const numOr = (v, d) => (v === undefined || v === null || v === '' || !isFinite(Number(v))) ? d : Number(v);
+
+// "Pecan, Coconut" -> ['coconut', 'pecan']: an allergen list split on , ; / & + and the word "and", lower case, letters and digits only.
+function allergenTokens(t) {
+    const out = [];
+    String(t === undefined || t === null ? '' : t).toLowerCase().split(/[,;\/&+]|\band\b/).forEach(x => { const k = x.replace(/[^a-z0-9]/g, ''); if (k && out.indexOf(k) < 0) out.push(k); });
+    return out.sort();
+}
+// An allergen clean is needed after an allergen run unless the same item runs again, or the next run carries every allergen of it.
+function allergenCleanNeeded(prev, next) {
+    if (!prev || !prev.allergen) return false;
+    if (!next) return true;
+    if (prev.code !== null && prev.code !== undefined && prev.code === next.code) return false;
+    if (!next.allergen) return true;
+    const a = allergenTokens(prev.allergenType), b = allergenTokens(next.allergenType);
+    if (!a.length || !b.length) return true;
+    return a.some(x => b.indexOf(x) < 0);
+}
+// The settings of a line on the Cleaning Times tab, however its area is spelled ("IBL 4" line 1, "IBL" line 4): the exact line first.
+function cleanCfgOf(clean, area, line) {
+    const c = clean || {};
+    const exact = c[lineKeyOf(area, line)];
+    if (exact) return exact;
+    const want = canonLine(area, line), keys = Object.keys(c).sort();
+    for (let i = 0; i < keys.length; i++) { const k = splitKey(keys[i]); if (k.area && canonLine(k.area, k.line) === want) return c[keys[i]] || {}; }
+    return {};
+}
+// The line key whose own shifts a line uses (exact spelling first, then any spelling of the same line), or '*' for the 'every line' ones.
+function shiftLineKey(own, area, line, group) {
+    const o = own || {}, lk = lineKeyOf(area, line);
+    if (o[`${lk}|${group}`]) return lk;
+    const want = canonLine(area, line), keys = Object.keys(o).sort();
+    for (let i = 0; i < keys.length; i++) {
+        const j = keys[i].lastIndexOf('|'), base = keys[i].slice(0, j);
+        if (keys[i].slice(j + 1) !== group || base === '*') continue;
+        const k = splitKey(base);
+        if (k.area && canonLine(k.area, k.line) === want) return base;
+    }
+    return '*';
+}
+// Everything the rules need to know about one line. ctx = { clean, own, occ (shift occurrences), assetsByArea, fallbackHeads }
+function lineCtxOf(ctx, area, line) {
+    const cfg = cleanCfgOf(ctx.clean, area, line), pieces = [];
+    (cfg.areas || []).forEach(a => ((ctx.assetsByArea || {})[a] || []).forEach(x => pieces.push(x)));
+    const own = ctx.own || {}, sk = shiftLineKey(own, area, line, 'sanitation');
+    const shiftsSet = sk !== '*' || !!own['*|sanitation'];
+    const occ = shiftsSet && ctx.occ ? occForLine(ctx.occ, sk, 'sanitation', own).slice().sort(byStart) : [];
+    let hs = 0, hn = 0;
+    occ.forEach(o => { if (o.heads > 0) { hs += o.heads; hn++; } });
+    const fallback = Math.max(1, Math.round(numOr(ctx.fallbackHeads, 2)) || 1);
+    return { area, line, cfg, pieces, occ, shiftsSet, fallbackHeads: fallback, typicalHeads: hn ? Math.max(1, Math.round(hs / hn)) : fallback, flagged: pieces.some(p => p.flagged) };
+}
+
+// The stops of one line in time order. runs = every run of the line (any spelling of it); runs without a start or stop, or over
+// 31 days, are left out. opts.last adds the stop after the last run. opts.weekHas (Monday YYYY-MM-DD -> true when the plan has a
+// run that week on any line) turns a stop that reaches a week with nothing planned into an open last stop that ends where the
+// unknown starts; opts.horizon ends the open last stop (else it has no end).
+//   { prev, next (null when last), start, end, stopKind: 'between' | 'overlap' | 'last', open: '' | 'unplanned' | 'read', maint: [[s, e]], maintMs }
+function lineStops(runs, opts) {
+    const o = opts || {}, prod = [], maint = [];
+    (runs || []).forEach(r => {
+        if (!r || !(r.start > 0) || !(r.end > r.start) || r.end - r.start > CR_MAX_RUN_MS) return;
+        (isMaint(r) ? maint : prod).push(r);
+    });
+    prod.sort((a, b) => a.start - b.start || a.end - b.end || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    const firstUnplanned = (from, to) => {   // the Monday of the first week after `from`'s week (before `to`) with nothing planned
+        if (!o.weekHas) return 0;
+        let mon = cpAddDaysYmd(cpMondayYmd(from - 1), 7);   // the week after the one that holds the run's last minute
+        for (let guard = 0; guard < 60 && mon; guard++) {
+            const t = parseYMD(mon).getTime();
+            if (t >= to) return 0;
+            if (!o.weekHas[mon]) return t;
+            mon = cpAddDaysYmd(mon, 7);
+        }
+        return 0;
+    };
+    const out = [];
+    let cur = null;
+    prod.forEach(n => {
+        if (cur) {
+            if (n.start >= cur.end) {
+                const u = firstUnplanned(cur.end, n.start);
+                if (u) { out.push({ prev: cur, next: null, start: cur.end, end: u, stopKind: 'last', open: 'unplanned', later: true }); }
+                else out.push({ prev: cur, next: n, start: cur.end, end: n.start, stopKind: 'between', open: '' });
+            } else out.push({ prev: cur, next: n, start: n.start, end: n.start, stopKind: 'overlap', open: '', overlapMs: Math.min(cur.end, n.end) - n.start });
+        }
+        if (!cur || n.end > cur.end || (n.end === cur.end && n.allergen && !cur.allergen)) cur = n;
+    });
+    if (cur && o.last) {
+        const lim = o.horizon > cur.end ? o.horizon : 0, u = firstUnplanned(cur.end, lim || cur.end + 400 * DAY);
+        out.push({ prev: cur, next: null, start: cur.end, end: u || lim || 0, stopKind: 'last', open: u ? 'unplanned' : 'read' });
+    }
+    if (maint.length) {
+        const mi = cpMerge(maint.map(m => [m.start, m.end]));
+        out.forEach(s => {
+            const e = s.end || s.start + CR_LAST_LOOK_MS;
+            s.maint = []; s.maintMs = 0;
+            mi.forEach(x => { const a = Math.max(s.start, x[0]), b = Math.min(e, x[1]); if (b > a) { s.maint.push([a, b]); s.maintMs += b - a; } });
+        });
+    }
+    return out;
+}
+
+// The work a clean of `kind` needs on a line: { basis: equipment | manual | changeover | untimed | none, work (crew minutes),
+// floor (the slowest piece with its own crew), manual (elapsed minutes), count, weekly (weekly pieces added), crumb, noDaily }
+// `next` tells a crumb clean before the same item (only the crumb minutes) from a product change.
+function cleanNeed(kind, prev, L, withWeekly, next) {
+    const c = L.cfg || {}, out = { basis: 'none', work: 0, floor: 0, manual: 0, count: 0, weekly: 0, crumb: 0, noDaily: false };
+    if (kind === 'none') return out;
+    const crumb = prev && prev.crumb ? Math.max(0, numOr(c.crumbMins, 0)) : 0;
+    out.crumb = crumb;
+    if (kind === 'changeover') {
+        const same = !!(next && prev && prev.code !== null && prev.code !== undefined && prev.code === next.code);
+        const cm = same ? 0 : numOr(c.changeMins, null);
+        out.basis = cm === null && !crumb ? 'untimed' : 'changeover';
+        out.manual = Math.max(0, cm || 0) + crumb;
+        return out;
+    }
+    let list = [];
+    if (kind === 'allergen' || !L.flagged) list = L.pieces.slice();
+    else {
+        L.pieces.forEach(p => { if (p.daily) list.push(p); });
+        if (!list.length) out.noDaily = true;
+        if (withWeekly) L.pieces.forEach(p => { if (p.weekly && !p.daily) { list.push(p); out.weekly++; } });
+    }
+    if (list.length) {
+        list.forEach(x => { const m = Math.max(0, numOr(kind === 'allergen' && x.allergenMins > 0 ? x.allergenMins : x.baseMins, 0)); out.work += m; out.floor = Math.max(out.floor, m / Math.max(1, x.heads || 1)); });
+        out.work += crumb; out.basis = 'equipment'; out.count = list.length;
+        return out;
+    }
+    out.manual = (kind === 'allergen' ? numOr(c.allergenMins, 480) : numOr(c.baseMins, 60)) + crumb;
+    out.basis = 'manual';
+    return out;
+}
+// Minutes a clean takes with a flat crew of H people.
+const needFlatMins = (need, H) => need.basis === 'equipment' ? Math.max(need.work / Math.max(1, H), need.floor) : need.manual;
+// Walks the sanitation shifts from `from` until the clean is done or `until` comes. Time with nobody on shift, or inside a
+// blocked piece (maintenance), does no work. { start (first minute worked, 0 = nobody came), end (done, 0 = not by `until`),
+// mins (minutes worked), heads (average while working), left (crew minutes still to do), leftFloor, seen (a shift falls in the
+// time), staffedMs (time with people on shift, blocked or not) }
+function crewWalk(occ, from, until, need, blocked) {
+    const equip = need.basis === 'equipment';
+    const work = equip ? need.work : 0, floor = equip ? need.floor : need.manual;
+    const pts = [from, until], mine = [], bl = blocked || [];
+    occ.forEach(o => { if (o.end > from && o.start < until) { mine.push(o); if (o.start > from) pts.push(o.start); if (o.end < until) pts.push(o.end); } });
+    bl.forEach(x => { if (x[0] > from && x[0] < until) pts.push(x[0]); if (x[1] > from && x[1] < until) pts.push(x[1]); });
+    pts.sort((a, b) => a - b);
+    let done = 0, worked = 0, hsum = 0, start = 0, staffedMs = 0;
+    for (let i = 0; i + 1 < pts.length; i++) {
+        const a = pts[i], b = pts[i + 1];
+        if (b <= a) continue;
+        const mid = (a + b) / 2;
+        let h = 0;
+        mine.forEach(o => { if (o.start <= mid && o.end > mid) h += o.heads; });
+        if (h <= 0) continue;
+        staffedMs += b - a;
+        if (bl.some(x => x[0] <= mid && x[1] > mid)) continue;
+        if (!start) start = a;
+        const seg = (b - a) / 60000, t = Math.max((work - done) / h, floor - worked, 0);
+        if (t <= seg) { worked += t; hsum += h * t; return { start, end: Math.round(a + t * 60000), mins: worked, heads: worked > 0 ? hsum / worked : h, left: 0, leftFloor: 0, seen: true, staffedMs }; }
+        done += h * seg; worked += seg; hsum += h * seg;
+    }
+    return { start, end: 0, mins: worked, heads: worked > 0 ? hsum / worked : 0, left: Math.max(0, work - done), leftFloor: Math.max(0, floor - worked), seen: mine.length > 0, staffedMs };
+}
+const runItem = (r) => !r ? '' : r.code !== null && r.code !== undefined ? String(r.code) : (r.product || 'a run');
+
+// Judges every stop of one line (from lineStops) with the line's settings L (from lineCtxOf). Returns one object per stop:
+//   { lineKey, lineCanon, prev, next, prevId, nextId, start, end, gapMs, stopKind, open, kind, status, need, mins (minutes the clean
+//     takes with the crew), heads, cleanStart, cleanEnd, shortMins, spareMins, assumed, maintMs, reason (one sentence),
+//     req / usableMs / cov (what the older views read) }
+function judgeStops(stops, L) {
+    // time a stop leaves for cleaning: its length less the maintenance in it (the open stop after the last run: no end)
+    const usable = (s) => s.stopKind === 'last' ? Infinity : s.end - s.start - (s.maintMs || 0);
+    // the line's daily (full) clean: on each local day, the stop (an hour or more of usable time) with the most usable time inside
+    // that day; ties go to the later stop. So a night stop from 22:00 to 06:00 is the clean of both days it touches, and a short
+    // product change at noon is not taken for a day clean. The open stop after the last run is the clean of the day it starts.
+    // The day of the first run read also counts the time before that run (its clean happened before it, unread).
+    const best = {}, bestMs = {};
+    const take = (day, ms, i) => { if (bestMs[day] === undefined || ms >= bestMs[day]) { best[day] = i; bestMs[day] = ms; } };
+    if (stops.length && stops[0].prev) { const f = stops[0].prev.start, d0 = midnightOf(f).getTime(); if (f > d0) take(getLocalYMD(new Date(f)), f - d0, -1); }
+    stops.forEach((s, i) => {
+        if (s.stopKind === 'last') { take(getLocalYMD(new Date(s.start)), Infinity, i); return; }
+        if (s.stopKind !== 'between' || usable(s) < CR_FULL_MIN * 60000) return;
+        let d = midnightOf(s.start);
+        for (let guard = 0; guard < 62 && d.getTime() < s.end; guard++) {
+            const n = addDaysLocal(d, 1), a = Math.max(s.start, d.getTime()), e = Math.min(s.end, n.getTime());
+            let ms = e - a;
+            (s.maint || []).forEach(x => { ms -= Math.max(0, Math.min(e, x[1]) - Math.max(a, x[0])); });
+            if (ms > 0) take(getLocalYMD(d), ms, i);
+            d = n;
+        }
+    });
+    const isFull = {};
+    Object.keys(best).forEach(d => { if (best[d] >= 0) isFull[best[d]] = true; });
+    const crumbSet = numOr((L.cfg || {}).crumbMins, 0) > 0;
+    const kinds = stops.map((s, i) => {
+        if (allergenCleanNeeded(s.prev, s.next)) return 'allergen';
+        if (s.stopKind === 'last' || isFull[i]) return 'full';
+        if (s.next && s.prev.code !== null && s.prev.code !== undefined && s.prev.code === s.next.code) return s.prev.crumb && crumbSet ? 'changeover' : 'none';
+        return 'changeover';
+    });
+    // the weekly pieces go with the full clean of each Monday-to-Sunday week that leaves the most time
+    const weekBest = {};
+    if (stops.length && stops[0].prev && best[getLocalYMD(new Date(stops[0].prev.start))] === -1) weekBest[cpMondayYmd(stops[0].prev.start)] = -1;   // the stop before the first run read is a long one: its week's weekly pieces went there
+    if (L.flagged && L.pieces.some(p => p.weekly && !p.daily)) stops.forEach((s, i) => {
+        if (kinds[i] !== 'full') return;
+        const wk = cpMondayYmd(s.stopKind === 'last' ? s.start : s.end - 1), b = weekBest[wk];
+        if (b === undefined || b >= 0 && usable(s) >= usable(stops[b])) weekBest[wk] = i;
+    });
+    const weeklyAt = {};
+    Object.keys(weekBest).forEach(w => { if (weekBest[w] >= 0) weeklyAt[weekBest[w]] = true; });
+    const tightFor = (spare, mins) => mins > 0 && spare < Math.max(CR_TIGHT_MIN, CR_TIGHT_SHARE * mins);
+
+    return stops.map((s, i) => {
+        const kind = kinds[i], need = cleanNeed(kind, s.prev, L, !!weeklyAt[i], s.next);
+        const last = s.stopKind === 'last', gapMs = last ? (s.end ? s.end - s.start : null) : s.end - s.start;
+        const g = { lineKey: lineKeyOf(s.prev.area, s.prev.line), lineCanon: canonLine(s.prev.area, s.prev.line), prev: s.prev, next: s.next, prevId: s.prev.id, nextId: s.next ? s.next.id : '',
+            start: s.start, end: s.end, gapMs, stopKind: s.stopKind, open: s.open || '', later: !!s.later, kind, need, status: 'ok', mins: 0, heads: 0, cleanStart: 0, cleanEnd: 0, shortMins: 0, spareMins: null,
+            assumed: false, crewSeen: true, maintMs: s.maintMs || 0, maint: s.maint || [], overlapMs: s.overlapMs || 0, usableMs: 0, reason: '' };
+        const free = last ? Infinity : Math.max(0, gapMs - g.maintMs) / 60000;   // minutes the line stands with no run and no maintenance
+        if (s.stopKind === 'overlap') {
+            g.status = 'overlap';
+            g.mins = kind === 'none' ? 0 : kind === 'changeover' ? need.manual : needFlatMins(need, L.shiftsSet ? L.typicalHeads : L.fallbackHeads);
+        } else if (kind === 'none') g.status = 'none';
+        else if (kind === 'changeover') {
+            g.mins = need.manual;
+            if (need.basis === 'untimed' || last) g.status = 'ok';
+            else if (free < g.mins) { g.status = 'short'; g.shortMins = g.mins - free; }
+            else { g.spareMins = free - g.mins; g.status = tightFor(g.spareMins, g.mins) ? 'tight' : 'ok'; }
+            g.usableMs = last ? 0 : free * 60000;
+        } else {
+            // the crew: the line's sanitation shifts, or (none set) the 'people if no shift set' for the whole stop
+            g.assumed = !L.shiftsSet;
+            const until = last ? s.start + CR_LAST_LOOK_MS : s.end;
+            const occ = L.shiftsSet ? L.occ : [{ start: s.start, end: until, heads: L.fallbackHeads }];
+            g.heads = L.shiftsSet ? L.typicalHeads : L.fallbackHeads;
+            g.mins = needFlatMins(need, g.heads);
+            const w = crewWalk(occ, s.start, until, need, s.maint);
+            g.usableMs = last ? 0 : w.mins * 60000;
+            g.crewSeen = w.seen && w.staffedMs > 0;
+            if (!w.start) {
+                if (!last && (gapMs <= 0 || w.staffedMs > 0)) { g.status = 'short'; g.shortMins = g.mins; }   // no time at all, or maintenance takes all of it
+                else g.status = 'nocrew';
+            } else if (!w.end) {
+                g.cleanStart = w.start; g.heads = w.heads;
+                const more = Math.max(w.heads > 0 ? w.left / w.heads : 0, w.leftFloor);
+                g.mins = w.mins + more;
+                if (last) g.status = 'ok';
+                else { g.status = 'short'; g.shortMins = more; }
+            } else {
+                g.cleanStart = w.start; g.cleanEnd = w.end; g.mins = w.mins; g.heads = w.heads;
+                if (!last) { g.spareMins = (s.end - w.end) / 60000; g.status = tightFor(g.spareMins, g.mins) ? 'tight' : 'ok'; }
+            }
+        }
+        g.reason = stopReason(g, L);
+        g.req = { mins: g.mins, basis: need.basis, heads: g.heads, allergenClean: kind === 'allergen', equipCount: need.count, work: need.work };
+        g.cov = { any: L.shiftsSet, uncovered: 0 };
+        return g;
+    });
+}
+// One plain sentence: what clean, how much work, with whom, and whether it fits. Fixed formats only (it is saved in the Clean Plan).
+function stopReason(g, L) {
+    const n = g.need, last = g.stopKind === 'last', gapWeek = last && g.open === 'unplanned' && g.later;
+    const what = g.kind === 'allergen' ? `Allergen clean${allergenTokens(g.prev.allergenType).length ? ` (${g.prev.allergenType})` : ''} after ${runItem(g.prev)}`
+        : g.kind === 'full' ? (gapWeek ? `Full clean after ${runItem(g.prev)}, before a week with nothing planned` : last ? `Full clean after the last run planned (${runItem(g.prev)})` : 'Full clean (the line\'s daily clean)')
+        : g.kind === 'changeover' ? (n.basis === 'untimed' ? `Product change from ${runItem(g.prev)} to ${runItem(g.next)}` : n.crumb && n.manual === n.crumb ? `Crumb clean after ${runItem(g.prev)}` : `Product change from ${runItem(g.prev)} to ${runItem(g.next)}`)
+        : `Same item ${runItem(g.prev)} runs on: nothing to clean`;
+    if (g.kind === 'none') return g.status === 'overlap' ? `Same item ${runItem(g.prev)} runs on, but the runs overlap: the next run starts ${cpHrs(g.overlapMs / 60000)} before this one ends.` : `${what}.`;
+    const parts = [];
+    if (n.basis === 'untimed') parts.push('not timed (set Product change minutes on Cleaning Times)');
+    else if (n.basis === 'changeover') parts.push(`${cpHrs(n.manual)}${n.crumb && n.manual !== n.crumb ? ` (crumb ${cpHrs(n.crumb)})` : ''}`);
+    else if (n.basis === 'equipment') parts.push(`${n.count} piece${n.count === 1 ? '' : 's'}, ${cpHrs(n.work)} of crew work${n.weekly ? ` (${n.weekly} weekly)` : ''}${n.crumb ? ` (crumb ${cpHrs(n.crumb)})` : ''}`);
+    else parts.push(`${cpHrs(n.manual)} (manual minutes${(L.cfg.areas || []).length ? '' : ': no equipment chosen on Cleaning Times'})`);
+    if (n.noDaily) parts.push('no piece of this line is flagged Daily');
+    if ((g.kind === 'allergen' || g.kind === 'full') && g.status !== 'overlap' && g.status !== 'nocrew') {
+        const h = Math.round(g.heads * 10) / 10;
+        parts.push(g.assumed ? `about ${cpHrs(g.mins)} with ${h} people assumed (no sanitation shift set)` : `about ${cpHrs(g.mins)} with ${h} on shift`);
+    }
+    let end = '';
+    if (g.status === 'overlap') end = `the next run starts ${cpHrs(g.overlapMs / 60000)} before this one ends`;
+    else if (g.status === 'nocrew') end = !g.crewSeen && g.need && L.shiftsSet && L.occ.some(o => o.end > g.start && o.start < (g.end || g.start + CR_LAST_LOOK_MS)) ? 'the sanitation shift in this stop has nobody on it (no one on the roster for its crew)'
+        : last ? 'no sanitation shift in the 7 days after it' : `no sanitation shift falls in this stop (${cpWhen(g.start)} to ${cpWhen(g.end)})`;
+    else if (g.status === 'short') end = g.gapMs <= 0 ? `no time between the runs: short ${cpHrs(g.shortMins)}` : g.usableMs <= 0 && g.maintMs > 0 ? `maintenance takes the whole stop: short ${cpHrs(g.shortMins)}` : `only ${cpHrs(g.usableMs / 60000)} of ${g.kind === 'changeover' ? 'stop' : 'crew time'} before the next run: short ${cpHrs(g.shortMins)}`;
+    else if (g.cleanEnd) end = `done by ${cpWhen(g.cleanEnd)}${g.spareMins !== null ? `, ${cpHrs(g.spareMins)} before the next run${g.status === 'tight' ? ' (tight)' : ''}` : ''}`;
+    else if (g.spareMins !== null && g.kind === 'changeover' && n.basis !== 'untimed') end = `${cpHrs(g.spareMins)} to spare${g.status === 'tight' ? ' (tight)' : ''}`;
+    if (end) parts.push(end);
+    if (g.maintMs > 0) parts.push(`maintenance ${cpHrs(g.maintMs / 60000)} in the stop`);
+    if (gapWeek) parts.push(`nothing is planned on any line in the week of ${cpDayText(cpMondayYmd(g.end))}`);
+    else if (g.open === 'unplanned') parts.push('nothing is planned after it yet');
+    else if (last && g.open === 'read') parts.push('no run after it in the weeks read');
+    else if (!last && g.gapMs > CR_IDLE_MS) parts.push(`the line is idle ${cpHrs(g.gapMs / 60000)}`);
+    return `${what}: ${parts.filter(Boolean).join('; ')}.`;
 }
 const GAP_STYLE = {
     ok: { bg: '#DCFCE7', border: '#16A34A', text: '#166534', label: 'Enough time to clean' },
     tight: { bg: '#FEF3C7', border: '#D97706', text: '#92400E', label: 'Tight' },
     short: { bg: '#FDE8EC', border: '#E4002B', text: '#B00020', label: 'Not enough time to clean' },
     overlap: { bg: '#FDE8EC', border: '#E4002B', text: '#B00020', label: 'Runs overlap' },
-    none: { bg: '#F1F5F9', border: '#CBD5E1', text: '#64748B', label: 'No cleaning time set' },
+    nocrew: { bg: '#FDE8EC', border: '#E4002B', text: '#B00020', label: 'No sanitation crew' },
+    none: { bg: '#F1F5F9', border: '#CBD5E1', text: '#64748B', label: 'No clean needed' },
 };
 
 // ============================================================================
@@ -1822,36 +2432,21 @@ function swapPlan(first, second) {
 }
 
 // ============================================================================
-// GAPS: the cleaning window before and after a run (used by the Gantt, the edit dialog and the import preview)
-//   ctx = { cleanCfg(lineKey), assetsByArea, occ (shift occurrences), fallbackHeads }
+// GAPS: the cleaning window before and after a run (used by the Gantt, the edit dialog and the import and change request previews)
+//   ctx = { clean (the Cleaning Times settings), own, occ (shift occurrences), assetsByArea, fallbackHeads }
 // ============================================================================
-function makeGap(p, n, ctx) {
-    const lk = lineKeyOf(p.area, p.line);
-    const gapMs = n.start - p.end;
-    const a = Math.min(p.end, n.start), b = Math.max(p.end, n.start);
-    const cov = coverageFor(ctx.occ, lk, 'sanitation', a, Math.max(b, a + 1), ctx.own);
-    const heads = cov.any ? Math.max(1, Math.round(cov.avg * 10) / 10) : ctx.fallbackHeads;
-    const req = cleanRequirement(p, n, ctx.cleanCfg(lk), ctx.assetsByArea, heads);
-    // time when no sanitation crew is on shift cannot be used for cleaning
-    const usableMs = cov.any ? Math.max(0, gapMs - cov.uncovered) : gapMs;
-    const status = req.basis === 'same product' && gapMs >= 0 ? 'ok' : gapStatus(gapMs < 0 ? gapMs : usableMs, req.mins);
-    return { lineKey: lk, prevId: p.id, nextId: n.id, prev: p, next: n, start: p.end, end: n.start, gapMs, usableMs, req, status, cov, heads };
-}
-function gapText(g) {
-    if (g.status === 'overlap') return `Overlap of ${fmtHrs(-g.gapMs)}`;
-    const need = g.req.basis === 'same product' ? 'same product, no clean' : `${g.req.allergenClean ? 'Allergen clean' : 'Clean'} needs ${fmtMins(g.req.mins)}`;
-    const how = g.req.basis === 'equipment' ? `${g.req.equipCount} equipment, ${g.heads} sanitation` : g.req.basis === 'manual' ? 'manual minutes' : '';
-    const unc = g.cov.any && g.cov.uncovered > 0 ? `; no sanitation shift for ${fmtHrs(g.cov.uncovered)}` : '';
-    return `${fmtHrs(g.gapMs)} between runs. ${need}${how ? ` (${how})` : ''}${unc}`;
-}
-// the gap right before and right after a candidate run, with everything else on its line
+const gapText = (g) => g ? g.reason || '' : '';
+// the stop right before and right after a candidate run, judged with every other run of its line (any spelling of the line)
 function gapsAround(cand, runs, ctx) {
-    const lk = lineKeyOf(cand.area, cand.line);
-    const seq = runs.filter(r => r.id !== cand.id && lineKeyOf(r.area, r.line) === lk).sort(byStart);
-    let prev = null, next = null;
-    seq.forEach(r => { if (r.start < cand.start || (r.start === cand.start && r.end <= cand.end && !next)) prev = r; else if (!next) next = r; });
+    const cl = canonLine(cand.area, cand.line);
     const c = { ...cand, id: cand.id || 'candidate' };
-    return { before: prev ? makeGap(prev, c, ctx) : null, after: next ? makeGap(c, next, ctx) : null };
+    const seq = runs.filter(r => r.id !== c.id && canonLine(r.area, r.line) === cl).concat([c]);
+    let before = null, after = null;
+    judgeStops(lineStops(seq), lineCtxOf(ctx, cand.area, cand.line)).forEach(g => {
+        if (g.next && g.next.id === c.id && !before) before = g;
+        if (g.prev.id === c.id && !after) after = g;
+    });
+    return { before, after };
 }
 
 // ============================================================================
@@ -2185,11 +2780,11 @@ const GanttRow = memo(function GanttRow({ row, vis, rowGaps, occProd, occSan, ra
                 {showClean && rowGaps.map(g => {
                     const l = Math.max(rangeFrom, g.start), r2 = Math.min(rangeTo, g.end);
                     if (r2 <= l) return null;
-                    const st = GAP_STYLE[g.status], w = ((r2 - l) / rangeMs) * trackW;
+                    const st = GAP_STYLE[g.status] || GAP_STYLE.none, w = ((r2 - l) / rangeMs) * trackW;
                     return <div key={g.prevId + g.nextId} data-gap="1" className="absolute rounded-sm border text-[9px] font-black overflow-hidden whitespace-nowrap flex items-center justify-center z-[5]"
                         style={{ left: `${pct(l)}%`, width: `${((r2 - l) / rangeMs) * 100}%`, top: 6, height: 34, background: st.bg, borderColor: st.border, color: st.text, backgroundImage: 'repeating-linear-gradient(45deg, transparent, transparent 5px, rgba(0,0,0,0.04) 5px, rgba(0,0,0,0.04) 10px)' }}
                         title={`${st.label}\n${gapText(g)}`}>
-                        {w > 34 && (g.status === 'overlap' ? 'OVERLAP' : g.req.mins <= 0 ? fmtHrs(g.gapMs) : w > 120 ? `Clean ${fmtMins(g.req.mins)} / ${fmtHrs(g.gapMs)}` : w > 60 ? `${fmtMins(g.req.mins)}/${fmtHrs(g.gapMs)}` : fmtHrs(g.gapMs))}
+                        {w > 34 && (g.status === 'overlap' ? 'OVERLAP' : !(g.mins > 0) ? fmtHrs(g.gapMs) : w > 120 ? `${CLEAN_KINDS[g.kind].short} ${fmtMins(g.mins)} / ${fmtHrs(g.gapMs)}` : w > 60 ? `${fmtMins(g.mins)}/${fmtHrs(g.gapMs)}` : fmtHrs(g.gapMs))}
                     </div>;
                 })}
                 {/* runs */}
@@ -2611,7 +3206,7 @@ function RunRow({ r, ed, onInclude, onEdit, onReset, onFlag }) {
                     <label title="Crumb clean"><input type="checkbox" checked={r.crumb} onChange={(e) => onFlag({ crumb: e.target.checked })} /> C</label>
                 </span>
                 <span className="text-[11px] text-slate-500 whitespace-nowrap">{p.cases !== null && p.cases !== undefined ? `${fmtNum(p.cases)} cases` : ''}{p.order ? ` · order # ${p.order}` : ''}{p.orderWarn && <span className="ml-1 text-[#B27B00]" title="This does not look like an order number. It is saved as typed.">⚠</span>}</span>
-                {r.gap && <span className="inline-block px-1.5 py-0.5 rounded border text-[10px] font-black whitespace-nowrap" style={{ background: GAP_STYLE[r.gap.status].bg, borderColor: GAP_STYLE[r.gap.status].border, color: GAP_STYLE[r.gap.status].text }} title={gapText(r.gap)}>{r.gap.status === 'overlap' ? 'OVERLAP' : r.gap.req.mins <= 0 ? 'same product' : `clean ${fmtHrs(r.gap.gapMs)} / needs ${fmtMins(r.gap.req.mins)}`}</span>}
+                {r.gap && <span className="inline-block px-1.5 py-0.5 rounded border text-[10px] font-black whitespace-nowrap" style={{ background: GAP_STYLE[r.gap.status].bg, borderColor: GAP_STYLE[r.gap.status].border, color: GAP_STYLE[r.gap.status].text }} title={gapText(r.gap)}>{r.gap.status === 'overlap' ? 'OVERLAP' : r.gap.kind === 'none' ? 'same product' : !(r.gap.mins > 0) ? `${CLEAN_KINDS[r.gap.kind].short.toLowerCase()} ${fmtHrs(r.gap.gapMs)}, not timed` : `${r.gap.kind === 'allergen' ? 'allergen ' : ''}clean ${fmtHrs(r.gap.gapMs)} / needs ${fmtMins(r.gap.mins)}`}</span>}
             </div>
             {notes.length > 0 && <div className="mt-1 pl-6 text-[10px] flex flex-wrap gap-x-3">{notes.map((n, i) => <span key={i} className={n.c} title={n.title}>{n.t}</span>)}</div>}
         </div>
@@ -3949,11 +4544,11 @@ function CleaningView({ rows, assets, assetsByArea, settings, updateSettings, ga
     const resolved = effDefs.map(x => x.heads !== '' && x.heads !== undefined ? Number(x.heads) : (x.crew ? rosterCount(x.crew, 'sanitation') : 0)).filter(h => h > 0);
     const typical = resolved.length ? Math.max(1, Math.round(resolved.reduce((a, b) => a + b, 0) / resolved.length)) : settings.cleanHeads;
     const ctxHeads = people !== '' ? Math.max(1, parseInt(people, 10) || 1) : typical;
-    const needAt = (h) => ({
-        base: cleanRequirement(null, { code: -1, allergen: false }, cfg, assetsByArea, h),
-        alg: cleanRequirement({ code: -2, allergen: true, allergenType: '', crumb: false }, { code: -1, allergen: false }, cfg, assetsByArea, h),
-    });
-    const { base, alg } = needAt(ctxHeads);
+    const L = useMemo(() => { const k = splitKey(lineKey); return lineCtxOf({ clean: settings.clean, own: {}, occ: [], assetsByArea, fallbackHeads: settings.cleanHeads }, k.area, k.line); }, [lineKey, settings.clean, assetsByArea, settings.cleanHeads]);
+    const needOf = (kind, h, weekly) => { const n = cleanNeed(kind, null, L, weekly); return { mins: needFlatMins(n, h), basis: n.basis, equipCount: n.count, work: n.work, weekly: n.weekly, noDaily: n.noDaily }; };
+    const needAt = (h) => ({ base: needOf('full', h, false), alg: needOf('allergen', h, false), week: needOf('full', h, true) });
+    const { base, alg, week } = needAt(ctxHeads);
+    const nDaily = L.pieces.filter(p => p.daily).length, nWeekly = L.pieces.filter(p => p.weekly && !p.daily).length;
     const mine = gaps.filter(g => g.lineKey === lineKey && g.end >= Date.now() - DAY).sort((a, b) => a.start - b.start).slice(0, 40);
     const th = "px-2 py-1.5 text-left text-[10px] font-black uppercase tracking-wider text-slate-500";
     const areaTotals = (a) => (assetsByArea[a] || []).reduce((n, x) => n + x.baseMins, 0);
@@ -3971,6 +4566,7 @@ function CleaningView({ rows, assets, assetsByArea, settings, updateSettings, ga
                     <Field label="Manual clean (min)" hint="Used when no equipment is chosen. Default 60."><input type="number" min="0" className={inputCls} value={cfg.baseMins ?? ''} placeholder="60" onChange={(e) => setCfg({ baseMins: e.target.value })} /></Field>
                     <Field label="Manual allergen clean (min)" hint="Default 480 (the 8 h rule)."><input type="number" min="0" className={inputCls} value={cfg.allergenMins ?? ''} placeholder="480" onChange={(e) => setCfg({ allergenMins: e.target.value })} /></Field>
                     <Field label="Extra after a crumb clean (min)"><input type="number" min="0" className={inputCls} value={cfg.crumbMins ?? ''} placeholder="0" onChange={(e) => setCfg({ crumbMins: e.target.value })} /></Field>
+                    <Field label="Product change (min)" hint="A different item with no clean between (production does it). Blank = not timed, never flagged."><input type="number" min="0" className={inputCls} value={cfg.changeMins ?? ''} placeholder="not timed" onChange={(e) => setCfg({ changeMins: e.target.value })} data-testid="change-mins" /></Field>
                     <Field label="Sanitation people if no shift set" hint="Used when the line has no sanitation shift."><input type="number" min="1" className={inputCls} value={settings.cleanHeads} onChange={(e) => updateSettings(s => ({ ...s, cleanHeads: Math.max(1, parseInt(e.target.value, 10) || 1) }))} /></Field>
                 </div>
                 <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs space-y-1">
@@ -3979,24 +4575,179 @@ function CleaningView({ rows, assets, assetsByArea, settings, updateSettings, ga
                         <input type="number" min="1" className="w-16 border border-slate-300 rounded px-1.5 py-0.5 text-xs bg-white" value={people} placeholder={String(typical)} onChange={(e) => setPeople(e.target.value)} />
                         <span className="font-black uppercase tracking-wider text-[10px] text-slate-500">sanitation {ctxHeads === 1 ? 'person' : 'people'} {people === '' ? `(this line's usual shift)` : ''}</span>
                     </div>
-                    <div>Normal clean: <b>{fmtMins(base.mins)}</b> <span className="text-slate-400">({base.basis}{base.equipCount ? `, ${base.equipCount} equipment, ${fmtMins(base.work || 0)} of work` : ''})</span></div>
+                    <div>Daily (full) clean: <b>{fmtMins(base.mins)}</b> <span className="text-slate-400">({base.basis}{base.equipCount ? `, ${base.equipCount} equipment, ${fmtMins(base.work || 0)} of work` : ''}{base.noDaily ? ', no piece flagged Daily' : ''})</span></div>
+                    {week.weekly > 0 && <div>Longest full clean of the week (with {week.weekly} weekly piece{week.weekly === 1 ? '' : 's'}): <b>{fmtMins(week.mins)}</b></div>}
                     <div>After an allergen run: <b>{fmtMins(alg.mins)}</b></div>
                     <table className="text-[11px] mt-1"><thead><tr className="text-left text-[9px] uppercase tracking-wider text-slate-400"><th className="pr-3">People</th><th className="pr-3">Normal</th><th>After allergen</th></tr></thead>
                         <tbody>{[1, 2, 3, 4, 5, 6].map(h => { const n = needAt(h); return <tr key={h} className={h === ctxHeads ? 'font-black text-[#00468B]' : ''}><td className="pr-3">{h}</td><td className="pr-3">{fmtMins(n.base.mins)}</td><td>{fmtMins(n.alg.mins)}</td></tr>; })}</tbody></table>
                     <p className="text-[10px] text-slate-400">Equipment minutes are crew minutes: elapsed time = total ÷ people, never faster than the slowest single piece (limited by its own crew size).</p>
+                    <p className="text-[10px] text-slate-500">{L.flagged ? `The daily clean counts the ${nDaily} piece${nDaily === 1 ? '' : 's'} flagged Daily on the equipment table${nWeekly ? `; the ${nWeekly} Weekly one${nWeekly === 1 ? ' goes' : 's go'} into the longest full clean of each week` : ''}.` : 'None of this line\'s equipment has a cleaning frequency set, so every piece counts in the daily clean.'} Which clean a stop needs: an allergen clean after an allergen run (unless the next run carries the same allergens), the daily (full) clean in the stop of an hour or more that leaves the line the most free time that day (a night stop counts for both days it touches), nothing when the same item runs on, else a product change.</p>
                 </div>
             </div>
             <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
-                <h2 className="text-base font-black text-[#00468B] uppercase tracking-widest mb-2">Upcoming changeovers on this line</h2>
-                {mine.length === 0 && <p className="text-sm text-slate-400">No changeovers loaded for this line. Open the Schedule over the dates you care about.</p>}
+                <h2 className="text-base font-black text-[#00468B] uppercase tracking-widest mb-2">Upcoming stops on this line</h2>
+                {mine.length === 0 && <p className="text-sm text-slate-400">No stops loaded for this line. Open the Schedule over the dates you care about.</p>}
                 <div className="space-y-1.5 max-h-[520px] overflow-y-auto">
-                    {mine.map(g => { const st = GAP_STYLE[g.status]; return (
+                    {mine.map(g => { const st = GAP_STYLE[g.status] || GAP_STYLE.none; return (
                         <button key={g.prevId + g.nextId} type="button" onClick={() => onJump(g.start)} className="w-full text-left rounded-lg border px-2.5 py-1.5 text-[11px]" style={{ background: st.bg, borderColor: st.border, color: st.text }}>
-                            <div className="font-black">{fmtDT(g.start)} → {fmtDT(g.end)} · {st.label}</div>
+                            <div className="font-black">{fmtDT(g.start)} → {fmtDT(g.end)} · {CLEAN_KINDS[g.kind].label} · {st.label}</div>
                             <div>{runTitle(g.prev)} → {runTitle(g.next)}</div>
                             <div className="opacity-80">{gapText(g)}</div>
                         </button>); })}
                 </div>
+            </div>
+        </div>
+    );
+}
+
+// ============================================================================
+// CLEAN PLAN tab: the cleans the runs need (the hangups a director should know about first), every allergen and full clean,
+// the days the MSS needs a Daily clean, and the publishing to the shared table the other apps read.
+// ============================================================================
+const CP_HANG = { short: 0, overlap: 1, nocrew: 2, tight: 3 };
+function CleanPlanView({ engine, cp, tick, cfgState, auto, setAuto, apiReady, onJump, onOpenCheck, nowMs, active }) {
+    const [from, setFrom] = useState(() => cpMondayYmd(Date.now()));
+    const [weeks, setWeeks] = useState(2);
+    const [data, setData] = useState(null);
+    const [loading, setLoading] = useState(false);
+    const [err, setErr] = useState('');
+    const [moreCleans, setMoreCleans] = useState(false);
+    const [confirmUse, setConfirmUse] = useState(false);
+    const F = parseYMD(from) ? cpWeekStart(parseYMD(from).getTime(), 0) : cpWeekStart(Date.now(), 0);
+    const T = cpWeekStart(F, weeks);
+    const epoch = cp.epoch;
+    useEffect(() => {
+        if (!active) return;
+        let alive = true;
+        setLoading(true); setErr('');
+        const t = setTimeout(async () => {
+            try { const b = await engine.preview(F, T); if (!alive) return; if (!b) setErr('The runs could not be read for these weeks. Press Refresh.'); else setData(b); }
+            catch (e) { if (alive) setErr(errText(e)); }
+            if (alive) setLoading(false);
+        }, 250);
+        return () => { alive = false; clearTimeout(t); };
+    }, [active, F, T, epoch, cfgState, engine]);
+    const shiftWeeks = (n) => setFrom(cpAddDaysYmd(getLocalYMD(new Date(F)), 7 * n));
+    const wins = data ? data.windows : [];
+    const hang = wins.filter(g => CP_HANG[g.status] !== undefined && (g.stopKind === 'last' ? g.start : g.end) >= nowMs - HOUR)
+        .sort((a, b) => (CP_HANG[a.status] === 3) - (CP_HANG[b.status] === 3) || a.start - b.start);
+    const red = hang.filter(g => g.status !== 'tight'), amber = hang.filter(g => g.status === 'tight');
+    const cleans = wins.filter(g => g.kind === 'allergen' || g.kind === 'full' || (g.kind === 'changeover' && g.need.basis !== 'untimed'));
+    const count = (k) => wins.filter(g => g.kind === k).length;
+    const groups = data ? data.groups : [];
+    const days = groups.length ? groups[0].days : [];
+    const noneDays = groups.reduce((n, G) => n + G.days.filter(d => d.kind === 'none').length, 0);
+    const busy = cp.busy, last = cp.last;
+    const tableText = { found: 'Clean Plan table found', missing: 'Clean Plan table not created yet', noaccess: 'No permission to read the Clean Plan table', error: 'The Clean Plan table could not be read', unknown: 'Looking for the Clean Plan table...', preview: 'Preview mode: nothing is written' }[cp.table] || cp.table;
+    const tz = browserTz(), plantTz = (cp.shared && cp.shared.tz) || CP_PLANT_TZ, tzOk = tz === plantTz;
+    const canPublish = apiReady && cp.table === 'found' && tzOk && cfgState !== 'differ' && !busy;
+    const pill = (ok, warn) => `px-2 py-1 rounded-lg border text-[11px] font-bold ${ok ? 'bg-[#DCFCE7] text-[#166534] border-[#16A34A]' : warn ? 'bg-[#FFF6E0] text-slate-800 border-[#FFB81C]' : 'bg-[#FDE8EC] text-[#B00020] border-[#E4002B]'}`;
+    const line = (g) => `${g.prev.area} L${g.prev.line}`;
+    const card = 'bg-white border border-slate-200 rounded-xl p-4 shadow-sm';
+    const h2 = 'text-sm font-black text-[#00468B] uppercase tracking-widest';
+    return (
+        <div className="space-y-4" data-testid="cleanplan">
+            <div className={card}>
+                <div className="flex flex-wrap items-center gap-3">
+                    <h2 className="text-base font-black text-[#00468B] uppercase tracking-widest">Clean Plan</h2>
+                    <span className={pill(cp.table === 'found', cp.table === 'unknown' || cp.table === 'preview')} data-testid="cp-table">{tableText}</span>
+                    <span className={pill(cfgState === 'same', cfgState === 'none')} data-testid="cp-cfg">{cfgState === 'same' ? 'Settings shared' : cfgState === 'differ' ? 'This browser\'s settings differ from the shared ones' : 'Settings not shared yet'}</span>
+                    {!tzOk && <span className={pill(false)}>This computer is on {tz || 'an unknown time zone'}; the plant is on {plantTz}</span>}
+                </div>
+                <p className="text-xs text-slate-600 mt-2">What every line needs cleaned, worked out from the runs: allergen cleans, each line's daily (full) clean, product changes, whether the sanitation crew has the time, and which days the MSS needs a Daily clean. Once published, the MSS calendar, the Ganttly, Shift Start and the Manager hub read it from Dataverse instead of each guessing. It follows the Cleaning Times and Shifts tabs.</p>
+                {cp.table === 'missing' && <p className="text-xs text-[#B00020] font-semibold mt-1">Create the Clean Plan table to share it: <button type="button" className="underline" onClick={() => onOpenCheck('columns')}>see what to create</button>. The plan below works without it.</p>}
+                {(cp.table === 'noaccess' || cp.table === 'error') && <p className="text-xs text-[#B00020] font-semibold mt-1 break-words">{cp.tableWhy}</p>}
+                {cp.reqMissing && cp.reqMissing.length > 0 && <p className="text-xs text-[#B00020] font-semibold mt-1">The Clean Plan table needs {cp.reqMissing.join(', ')}: <button type="button" className="underline" onClick={() => onOpenCheck('columns')}>see what to create</button>, then Check again.</p>}
+                <div className="flex flex-wrap items-center gap-2 mt-3">
+                    {cfgState !== 'same' && cp.table === 'found' && <Btn kind="yellow" onClick={() => engine.share()} disabled={busy} title="Saves this browser's Cleaning Times and Shifts settings in the Clean Plan table: every page that publishes then uses the same ones">Share these settings</Btn>}
+                    {cfgState === 'differ' && (confirmUse
+                        ? <><span className="text-xs font-bold">Replace this browser's cleaning and shift settings with the shared ones?</span><Btn onClick={() => { engine.useShared(); setConfirmUse(false); }}>Yes, use the shared ones</Btn><Btn kind="ghost" onClick={() => setConfirmUse(false)}>No</Btn></>
+                        : <Btn kind="ghost" onClick={() => setConfirmUse(true)}>Use the shared settings</Btn>)}
+                    <Chip on={auto} onClick={() => setAuto(!auto)} title="A few seconds after a run is saved, moved, imported or deleted on this page (and when this tab opens) last week to 8 weeks ahead are published again; only rows that changed are written">Publish by itself</Chip>
+                    <Btn onClick={() => engine.publish(F, T)} disabled={!canPublish} title={!canPublish ? 'See the notes above' : 'Write these weeks to the Clean Plan table'}>{cfgState === 'none' && cp.table === 'found' ? 'Share settings and publish these weeks' : 'Publish these weeks'}</Btn>
+                    {busy && <Btn kind="danger" onClick={() => engine.stop()}>Stop</Btn>}
+                    <Btn kind="ghost" onClick={() => engine.recheck()} disabled={busy}>Check again</Btn>
+                </div>
+                {busy && cp.progress && (
+                    <div className="mt-3" data-testid="cp-progress">
+                        <div className="text-xs font-bold text-[#00468B]">{cp.progress.what}{cp.progress.total ? ` (${cp.progress.done} of ${cp.progress.total})` : ''}</div>
+                        <div className="h-2 rounded bg-slate-100 mt-1 overflow-hidden"><div className="h-2 bg-[#0072CE]" style={{ width: `${cp.progress.total ? Math.round(100 * cp.progress.done / cp.progress.total) : 10}%` }} /></div>
+                    </div>
+                )}
+                {last && !busy && (
+                    <div className={`mt-3 text-xs rounded-lg border px-3 py-2 ${last.errors.length || last.failed ? 'bg-[#FDE8EC] border-[#E4002B]/40 text-[#B00020]' : last.skipped ? 'bg-[#FFF6E0] border-[#FFB81C] text-slate-800' : 'bg-[#F0FDF4] border-[#86EFAC] text-[#166534]'}`} data-testid="cp-last">
+                        {last.skipped ? <>Not published ({last.why}): {last.skipped}</>
+                            : <>Published {fmtDT(last.at)} ({last.why}): {last.weeks} week{last.weeks === 1 ? '' : 's'} from {fmtDay(last.from)}, {last.created} new, {last.updated} changed, {last.removed} removed, {last.same} unchanged{last.failed ? `, ${last.failed} failed` : ''}{last.stopped ? ', stopped' : ''}.{last.dropped && last.dropped.length ? ` Not stored (column missing): ${last.dropped.join(', ')}.` : ''}</>}
+                        {last.errors.length > 0 && <div className="font-semibold break-words">{last.errors[0]}</div>}
+                    </div>
+                )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 bg-white border border-slate-200 rounded-xl px-3 py-2 shadow-sm">
+                <Btn kind="ghost" onClick={() => shiftWeeks(-weeks)}>{'<'}</Btn>
+                <Btn kind="ghost" onClick={() => setFrom(cpMondayYmd(Date.now()))}>This week</Btn>
+                <Btn kind="ghost" onClick={() => shiftWeeks(weeks)}>{'>'}</Btn>
+                <label className="text-[10px] font-black uppercase tracking-wider text-slate-500 flex items-center gap-1">Week of
+                    <input type="date" className="border border-slate-300 rounded-lg px-2 py-1 text-xs normal-case font-bold" value={getLocalYMD(new Date(F))} onChange={(e) => { const d = parseYMD(e.target.value); if (d) setFrom(cpMondayYmd(d.getTime())); }} /></label>
+                <label className="text-[10px] font-black uppercase tracking-wider text-slate-500 flex items-center gap-1">Weeks
+                    <select className="border border-slate-300 rounded-lg px-1.5 py-1 text-xs normal-case font-bold" value={weeks} onChange={(e) => setWeeks(Number(e.target.value))}>{[1, 2, 3, 4, 6, 8].map(n => <option key={n} value={n}>{n}</option>)}</select></label>
+                <span className="text-sm font-black text-[#00468B] whitespace-nowrap">{fmtDay(F)} to {fmtDay(T - 1)}</span>
+                {loading && <span className="text-xs text-slate-500">Working it out...</span>}
+                {data && !loading && <span className="text-xs text-slate-500" data-testid="cp-summary">{count('allergen')} allergen clean{count('allergen') === 1 ? '' : 's'} · {count('full')} full clean{count('full') === 1 ? '' : 's'} · {count('changeover')} product change{count('changeover') === 1 ? '' : 's'} · <b className={red.length ? 'text-[#B00020]' : 'text-[#166534]'}>{red.length} hangup{red.length === 1 ? '' : 's'}</b> · {noneDays} line-day{noneDays === 1 ? '' : 's'} with no Daily clean needed</span>}
+            </div>
+            {err && <div className="px-3 py-2 rounded-lg bg-[#FDE8EC] border border-[#E4002B]/40 text-xs font-bold text-[#B00020]">{err}</div>}
+            {data && data.long > 0 && <div className="px-3 py-2 rounded-lg bg-[#FFF6E0] border border-[#FFB81C] text-xs text-slate-800">{data.long} run{data.long === 1 ? ' is' : 's are'} longer than {CP_MAX_RUN_DAYS} days (a mistyped end date?) and left out, as the MSS does. The Run check on Data Check finds them.</div>}
+
+            <div className={card} data-testid="cp-hangups">
+                <h3 className={h2}>Hangups for directors</h3>
+                <p className="text-[11px] text-slate-500 mb-2">Cleans that do not fit: not enough crew time before the next run, runs that overlap, or no sanitation shift in the stop. Click one to see it on the Schedule.</p>
+                {data && !red.length && <p className="text-sm text-[#166534] font-semibold">No hangups in these weeks: every clean fits the time and the crew on shift.</p>}
+                <div className="space-y-1.5">
+                    {red.concat(amber).map(g => { const st = GAP_STYLE[g.status]; return (
+                        <button key={`${g.prevId}|${g.nextId}|${g.stopKind}`} type="button" onClick={() => onJump(g.start)} className="w-full text-left rounded-lg border px-2.5 py-1.5 text-[11px]" style={{ background: st.bg, borderColor: st.border, color: st.text }} data-hang={g.status}>
+                            <div className="font-black">{line(g)} · {fmtDT(g.start)}{g.stopKind !== 'last' && g.end > g.start ? ` to ${fmtDT(g.end)}` : g.stopKind === 'overlap' ? ' (the next run starts before this one ends)' : g.stopKind !== 'last' ? ' (no time between the runs)' : ''} · {CLEAN_KINDS[g.kind].label} · {st.label}{g.shortMins > 0 ? ` by ${cpHrs(g.shortMins)}` : ''}</div>
+                            <div className="opacity-90">{g.reason}</div>
+                        </button>); })}
+                </div>
+            </div>
+
+            <div className={card} data-testid="cp-cleans">
+                <h3 className={h2}>Cleans and downtime</h3>
+                <p className="text-[11px] text-slate-500 mb-2">Every allergen clean and daily (full) clean, and the timed product changes: when the line stops, when it starts again, how long the clean takes with the crew on shift.</p>
+                {data && !cleans.length && <p className="text-sm text-slate-500">No cleans in these weeks.</p>}
+                {cleans.length > 0 && <div className="overflow-x-auto">
+                    <table className="w-full text-[11px]">
+                        <thead><tr className="text-left text-[10px] uppercase tracking-wider text-slate-400"><th className="pr-3 py-1">Line</th><th className="pr-3">Stops</th><th className="pr-3">Starts again</th><th className="pr-3">Clean</th><th className="pr-3">Takes</th><th className="pr-3">Crew</th><th className="pr-3">Status</th></tr></thead>
+                        <tbody>{(moreCleans ? cleans : cleans.slice(0, 150)).map(g => { const st = GAP_STYLE[g.status] || GAP_STYLE.ok; return (
+                            <tr key={`${g.prevId}|${g.nextId}|${g.stopKind}`} className="border-t border-slate-100 align-top hover:bg-slate-50 cursor-pointer" onClick={() => onJump(g.start)} title={g.reason}>
+                                <td className="pr-3 py-1 font-bold whitespace-nowrap">{line(g)}</td>
+                                <td className="pr-3 whitespace-nowrap">{fmtDT(g.start)}</td>
+                                <td className="pr-3 whitespace-nowrap">{g.next ? fmtDT(g.end) : g.open === 'unplanned' ? 'not planned yet' : 'no run after it'}</td>
+                                <td className="pr-3 whitespace-nowrap">{CLEAN_KINDS[g.kind].label}{g.kind === 'allergen' && g.prev.allergenType ? ` (${g.prev.allergenType})` : ''}</td>
+                                <td className="pr-3 whitespace-nowrap">{g.mins > 0 ? cpHrs(g.mins) : ''}</td>
+                                <td className="pr-3 whitespace-nowrap">{g.kind === 'changeover' ? 'line crew' : g.assumed ? `${g.heads} assumed` : g.heads ? `${Math.round(g.heads * 10) / 10} on shift` : ''}</td>
+                                <td className="pr-3 whitespace-nowrap"><span className="px-1.5 py-0.5 rounded border text-[10px] font-black" style={{ background: st.bg, borderColor: st.border, color: st.text }}>{g.status === 'ok' ? (g.cleanEnd ? `done ${fmtTime(g.cleanEnd)}` : 'ok') : STATUS_WORDS[g.status]}</span></td>
+                            </tr>); })}</tbody>
+                    </table>
+                    {cleans.length > 150 && !moreCleans && <button type="button" className="mt-1 text-xs font-bold text-[#0072CE] underline" onClick={() => setMoreCleans(true)}>Show all {cleans.length}</button>}
+                </div>}
+            </div>
+
+            <div className={card} data-testid="cp-days">
+                <h3 className={h2}>Days the MSS needs a Daily clean</h3>
+                <p className="text-[11px] text-slate-500 mb-2">Per MSS area (all its lines together), the same rule as the MSS calendar's line rules: a Daily clean on a day the area had an hour or more without production; one clean for a stretch of idle days in a row (a down weekend too); none on a day it ran with less than an hour free. The MSS reads these days instead of a fixed daily frequency.</p>
+                {data && !groups.length && <p className="text-sm text-slate-500">No runs in these weeks.</p>}
+                {groups.length > 0 && <div className="overflow-x-auto">
+                    <table className="text-[10px] border-separate" style={{ borderSpacing: 2 }}>
+                        <thead><tr><th className="text-left pr-2 text-slate-400 font-black uppercase tracking-wider sticky left-0 bg-white">Area</th>{days.map(d => <th key={d.date} className={`px-1 font-bold whitespace-nowrap ${d.dow === 1 ? 'border-l-2 border-slate-300' : ''} ${d.dow === 0 || d.dow === 6 ? 'text-slate-400' : 'text-slate-600'}`}>{DOW[d.dow]} {Number(d.date.slice(8))}</th>)}</tr></thead>
+                        <tbody>{groups.map(G => (
+                            <tr key={G.key}>
+                                <td className="pr-2 font-black text-slate-700 whitespace-nowrap sticky left-0 bg-white">{G.name}</td>
+                                {G.days.map(d => { const k = DAY_KINDS[d.kind]; return <td key={d.date} title={`${G.name} ${cpDayText(d.date)}: ${d.reason}`} className={`text-center rounded font-bold px-1 py-1 whitespace-nowrap ${d.dow === 1 ? 'border-l-2 border-slate-300' : ''}`} style={{ background: k.bg, color: k.fg, boxShadow: `inset 0 0 0 1px ${k.border}`, minWidth: 34 }} data-day={d.kind}>{k.short}</td>; })}
+                            </tr>))}</tbody>
+                    </table>
+                </div>}
+                <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2 text-[10px] text-slate-500">{['due', 'stretch', 'covered', 'none', 'unplanned'].map(k => <span key={k}><i className="inline-block w-3 h-3 rounded-sm align-middle mr-1" style={{ background: DAY_KINDS[k].bg, boxShadow: `inset 0 0 0 1px ${DAY_KINDS[k].border}` }} />{DAY_KINDS[k].label}</span>)}</div>
             </div>
         </div>
     );
@@ -4244,8 +4995,10 @@ function ColumnsPanel({ colStatus, probeColumns, probing, resetRefused, apiReady
     COLUMN_GUIDE.forEach(t => { if (t.key !== 'runs') return; rowsOf(t).forEach(x => { if (x.c.need !== 'optional' || x.st.s === 'found') return; (x.st.s === 'missing' ? toCreate : untested).push(x); }); });
     const missing = COLUMN_GUIDE.reduce((n, t) => n + (t.optionalTable ? 0 : rowsOf(t).filter(x => x.st.s === 'missing').length), 0);
     const tablesToCreate = COLUMN_GUIDE.filter(t => t.optionalTable && !rowsOf(t).some(x => x.st.s === 'found'));
-    const copyTable = async (t) => {
-        const txt = `In Dataverse create a table with the display name "Schedule Change" (its name will be ${t.table}) and these columns:\n` + t.cols.map(c => `- Display name "${c.label || c.name}", type ${c.type} (column name ${c.name}): ${c.why}`).join('\n');
+    const tablesWithGaps = COLUMN_GUIDE.filter(t => t.optionalTable && rowsOf(t).some(x => x.st.s === 'found') && rowsOf(t).some(x => x.st.s === 'missing'));
+    const copyTable = async (t, only) => {
+        const cols = only || t.cols;
+        const txt = (only ? `On the table ${t.table} (${t.displayName || t.title}) create these columns:\n` : `In Dataverse create a table with the display name "${t.displayName || t.title}" (its name will be ${t.table}) and these columns:\n`) + cols.map(c => `- Display name "${c.label || c.name}", type ${c.type} (column name ${c.name}): ${c.why}`).join('\n') + (only || !t.note ? '' : `\n${t.note}`);
         setCopied((await copyText(txt)) ? 'Copied' : 'Could not copy: select the list and copy it by hand'); setTimeout(() => setCopied(''), 4000);
     };
     const copyList = async () => {
@@ -4278,9 +5031,14 @@ function ColumnsPanel({ colStatus, probeColumns, probing, resetRefused, apiReady
                     <div className="flex flex-wrap items-center gap-3 mb-1"><h3 className="text-xs font-black uppercase tracking-wider text-slate-700">Optional table to create: {t.title} <code className="normal-case tracking-normal font-semibold">{t.table}</code></h3><Btn kind="ghost" onClick={() => copyTable(t)}>Copy this list</Btn>{copied && <span className="text-xs font-bold text-[#166534]">{copied}</span>}</div>
                     <p className="text-[11px] text-slate-600 mb-2">{t.note}</p>
                     <ul className="text-xs text-slate-800 space-y-1">{t.cols.map(c => <li key={c.name}><b>{c.label || c.name}</b> · {c.type} · <code className="px-1 bg-white rounded border border-slate-200">{c.name}</code> <span className="text-slate-500">{c.why}</span></li>)}</ul>
-                    <p className="text-[11px] text-slate-500 mt-2">In Dataverse: Tables, New table. Display name "Schedule Change" (so the table name is {t.table}); the Name column is already there. Add the other columns with the display names and types above, then press "Test the columns in Dataverse".</p>
+                    <p className="text-[11px] text-slate-500 mt-2">In Dataverse: Tables, New table. Display name "{t.displayName || t.title}" (so the table name is {t.table}); the Name column is already there. Add the other columns with the display names and types above, then press "Test the columns in Dataverse".</p>
                 </div>
             ))}
+            {tablesWithGaps.map(t => { const miss = rowsOf(t).filter(x => x.st.s === 'missing').map(x => x.c); return (
+                <div key={`gap-${t.key}`} className="bg-[#FFF6E0] border border-[#FFB81C] rounded-xl p-4" data-testid="table-columns-to-create">
+                    <div className="flex flex-wrap items-center gap-3 mb-1"><h3 className="text-xs font-black uppercase tracking-wider text-slate-700">Columns to create on {t.title} <code className="normal-case tracking-normal font-semibold">{t.table}</code> ({miss.length})</h3><Btn kind="ghost" onClick={() => copyTable(t, miss)}>Copy this list</Btn>{copied && <span className="text-xs font-bold text-[#166534]">{copied}</span>}</div>
+                    <ul className="text-xs text-slate-800 space-y-1">{miss.map(c => <li key={c.name}><b>{c.label || c.name}</b> · {c.type} · <code className="px-1 bg-white rounded border border-slate-200">{c.name}</code> <span className="text-slate-500">{c.need} · {c.why}</span></li>)}</ul>
+                </div>); })}
             {COLUMN_GUIDE.map(t => (
                 <div key={t.key} className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
                     <div className="px-4 py-2 bg-[#E6F1FB]"><h3 className="text-xs font-black uppercase tracking-wider text-[#00468B]">{t.title} <code className="normal-case tracking-normal font-semibold text-slate-600">{t.table}</code></h3><p className="text-[11px] text-slate-600">{t.note}</p></div>
@@ -4491,9 +5249,11 @@ export default function ProductionScheduleApp({ dataApi }) {
         const head = mss.tier === 'runs' ? 'Production lines (MSS)' : mss.tier === 'production' ? 'Production areas (MSS)' : 'MSS areas';
         return areaOptions.map(n => inMss[n] ? { value: n, label: n, group: head } : { value: n, label: n, group: mss.names.length ? 'Other lines already on the schedule' : '' });
     }, [areaOptions, mss]);
+    // daily / weekly / flagged: the cleaning frequency on the equipment row (the daily clean counts the Daily pieces; flagged = any frequency set)
     const assetList = useMemo(() => assets.map((a, i) => ({
         id: a.craa5_aa_assetsid || `a${i}`, name: a.craa5_equipmentidentifier || 'Equipment', area: renderSafe(a.craa5_areaname) || 'General',
         baseMins: parseFloat(a.craa5_hoursrequired) || 0, allergenMins: parseFloat(a.craa5_MINALRG || a.craa5_minalrg) || 0, heads: parseInt(a.craa5_heads || a.craa5_Heads, 10) || 1,
+        daily: truthy(rv(a, 'craa5_dailyclean')), weekly: truthy(rv(a, 'craa5_weeklyclean')), flagged: FREQ_COLS.some(c => truthy(rv(a, c))),
     })).filter(a => a.baseMins > 0), [assets]);
     const assetsByArea = useMemo(() => { const m = {}; assetList.forEach(a => { (m[a.area] = m[a.area] || []).push(a); }); return m; }, [assetList]);
     const rosterTable = useMemo(() => {
@@ -4595,6 +5355,7 @@ export default function ProductionScheduleApp({ dataApi }) {
     const mssIdx = useMemo(() => mssIndex(areas), [areas]);
     const mssIdxRef = useRef(mssIdx); mssIdxRef.current = mssIdx;
     const areaIdFor = (area) => { const it = mssIdxRef.current.byName[String(area === undefined || area === null ? '' : area).trim()]; return it ? it.id : ''; };
+    const cpTouchRef = useRef(null);   // the Clean Plan hears of every saved run change (see CLEAN PLAN below)
     const deliver = async (op, id, required, optional, meta) => {
         const w = writer();
         if (!w) throw new Error("No Dataverse write connection in this environment. Nothing was saved.");
@@ -4619,6 +5380,7 @@ export default function ProductionScheduleApp({ dataApi }) {
         if (!failure && apiReady) sent.forEach(c => { st.sent[c] = (st.sent[c] || 0) + 1; });
         const entry = logPayload({ op, table: TABLE_PROD, id: id || (typeof res === 'string' ? res : ''), what: (meta && meta.what) || '', fields: clipFields(body), sent, dropped: failure ? [] : wanted.filter(c => sent.indexOf(c) < 0), ok: !failure, error: failure ? errText(failure) : '', preview: !apiReady });
         if (failure) throw failure;
+        if (cpTouchRef.current) cpTouchRef.current();
         return { id: op === 'create' ? res : id, sent, dropped: entry.dropped };
     };
     const saveRun = async (op, id, run, extras, meta) => {
@@ -4658,6 +5420,7 @@ export default function ProductionScheduleApp({ dataApi }) {
         catch (e) { logPayload({ op: 'delete', table: TABLE_PROD, id, what: (meta && meta.what) || 'delete', fields: {}, sent: [], dropped: [], ok: false, error: errText(e), preview: !apiReady }); throw e; }
         forgetSide(id);
         logPayload({ op: 'delete', table: TABLE_PROD, id, what: (meta && meta.what) || 'delete', fields: {}, sent: [], dropped: [], ok: true, error: '', preview: !apiReady });
+        if (cpTouchRef.current) cpTouchRef.current();
         if (!(meta && meta.quiet)) { touched(id); setRuns(prev => prev.filter(r => r.id !== id)); }
     };
     const pushUndo = (label, items) => setUndoStack(s => s.concat([{ label, items }]).slice(-30));
@@ -4728,18 +5491,21 @@ export default function ProductionScheduleApp({ dataApi }) {
     }, [runs, view.from, rangeTo]);
     const rosterSig = JSON.stringify(rosterTable);
     const occ = useMemo(() => shiftOccurrences(settings.shifts, span[0] - DAY, span[1] + DAY, rosterCount), [settings.shifts, span[0], span[1], rosterSig]);
-    const gapCtx = useMemo(() => ({ occ, own, cleanCfg: (lk) => settings.clean[lk], assetsByArea, fallbackHeads: settings.cleanHeads }), [occ, own, settings.clean, assetsByArea, settings.cleanHeads]);
+    const gapCtx = useMemo(() => ({ occ, own, clean: settings.clean, assetsByArea, fallbackHeads: settings.cleanHeads }), [occ, own, settings.clean, assetsByArea, settings.cleanHeads]);
     const analysis = useMemo(() => {
-        const byLine = {};
-        runs.forEach(r => { (byLine[lineKeyOf(r.area, r.line)] = byLine[lineKeyOf(r.area, r.line)] || []).push(r); });
+        const byLine = {}, exact = {};
+        runs.forEach(r => { const c = canonLine(r.area, r.line), k = lineKeyOf(r.area, r.line); (byLine[c] = byLine[c] || []).push(r); (exact[k] = exact[k] || []).push(r); });
         const gaps = [], issueMap = {}, uncoveredMap = {};
-        Object.keys(byLine).forEach(k => {
-            const l = byLine[k].sort(byStart);
-            for (let i = 1; i < l.length; i++) {
-                const g = makeGap(l[i - 1], l[i], gapCtx);
+        // the stops of each line (however its area is spelled), judged by the cleaning rules
+        Object.keys(byLine).forEach(c => {
+            const l = byLine[c], latest = l.reduce((a, b) => b.start > a.start ? b : a, l[0]);
+            judgeStops(lineStops(l), lineCtxOf(gapCtx, latest.area, latest.line)).forEach(g => {
                 gaps.push(g);
-                if (g.status === 'overlap') { issueMap[l[i].id] = 'overlap'; issueMap[l[i - 1].id] = 'overlap'; }
-            }
+                if (g.status === 'overlap') { issueMap[g.nextId] = 'overlap'; issueMap[g.prevId] = 'overlap'; }
+            });
+        });
+        Object.keys(exact).forEach(k => {
+            const l = exact[k];
             const hasProd = own[`${k}|production`] || own['*|production'];
             if (hasProd) l.forEach(r => {
                 if (isMaint(r)) return;
@@ -4753,13 +5519,350 @@ export default function ProductionScheduleApp({ dataApi }) {
         const list = [];
         analysis.gaps.forEach(g => {
             if (g.end < view.from || g.start > rangeTo) return;
-            if (g.status === 'overlap') list.push({ key: `o${g.prevId}${g.nextId}`, kind: 'overlap', ms: g.next.start, runId: g.nextId, text: `${lineLabelOf(g.prev.area, g.prev.line)}: ${runTitle(g.prev)} and ${runTitle(g.next)} overlap by ${fmtHrs(-g.gapMs)}` });
-            else if (g.status === 'short') list.push({ key: `s${g.prevId}${g.nextId}`, kind: 'short', ms: g.start, runId: g.nextId, text: `${lineLabelOf(g.prev.area, g.prev.line)}: ${gapText(g)}. Needs ${fmtMins(Math.max(0, g.req.mins - g.usableMs / 60000))} more` });
-            else if (g.status === 'tight') list.push({ key: `t${g.prevId}${g.nextId}`, kind: 'tight', ms: g.start, runId: g.nextId, text: `${lineLabelOf(g.prev.area, g.prev.line)}: tight changeover. ${gapText(g)}` });
+            if (g.status === 'overlap') list.push({ key: `o${g.prevId}${g.nextId}`, kind: 'overlap', ms: g.next.start, runId: g.nextId, text: `${lineLabelOf(g.prev.area, g.prev.line)}: ${runTitle(g.prev)} and ${runTitle(g.next)} overlap by ${fmtHrs(g.overlapMs)}` });
+            else if (g.status === 'short' || g.status === 'nocrew' || g.status === 'tight') list.push({ key: `${g.status[0]}${g.prevId}${g.nextId}`, kind: g.status, ms: g.start, runId: g.nextId, text: `${lineLabelOf(g.prev.area, g.prev.line)}: ${gapText(g)}` });
         });
         runs.forEach(r => { if (analysis.uncoveredMap[r.id] && r.start < rangeTo && r.end > view.from) list.push({ key: `u${r.id}`, kind: 'shift', ms: r.start, runId: r.id, text: `${lineLabelOf(r.area, r.line)}: ${runTitle(r)} has no production shift for ${fmtHrs(analysis.uncoveredMap[r.id])}` }); });
         return list.sort((a, b) => a.ms - b.ms);
     }, [analysis, runs, view.from, rangeTo]);
+
+    // ------------------------------------------------------------------------
+    // CLEAN PLAN: the cleans worked out from the runs, written to the shared table craa5_cleanplan for the other apps (see the
+    // CLEAN PLAN blocks above). The settings it uses are the shared ones (the config row), so every page publishes the same answer.
+    // ------------------------------------------------------------------------
+    const cpRef = useRef({ table: 'unknown', tableWhy: '', shared: null, sharedAt: '', busy: false, progress: null, last: null, timer: null, lastStart: 0, pending: [],
+        hashCol: true, idsOk: true, missing: {}, reqMissing: [], stop: false, epoch: 0, visitFull: 0, previewCache: {} });
+    const [cpTick, setCpTick] = useState(0);
+    const cpEmitTimer = useRef(null);
+    const cpEmit = (soon) => { if (soon) { if (cpEmitTimer.current) return; cpEmitTimer.current = setTimeout(() => { cpEmitTimer.current = null; setCpTick(n => n + 1); }, 1000); } else setCpTick(n => n + 1); };
+    const empRef = useRef(employees); empRef.current = employees;
+    const assetsByAreaRef = useRef(assetsByArea); assetsByAreaRef.current = assetsByArea;
+    const cpReadyRef = useRef(false); cpReadyRef.current = assetsLoaded && !issues.assets && empLoaded && !issues.emp;
+    const cpLs = () => lsRead(LS_CP, {});
+    const cpLsSet = (patch) => lsWrite(LS_CP, { ...cpLs(), ...patch });
+    const cpAuto = settings.cpAuto !== false;
+    const cpCfgLocal = cpCfgOf(settings);
+    const cpCfgState = !cpRef.current.shared ? 'none' : cpCfgSig(cpRef.current.shared) === cpCfgSig(cpCfgLocal) ? 'same' : 'differ';
+    const cpRead = async (filter, select, orderby, top) => {
+        const errs = [];
+        const rows = await queryRecords(TABLE_CLEAN, dataApiRef.current, { filter, select, orderby, top: top || RANGE_LIMIT, quiet: true, errs });
+        return { rows, err: rows === null ? (errs[errs.length - 1] || 'The Clean Plan table could not be read.') : '' };
+    };
+    const cpClassify = (e) => TABLE_GONE_RE.test(e) ? 'missing' : CP_PRIV_RE.test(e) ? 'noaccess' : 'error';
+    const cpAdopt = (cfg) => updateSettings(s => ({ ...s, clean: cfg.clean || {}, shifts: cfg.shifts || [], cleanHeads: numOr(cfg.cleanHeads, s.cleanHeads), rosterOverrides: cfg.rosterOverrides || {} }));
+    // Is the table there, and what settings are shared? A browser with no cleaning or shift settings of its own takes the shared ones.
+    const cpLoadConfig = async () => {
+        const C = cpRef.current;
+        if (!apiReady) { C.table = 'preview'; cpEmit(); return; }
+        const res = await cpRead("statecode eq 0 and craa5_rowtype eq 'config'", null, 'modifiedon desc', 5);
+        if (res.rows === null) { C.table = cpClassify(res.err); C.tableWhy = res.err; if (C.table === 'error' && badColumns(res.err, ['craa5_rowtype']).length) C.reqMissing = ['Row Type']; cpEmit(); return; }
+        C.table = 'found'; C.tableWhy = '';
+        noteKeys('cleanplan', res.rows);
+        const row = res.rows.filter(r => String(rv(r, CP_ID) || '').toLowerCase() === cpGuid('config'))[0] || res.rows[0];
+        let cfg = null;
+        try { cfg = row ? JSON.parse(rv(row, 'craa5_details') || 'null') : null; } catch (e) { cfg = null; }
+        C.shared = cfg && typeof cfg === 'object' && !Array.isArray(cfg) ? cfg : null;
+        C.sharedAt = row ? String(row.modifiedon || '') : '';
+        if (C.shared && cpCfgSig(C.shared) !== cpCfgSig(cpCfgOf(settingsRef.current)) && cpCfgEmpty(cpCfgOf(settingsRef.current))) cpAdopt(C.shared);
+        cpEmit();
+    };
+    useEffect(() => { cpLoadConfig(); }, [apiReady, reloadTick]);
+    const cpSleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const cpMark = (col, st) => { colStateRef.current.probed[`cleanplan|${col}`] = st; };
+    // One row written: a fixed id from its plan key (an existing row with that id is updated instead), a missing optional column left
+    // out and named, a busy Dataverse waited for. Returns { id, op } or throws.
+    const cpPut = async (w, key, fields, id) => {
+        const C = cpRef.current;
+        let body = {};
+        Object.keys(fields).forEach(c => { if (!C.missing[c]) body[c] = fields[c]; });
+        let op = id ? 'update' : 'create', tries = 0, revive = false;
+        const rid = id || cpGuid(key);
+        for (;;) {
+            try {
+                if (op === 'update') await w.update(TABLE_CLEAN, rid, revive ? { ...body, statecode: 0, statuscode: 1 } : body);
+                else { const b = C.idsOk ? { ...body, [CP_ID]: rid } : body; const got = await w.create(TABLE_CLEAN, b); Object.keys(body).forEach(c => cpMark(c, { s: 'found' })); return { id: got || rid, op }; }
+                Object.keys(body).forEach(c => cpMark(c, { s: 'found' }));
+                return { id: rid, op };
+            } catch (e) {
+                const msg = errText(e);
+                if (++tries > 8) throw e;
+                if (CP_BUSY_RE.test(msg)) { await cpSleep(30000); continue; }
+                if (op === 'update' && !revive && /does not exist|0x80040217/i.test(msg) && !badColumns(msg, Object.keys(body)).length) { op = 'create'; continue; }   // removed since it was read: make it again
+                if (op === 'create' && C.idsOk && CP_DUP_RE.test(msg)) { op = 'update'; revive = true; continue; }
+                if (revive && badColumns(msg, ['statecode', 'statuscode']).length) { revive = false; continue; }
+                if (op === 'create' && C.idsOk && badColumns(msg, [CP_ID]).length) { C.idsOk = false; continue; }
+                const bad = badColumns(msg, Object.keys(body));
+                const opt = bad.filter(c => CP_OPTIONAL.indexOf(c) >= 0), req = bad.filter(c => CP_OPTIONAL.indexOf(c) < 0);
+                if (req.length && msg.toLowerCase().indexOf(req[0].toLowerCase()) >= 0) {
+                    req.forEach(c => cpMark(c, { s: 'missing', why: msg }));
+                    C.reqMissing = req.map(c => (CP_COLS.filter(x => x.name === c)[0] || { label: c }).label);
+                    const err = new Error(`The Clean Plan table has no ${C.reqMissing.join(', ')} column: create it (Data Check > Columns lists it), then Check again.`); err.required = true; throw err;
+                }
+                if (opt.length) { opt.forEach(c => { C.missing[c] = msg; cpMark(c, { s: 'missing', why: msg }); delete body[c]; }); continue; }
+                throw e;
+            }
+        }
+    };
+    const cpRemove = async (w, id) => {
+        for (let tries = 0; ; tries++) {
+            try { await w.remove(TABLE_CLEAN, id); return 'removed'; }
+            catch (e) {
+                const msg = errText(e);
+                if (CP_BUSY_RE.test(msg) && tries < 5) { await cpSleep(30000); continue; }
+                if (/does not exist|not found|0x80040217/i.test(msg)) return 'removed';
+                if (CP_PRIV_RE.test(msg)) { await w.update(TABLE_CLEAN, id, { statecode: 1, statuscode: 2 }); return 'deactivated'; }   // no Delete permission: switched off, which readers skip
+                throw e;
+            }
+        }
+    };
+    // The runs of [F, T) and around them, read until no idle stretch or open stop reaches the edge (at most CP_PAD_WEEKS more), then the plan.
+    const cpCompute = async (F, T, cfg, onWhat, must) => {   // must: MSS area keys that have day rows in these weeks (read until their runs are found)
+        const own = {};
+        (cfg.shifts || []).forEach(s => { own[`${s.lineKey}|${s.group}`] = true; });
+        const rt = {};
+        (empRef.current || []).forEach(e => { const g = rosterGroup(e, cfg.rosterOverrides || {}); if (!e.crew || (g !== 'production' && g !== 'sanitation')) return; const k = `${e.crew}|${g}`; rt[k] = (rt[k] || 0) + 1; });
+        const rc = (crew, group) => rt[`${crew}|${group}`] || 0;
+        const byId = {};
+        let lo = 0, hi = 0, back = CP_READ_BEFORE_DAYS, ahead = CP_READ_AFTER_DAYS, built = null;
+        const sel = CP_RUN_COLS.concat(colStatus('runs', { name: F_AREA_ID }).s === 'found' ? [F_AREA_ID] : []);
+        const read = async (a, b) => {
+            if (!apiReady) { runsRef.current.forEach(r => { if (r.start < b && r.end > a) byId[r.id] = r; }); return true; }
+            if (onWhat) onWhat(`Reading the runs ${fmtDay(a)} to ${fmtDay(b - 1)}`);
+            let rows = await readRunRange(dataApiRef.current, a, b, 'overlap', 0, sel);
+            if (rows === null) rows = await readRunRange(dataApiRef.current, a, b, 'overlap', 0);   // a column the select names may be missing: read every column
+            if (rows === null) return false;
+            rows.forEach(r => { const x = normRun(r, sideRef.current); if (x.id) byId[x.id] = x; });
+            return true;
+        };
+        for (let step = 0; step < 14; step++) {
+            const rf = addDaysLocal(new Date(F), -back).getTime(), rtTo = addDaysLocal(new Date(T), ahead).getTime();
+            if (!lo) { if (!(await read(rf, rtTo))) return null; lo = rf; hi = rtTo; }
+            else {
+                if (rf < lo) { if (!(await read(rf, lo))) return null; lo = rf; }
+                if (rtTo > hi) { if (!(await read(hi, rtTo))) return null; hi = rtTo; }
+            }
+            const runs = Object.keys(byId).map(k => byId[k]);
+            const occ = shiftOccurrences(cfg.shifts || [], lo - DAY, hi + CR_LAST_LOOK_MS + DAY, rc);
+            built = cpBuild(runs, { from: F, to: T, readFrom: lo, readTo: hi, ctx: { clean: cfg.clean || {}, own, occ, assetsByArea: assetsByAreaRef.current, fallbackHeads: cfg.cleanHeads }, areaIdOf: areaIdFor });
+            let more = false;
+            // an area published before but with no run in the read yet: its runs are further out (a long idle stretch), so read further
+            // both ways rather than removing its days (a narrower read would otherwise drop rows a wider one wrote)
+            const lacking = (must || []).some(k => !built.groups.some(g => g.key === k));
+            if ((built.needBack || lacking) && back < CP_PAD_WEEKS * 7) { back += CP_EXTEND_DAYS; more = true; }
+            if ((built.needAhead || lacking) && ahead < CP_PAD_WEEKS * 7 + 7) { ahead += CP_EXTEND_DAYS; more = true; }
+            if (!more) break;
+        }
+        built.readFrom = lo; built.readTo = hi; built.runCount = Object.keys(byId).length;
+        return built;
+    };
+    const cpCan = (manual) => {
+        const C = cpRef.current;
+        if (!apiReady) return 'preview mode, nothing is written';
+        if (C.table !== 'found') return C.table === 'missing' ? 'the Clean Plan table is not created yet (Data Check > Columns)' : C.table === 'unknown' ? 'still looking for the Clean Plan table' : `the Clean Plan table could not be read (${C.tableWhy})`;
+        const tz = browserTz(), want = (C.shared && C.shared.tz) || CP_PLANT_TZ;
+        if (tz !== want) return `this computer is set to ${tz || 'an unknown time zone'} and the plant runs on ${want}, so its days would be wrong`;
+        if (!cpReadyRef.current) return 'the equipment and the roster are not read yet (or could not be read)';
+        if (C.reqMissing.length) return `the Clean Plan table needs ${C.reqMissing.join(', ')}`;
+        if (!C.shared && !manual) return 'the cleaning settings are not shared yet (Share these settings)';
+        if (C.shared && cpCfgSig(C.shared) !== cpCfgSig(cpCfgOf(settingsRef.current))) return 'this browser\'s cleaning settings differ from the shared ones (use the shared ones or share yours)';
+        return '';
+    };
+    // Shares this browser's cleaning and shift settings: the config row every publishing page reads.
+    const cpShare = async (quiet) => {
+        const C = cpRef.current, w = writer();
+        if (!w || C.table !== 'found') { if (!quiet) notify('The Clean Plan table is not there to share the settings in.', 'warn'); return false; }
+        const now = Date.now(), cfg = { v: 1, tz: (C.shared && C.shared.tz) || CP_PLANT_TZ, at: isoZ(now), ...cpCfgOf(settingsRef.current) };
+        const f = { craa5_name: 'Shared cleaning settings', craa5_plankey: 'config', craa5_rowtype: 'config', craa5_linekey: '*', craa5_start: CP_CONFIG_START, craa5_end: CP_CONFIG_START, craa5_day: '',
+            craa5_cleankind: 'config', craa5_minutes: 0, craa5_status: 'shared', craa5_details: JSON.stringify(cfg), craa5_reason: `Cleaning Times and Shifts settings shared ${cpWhen(now)}.` };
+        try {
+            const res = await cpRead("statecode eq 0 and craa5_rowtype eq 'config'", [CP_ID], null, 5);
+            const ids = (res.rows || []).map(r => String(rv(r, CP_ID) || '').toLowerCase());
+            const mine = ids.indexOf(cpGuid('config')) >= 0 ? cpGuid('config') : ids[0];
+            await cpPut(w, 'config', f, mine || null);
+            for (let i = 0; i < ids.length; i++) if (ids[i] && ids[i] !== (mine || cpGuid('config'))) { try { await cpRemove(w, ids[i]); } catch (e) { /* a second config row only wastes space: readers take the fixed id */ } }
+            logPayload({ op: mine ? 'update' : 'create', table: TABLE_CLEAN, id: mine || cpGuid('config'), what: 'Clean Plan: shared settings', fields: clipFields(f), sent: [], dropped: [], ok: true, error: '', preview: false });
+            C.shared = cfg; C.sharedAt = isoZ(now);
+            if (!quiet) notify('Settings shared: every page that publishes the Clean Plan now uses them.', 'success');
+            cpEmit();
+            if (!quiet && settingsRef.current.cpAuto !== false) cpSchedule(1500, 'settings shared');
+            return true;
+        } catch (e) {
+            logPayload({ op: 'update', table: TABLE_CLEAN, id: '', what: 'Clean Plan: shared settings', fields: clipFields(f), sent: [], dropped: [], ok: false, error: errText(e), preview: false });
+            notify(`Could not share the settings: ${errText(e)}`, 'error'); cpEmit(); return false;
+        }
+    };
+    // Publishes the weeks [F, T): reads the runs, works the plan out, and writes only what changed, one week at a time
+    // (stamp 'writing', the rows, the stale rows removed, stamp 'done'). One publish at a time; a later request waits its turn.
+    const cpPublish = async (F, T, why, manual) => {
+        const C = cpRef.current;
+        if (C.busy) {   // waits its turn: merged with a waiting request of the same kind whose weeks touch it, else queued on its own
+            const q = C.pending.filter(x => !!x.manual === !!manual && x.F <= T && F <= x.T)[0];
+            if (q) { q.F = Math.min(q.F, F); q.T = Math.max(q.T, T); q.why = why; } else if (C.pending.length < 6) C.pending.push({ F, T, why, manual: !!manual });
+            return;
+        }
+        const no = cpCan(manual);
+        if (no) { C.last = { at: Date.now(), why, skipped: no, errors: [], from: F, to: T }; if (manual) notify(`Not published: ${no}.`, 'warn'); cpEmit(); return; }
+        if (manual && !C.shared && !(await cpShare(true))) return;
+        const w = writer();
+        C.busy = true; C.stop = false; C.lastStart = Date.now(); C.progress = { what: 'Reading the runs', done: 0, total: 0 }; cpEmit();
+        const sum = { at: Date.now(), why, from: F, to: T, weeks: 0, created: 0, updated: 0, removed: 0, same: 0, failed: 0, errors: [], samples: [], dropped: [], stopped: false };
+        try {
+            const cfg = C.shared;
+            const sig = cpCfgSig(cfg);
+            C.progress = { what: 'Reading what is already published', done: 0, total: 0 }; cpEmit(true);
+            // what the table holds for these weeks (the rows this publish owns: craa5_start in [F, T))
+            const range = `statecode eq 0 and craa5_start ge ${isoZ(F)} and craa5_start lt ${isoZ(T)}`;
+            const avail = CP_COLS.filter(c => !C.missing[c.name] && c.name !== 'craa5_publishbatch' && c.name !== 'craa5_contenthash').map(c => c.name);
+            const hashOf = (f) => cpHash(avail.map(c => { const v = f[c]; return v === undefined || v === null ? '' : String(v); }).join('\u0001'));
+            let have = null;
+            const readHave = async (sel) => {
+                const all = [];
+                const part = async (a, b, d) => {
+                    const res = await cpRead(`statecode eq 0 and craa5_start ge ${isoZ(a)} and craa5_start lt ${isoZ(b)}`, sel, 'craa5_start asc', RANGE_LIMIT);
+                    if (res.rows === null) throw new Error(res.err);
+                    if (res.rows.length >= RANGE_LIMIT && b - a > DAY && d < 12) { const mid = midnightOf(a + (b - a) / 2).getTime(); if (mid > a && mid < b) { await part(a, mid, d + 1); await part(mid, b, d + 1); return; } }
+                    res.rows.forEach(r => all.push(r));
+                };
+                await part(F, T, 0);
+                return all;
+            };
+            if (C.hashCol && !C.missing.craa5_contenthash) {
+                try { have = await readHave([CP_ID, 'craa5_plankey', 'craa5_rowtype', 'craa5_linekey', 'craa5_start', 'craa5_contenthash', 'createdon']); }
+                catch (e) { if (badColumns(errText(e), ['craa5_contenthash']).length) { C.hashCol = false; C.missing.craa5_contenthash = errText(e); cpMark('craa5_contenthash', { s: 'missing', why: errText(e) }); } else throw e; }
+            }
+            if (have === null) have = await readHave(null);   // no Content Hash column: every column is read and compared
+            noteKeys('cleanplan', have);
+            const must = [];
+            have.forEach(r => { const k = String(rv(r, 'craa5_linekey') || ''); if (String(rv(r, 'craa5_rowtype') || '') === 'day' && k && must.indexOf(k) < 0) must.push(k); });
+            const built = await cpCompute(F, T, cfg, (what) => { C.progress = { what, done: 0, total: 0 }; cpEmit(true); }, must);
+            if (!built) throw new Error('The runs could not be read, so nothing was changed. It is tried again on the next change.');
+            // the week stamps with their details (which rules and settings wrote the week)
+            const stamps = {};
+            if (have.some(r => String(rv(r, 'craa5_rowtype') || '') === 'week')) {
+                const res = await cpRead(`${range} and craa5_rowtype eq 'week'`, [CP_ID, 'craa5_plankey', 'craa5_status', 'craa5_details'], null, 100);
+                (res.rows || []).forEach(r => { stamps[String(rv(r, CP_ID) || '').toLowerCase()] = r; });
+            }
+            const byKey = {};
+            have.forEach(r => { const k = String(rv(r, 'craa5_plankey') || ''); (byKey[k] = byKey[k] || []).push(r); });
+            const idOfRow = (r) => String(rv(r, CP_ID) || '').toLowerCase();
+            const keep = (k) => { const l = byKey[k] || []; const fixed = l.filter(r => idOfRow(r) === cpGuid(k))[0]; return fixed || l.slice().sort((a, b) => String(a.createdon || '').localeCompare(String(b.createdon || '')) || (idOfRow(a) < idOfRow(b) ? -1 : 1))[0] || null; };
+            const storedHash = (r) => C.hashCol && !C.missing.craa5_contenthash ? String(rv(r, 'craa5_contenthash') || '') : hashOf(CP_COLS.reduce((o, c) => { o[c.name] = rv(r, c.name); return o; }, {}));
+            const batch = clipText(`${cpWhen(sum.at)} · ${why} · weeks of ${cpDayText(getLocalYMD(new Date(F)))} to ${cpDayText(cpAddDaysYmd(getLocalYMD(new Date(T)), -7))}`, 200);
+            const plan = {};   // week -> { put: [{ key, f, id }], del: [ids], same, want, stamp }
+            built.weeks.forEach(m => { plan[m] = { put: [], del: [], same: 0, want: 0, stamp: null }; });
+            const wanted = {};
+            built.rows.forEach(r => {
+                const p = plan[r.week]; if (!p) return;
+                wanted[r.key] = true; p.want++;
+                const h = hashOf(r.f), cur = keep(r.key);
+                if (cur && storedHash(cur) === h) { p.same++; return; }
+                const was = cur ? cpMondayYmd(Date.parse(rv(cur, 'craa5_start') || '') || F) : r.week;
+                (was < r.week && plan[was] ? plan[was] : p).put.push({ key: r.key, f: { ...r.f, craa5_contenthash: h, craa5_publishbatch: batch }, id: cur ? idOfRow(cur) : null });
+            });
+            Object.keys(byKey).forEach(k => {
+                const l = byKey[k], type = String(rv(l[0], 'craa5_rowtype') || '');
+                if (type === 'week') { const p = plan[k.slice(2)]; if (p) p.stamp = keep(k); l.forEach(r => { if (p && r !== p.stamp) p.del.push(idOfRow(r)); }); return; }
+                if (type === 'config') return;
+                const k0 = keep(k);
+                l.forEach(r => {
+                    if (wanted[k] && r === k0) return;
+                    const st = Date.parse(rv(r, 'craa5_start') || '') || F, p = plan[cpMondayYmd(st)];
+                    if (p) p.del.push(idOfRow(r));
+                });
+            });
+            const weeksList = built.weeks.filter(m => plan[m]);
+            const total = weeksList.reduce((n, m) => n + plan[m].put.length + plan[m].del.length, 0);
+            let done = 0;
+            for (let wi = 0; wi < weeksList.length; wi++) {
+                if (C.stop) { sum.stopped = true; break; }
+                const m = weeksList[wi], p = plan[m];
+                sum.weeks++; sum.same += p.same;
+                let stampDet = null;
+                const sr = p.stamp ? stamps[idOfRow(p.stamp)] || p.stamp : null;
+                try { stampDet = sr ? JSON.parse(rv(sr, 'craa5_details') || 'null') : null; } catch (e) { stampDet = null; }
+                const stampOk = sr && String(rv(sr, 'craa5_status') || '') === 'done' && stampDet && stampDet.v === CP_RULES && stampDet.cfg === sig;
+                if (!p.put.length && !p.del.length && stampOk) continue;
+                const stampId = p.stamp ? idOfRow(p.stamp) : null;
+                C.progress = { what: `Week of ${fmtDay(parseYMD(m).getTime())}`, done, total }; cpEmit(true);
+                let failed = 0, sid = stampId;
+                try { sid = (await cpPut(w, `k|${m}`, cpWeekRow(m, 'writing', p.want, sig, Date.now()), stampId)).id; }
+                catch (e) { if (e.required) throw e; sum.errors.push(`Week of ${m}: ${errText(e)}`); failed++; }
+                await poolRun(p.put, CP_CONC, async (x) => {
+                    if (C.stop) return;
+                    try { const r = await cpPut(w, x.key, x.f, x.id); if (r.op === 'create') sum.created++; else sum.updated++; if (sum.samples.length < 3) sum.samples.push(clipFields(x.f)); }
+                    catch (e) { if (e.required) throw e; failed++; if (sum.errors.length < 5) sum.errors.push(`${x.key}: ${errText(e)}`); }
+                    done++; C.progress = { what: `Week of ${fmtDay(parseYMD(m).getTime())}`, done, total }; cpEmit(true);
+                });
+                await poolRun(p.del, CP_CONC, async (id) => {
+                    if (C.stop) return;
+                    try { await cpRemove(w, id); sum.removed++; }
+                    catch (e) { failed++; if (sum.errors.length < 5) sum.errors.push(`remove ${id}: ${errText(e)}`); }
+                    done++; C.progress = { what: `Week of ${fmtDay(parseYMD(m).getTime())}`, done, total }; cpEmit(true);
+                });
+                sum.failed += failed;
+                if (!failed && !C.stop) {
+                    try { await cpPut(w, `k|${m}`, cpWeekRow(m, 'done', p.want, sig, Date.now()), sid); }
+                    catch (e) { sum.failed++; sum.errors.push(`Week of ${m}: ${errText(e)}`); }
+                }
+            }
+            sum.dropped = Object.keys(C.missing).map(c => (CP_COLS.filter(x => x.name === c)[0] || { label: c }).label);
+            const horizon = F <= cpWeekStart(Date.now(), -CP_AUTO_BACK_WEEKS) && T >= cpWeekStart(Date.now(), CP_AUTO_AHEAD_WEEKS + 1);
+            if (!sum.failed && !sum.stopped && !sum.errors.length && horizon) { cpLsSet({ lastFull: Date.now(), dirty: false }); C.visitFull = Date.now(); }
+        } catch (e) { sum.errors.unshift(errText(e)); }
+        finally {
+            C.busy = false; C.progress = null; C.last = sum;
+            logPayload({ op: 'publish', table: TABLE_CLEAN, id: '', what: `Clean Plan (${why})`, fields: { weeks: sum.weeks, from: getLocalYMD(new Date(F)), created: sum.created, updated: sum.updated, removed: sum.removed, unchanged: sum.same, failed: sum.failed, stopped: sum.stopped, first: sum.samples[0] || null }, sent: [], dropped: Object.keys(C.missing), ok: !sum.failed && !sum.errors.length, error: sum.errors.join(' | '), preview: false });
+            cpEmit();
+            if (manual) notify(sum.errors.length || sum.failed ? `Clean Plan: ${sum.errors[0] || `${sum.failed} rows failed`}` : `Clean Plan published: ${sum.created} new, ${sum.updated} changed, ${sum.removed} removed, ${sum.same} unchanged.`, sum.errors.length || sum.failed ? 'error' : 'success');
+            const nx = C.pending.shift();
+            if (nx) setTimeout(() => cpPublish(nx.F, nx.T, nx.why, nx.manual), nx.manual ? 50 : Math.max(50, CP_MIN_GAP_MS - (Date.now() - C.lastStart)));
+        }
+    };
+    // 'Publish by itself': last week to 8 weeks ahead, a few seconds after the last change (at most once a minute)
+    const cpSchedule = (delay, why) => {
+        const C = cpRef.current;
+        if (!apiReady || settingsRef.current.cpAuto === false) return;
+        clearTimeout(C.timer);
+        const wait = Math.max(delay, C.lastStart + CP_MIN_GAP_MS - Date.now());
+        C.timer = setTimeout(() => { C.timer = null; cpPublish(cpWeekStart(Date.now(), -CP_AUTO_BACK_WEEKS), cpWeekStart(Date.now(), CP_AUTO_AHEAD_WEEKS + 1), why, false); }, wait);
+    };
+    const cpTouched = () => {
+        const C = cpRef.current;
+        C.epoch++; C.previewCache = {};
+        cpEmit(true);
+        if (!apiReady) return;
+        cpLsSet({ dirty: true });
+        if (C.table === 'found') cpSchedule(CP_DEBOUNCE_MS, 'runs changed');
+    };
+    cpTouchRef.current = cpTouched;
+    useEffect(() => () => { clearTimeout(cpRef.current.timer); clearTimeout(cpEmitTimer.current); }, []);
+    // once the table, the equipment and the roster are known: catch up on a change left unpublished, or refresh twice a day
+    const cpReadyNow = cpRef.current.table === 'found' && cpReadyRef.current;
+    useEffect(() => {
+        if (!cpReadyNow || !cpAuto) return;
+        const ls = cpLs();
+        if (ls.dirty || !(Date.now() - (ls.lastFull || 0) < CP_REFRESH_MS)) cpSchedule(ls.dirty ? 3000 : 30000, ls.dirty ? 'a change not published yet' : 'twice-a-day refresh');
+    }, [cpReadyNow, cpAuto]);
+    useEffect(() => {
+        if (tab !== 'cleanplan' || !cpReadyNow || !cpAuto) return;
+        if (Date.now() - cpRef.current.visitFull > 10 * 60000) cpSchedule(1500, 'Clean Plan tab opened');
+    }, [tab, cpReadyNow, cpAuto]);
+    const cpEngine = useMemo(() => ({
+        preview: (F, T) => {
+            const C = cpRef.current, s = settingsRef.current;
+            const cfg = C.shared && cpCfgSig(C.shared) === cpCfgSig(cpCfgOf(s)) ? C.shared : cpCfgOf(s);
+            const key = `${F}|${T}|${C.epoch}|${cpCfgSig(cfg)}|${runsRef.current.length}`;
+            if (!C.previewCache[key]) C.previewCache = { [key]: cpLatest.current.compute(F, T, cfg, null).catch(e => { C.previewCache = {}; throw e; }) };
+            return C.previewCache[key];
+        },
+        publish: (F, T) => cpLatest.current.publish(F, T, 'by hand', true),
+        stop: () => { cpRef.current.stop = true; cpEmit(); },
+        share: () => cpLatest.current.share(false),
+        useShared: () => { const C = cpRef.current; if (C.shared) { cpAdopt(C.shared); notify('This browser now uses the shared cleaning and shift settings.', 'success'); cpEmit(); } },
+        recheck: () => { const C = cpRef.current; C.missing = {}; C.reqMissing = []; C.hashCol = true; C.idsOk = true; C.previewCache = {}; C.epoch++; cpLatest.current.load(); },
+    }), []);
+    const cpLatest = useRef(null); cpLatest.current = { publish: cpPublish, share: cpShare, load: cpLoadConfig, compute: cpCompute };
+    const setCpAuto = (on) => { updateSettings(s => ({ ...s, cpAuto: on })); if (on) setTimeout(() => cpSchedule(1500, 'Publish by itself switched on'), 0); else clearTimeout(cpRef.current.timer); };
 
     // ------------------------------------------------------------------------
     // API handed to the import view
@@ -5205,16 +6308,17 @@ export default function ProductionScheduleApp({ dataApi }) {
         { id: 'changes', label: 'Change Requests', icon: MailIcon, badge: crPending },
         { id: 'shifts', label: 'Shifts & Roster', icon: UsersIcon },
         { id: 'cleaning', label: 'Cleaning Times', icon: SprayIcon },
+        { id: 'cleanplan', label: 'Clean Plan', icon: SprayIcon, badge: cpRef.current.busy ? '…' : '' },
         { id: 'check', label: 'Data Check', icon: CheckIcon },
     ];
     const selected = selectedId ? runs.find(r => r.id === selectedId) : null;
     const selSeq = selected ? lineRunsOf(selected.area, selected.line) : [];
     const selIdx = selected ? selSeq.findIndex(r => r.id === selected.id) : -1;
     const dialogCanSwap = dialog && dialog.draft.id ? (() => { const r = runs.find(x => x.id === dialog.draft.id); if (!r) return null; const sq = lineRunsOf(r.area, r.line), i = sq.findIndex(x => x.id === r.id); return { earlier: i > 0, later: i >= 0 && i < sq.length - 1 }; })() : null;
-    const issueColor = { overlap: BRAND.red, short: BRAND.red, tight: '#D97706', shift: '#F97316' };
+    const issueColor = { overlap: BRAND.red, short: BRAND.red, nocrew: BRAND.red, tight: '#D97706', shift: '#F97316' };
     const rangeLabel = view.days === 1 ? fmtDay(view.from) : `${fmtDay(view.from)} to ${fmtDay(rangeTo - 1)}`;
     const issueValues = Object.keys(issues).map(k => issues[k]);
-    const lastPay = (() => { const l = payloadsRef.current; for (let k = l.length - 1; k >= 0; k--) { if (l[k].table !== TABLE_INBOX) return l[k]; } return null; })();   // the header shows the last save of a RUN; a status write-back to the optional inbox is not one
+    const lastPay = (() => { const l = payloadsRef.current; for (let k = l.length - 1; k >= 0; k--) { if (l[k].table !== TABLE_INBOX && l[k].table !== TABLE_CLEAN) return l[k]; } return null; })();   // the header shows the last save of a RUN; a write to the optional inbox or Clean Plan is not one
 
     return (
         <div className="flex flex-col h-screen bg-[#F7F9FC] text-slate-800 overflow-hidden" style={{ fontFamily: BRAND_FONT }}>
@@ -5223,7 +6327,7 @@ export default function ProductionScheduleApp({ dataApi }) {
                 <div className="leading-tight"><div className="text-sm font-black uppercase tracking-widest text-[#00468B]">Production Schedule</div><div className="text-[10px] text-slate-400">plan · import · shifts · cleaning</div></div>
                 <div className="flex flex-wrap gap-1.5 ml-2">
                     {TABS.map(t => { const I = t.icon; return (
-                        <button key={t.id} type="button" onClick={() => setTab(t.id)} className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-xs font-extrabold border whitespace-nowrap transition-colors ${tab === t.id ? 'bg-[#0072CE] text-white border-[#0072CE]' : 'bg-white text-slate-600 border-slate-300 hover:bg-[#E6F1FB]'}`}><I className="w-4 h-4" />{t.label}{t.badge > 0 && <span className="px-1.5 rounded-full bg-[#FFB81C] text-slate-900 text-[10px] font-black" data-testid="cr-badge">{t.badge}</span>}</button>); })}
+                        <button key={t.id} type="button" onClick={() => setTab(t.id)} className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-xs font-extrabold border whitespace-nowrap transition-colors ${tab === t.id ? 'bg-[#0072CE] text-white border-[#0072CE]' : 'bg-white text-slate-600 border-slate-300 hover:bg-[#E6F1FB]'}`}><I className="w-4 h-4" />{t.label}{(t.badge > 0 || (typeof t.badge === 'string' && t.badge)) && <span className="px-1.5 rounded-full bg-[#FFB81C] text-slate-900 text-[10px] font-black" data-testid={t.id === 'changes' ? 'cr-badge' : `${t.id}-badge`}>{t.badge}</span>}</button>); })}
                 </div>
                 <div className="ml-auto flex items-center gap-2">
                     {lastPay && (() => {
@@ -5281,7 +6385,7 @@ export default function ProductionScheduleApp({ dataApi }) {
                             </div>
                             {showIssues && (
                                 <div className="bg-white border border-slate-200 rounded-xl p-3 shadow-sm max-h-56 overflow-y-auto">
-                                    {issueList.length === 0 && <p className="text-sm text-[#166534] font-semibold">Nothing to flag in this period: no overlaps, every changeover has time to clean{settings.shifts.length ? ', every run is covered by a production shift' : ''}.</p>}
+                                    {issueList.length === 0 && <p className="text-sm text-[#166534] font-semibold">Nothing to flag in this period: no overlaps, every clean has the time and the crew{settings.shifts.length ? ', every run is covered by a production shift' : ''}.</p>}
                                     {issueList.map(it => (
                                         <button key={it.key} type="button" onClick={() => { setSelectedId(it.runId); if (it.ms < view.from || it.ms > rangeTo) jumpTo(it.ms); }} className="w-full text-left flex items-start gap-2 py-1 text-xs border-b border-slate-100 hover:bg-slate-50">
                                             <span className="mt-1 w-2 h-2 rounded-full flex-shrink-0" style={{ background: issueColor[it.kind] }} /><span className="font-bold text-slate-500 whitespace-nowrap">{fmtDT(it.ms)}</span><span>{it.text}</span></button>))}
@@ -5305,7 +6409,7 @@ export default function ProductionScheduleApp({ dataApi }) {
                                 <span><i className="inline-block w-3 h-3 rounded-sm bg-[#0072CE] align-middle mr-1" />Run</span>
                                 <span><i className="inline-block w-3 h-3 rounded-sm bg-[#FFB81C] align-middle mr-1" />Allergen</span>
                                 <span><i className="inline-block w-3 h-3 rounded-sm bg-black align-middle mr-1" />Maintenance</span>
-                                {['ok', 'tight', 'short'].map(k => <span key={k}><i className="inline-block w-3 h-3 rounded-sm border align-middle mr-1" style={{ background: GAP_STYLE[k].bg, borderColor: GAP_STYLE[k].border }} />{k === 'ok' ? 'Enough time to clean' : k === 'tight' ? 'Tight' : 'Not enough time'}</span>)}
+                                {['ok', 'tight', 'short', 'none'].map(k => <span key={k}><i className="inline-block w-3 h-3 rounded-sm border align-middle mr-1" style={{ background: GAP_STYLE[k].bg, borderColor: GAP_STYLE[k].border }} />{k === 'ok' ? 'Enough time to clean' : k === 'tight' ? 'Tight' : k === 'short' ? 'Not enough time (or no crew)' : 'No clean needed (same item)'}</span>)}
                                 <span><i className="inline-block w-3 h-3 rounded-sm border align-middle mr-1" style={{ background: SHIFT_GROUPS.production.soft, borderColor: SHIFT_GROUPS.production.color }} />Production shift (people)</span>
                                 <span><i className="inline-block w-3 h-3 rounded-sm border align-middle mr-1" style={{ background: SHIFT_GROUPS.sanitation.soft, borderColor: SHIFT_GROUPS.sanitation.color }} />Sanitation shift (people)</span>
                                 <span className="ml-auto">Drag = move · edges = start / stop · drop past a neighbour = swap order · Alt = no snapping · Esc = cancel · double-click = edit / add</span>
@@ -5339,6 +6443,8 @@ export default function ProductionScheduleApp({ dataApi }) {
                         undoFix={undoFix} openRun={openRunFromCheck} mssIdx={mssIdx} payloadsRef={payloadsRef} payloadTick={payloadTick} colStatus={colStatus} refusedCols={refusedCols} probeColumns={probeColumns} probing={probing}
                         resetRefused={resetRefused} clearPayloads={clearPayloads} apiReady={apiReady} />}
                     {tab === 'shifts' && <ShiftsView rows={allRows} settings={settings} updateSettings={updateSettings} employees={employees} empLoaded={empLoaded} rosterCount={rosterCount} own={own} />}
+                    {tab === 'cleanplan' && <CleanPlanView engine={cpEngine} cp={cpRef.current} tick={cpTick} cfgState={cpCfgState} auto={cpAuto} setAuto={setCpAuto} apiReady={apiReady}
+                        onJump={(ms) => { setTab('schedule'); jumpTo(ms); }} onOpenCheck={openCheck} nowMs={nowMs} active={tab === 'cleanplan'} />}
                     {tab === 'cleaning' && <CleaningView rows={allRows} assets={assetList} assetsByArea={assetsByArea} settings={settings} updateSettings={updateSettings} gaps={analysis.gaps} own={own} rosterCount={rosterCount} assetsLoaded={assetsLoaded}
                         onJump={(ms) => { setTab('schedule'); jumpTo(ms); }} />}
                 </div>
