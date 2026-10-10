@@ -466,6 +466,782 @@ function textOnHex(h) {
 // The room colors the app has always used (Tailwind classes), as hex, so a color picker can start from what is on screen.
 const ROOM_CLASS_HEX = { 'bg-amber-800': '#92400e', 'bg-orange-500': '#f97316', 'bg-red-500': '#ef4444', 'bg-purple-500': '#a855f7', 'bg-blue-500': '#3b82f6', 'bg-emerald-500': '#10b981', 'bg-teal-500': '#14b8a6', 'bg-cyan-500': '#06b6d4', 'bg-indigo-500': '#6366f1', 'bg-pink-500': '#ec4899', 'bg-slate-500': '#64748b' };
 const manualLineId = function(name) { return 'manual:' + normS(name); };
+/* ============================================================================
+ * LINE PRIORITY READER  v3  (paste this whole block into any app that lists production lines)
+ * ----------------------------------------------------------------------------
+ * Gerald's rule (Oct 10): the production lines are shown in ONE order in every app:
+ *     IBL 4, IBL 5, Waterjet, High Speed, Custard, Breading, Dough Room, Kettles
+ * Anything not on that list follows (production lines first, then support, then by name). He edits the order in Hub - manager
+ * ("Line order" tab); it is saved in the Dataverse table craa5_linepriority. Guide: line-priority-spec.md.
+ *
+ * Host rule: the host compiles to ES5 with no iterable support. This block uses only arrays, plain objects and Promises.
+ * v3 (Oct 10, found while building the editor): the read also asks for the row's own id column (<table>id), so a page whose dataApi returns only the
+ *     columns asked for still gets the ids the editor needs to update and remove rows; and when the first table answers 'no permission' or a timeout,
+ *     the later 'table not found' answers from the other spellings no longer hide it (why keeps the most useful message).
+ *
+ *   linePriorityRead(dataApi, picks) -> Promise of { found, source, entries, table, cols, why, missing }
+ *        source 'dataverse' = rows read from the table; 'default' = the table is missing/unreadable or empty, the built-in list
+ *        above is used (found is false then, why says why). Never throws. `picks` is optional: { table, name, priority, aliases }
+ *        = names typed by hand (Gerald's "my column is called ..."); linePriorityPicksLoad() gives the saved ones.
+ *        missing = ['aliases'] when the table answers but has no aliases column (the order still works, only the other spellings are lost).
+ *   linePriorityRank(entries, area, line) -> 0,1,2... (position on the list) or LINE_PRIORITY_NONE (9999) when the line is not listed.
+ *        `area` is the run's area text ("IBL 4", "Breading"), `line` its line number (1 when unknown).
+ *   linePriorityCompare(entries, a, b)    -> -1/0/1 for two lanes { area, line, support } : listed lines first in list order, then
+ *        production before support, then area name, then line number. Use it as  lanes.sort(function (a, b) { return linePriorityCompare(e, a, b); }).
+ *   linePriorityProbe(dataApi, picks)     -> Promise of { table, tableState, cols: { name, priority, aliases }, ok, why } : which table
+ *        and columns exist. tableState / each column state is 'found' | 'missing' | 'denied' | 'unknown'. Never throws.
+ *   linePriorityPicksLoad() / linePriorityPicksSave(picks) : the names typed by hand, kept on this computer under the device
+ *        setting 'stillwell.columnPicks' (keys linepriority.table / .name / .priority / .aliases), the same place the other apps keep theirs.
+ *   linePriorityDiff(saved, wanted, cols, opts) -> { create, update, remove, same } : what to write to turn the saved rows into the wanted order.
+ * ============================================================================ */
+var LINE_PRIORITY_TABLES = ['craa5_linepriority', 'craa5__aa_linepriority', 'craa5_aa_linepriority'];
+var LINE_PRIORITY_COLS = { name: 'craa5_name', priority: 'craa5_priority', aliases: 'craa5_aliases' };
+var LINE_PRIORITY_NONE = 9999;
+var LINE_PRIORITY_TIMEOUT_MS = 20000;
+var LINE_PRIORITY_PICKS_KEY = 'stillwell.columnPicks';
+// What Gerald creates in Dataverse (shown by every app that has the columns card).
+var LINE_PRIORITY_SPEC = {
+    table: 'craa5_linepriority',
+    tableLabel: 'Line Priority',
+    tableSchema: 'linepriority',
+    cols: [
+        { key: 'name', logical: 'craa5_name', label: 'Line', type: 'Single line of text', required: true, note: 'The Name column every Dataverse table already has. Rename its display name to "Line" if you like.' },
+        { key: 'priority', logical: 'craa5_priority', label: 'Priority', type: 'Whole number', required: true, note: '1 = shown first.' },
+        { key: 'aliases', logical: 'craa5_aliases', label: 'Other spellings', type: 'Single line of text', required: false, note: 'Optional. Other names the same line goes by, separated by commas (for example "WJ, Water jet").' }
+    ]
+};
+var LINE_PRIORITY_DEFAULT = [
+    { name: 'IBL 4', aliases: 'IBL4' },
+    { name: 'IBL 5', aliases: 'IBL5' },
+    { name: 'Waterjet', aliases: 'WJ, Water jet' },
+    { name: 'High Speed', aliases: 'HS, Highspeed' },
+    { name: 'Custard', aliases: '' },
+    { name: 'Breading', aliases: '' },
+    { name: 'Dough Room', aliases: 'Dough' },
+    { name: 'Kettles', aliases: '' }
+];
+
+function linePriorityCanon(s) { return String(s === undefined || s === null ? '' : s).toLowerCase().replace(/[^a-z0-9]+/g, ''); }
+// Every spelling one entry answers to, as canonical keys: its name and each alias (split on comma, semicolon, slash or bar).
+function linePriorityKeys(entry) {
+    var out = [], seen = {};
+    var add = function (t) { var k = linePriorityCanon(t); if (k && !seen[k]) { seen[k] = true; out.push(k); } };
+    add(entry && entry.name);
+    String(entry && entry.aliases || '').split(/[,;\/|]+/).forEach(add);
+    return out;
+}
+function linePriorityDefaultEntries() {
+    return LINE_PRIORITY_DEFAULT.map(function (d, i) { return { id: '', name: d.name, aliases: d.aliases, priority: i + 1, keys: linePriorityKeys(d) }; });
+}
+function linePriorityColsOf(picks) {
+    var p = picks || {};
+    return {
+        name: String(p.name || '').trim() || LINE_PRIORITY_COLS.name,
+        priority: String(p.priority || '').trim() || LINE_PRIORITY_COLS.priority,
+        aliases: String(p.aliases || '').trim() || LINE_PRIORITY_COLS.aliases
+    };
+}
+// The tables to try, in order: the one typed by hand first, then the names the table could have.
+function linePriorityTablesOf(picks) {
+    var typed = String(picks && picks.table || '').replace(/[^A-Za-z0-9_]/g, '');
+    return typed ? [typed].concat(LINE_PRIORITY_TABLES.filter(function (t) { return t !== typed; })) : LINE_PRIORITY_TABLES.slice();
+}
+// Rows -> entries in list order. A row with no name is dropped; two rows with one name keep the first.
+function linePriorityParse(rows, cols, table) {
+    var c = cols || LINE_PRIORITY_COLS, seen = {}, out = [], idCol = table ? table + 'id' : '';
+    (rows || []).forEach(function (r) {
+        var name = String(r[c.name] === undefined || r[c.name] === null ? '' : r[c.name]).replace(/\s+/g, ' ').trim();
+        var k = linePriorityCanon(name);
+        if (!k || seen[k]) return;
+        seen[k] = true;
+        var p = Number(r[c.priority]);
+        var id = (idCol && r[idCol]) || r.craa5_linepriorityid || r.craa5__aa_linepriorityid || r.craa5_aa_linepriorityid || r.id || '';
+        var e = { id: String(id || '').replace(/[{}]/g, ''), name: name, aliases: String(r[c.aliases] === undefined || r[c.aliases] === null ? '' : r[c.aliases]).trim(), priority: isFinite(p) && p > 0 ? p : LINE_PRIORITY_NONE };
+        e.keys = linePriorityKeys(e);
+        out.push(e);
+    });
+    out.sort(function (a, b) { return a.priority - b.priority || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0); });
+    return out;
+}
+function linePriorityXrm() {
+    try {
+        if (typeof window === 'undefined') return null;
+        var x = window.Xrm; if (!x) { try { if (window.parent && window.parent !== window) x = window.parent.Xrm; } catch (e1) {} }
+        return (x && x.WebApi) ? x.WebApi : null;
+    } catch (e) { return null; }
+}
+function linePriorityTimeout(promise, label) {
+    return new Promise(function (resolve, reject) {
+        var t = setTimeout(function () { reject(new Error(label + ' timed out')); }, LINE_PRIORITY_TIMEOUT_MS);
+        Promise.resolve(promise).then(function (v) { clearTimeout(t); resolve(v); }, function (e) { clearTimeout(t); reject(e); });
+    });
+}
+function linePriorityErrText(e) { return String(e && e.message || e || '').replace(/\s+/g, ' ').slice(0, 300); }
+// What kind of Dataverse refusal this is: 'column' (a property the table does not have), 'table' (no such table), 'denied', 'network' or 'other'.
+function linePriorityClassify(err) {
+    var m = typeof err === 'string' ? err : linePriorityErrText(err);
+    if (/could not find a property|property .{0,80}(does not exist|not found)|not a valid (attribute|property|column)|invalid (column|attribute|property)|(attribute|column) .{0,60}(does not exist|not found)|0x80040203|does not contain (an )?(attribute|column|property)/i.test(m)) return 'column';
+    if (/resource not found for the segment|(entity|table) .{0,60}(does not exist|not found)|could not find (an? )?(entity|table)|not a valid (entity|table)|unknown (table|entity)|\b404\b|0x80040217|doesn'?t exist/i.test(m)) return 'table';
+    if (/\b40[13]\b|forbidden|privilege|prv(read|create|write|delete)|access (is )?denied|not authori[sz]ed|permission|0x80040220/i.test(m)) return 'denied';
+    if (/timed out|failed to fetch|network|offline|\b(429|5\d\d)\b|unavailable|too many requests/i.test(m)) return 'network';
+    return 'other';
+}
+
+// One table, one try. Xrm.WebApi first (like the Clean Plan reader), then the page's dataApi. Resolves { rows } or { rows: null, err }.
+function linePriorityQuery(dataApi, table, select, orderBy, top) {
+    var web = linePriorityXrm();
+    var n = top || 200;
+    var viaData = function (firstErr) {
+        if (!dataApi || !dataApi.queryTable) return Promise.resolve({ rows: null, err: firstErr || 'No data API on this page.' });
+        var opts = { filter: 'statecode eq 0', select: select, pageSize: n };
+        if (orderBy) opts.orderBy = orderBy;
+        return linePriorityTimeout(dataApi.queryTable(table, opts), 'dataApi ' + table)
+            .then(function (page) { return { rows: (page && page.rows) ? Array.prototype.slice.call(page.rows, 0, n) : [] }; })
+            .catch(function (e) { return { rows: null, err: linePriorityErrText(e) }; });
+    };
+    if (web && web.retrieveMultipleRecords) {
+        var odata = '?$select=' + select.join(',') + '&$filter=statecode eq 0' + (orderBy ? '&$orderby=' + orderBy : '') + '&$top=' + n;
+        return linePriorityTimeout(web.retrieveMultipleRecords(table, odata), 'Xrm.WebApi ' + table)
+            .then(function (res) { return { rows: res && res.entities ? res.entities : [] }; })
+            .catch(function (e) { return viaData(linePriorityErrText(e)); });
+    }
+    return viaData('');
+}
+function linePriorityRead(dataApi, picks) {
+    var cols = linePriorityColsOf(picks), tables = linePriorityTablesOf(picks);
+    var lastErr = '', i = 0;
+    // The most useful message wins: a 'no permission' or timeout on one table must not be hidden by 'table not found' from the next spelling.
+    var keepErr = function (err) {
+        if (!err) return;
+        if (!lastErr || (linePriorityClassify(lastErr) === 'table' && linePriorityClassify(err) !== 'table')) lastErr = err;
+    };
+    var fallback = function (why) { return { found: false, source: 'default', entries: linePriorityDefaultEntries(), table: '', cols: cols, why: why, missing: [] }; };
+    var next = function () {
+        if (i >= tables.length) return Promise.resolve(fallback(lastErr || 'The Line Priority table was not found.'));
+        var t = tables[i++];
+        var done = function (res, missing) {
+            var entries = linePriorityParse(res.rows, cols, t);
+            if (!entries.length) return { found: true, source: 'default', entries: linePriorityDefaultEntries(), table: t, cols: cols, why: 'The table is empty, so the built-in order is used.', missing: missing };
+            return { found: true, source: 'dataverse', entries: entries, table: t, cols: cols, why: '', missing: missing };
+        };
+        // The row's own id column goes last in the list: the editor needs it to update and remove rows. A table whose id column
+        // is called something else is still read, without ids (the editor then refuses to save instead of making duplicates).
+        var idCol = t + 'id';
+        var ask = function (withAliases, withId) {
+            var sel = [cols.name, cols.priority]; if (withAliases) sel.push(cols.aliases); if (withId) sel.push(idCol);
+            return linePriorityQuery(dataApi, t, sel, cols.priority + ' asc', 200);
+        };
+        return ask(true, true).then(function (res) {
+            if (res.rows !== null) return done(res, []);
+            var kind = linePriorityClassify(res.err);
+            if (kind === 'column' && res.err.indexOf(idCol) > -1) {
+                return ask(true, false).then(function (res2) {
+                    if (res2.rows !== null) return done(res2, []);
+                    keepErr(res2.err || res.err); return next();
+                });
+            }
+            // The other spellings are optional: when only that column is missing, read the order without it.
+            if (kind === 'column' && res.err.indexOf(cols.aliases) > -1) {
+                return ask(false, true).then(function (res2) {
+                    if (res2.rows !== null) return done(res2, ['aliases']);
+                    keepErr(res2.err || res.err); return next();
+                });
+            }
+            keepErr(res.err); return next();
+        });
+    };
+    return next();
+}
+
+// Which table and which columns exist. One tiny request per column, so a message about one column cannot hide the others.
+function linePriorityProbe(dataApi, picks) {
+    var cols = linePriorityColsOf(picks), tables = linePriorityTablesOf(picks);
+    var out = { table: tables[0], tableState: 'unknown', cols: {}, ok: false, why: '' };
+    ['name', 'priority', 'aliases'].forEach(function (k) { out.cols[k] = { logical: cols[k], state: 'unknown', why: '' }; });
+    var i = 0;
+    var findTable = function () {
+        if (i >= tables.length) { out.tableState = out.tableState === 'unknown' ? 'missing' : out.tableState; return Promise.resolve(false); }
+        var t = tables[i++];
+        return linePriorityQuery(dataApi, t, [cols.name], '', 1).then(function (res) {
+            if (res.rows !== null) { out.table = t; out.tableState = 'found'; out.cols.name.state = 'found'; return true; }
+            var kind = linePriorityClassify(res.err);
+            if (kind === 'column') { out.table = t; out.tableState = 'found'; out.cols.name.state = 'missing'; out.cols.name.why = res.err; return true; }
+            if (kind === 'table') { out.why = res.err; return findTable(); }
+            out.table = t; out.tableState = kind === 'denied' ? 'denied' : 'unknown'; out.why = res.err; return false;
+        });
+    };
+    var probeCol = function (k) {
+        return linePriorityQuery(dataApi, out.table, [cols[k]], '', 1).then(function (res) {
+            if (res.rows !== null) { out.cols[k].state = 'found'; return; }
+            var kind = linePriorityClassify(res.err);
+            out.cols[k].state = kind === 'column' ? 'missing' : (kind === 'denied' ? 'denied' : 'unknown');
+            out.cols[k].why = res.err;
+        });
+    };
+    return findTable().then(function (found) {
+        if (!found) return out;
+        return probeCol('priority').then(function () { return probeCol('aliases'); }).then(function () { return out; });
+    }).then(function (o) {
+        o.ok = o.tableState === 'found' && o.cols.name.state === 'found' && o.cols.priority.state === 'found';
+        return o;
+    }).catch(function (e) { out.why = linePriorityErrText(e); return out; });
+}
+
+// The names typed by hand, kept on this computer ('' = use the app's own name). Never throws; a browser without storage keeps them until the page closes.
+var linePriorityPicksNow = null;
+function linePriorityPicksLoad() {
+    var out = { table: '', name: '', priority: '', aliases: '' };
+    if (linePriorityPicksNow) return linePriorityPicksNow;
+    try {
+        var raw = JSON.parse(window.localStorage.getItem(LINE_PRIORITY_PICKS_KEY) || '{}');
+        if (raw && typeof raw === 'object') Object.keys(out).forEach(function (k) { var v = raw['linepriority.' + k]; if (typeof v === 'string') out[k] = v.replace(/[^A-Za-z0-9_]/g, ''); });
+    } catch (e) { /* no storage: the app's own names are used */ }
+    return out;
+}
+function linePriorityPicksSave(picks) {
+    var clean = { table: '', name: '', priority: '', aliases: '' };
+    Object.keys(clean).forEach(function (k) { clean[k] = String(picks && picks[k] || '').replace(/[^A-Za-z0-9_]/g, ''); });
+    linePriorityPicksNow = clean;
+    try {
+        var old = {}; try { old = JSON.parse(window.localStorage.getItem(LINE_PRIORITY_PICKS_KEY) || '{}') || {}; } catch (e0) { old = {}; }
+        if (!old || typeof old !== 'object') old = {};
+        Object.keys(clean).forEach(function (k) { if (clean[k]) old['linepriority.' + k] = clean[k]; else delete old['linepriority.' + k]; });
+        window.localStorage.setItem(LINE_PRIORITY_PICKS_KEY, JSON.stringify(old));
+    } catch (e) { /* kept until the page closes */ }
+    return clean;
+}
+
+// What to write to turn the saved rows into the wanted order. saved: entries from linePriorityRead (source 'dataverse'; pass [] for the
+// built-in list). wanted: [{ id, name, aliases }] in the order to save; priority is the position (1, 2, 3 ...). opts.skipAliases leaves the
+// aliases column out (the table has none). Rows matched by id; a wanted row with no id is created; a saved row not wanted is removed.
+function linePriorityPayload(entry, position, cols, opts) {
+    var c = cols || LINE_PRIORITY_COLS, p = {};
+    p[c.name] = String(entry.name || '').replace(/\s+/g, ' ').trim();
+    p[c.priority] = position;
+    if (!(opts && opts.skipAliases)) p[c.aliases] = String(entry.aliases || '').replace(/\s+/g, ' ').trim();
+    return p;
+}
+function linePriorityDiff(saved, wanted, cols, opts) {
+    var c = cols || LINE_PRIORITY_COLS, byId = {}, out = { create: [], update: [], remove: [], same: 0 }, used = {};
+    (saved || []).forEach(function (s) { if (s.id) byId[s.id] = s; });
+    (wanted || []).forEach(function (w, i) {
+        var pos = i + 1, payload = linePriorityPayload(w, pos, c, opts), s = w.id ? byId[w.id] : null;
+        if (!s) { out.create.push({ name: payload[c.name], payload: payload }); return; }
+        used[s.id] = true;
+        var change = {};
+        if (payload[c.name] !== s.name) change[c.name] = payload[c.name];
+        if (pos !== s.priority) change[c.priority] = pos;
+        if (!(opts && opts.skipAliases) && payload[c.aliases] !== String(s.aliases || '').trim()) change[c.aliases] = payload[c.aliases];
+        if (Object.keys(change).length) out.update.push({ id: s.id, name: payload[c.name], payload: change }); else out.same++;
+    });
+    (saved || []).forEach(function (s) { if (s.id && !used[s.id]) out.remove.push({ id: s.id, name: s.name }); });
+    return out;
+}
+
+// Position of a lane on the list. The line key is the area in letters and digits plus the line number when it is 2 or more
+// ("IBL 4" line 1 = "ibl4"; area "IBL" line 4 = "ibl4"), exactly like the Clean Plan; an entry named for the whole area ("Breading")
+// also answers to every line of that area.
+function linePriorityRank(entries, area, line) {
+    var a = linePriorityCanon(area), n = Math.floor(Number(line)) || 1;
+    var full = a + (n > 1 ? String(n) : '');
+    var hit = function (key) {
+        for (var i = 0; i < (entries || []).length; i++) {
+            var ks = entries[i].keys || linePriorityKeys(entries[i]);
+            if (ks.indexOf(key) > -1) return i;
+        }
+        return -1;
+    };
+    var r = hit(full);
+    if (r < 0 && full !== a) r = hit(a);
+    return r < 0 ? LINE_PRIORITY_NONE : r;
+}
+function linePriorityCompare(entries, x, y) {
+    var rx = linePriorityRank(entries, x.area, x.line), ry = linePriorityRank(entries, y.area, y.line);
+    if (rx !== ry) return rx < ry ? -1 : 1;
+    if (!!x.support !== !!y.support) return x.support ? 1 : -1;
+    var ax = String(x.area || '').toLowerCase(), ay = String(y.area || '').toLowerCase();
+    if (ax !== ay) return ax < ay ? -1 : 1;
+    return (Number(x.line) || 1) - (Number(y.line) || 1);
+}
+// Where a Ganttly room sits on Gerald's line order (LINE PRIORITY READER above): the room's own name, else the MSS line it belongs to,
+// else the listed line whose name (or other spelling) the room name contains as whole words ("IBL 4 Packaging" -> IBL 4); the
+// longest such name wins. LINE_PRIORITY_NONE when the room is on no listed line.
+function lineRankOfRoom(entries, lineIndex, room) {
+    let best = linePriorityRank(entries, room, 1);
+    const ln = lineIndex && lineIndex.length ? lineForArea(lineIndex, room) : null;
+    if (ln) best = Math.min(best, linePriorityRank(entries, ln.name, 1));
+    if (best < LINE_PRIORITY_NONE) return best;
+    const w = wordsOf(room);
+    let len = 0;
+    (entries || []).forEach(function(e, i) {
+        [e.name].concat(String(e.aliases || '').split(/[,;\/|]+/)).forEach(function(sp) {
+            const n = wordsOf(sp);
+            if (n.length && hasWords(w, n) && (n.length > len || (n.length === len && i < best))) { len = n.length; best = i; }
+        });
+    });
+    if (best < LINE_PRIORITY_NONE) return best;
+    // Last: the room name starts with a listed name ("Ibl4Line"), or is the start of one ("Kettle" for Kettles), letters and digits only.
+    const rk = linePriorityCanon(room);
+    (entries || []).forEach(function(e, i) {
+        if (best < LINE_PRIORITY_NONE) return;
+        (e.keys || linePriorityKeys(e)).forEach(function(k) { if (best === LINE_PRIORITY_NONE && k && k.length >= 4 && (rk.indexOf(k) === 0 || (rk.length >= 4 && k.indexOf(rk) === 0))) best = i; });
+    });
+    return best;
+}
+/* ============================================================================
+ * STILLWELL COLUMNS  v1   ("Columns this needs" for any app that saves to Dataverse)
+ * ----------------------------------------------------------------------------
+ * Gerald, Oct 10: "assume column names after double checking. then tell me which column name they should be for which table and
+ * i'll create them. have it check/retry. ... if i need to change the column to something else i can manually type it and it will update."
+ *
+ * One block, pasted once per app (no imports). It gives an app:
+ *   1. a SPEC of the table and columns it writes (shown to Gerald, so he knows what to create);
+ *   2. a PROBE that asks Dataverse which of them exist (found / not found / no permission / could not tell);
+ *   3. the names TYPED BY HAND, kept on this computer in the device setting 'stillwell.columnPicks' (keys '<app>.table',
+ *      '<app>.<column key>'), the same place Map addition and the Line Priority reader keep theirs;
+ *   4. small WRITE helpers: an Xrm.WebApi / dataApi writer, a GUID made from a key (so a retried create never makes a second row),
+ *      and an error sorter (missing column / missing table / no permission / busy / duplicate / row gone / network);
+ *   5. <StillwellColumnsCard> : the card with the list, Check again, the steps to create the table, and the
+ *      "My table or column has a different name" boxes (Apply / Back to the app's names).
+ *
+ * Host rule: the host compiles to ES5 with no iterable support. Only arrays, plain objects and Promises are used here.
+ * The card needs React's useState, useEffect and useRef in scope, and Tailwind (every app has both).
+ *
+ * THE SPEC (one per table the app writes):
+ *   var MY_SPEC = {
+ *       app: 'ganttly',                         // key prefix for the typed names on this computer
+ *       table: 'craa5_cleancheckoff',           // the logical name Gerald creates
+ *       tables: ['craa5__cleancheckoff'],       // other spellings worth trying (optional)
+ *       tableLabel: 'Clean Check-off', tableSchema: 'cleancheckoff',
+ *       why: 'One row per Start / Done pressed in Ganttly, so every computer sees the same progress.',
+ *       cols: [ { key: 'key', logical: 'craa5_name', label: 'Check-off', type: 'Single line of text', required: true, primary: true, note: '...' },
+ *               { key: 'status', logical: 'craa5_status', label: 'Status', type: 'Single line of text', required: true, note: '...' }, ... ]
+ *       (a column may add maxLen: the maximum character count to set in Power Apps, shown in the steps)
+ *   };
+ *
+ *   swPicksLoad(app)            -> { table: '', <col key>: '' ... } the names typed on this computer ('' = the app's own name)
+ *   swPicksSave(app, picks)     -> the cleaned picks (saved; '' removes a pick)
+ *   swResolve(spec, picks)      -> { table, tables, cols: { key: logical }, idCol } the names to use now
+ *   swProbe(dataApi, spec, picks) -> Promise of { table, tableState, cols: { key: { logical, state, why } }, ok, missingRequired,
+ *                                  missingOptional, why }. States: 'found' | 'missing' | 'denied' | 'unknown'. Never throws.
+ *   swQuery(dataApi, table, { select, filter, orderBy, top }) -> Promise of { rows } or { rows: null, err }. Never throws.
+ *   swWriter(dataApi)           -> { create(table, body) -> Promise of id, update(table, id, body) -> Promise } or null
+ *   swGuid(key)                 -> a GUID made from the key (the same key always gives the same GUID)
+ *   swClassify(err)             -> 'column' | 'table' | 'denied' | 'busy' | 'duplicate' | 'gone' | 'network' | 'other'
+ *   swNamedColumns(err, names)  -> the names the error message mentions (blame only a column Dataverse names)
+ *   swErrText(err)              -> the message, one line, at most 300 characters
+ * ============================================================================ */
+var SW_PICKS_KEY = 'stillwell.columnPicks';
+var SW_TIMEOUT_MS = 20000;
+var swPicksNow = {};   // picks made this session (a browser with no storage keeps them until the page closes)
+
+function swCleanName(v) { return String(v === undefined || v === null ? '' : v).replace(/[^A-Za-z0-9_]/g, '').toLowerCase(); }
+function swErrText(e) {
+    var m = e && (e.message || (e.raw && e.raw.message) || (e.error && e.error.message));
+    return String(m || e || 'Unknown error').replace(/\s+/g, ' ').slice(0, 300);
+}
+function swClassify(err) {
+    var m = typeof err === 'string' ? err : swErrText(err);
+    if (/\b429\b|too many requests|number of requests exceeded|combined execution time|0x80072322|0x80072321|0x80072326|server busy|try again later/i.test(m)) return 'busy';
+    if (/duplicate|already exists|0x80040237|0x80040333/i.test(m)) return 'duplicate';
+    if (/could not find a property|property .{0,80}(does not exist|not found)|not a valid (attribute|property|column)|invalid (column|attribute|property)|(attribute|column) .{0,60}(does not exist|not found)|undeclared property|0x80040203|0x80060888|does not contain (an )?(attribute|column|property)/i.test(m)) return 'column';
+    if (/resource not found for the segment|(entity|table) .{0,60}(does not exist|not found)|could not find (an? )?(entity|table)|not a valid (entity|table)|unknown (table|entity)|0x80060891/i.test(m)) return 'table';
+    if (/\b40[13]\b|forbidden|privilege|prv(read|create|write|append|delete)|access (is )?denied|not authori[sz]ed|permission|0x80040220/i.test(m)) return 'denied';
+    if (/(record|row|entity) .{0,60}(does not exist|not found)|0x80040217|\b404\b/i.test(m)) return 'gone';
+    if (/timed out|failed to fetch|network|offline|\b5\d\d\b|unavailable|connection/i.test(m)) return 'network';
+    return 'other';
+}
+function swNamedColumns(err, names) {
+    var m = (typeof err === 'string' ? err : swErrText(err)).toLowerCase();
+    return (names || []).filter(function (n) { return n && new RegExp('(^|[^a-z0-9_])' + String(n).toLowerCase() + '([^a-z0-9_]|$)').test(m); });
+}
+function swReadPicks() {
+    try { var o = JSON.parse(window.localStorage.getItem(SW_PICKS_KEY) || '{}'); return o && typeof o === 'object' ? o : {}; } catch (e) { return {}; }
+}
+function swPicksLoad(app) {
+    var all = swReadPicks(), out = {}, pre = String(app || '') + '.';
+    Object.keys(all).forEach(function (k) { if (k.indexOf(pre) === 0 && typeof all[k] === 'string') out[k.slice(pre.length)] = swCleanName(all[k]); });
+    Object.keys(swPicksNow).forEach(function (k) { if (k.indexOf(pre) === 0) out[k.slice(pre.length)] = swPicksNow[k]; });
+    return out;
+}
+function swPicksSave(app, picks) {
+    var pre = String(app || '') + '.', clean = {}, all = swReadPicks();
+    Object.keys(picks || {}).forEach(function (k) {
+        var v = swCleanName(picks[k]);
+        clean[k] = v; swPicksNow[pre + k] = v;
+        if (v) all[pre + k] = v; else delete all[pre + k];
+    });
+    try { window.localStorage.setItem(SW_PICKS_KEY, JSON.stringify(all)); } catch (e) { /* kept until the page closes */ }
+    return clean;
+}
+function swResolve(spec, picks) {
+    var p = picks || {}, cols = {};
+    (spec.cols || []).forEach(function (c) { cols[c.key] = p[c.key] || c.logical; });
+    var typed = p.table || '';
+    var tables = [typed || spec.table].concat([spec.table].concat(spec.tables || []).filter(function (t) { return t && t !== (typed || spec.table); }));
+    return { table: tables[0], tables: tables, cols: cols, idCol: tables[0] + 'id' };
+}
+function swWebApi() {
+    try {
+        if (typeof window === 'undefined') return null;
+        var x = window.Xrm; if (!x) { try { if (window.parent && window.parent !== window) x = window.parent.Xrm; } catch (e1) {} }
+        return (x && x.WebApi) ? x.WebApi : null;
+    } catch (e) { return null; }
+}
+function swTimeout(promise, label) {
+    return new Promise(function (resolve, reject) {
+        var t = setTimeout(function () { reject(new Error(label + ' timed out')); }, SW_TIMEOUT_MS);
+        Promise.resolve(promise).then(function (v) { clearTimeout(t); resolve(v); }, function (e) { clearTimeout(t); reject(e); });
+    });
+}
+// One read. Xrm.WebApi first, then the page's dataApi. opts: { select: [..], filter: '..', orderBy: 'col asc', top: n }.
+function swQuery(dataApi, table, opts) {
+    var o = opts || {}, n = o.top || 50, web = swWebApi();
+    var viaData = function (firstErr) {
+        if (!dataApi || !dataApi.queryTable) return Promise.resolve({ rows: null, err: firstErr || 'No data API on this page.' });
+        var q = { select: o.select, pageSize: Math.min(n, 250), top: n };
+        if (o.filter) q.filter = o.filter;
+        if (o.orderBy) q.orderBy = o.orderBy;
+        return swTimeout(dataApi.queryTable(table, q), 'dataApi ' + table).then(function (page) {
+            var rows = page && page.rows ? Array.prototype.slice.call(page.rows) : [];
+            var more = function (pg) {
+                var has = pg && (pg.hasMoreRows || pg.hasMore), load = pg && (pg.loadMoreRows || pg.loadMore);
+                if (rows.length >= n || !has || typeof load !== 'function') return Promise.resolve({ rows: rows.slice(0, n) });
+                return swTimeout(load.call(pg), 'dataApi ' + table).then(function (nx) { rows = rows.concat(nx && nx.rows ? Array.prototype.slice.call(nx.rows) : []); return more(nx); });
+            };
+            return more(page);
+        }).catch(function (e) { return { rows: null, err: swErrText(e) }; });
+    };
+    if (web && web.retrieveMultipleRecords) {
+        // Up to 5000 rows: one request with $top. More: pages of 5000 through nextLink (Dataverse gives no nextLink with $top).
+        var odata = '?$select=' + (o.select || []).join(',') + (o.filter ? '&$filter=' + o.filter : '') + (o.orderBy ? '&$orderby=' + o.orderBy : '') + (n <= 5000 ? '&$top=' + n : '');
+        var rows = [];
+        var page = function (next) {
+            var q = next ? next.slice(next.indexOf('?')) : odata;
+            return swTimeout(n <= 5000 ? web.retrieveMultipleRecords(table, q) : web.retrieveMultipleRecords(table, q, 5000), 'Xrm.WebApi ' + table).then(function (res) {
+                rows = rows.concat(res && res.entities ? res.entities : []);
+                if (rows.length < n && res && res.nextLink && res.nextLink.indexOf('?') > -1) return page(res.nextLink);
+                return { rows: rows.slice(0, n) };
+            });
+        };
+        return page(null).catch(function (e) { return dataApi && dataApi.queryTable ? viaData(swErrText(e)) : { rows: null, err: swErrText(e) }; });
+    }
+    return viaData('');
+}
+function swWriter(dataApi) {
+    var idOf = function (r) { var v = typeof r === 'string' ? r : (r && (r.id || r.Id)) || ''; return String(v).replace(/[{}]/g, '').toLowerCase(); };
+    var web = swWebApi();
+    if (web && web.createRecord && web.updateRecord) return {
+        via: 'Xrm.WebApi',
+        create: function (t, d) { return swTimeout(web.createRecord(t, d), 'Save').then(idOf); },
+        update: function (t, id, d) { return swTimeout(web.updateRecord(t, id, d), 'Save'); }
+    };
+    if (dataApi && dataApi.createRow && dataApi.updateRow) return {
+        via: 'dataApi',
+        create: function (t, d) { return swTimeout(dataApi.createRow(t, d), 'Save').then(function (r) { return idOf(r && (r.id || r[t + 'id']) || r); }); },
+        update: function (t, id, d) { return swTimeout(dataApi.updateRow(t, id, d), 'Save'); }
+    };
+    return null;
+}
+// FNV-1a with four seeds, shaped like a version 4 GUID.
+function swGuid(key) {
+    var s = String(key).toLowerCase();
+    var h = function (seed) {
+        var x = (0x811c9dc5 ^ (seed * 0x9e3779b1)) >>> 0;
+        for (var i = 0; i < s.length; i++) { x ^= s.charCodeAt(i); x = Math.imul ? Math.imul(x, 0x01000193) >>> 0 : (x * 0x01000193) >>> 0; }
+        return ('0000000' + x.toString(16)).slice(-8);
+    };
+    var g = h(1) + h(2) + h(3) + h(4);
+    return g.slice(0, 8) + '-' + g.slice(8, 12) + '-4' + g.slice(13, 16) + '-' + '89ab'.charAt(parseInt(g.charAt(16), 16) % 4) + g.slice(17, 20) + '-' + g.slice(20, 32);
+}
+// Which table and which columns exist: one tiny read for the table, then one per column, so a message about one column cannot hide another.
+function swProbe(dataApi, spec, picks) {
+    var r = swResolve(spec, picks), out = { table: r.table, tableState: 'unknown', cols: {}, ok: false, missingRequired: [], missingOptional: [], why: '' };
+    (spec.cols || []).forEach(function (c) { out.cols[c.key] = { logical: r.cols[c.key], state: 'unknown', why: '' }; });
+    var i = 0;
+    var findTable = function () {
+        if (i >= r.tables.length) { if (out.tableState === 'unknown') out.tableState = 'missing'; return Promise.resolve(false); }
+        var t = r.tables[i++];
+        return swQuery(dataApi, t, { select: [t + 'id'], top: 1 }).then(function (res) {
+            if (res.rows !== null) { out.table = t; out.tableState = 'found'; return true; }
+            var kind = swClassify(res.err);
+            if (kind === 'table' || kind === 'gone') { out.why = res.err; return findTable(); }
+            if (kind === 'column') { out.table = t; out.tableState = 'found'; return true; }   // the id column has another name: the table is there
+            out.table = t; out.tableState = kind === 'denied' ? 'denied' : 'unknown'; out.why = res.err; return false;
+        });
+    };
+    var probeCol = function (c) {
+        return swQuery(dataApi, out.table, { select: [out.cols[c.key].logical], top: 1 }).then(function (res) {
+            if (res.rows !== null) { out.cols[c.key].state = 'found'; return; }
+            var kind = swClassify(res.err);
+            out.cols[c.key].state = kind === 'column' ? 'missing' : (kind === 'denied' ? 'denied' : 'unknown');
+            out.cols[c.key].why = res.err;
+        });
+    };
+    return findTable().then(function (found) {
+        if (!found) return out;
+        return (spec.cols || []).reduce(function (p, c) { return p.then(function () { return probeCol(c); }); }, Promise.resolve()).then(function () { return out; });
+    }).then(function (o) {
+        (spec.cols || []).forEach(function (c) { if (o.cols[c.key].state === 'missing') (c.required ? o.missingRequired : o.missingOptional).push(c.key); });
+        o.ok = o.tableState === 'found' && (spec.cols || []).every(function (c) { return !c.required || o.cols[c.key].state === 'found'; });
+        return o;
+    }).catch(function (e) { out.why = swErrText(e); return out; });
+}
+// One plain sentence about a probe answer.
+function swProbeSentence(spec, p) {
+    if (!p) return '';
+    var lbl = function (k) { var c = (spec.cols || []).filter(function (x) { return x.key === k; })[0]; return c ? c.label + ' (' + p.cols[k].logical + ')' : k; };
+    if (p.tableState === 'denied') return 'You do not have permission to read the ' + spec.tableLabel + ' table. Ask the person who looks after Dataverse for Read, Create and Write on it, then press Check again.';
+    if (p.tableState === 'missing') return 'The ' + spec.tableLabel + ' table was not found. Create it with the steps below (or type its name in the box at the bottom if it has another name), then press Check again.';
+    if (p.tableState !== 'found') return 'Could not tell if the table is there' + (p.why ? ' (' + p.why + ')' : '') + '. Press Check again in a moment.';
+    if (p.missingRequired.length) return 'The table is there, but ' + (p.missingRequired.length === 1 ? 'this column is' : 'these columns are') + ' missing: ' + p.missingRequired.map(lbl).join(', ') + '. Add ' + (p.missingRequired.length === 1 ? 'it' : 'them') + ' (or type the name in the box at the bottom), then press Check again.';
+    var unsure = (spec.cols || []).filter(function (c) { return p.cols[c.key].state !== 'found' && p.cols[c.key].state !== 'missing'; });
+    if (unsure.length) return 'The table is there, but ' + unsure.map(function (c) { return lbl(c.key); }).join(', ') + ' could not be checked. Press Check again.';
+    if (p.missingOptional.length) return 'Saving works. Optional, not there yet: ' + p.missingOptional.map(lbl).join(', ') + '. Add ' + (p.missingOptional.length === 1 ? 'it' : 'them') + ' when you can; the app leaves ' + (p.missingOptional.length === 1 ? 'it' : 'them') + ' out until then.';
+    return 'The table and every column are there.';
+}
+
+var SW_CARD_SEQ = 0;
+var SW_CARD_STATES = {
+    found: { text: 'Found', mark: '✓', cls: 'bg-[#E6F1FB] text-[#00468B] border-[#B3D4F2]' },
+    missing: { text: 'Not found', mark: '✕', cls: 'bg-[#FDE8EC] text-[#B80022] border-[#E4002B]/40' },
+    denied: { text: 'No permission', mark: '!', cls: 'bg-[#FFF6E0] text-[#7A4B00] border-[#FFB81C]' },
+    unknown: { text: 'Could not tell', mark: '?', cls: 'bg-slate-100 text-slate-700 border-slate-300' },
+    waiting: { text: 'Not checked yet', mark: '•', cls: 'bg-slate-50 text-slate-600 border-slate-200' }
+};
+/* <StillwellColumnsCard spec={MY_SPEC} dataApi={dataApi} onChange={function (picks, probe) {...}} startOpen extra={<p>...</p>} className="..." />
+ *   onChange  called with (the picks now in use, the probe answer) after Check again; Apply and Back call it twice: at once with a
+ *             null probe (so the typed names are used even if the card closes), then with the probe answer. When the probe found the
+ *             table under another listed spelling (probe.table), the app should read and write that one.
+ *   startOpen opens the card at first (pass true when something is missing). extra: anything the app shows above the list (queue status).
+ * The card asks Dataverse only when it opens and when a button is pressed, never on every render. */
+function StillwellColumnsCard(props) {
+    var spec = props.spec, className = props.className || '';
+    var idRef = useRef(null);
+    if (idRef.current === null) idRef.current = 'swcc' + (++SW_CARD_SEQ);
+    var uid = idRef.current;
+    var s_open = useState(!!props.startOpen), open = s_open[0], setOpen = s_open[1];
+    var s_probe = useState(null), probe = s_probe[0], setProbe = s_probe[1];
+    var s_busy = useState(false), busy = s_busy[0], setBusy = s_busy[1];
+    var s_msg = useState(''), msg = s_msg[0], setMsg = s_msg[1];
+    var s_fold = useState(false), fold = s_fold[0], setFold = s_fold[1];
+    var s_saved = useState(function () { return swPicksLoad(spec.app); }), saved = s_saved[0], setSaved = s_saved[1];
+    var s_typed = useState(function () { return swPicksLoad(spec.app); }), typed = s_typed[0], setTyped = s_typed[1];
+    var s_bad = useState(''), bad = s_bad[0], setBad = s_bad[1];
+    var seq = useRef(0), alive = useRef(true);
+    var apiRef = useRef(props.dataApi); apiRef.current = props.dataApi;
+    var changeRef = useRef(props.onChange); changeRef.current = props.onChange;
+    useEffect(function () { alive.current = true; return function () { alive.current = false; }; }, []);
+    useEffect(function () { if (props.startOpen) setOpen(true); }, [props.startOpen]);
+    var run = function (tell, note) {
+        var mine = ++seq.current, picks = swPicksLoad(spec.app);
+        setBusy(true); setMsg(note || 'Checking…');
+        return swProbe(apiRef.current, spec, picks).then(function (p) {
+            if (!alive.current || mine !== seq.current) return;
+            setProbe(p); setBusy(false); setMsg(swProbeSentence(spec, p));
+            if (tell && changeRef.current) { try { changeRef.current(picks, p); } catch (e) { /* the app's own handler failed */ } }
+        });
+    };
+    useEffect(function () { if (open) run(false); }, [open]);
+    var keys = ['table'].concat((spec.cols || []).map(function (c) { return c.key; }));
+    var apply = function () {
+        var clean = {}, wrong = '';
+        keys.forEach(function (k) { var v = String(typed[k] || '').trim(); clean[k] = v; if (v && !/^[A-Za-z0-9_]+$/.test(v)) wrong = k; });
+        if (wrong) { setBad('Use only letters, digits and the underscore (_), with no spaces. For example craa5_status.'); return; }
+        var cleaned = swPicksSave(spec.app, clean);
+        setBad(''); setTyped(clean); setSaved(cleaned);
+        if (changeRef.current) { try { changeRef.current(cleaned, null); } catch (e) { /* the app's own handler failed */ } }   // used at once, even if the window closes before the check ends
+        run(true, 'Saved on this computer. Checking with your names…');
+    };
+    var back = function () {
+        var empty = {}; keys.forEach(function (k) { empty[k] = ''; });
+        var cleaned = swPicksSave(spec.app, empty);
+        setBad(''); setTyped(empty); setSaved(cleaned);
+        if (changeRef.current) { try { changeRef.current(cleaned, null); } catch (e) { /* the app's own handler failed */ } }
+        run(true, 'Back to the app’s own names. Checking…');
+    };
+    var r = swResolve(spec, saved);
+    var badge = function (state) {
+        var d = SW_CARD_STATES[state] || SW_CARD_STATES.unknown;
+        return <span className={'inline-flex items-center gap-1 px-2.5 py-1 rounded-full border text-xs font-bold whitespace-nowrap ' + d.cls}><span aria-hidden="true">{d.mark}</span>{d.text}</span>;
+    };
+    var rows = [{ key: 'table', label: 'Table', logical: probe ? probe.table : r.table, type: spec.tableLabel, required: true, state: !probe ? 'waiting' : probe.tableState }];
+    (spec.cols || []).forEach(function (c) { rows.push({ key: c.key, label: c.label, logical: probe ? probe.cols[c.key].logical : r.cols[c.key], type: c.type, note: c.note, required: c.required, state: !probe ? 'waiting' : (probe.tableState !== 'found' ? 'waiting' : probe.cols[c.key].state) }); });
+    var usingOwn = keys.some(function (k) { return !!saved[k]; });
+    var summary = !probe ? 'Not checked yet' : (probe.ok ? (probe.missingOptional.length ? 'Working, ' + probe.missingOptional.length + ' optional missing' : 'All found') : 'Something is missing');
+    var inputCls = 'w-full min-h-[44px] border border-slate-300 rounded-lg px-3 text-sm font-mono bg-white focus:outline-none focus:ring-2 focus:ring-[#0072CE]/40 focus:border-[#0072CE]';
+    var btnCls = 'min-h-[44px] px-4 rounded-lg text-sm font-extrabold border focus:outline-none focus:ring-2 focus:ring-[#0072CE]/40 disabled:opacity-50';
+    var primary = (spec.cols || []).filter(function (c) { return c.primary; })[0];
+    return (
+        <section data-card="stillwell-columns" data-app={spec.app} aria-label="Columns this needs" className={'rounded-xl border border-slate-200 bg-white shadow-sm ' + className}>
+            <h3 className="m-0">
+                <button type="button" aria-expanded={open} aria-controls={uid + '-body'} onClick={function () { setOpen(function (o) { return !o; }); }}
+                    className="w-full min-h-[44px] flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-4 py-2 text-left rounded-xl focus:outline-none focus:ring-2 focus:ring-[#0072CE]/40">
+                    <span className="flex items-center gap-2 text-sm font-black text-[#00468B] uppercase tracking-widest"><span aria-hidden="true">{open ? '▾' : '▸'}</span>Columns this needs</span>
+                    <span className="text-xs font-bold text-slate-600">{summary}</span>
+                </button>
+            </h3>
+            {open && (
+                <div id={uid + '-body'} className="px-4 pb-4 border-t border-slate-100">
+                    {spec.why && <p className="text-sm text-slate-700 mt-3">{spec.why}</p>}
+                    {props.extra}
+                    <ul className="mt-3 space-y-2" aria-label="Table and columns">
+                        {rows.map(function (x) {
+                            return (
+                                <li key={x.key} data-row={x.key} data-state={x.state} className="flex flex-wrap items-start justify-between gap-x-3 gap-y-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                                    <div className="min-w-0">
+                                        <p className="text-sm font-bold text-slate-800">{x.label}{x.key !== 'table' && !x.required ? <span className="font-semibold text-slate-600"> (optional)</span> : null}</p>
+                                        <p className="text-xs text-slate-600"><code className="font-mono font-bold text-[#00468B] break-all">{x.logical}</code> · {x.type}</p>
+                                        {x.note && <p className="text-xs text-slate-500 mt-0.5">{x.note}</p>}
+                                    </div>
+                                    {badge(x.state)}
+                                </li>
+                            );
+                        })}
+                    </ul>
+                    <div className="mt-3 flex flex-wrap items-center gap-3">
+                        <button type="button" onClick={function () { run(true); }} disabled={busy} className={btnCls + ' bg-[#0072CE] text-white border-[#0072CE] hover:bg-[#00468B]'}>{busy ? 'Checking…' : 'Check again'}</button>
+                        <p role="status" aria-live="polite" className="text-sm text-slate-700 flex-1 min-w-[12rem]">{msg}</p>
+                    </div>
+                    <div className="mt-4 rounded-lg bg-[#E6F1FB] border border-[#B3D4F2] px-3 py-2">
+                        <p className="text-xs font-black uppercase tracking-widest text-[#00468B]">To create it in Power Apps</p>
+                        <ol className="list-decimal pl-5 mt-1 text-sm text-slate-800 space-y-0.5">
+                            <li>Open Power Apps, choose <strong>Tables</strong>, then <strong>New table</strong>.</li>
+                            <li>Call it <strong>{spec.tableLabel}</strong> with the schema name <strong>{spec.tableSchema}</strong> (the table is then {spec.table}).</li>
+                            {primary && <li>Keep the <strong>Name</strong> column Power Apps adds by itself, and do not rename it: the app keeps the <strong>{primary.label}</strong> in it.</li>}
+                            {(spec.cols || []).filter(function (c) { return !c.primary; }).map(function (c) {
+                                return <li key={c.key}>Add a column <strong>{c.label}</strong> (schema name {String(c.logical).replace(/^[a-z0-9]+_/, '')}), type <strong>{c.type}</strong>{c.type === 'Date and time' ? ' (format Date and time, not Date only)' : ''}{c.maxLen ? ', maximum character count ' + Number(c.maxLen).toLocaleString('en-US') : ''}{c.required ? '' : '. Optional'}.</li>;
+                            })}
+                            <li>Give everyone who uses the app Read, Create and Write on the table. Then press Check again.</li>
+                        </ol>
+                    </div>
+                    <div className="mt-4">
+                        <button type="button" aria-expanded={fold} aria-controls={uid + '-fold'} onClick={function () { setFold(function (f) { return !f; }); }}
+                            className="min-h-[44px] flex items-center gap-2 text-sm font-extrabold text-[#0072CE] underline focus:outline-none focus:ring-2 focus:ring-[#0072CE]/40 rounded"><span aria-hidden="true">{fold ? '▾' : '▸'}</span>My table or column has a different name</button>
+                        {fold && (
+                            <div id={uid + '-fold'} className="mt-2 rounded-lg border border-slate-200 p-3">
+                                <p className="text-sm text-slate-700">Type the name it has in Dataverse (the logical name, like craa5_status) and press Apply. It is saved on this computer and used from then on. Leave a box empty to keep the app&rsquo;s own name.</p>
+                                <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                    {rows.map(function (x) {
+                                        return (
+                                            <div key={x.key}>
+                                                <label htmlFor={uid + '-in-' + x.key} className="block text-xs font-bold text-slate-700 mb-1">{x.key === 'table' ? 'Table' : x.label + ' column'}</label>
+                                                <input id={uid + '-in-' + x.key} data-pick={x.key} type="text" autoComplete="off" autoCapitalize="off" spellCheck={false} value={typed[x.key] || ''}
+                                                    placeholder={x.key === 'table' ? spec.table : (spec.cols.filter(function (c) { return c.key === x.key; })[0] || {}).logical}
+                                                    onChange={function (e) { var v = e.target.value, k = x.key; setTyped(function (t) { var n = {}; Object.keys(t).forEach(function (q) { n[q] = t[q]; }); n[k] = v; return n; }); setBad(''); }}
+                                                    onKeyDown={function (e) { if (e.key === 'Enter') { e.preventDefault(); if (!busy) apply(); } }}
+                                                    className={inputCls} />
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                                {bad && <p role="alert" className="mt-2 text-sm font-bold text-[#B80022]">{bad}</p>}
+                                <div className="mt-3 flex flex-wrap items-center gap-3">
+                                    <button type="button" data-apply-picks onClick={apply} disabled={busy} className={btnCls + ' bg-[#0072CE] text-white border-[#0072CE] hover:bg-[#00468B]'}>Apply</button>
+                                    <button type="button" onClick={back} disabled={busy} className={btnCls + ' bg-white text-[#00468B] border-slate-300 hover:bg-slate-50'}>Back to the app&rsquo;s names</button>
+                                </div>
+                                <p className="mt-2 text-xs text-slate-600">{usingOwn ? 'This computer is using the names you typed.' : 'This computer is using the app’s own names.'}</p>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
+        </section>
+    );
+}
+/* ============================== END STILLWELL COLUMNS v1 ============================== */
+// ============================================================================
+// START / DONE SAVED IN DATAVERSE (Ganttly; Gerald Oct 10: "we can save to dataverse ... have it check/retry ... if i need to change
+// the column to something else i can manually type it"). Every Start / Done / Undo pressed in Ganttly is one row of the table
+// Clean Check-off (craa5_cleancheckoff), so every computer shows the same progress. The row's Name is the check-off's own key (block
+// id + when it was first pressed) and its id is a GUID made from that key, so a retried save never makes a second row. Undo writes
+// status 'undone' (the row stays, so the other computers drop it too). A dedicated table: the task assignment table is Shift Start's
+// roster (its Save Progress closes open rows, hub - Lead and Manager count them) and the MSS log is the paperwork record.
+// Saves wait in a queue on this computer (itp_current_sync_v1) and are retried with growing waits; other computers' check-offs are
+// read every CHECKOFF_READ_MS. PBED never saves or reads them.
+// ============================================================================
+const CHECKOFF_SPEC = {
+    app: 'ganttly',
+    table: 'craa5_cleancheckoff',
+    tables: ['craa5__cleancheckoff', 'craa5_ganttlycheckoff'],
+    tableLabel: 'Clean Check-off',
+    tableSchema: 'cleancheckoff',
+    why: 'Ganttly saves every Start, Done and Undo here, one row per check-off, so every computer and the director board show the same progress.',
+    cols: [
+        { key: 'key', logical: 'craa5_name', label: 'Check-off', type: 'Single line of text', required: true, primary: true, note: 'The Name column every table already has. Ganttly writes the check-off key in it.' },
+        { key: 'status', logical: 'craa5_status', label: 'Status', type: 'Single line of text', required: true, note: 'started, done or undone.' },
+        { key: 'details', logical: 'craa5_details', label: 'Details', type: 'Multiple lines of text', maxLen: 1048576, required: true, note: 'The whole check-off (times, people, minutes) for the other computers. Set its maximum character count to 1,048,576 (Power Apps starts it at 150, too short).' },
+        { key: 'equipmentguid', logical: 'craa5_equipmentguid', label: 'Equipment ID', type: 'Single line of text', required: false, note: 'The equipment row id, like the MSS log.' },
+        { key: 'equipment', logical: 'craa5_equipment', label: 'Equipment', type: 'Single line of text', required: false, note: 'The equipment name.' },
+        { key: 'area', logical: 'craa5_area', label: 'Area', type: 'Single line of text', required: false, note: 'The room.' },
+        { key: 'startedat', logical: 'craa5_startedat', label: 'Started at', type: 'Date and time', required: false, note: 'When Start was pressed.' },
+        { key: 'doneat', logical: 'craa5_doneat', label: 'Done at', type: 'Date and time', required: false, note: 'When Done was pressed.' },
+        { key: 'keepuntil', logical: 'craa5_keepuntil', label: 'Keep until', type: 'Date and time', required: false, note: 'Until when the check-off still counts (a monthly clean: a month). A computer opened for the first time, like the TV, reads these too.' }
+    ]
+};
+const CHECKOFF_STORE_KEY = 'itp_current_sync_v1';
+const CHECKOFF_READ_MS = 2 * 60000;          // other computers' check-offs are read this often (and when the page is shown again)
+const CHECKOFF_READ_DAYS = 8;                // the first read looks back this far (a weekly clean's last Done)
+const CHECKOFF_FLUSH_MS = 15000;             // the save queue is looked at this often
+const CHECKOFF_RETRY_MS = [15000, 30000, 60000, 120000, 300000];   // waits after a failed save (the last one repeats)
+const CHECKOFF_BUSY_MS = 30000;              // Dataverse said "too many requests": wait this long
+const CHECKOFF_KEEP_MS = 14 * 86400000;      // a save still queued, or a key dropped as old, is forgotten after this
+const CHECKOFF_MISSING_RETRY_MS = 3600000;   // an optional column Dataverse refused is tried again after this (it may have been added)
+const CHECKOFF_DETAIL_FIELDS = ['status', 'parentId', 'name', 'startMs', 'durationMins', 'laneKeys', 'workMins', 'heads', 'updatedAt', 'startedAt', 'doneAt', 'noStart', 'syncAt'];
+// A check-off's key: its block id plus when it was first pressed (kept in the record; worked out the same way for older records).
+function checkoffKeyOf(blockId, rec) {
+    if (rec && rec.syncKey) return String(rec.syncKey);
+    const first = rec ? (rec.startedAt || rec.doneAt || rec.updatedAt || rec.startMs || 0) : 0;
+    return String(blockId) + '~' + Math.round(first / 1000).toString(36);
+}
+// What a save carries: the record's own fields, nothing the plan works out.
+function checkoffBody(rec) {
+    const o = {};
+    CHECKOFF_DETAIL_FIELDS.forEach(function(k) { if (rec[k] !== undefined) o[k] = rec[k]; });
+    return o;
+}
+function checkoffSig(rec) { return rec ? JSON.stringify(checkoffBody(rec)) : ''; }
+// A record read back from Dataverse, with every field checked (another computer, or an older Ganttly, wrote it).
+function checkoffClean(r, key) {
+    if (!r || typeof r !== 'object') return null;
+    const num = function(v) { const n = Number(v); return isFinite(n) ? n : null; };
+    const status = r.status === 'done' || r.status === 'started' ? r.status : null;
+    const startMs = num(r.startMs), durationMins = num(r.durationMins);
+    if (!status || startMs === null || durationMins === null || !r.parentId) return null;
+    const out = { status: status, parentId: String(r.parentId), name: String(r.name || ''), startMs: startMs, durationMins: Math.max(5, durationMins),
+        laneKeys: Array.isArray(r.laneKeys) ? r.laneKeys.map(String) : [], workMins: num(r.workMins) || 0, heads: num(r.heads) || 1,
+        updatedAt: num(r.updatedAt) || startMs, syncKey: key, syncAt: num(r.syncAt) || num(r.updatedAt) || 0, remote: true };
+    if (num(r.startedAt)) out.startedAt = num(r.startedAt); else if (r.startedAt === null) out.startedAt = null;
+    if (num(r.doneAt)) out.doneAt = num(r.doneAt);
+    if (r.noStart !== undefined) out.noStart = !!r.noStart;
+    return out;
+}
+// Two computers pressed the same block: Done beats Started, then the later press, then the key (so every computer picks the same one).
+function checkoffBeats(a, b) {
+    if (a.status !== b.status) return a.status === 'done';
+    const ta = a.syncAt || a.updatedAt || 0, tb = b.syncAt || b.updatedAt || 0;
+    if (ta !== tb) return ta > tb;
+    return String(a.syncKey) > String(b.syncKey);
+}
+function checkoffStoreLoad() {
+    const empty = { v: 1, sent: {}, pending: {}, gone: {}, known: {}, missing: {}, rowId: {}, readFrom: '' };
+    try {
+        const o = JSON.parse(localStorage.getItem(CHECKOFF_STORE_KEY) || 'null');
+        if (!o || o.v !== 1) return empty;
+        Object.keys(empty).forEach(function(k) { if (o[k] === undefined || o[k] === null || typeof o[k] !== typeof empty[k]) o[k] = empty[k]; });
+        return o;
+    } catch (e) { return empty; }
+}
+function checkoffStoreSave(S) {
+    const now = Date.now();
+    Object.keys(S.gone).forEach(function(k) { if (now - S.gone[k] > CHECKOFF_KEEP_MS) delete S.gone[k]; });
+    Object.keys(S.pending).forEach(function(k) { if (now - (S.pending[k].at || 0) > CHECKOFF_KEEP_MS) delete S.pending[k]; });
+    Object.keys(S.known).forEach(function(k) { if (!S.sent[k] && !S.pending[k] && !S.gone[k]) delete S.known[k]; });
+    Object.keys(S.missing).forEach(function(k) { if (typeof S.missing[k] !== 'number' || now - S.missing[k] > CHECKOFF_MISSING_RETRY_MS) delete S.missing[k]; });
+    Object.keys(S.rowId || {}).forEach(function(k) { if (!S.known[k]) delete S.rowId[k]; });
+    try { localStorage.setItem(CHECKOFF_STORE_KEY, JSON.stringify(S)); } catch (e) { /* storage full or off: the queue lives until the page closes */ }
+}
+function isoOrNull(ms) { return ms ? new Date(ms).toISOString() : null; }
 // Which line an equipment area belongs to: exact name, else the longest line name it contains as whole words (Shift Start's
 // rule). Chemical / admin / janitorial areas also match a line like "Chemical Clerk" (first by name, the line Shift Start puts
 // those roles on). Last, a manual task on a board with exactly the area's name. Returns { id, name } or null.
@@ -616,12 +1392,13 @@ function deptOf(id) { return DEPTS.filter(function(d) { return d.id === id; })[0
 const PROD_RESTART_AHEAD_MS = 4 * 86400000;   // how far past the plan end the production schedule is read to find the restart
 // ============================================================================
 // STARTUP BOARD (Ganttly, Gerald Oct 9: "show if we are on track for startup or not, effort expended, and kudos / accountability").
-// A production room is READY when its cleaning is done by its ready-by time = startup minus a hand-back buffer: the preflight hour on a
-// short changeover, FSQ inspect (11 h before) when the line is down a day or more. The rules below are shown in "How this is judged".
+// A production room is READY when its cleaning is done by its ready-by time = 2 h before the next run (Gerald Oct 10: "we'd like to be
+// done roughly 2 hours before the next run"), on short and long changeovers alike. The rules below are shown in "How this is judged".
 // ============================================================================
-const READY_BY_SHORT_MINS = 60;          // preflight before a short (nightly) changeover's startup
-const READY_BY_LONG_MINS = 660;          // FSQ inspect before a long changeover's startup (DEPT_DEFAULT_STEPS)
-const LONG_CHANGEOVER_MINS = 1440;       // a line down this long or longer is a long changeover
+const READY_BY_MINS = 120;               // cleaning done this long before the next run starts
+const READY_BY_LABEL = 'the 2 h mark';   // the ready-by time in sentences ("will miss the 2 h mark by 20 min")
+// Why a room's ready-by is where it is: 2 h before startup, or the line stop when the line stops less than 2 h before startup.
+function readyByWhy(x) { return x && x.shortWindow ? 'when the line stops, under ' + (READY_BY_MINS / 60) + ' h before startup' : (READY_BY_MINS / 60) + ' h before startup'; }
 const AT_RISK_MINS = 60;                 // less spare than this before the ready-by time = at risk
 const OVERRUN_RISK_MINS = 120;           // a clean running past its plan makes the room at risk while spare is under this
 const LOG_GAP_MINS = 90;                 // people planned on a room and no Start / Done there for this long = check-offs may be behind
@@ -2610,6 +3387,14 @@ export default function App(props) {
     const objOf = function(v) { return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; };
     const [roomGroups, setRoomGroups] = useState(objOf(initialSettings.roomGroups));
     const [roomOrder, setRoomOrder] = useState(Array.isArray(initialSettings.roomOrder) ? initialSettings.roomOrder.map(String) : []);
+    // Gerald's line order for every app (Oct 10: IBL 4, IBL 5, Waterjet, High Speed, Custard, Breading, Dough Room, Kettles), edited in
+    // Hub - manager and saved in the Dataverse table craa5_linepriority. The built-in list until the table answers; read once at load.
+    const [lineOrder, setLineOrder] = useState(function() { return { entries: linePriorityDefaultEntries(), source: 'default', why: '' }; });
+    useEffect(function() {
+        let off = false;
+        linePriorityRead(props.dataApi, linePriorityPicksLoad()).then(function(r) { if (!off) setLineOrder({ entries: r.entries, source: r.source, why: r.why }); });
+        return function() { off = true; };
+    }, [props.dataApi]);
     const [roomColors, setRoomColors] = useState(objOf(initialSettings.roomColors));
     const [functionColors, setFunctionColors] = useState(objOf(initialSettings.functionColors));
     const [equipColors, setEquipColors] = useState(objOf(initialSettings.equipColors));
@@ -2953,6 +3738,331 @@ export default function App(props) {
         try { localStorage.setItem(PLAN_KEY, JSON.stringify(p)); } catch(e) {}
     }, [overrides, taskStatus, customTasks, assetEdits, downtimes, targetDowntimes, timeBlocks, downLineList]);
 
+    // ---- Start / Done saved in Dataverse (Ganttly only; CHECKOFF_SPEC above) ----
+    // ckRef = the save queue and what was last saved / read on this computer (kept in itp_current_sync_v1); ckSync = what the screen
+    // says about it. A check-off is queued when its record changes here (Start, Done, a move), saved in the background and retried
+    // with growing waits; the other computers' check-offs are read every CHECKOFF_READ_MS and merged into taskStatus.
+    const ckRef = useRef(null);
+    if (ckRef.current === null) ckRef.current = IS_CURRENT ? checkoffStoreLoad() : { v: 1, sent: {}, pending: {}, gone: {}, known: {}, missing: {}, rowId: {}, readFrom: '' };
+    const ckUndoneRef = useRef({});        // keys undone on this computer, to be saved as 'undone'
+    const ckBlockedRef = useRef(null);     // { kind: 'table' | 'columns' | 'denied', err, cols }: saving waits for Check again (or a good read)
+    const ckPauseRef = useRef(0);          // Dataverse busy or out of reach: no save before this time
+    const ckDirtyRef = useRef(false);      // a read changed the queue: save it after the next render
+    const ckBusyRef = useRef(false), ckReadBusyRef = useRef(false);
+    const ckFnRef = useRef({});
+    const [ckPicks, setCkPicks] = useState(function() { return IS_CURRENT ? swPicksLoad(CHECKOFF_SPEC.app) : {}; });
+    const ckPicksRef = useRef(ckPicks);
+    const [ckSync, setCkSync] = useState({ mode: 'starting', pending: 0, lastSaveAt: 0, lastReadAt: 0, readOk: null, err: '', blocked: null, missing: [] });
+    const [ckModal, setCkModal] = useState(false);
+    const ckTableRef = useRef('');         // the listed spelling of the table that answered (Check again, or a read that tried the others)
+    const ckNames = function() {
+        const r = swResolve(CHECKOFF_SPEC, ckPicksRef.current), t = ckTableRef.current;
+        if (t && t !== r.table && r.tables.indexOf(t) > -1) { r.table = t; r.idCol = t + 'id'; }
+        return r;
+    };
+    const ckHasApi = function() { return !!swWebApi() || !!(props.dataApi && typeof props.dataApi.queryTable === 'function'); };
+    const ckPublish = function(patch) {
+        const S = ckRef.current;
+        setCkSync(function(prev) {
+            const n = Object.assign({}, prev, patch || {});
+            n.pending = Object.keys(S.pending).length;
+            n.missing = Object.keys(S.missing);
+            n.blocked = ckBlockedRef.current;
+            n.mode = !ckHasApi() ? 'nodv' : n.blocked ? 'blocked' : !swWriter(props.dataApi) ? 'nowrite' : n.readOk === false ? 'offline' : n.lastReadAt ? 'shared' : 'starting';
+            return n;
+        });
+    };
+    // Each asset's room, and its id as this computer writes it (a row from another host may spell the GUID another way).
+    const ckAreaOf = useMemo(function() {
+        const m = { area: {}, id: {} };
+        if (IS_CURRENT) assets.forEach(function(a) { m.area[String(a.id)] = String(a.area || ''); m.id[normGuid(a.id)] = String(a.id); });
+        return m;
+    }, [assets]);
+    // Until when a check-off still counts: a Done one for its equipment's cadence (+2 days), a started one a day past its end.
+    const ckKeepUntil = function(rec) {
+        const end = (rec.doneAt || (rec.startMs + rec.durationMins * 60000)) || Date.now();
+        if (rec.status !== 'done') return end + 86400000;
+        const a = assets.find(function(x) { return String(x.id) === String(rec.parentId); });
+        const cad = a ? cadenceMsOf(a) : 86400000;
+        return end + Math.min(isFinite(cad) ? cad : 400 * 86400000, 400 * 86400000) + 2 * 86400000;
+    };
+    // Queue what changed here since it was last saved (or read). A record gone from taskStatus was undone (saved as 'undone') or
+    // dropped as old (remembered, so a read never brings it back).
+    useEffect(function() {
+        if (!IS_CURRENT || isLoading) return;
+        const S = ckRef.current, now = Date.now(), live = {};
+        let changed = false;
+        Object.keys(taskStatus).forEach(function(id) {
+            const rec = taskStatus[id];
+            if (!rec || String(id).indexOf('custom_') === 0) return;   // a custom task exists on one computer only
+            const key = checkoffKeyOf(id, rec), sig = checkoffSig(rec);
+            live[key] = true;
+            if (S.gone[key]) { delete S.gone[key]; changed = true; }   // in use again here
+            if (S.sent[key] && S.sent[key].sig === sig) return;
+            S.sent[key] = { sig: sig, id: id };
+            S.pending[key] = { id: id, rec: checkoffBody(rec), area: ckAreaOf.area[String(rec.parentId)] || '', keep: ckKeepUntil(rec), tries: 0, nextAt: 0, at: now };
+            changed = true;
+        });
+        Object.keys(S.sent).forEach(function(key) {
+            if (live[key]) return;
+            if (ckUndoneRef.current[key]) S.pending[key] = { id: S.sent[key].id, rec: null, tries: 0, nextAt: 0, at: now };
+            S.gone[key] = now;
+            delete ckUndoneRef.current[key];
+            delete S.sent[key];
+            changed = true;
+        });
+        if (changed || ckDirtyRef.current) {
+            ckDirtyRef.current = false;
+            checkoffStoreSave(S);
+            ckPublish();
+            setTimeout(function() { if (ckFnRef.current.flush) ckFnRef.current.flush(); }, 300);
+        }
+    }, [taskStatus, isLoading]);
+    // One save. Returns { ok } or { err, stop: 'table' | 'columns' | 'denied' } or { err, busy, network }.
+    const ckPut = async function(w, key, item) {
+        const S = ckRef.current, r = ckNames(), C = r.cols;
+        const rid = swGuid('ganttly-checkoff|' + key), rec = item.rec;
+        const body = {};
+        body[C.key] = String(key).slice(0, 100);
+        body[C.status] = rec ? rec.status : 'undone';
+        body[C.details] = JSON.stringify({ v: 1, id: item.id, rec: rec, area: item.area || '' });
+        const opt = {};
+        if (rec) {
+            const g = String(rec.parentId || '').replace(/[{}]/g, '').toLowerCase();
+            if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(g)) opt[C.equipmentguid] = g;
+            opt[C.equipment] = String(rec.name || '').slice(0, 100);
+            opt[C.area] = String(item.area || '').slice(0, 100);
+            opt[C.startedat] = isoOrNull(rec.startedAt);
+            opt[C.doneat] = isoOrNull(rec.doneAt);
+        }
+        opt[C.keepuntil] = isoOrNull(item.keep || Date.now() + 86400000);   // an Undo row only matters until the other computers have read it
+        const optCols = Object.keys(opt);
+        optCols.forEach(function(c) { if (!S.missing[c]) body[c] = opt[c]; });
+        S.rowId = S.rowId || {};
+        let op = S.known[key] ? 'update' : 'create';
+        for (let tries = 0; tries < 12; tries++) {
+            try {
+                if (op === 'create') {
+                    const b = Object.assign({}, body); b[r.idCol] = rid;
+                    const got = await w.create(r.table, b);
+                    if (got && got !== rid) S.rowId[key] = got;   // a host that picks its own id: later saves go to that row
+                } else await w.update(r.table, S.rowId[key] || rid, body);
+                return { ok: true };
+            } catch (e) {
+                const msg = swErrText(e), kind = swClassify(msg), named = swNamedColumns(msg, Object.keys(body));
+                if (op === 'create' && kind === 'duplicate') { op = 'update'; continue; }   // saved before (another computer, or a lost answer)
+                if (op === 'update' && kind === 'gone' && !named.length) { op = 'create'; continue; }
+                if (/exceed(s|ed)? the maximum (allowed )?length|maximum length|too long/i.test(msg) && named.length) return { stop: 'columns', err: msg, cols: named, short: true };   // a text column set shorter than the check-off
+                if (kind === 'column' || named.length) {
+                    const bad = named.filter(function(c) { return optCols.indexOf(c) > -1; });
+                    const req = named.filter(function(c) { return optCols.indexOf(c) < 0; });
+                    if (req.length || !bad.length) return { stop: 'columns', err: msg, cols: req };
+                    bad.forEach(function(c) { S.missing[c] = Date.now(); delete body[c]; });   // an optional column the table does not have: left out (tried again in an hour)
+                    continue;
+                }
+                if (kind === 'table') return { stop: 'table', err: msg };
+                if (kind === 'denied') return { stop: 'denied', err: msg };
+                return { err: msg, busy: kind === 'busy', network: kind === 'network' || kind === 'busy' };
+            }
+        }
+        return { err: 'The save kept failing.' };
+    };
+    // Save what is queued and due, oldest first, one at a time.
+    const ckFlush = async function() {
+        if (!IS_CURRENT || ckBusyRef.current || ckBlockedRef.current || Date.now() < ckPauseRef.current) return;
+        const S = ckRef.current, now = Date.now();
+        const due = Object.keys(S.pending).filter(function(k) { return (S.pending[k].nextAt || 0) <= now; }).sort(function(a, b) { return (S.pending[a].at || 0) - (S.pending[b].at || 0); });
+        if (!due.length) return;
+        const w = swWriter(props.dataApi);
+        if (!w) { ckPublish(); return; }
+        ckBusyRef.current = true;
+        let saved = 0, lastErr = '';
+        try {
+            for (let i = 0; i < due.length; i++) {
+                const key = due[i], item = S.pending[key];
+                if (!item) continue;
+                const res = await ckPut(w, key, item);
+                if (res.ok) S.known[key] = true;
+                if (S.pending[key] !== item) continue;   // pressed again while it was saving: the newer one is next
+                if (res.ok) { delete S.pending[key]; saved++; continue; }
+                lastErr = res.err;
+                if (res.stop) { ckBlockedRef.current = { kind: res.stop, err: res.err, cols: res.cols || [], short: !!res.short }; break; }
+                item.tries = (item.tries || 0) + 1;
+                item.err = res.err;
+                item.nextAt = Date.now() + (res.busy ? CHECKOFF_BUSY_MS : CHECKOFF_RETRY_MS[Math.min(item.tries, CHECKOFF_RETRY_MS.length) - 1]);
+                if (res.network) { ckPauseRef.current = item.nextAt; break; }   // busy or out of reach: the rest wait too
+            }
+        } finally {
+            ckBusyRef.current = false;
+            checkoffStoreSave(S);
+            ckPublish(saved ? { lastSaveAt: Date.now(), err: lastErr } : { err: lastErr });
+        }
+    };
+    // Merge rows read from Dataverse into taskStatus. This computer's own unsaved change of a check-off wins; two computers' check-offs
+    // of one block: Done beats Started, then the later press (checkoffBeats), and the loser is saved as 'undone' by its own computer.
+    const ckMerge = function(rows, C) {
+        const S = ckRef.current, now = Date.now(), incoming = [];
+        rows.forEach(function(row) {
+            const key = String(row[C.key] || '');
+            let d = null;
+            try { d = JSON.parse(row[C.details] || 'null'); } catch (e) { d = null; }
+            if (!key || !d || !d.id || String(d.id).indexOf('custom_') === 0) return;
+            S.known[key] = true;
+            const status = String(row[C.status] || '').toLowerCase();
+            const undone = status === 'undone' || !d.rec;
+            const rec = undone ? null : checkoffClean(d.rec, key);
+            if (rec && ckAreaOf.id[normGuid(rec.parentId)]) rec.parentId = ckAreaOf.id[normGuid(rec.parentId)];
+            incoming.push({ key: key, id: String(d.id), undone: undone, rec: rec });
+        });
+        ckDirtyRef.current = true;
+        if (!incoming.length) return;
+        setTaskStatus(function(prev) {
+            let next = null;
+            const put = function(id, rec) { if (!next) next = Object.assign({}, prev); if (rec) next[id] = rec; else delete next[id]; };
+            incoming.forEach(function(x) {
+                // This computer's own change of it is on its way, unless the row is a Done and the change here is still a Start:
+                // Done wins (a Start never follows a Done of the same check-off), so the queued Start is dropped.
+                const pd = S.pending[x.key];
+                if (pd) {
+                    if (!(x.rec && x.rec.status === 'done' && pd.rec && pd.rec.status === 'started')) return;
+                    delete S.pending[x.key];
+                }
+                const cur = next ? next[x.id] : prev[x.id];
+                const curKey = cur ? checkoffKeyOf(x.id, cur) : '';
+                if (x.undone) {
+                    if (cur && curKey === x.key) { put(x.id, null); S.gone[x.key] = now; delete S.sent[x.key]; }
+                    return;
+                }
+                if (!x.rec) return;
+                // Undone or dropped here: only a save made after that brings it back (Done pressed on another computer that had not read the Undo).
+                if (S.gone[x.key]) { if (!((x.rec.syncAt || 0) > S.gone[x.key])) return; delete S.gone[x.key]; }
+                if (!cur) { put(x.id, x.rec); S.sent[x.key] = { sig: checkoffSig(x.rec), id: x.id }; return; }
+                if (curKey === x.key) {
+                    if (cur.status !== x.rec.status) {
+                        if (x.rec.status === 'done') { put(x.id, x.rec); S.sent[x.key] = { sig: checkoffSig(x.rec), id: x.id }; }
+                        // A Start read back over this computer's Done (another computer moved the block before it read the Done):
+                        // the Done stays, and the computer that pressed it saves it again.
+                        else if (cur.status === 'done' && !cur.remote) put(x.id, Object.assign({}, cur, { syncAt: Math.max(now, (cur.syncAt || 0) + 1, (x.rec.syncAt || 0) + 1) }));
+                        return;
+                    }
+                    if ((x.rec.syncAt || 0) > (cur.syncAt || cur.updatedAt || 0) && checkoffSig(x.rec) !== checkoffSig(cur)) { put(x.id, x.rec); S.sent[x.key] = { sig: checkoffSig(x.rec), id: x.id }; }
+                    return;
+                }
+                if (!checkoffBeats(x.rec, Object.assign({ syncKey: curKey }, cur))) return;
+                const won = Object.assign({}, x.rec);
+                S.sent[x.key] = { sig: checkoffSig(x.rec), id: x.id };
+                // Done on the other computer without Start, started on this one: keep this computer's Start (saved back with the row).
+                if (!cur.remote && won.status === 'done' && !won.startedAt && cur.startedAt) {
+                    won.startedAt = cur.startedAt; won.noStart = false; won.syncAt = now; delete won.remote;
+                    won.startMs = cur.startMs; won.durationMins = Math.max(5, Math.round(((won.doneAt || now) - cur.startMs) / 60000));
+                }
+                put(x.id, won);
+                delete S.sent[curKey]; S.gone[curKey] = now;
+                // Only the computer that pressed the losing one closes it (a check-off read from another computer is just replaced here).
+                if (!cur.remote) S.pending[curKey] = { id: x.id, rec: null, tries: 0, nextAt: 0, at: now };
+            });
+            return next || prev;
+        });
+    };
+    // Read what changed in Dataverse since the last read (the first read looks back CHECKOFF_READ_DAYS days).
+    const ckRead = async function() {
+        if (!IS_CURRENT || ckReadBusyRef.current) return;
+        if (!ckHasApi()) { ckPublish(); return; }
+        const S = ckRef.current, r = ckNames(), C = r.cols;
+        const fromMs = S.readFrom ? Date.parse(S.readFrom) - 2 * 60000 : Date.now() - CHECKOFF_READ_DAYS * 86400000;
+        ckReadBusyRef.current = true;
+        try {
+            // The first read also takes older check-offs that still count (Keep until), so a computer opened for the first time
+            // (the TV, the director's) knows last month's Done; without that column it reads the last CHECKOFF_READ_DAYS days.
+            const since = 'modifiedon ge ' + new Date(isFinite(fromMs) ? fromMs : Date.now() - CHECKOFF_READ_DAYS * 86400000).toISOString();
+            const ask = function(withKeep) { return swQuery(props.dataApi, r.table, { select: [C.key, C.status, C.details, 'modifiedon'], filter: 'statecode eq 0 and ' + (withKeep ? '(' + since + ' or ' + C.keepuntil + ' ge ' + new Date().toISOString() + ')' : since), orderBy: 'modifiedon asc', top: 5000 }); };
+            const first = !S.readFrom && !S.missing[C.keepuntil];
+            let res = await ask(first);
+            if (first && res.rows === null && swNamedColumns(res.err, [C.keepuntil]).length) { S.missing[C.keepuntil] = Date.now(); res = await ask(false); }
+            if (res.rows === null && swClassify(res.err) === 'table' && !ckTableRef.current) {
+                for (let i = 0; i < r.tables.length; i++) {
+                    const t = r.tables[i];
+                    if (t === r.table) continue;
+                    const q = await swQuery(props.dataApi, t, { select: [t + 'id'], top: 1 });
+                    if (q.rows !== null) { ckTableRef.current = t; S.readFrom = ''; S.known = {}; ckBlockedRef.current = null; setTimeout(function() { if (ckFnRef.current.read) ckFnRef.current.read(); }, 0); return; }
+                }
+            }
+            if (res.rows === null) {
+                const kind = swClassify(res.err);
+                if (kind === 'table' || kind === 'denied' || kind === 'column') ckBlockedRef.current = { kind: kind === 'column' ? 'columns' : kind, err: res.err, cols: swNamedColumns(res.err, [C.key, C.status, C.details]) };
+                ckPublish({ readOk: kind === 'table' || kind === 'denied' || kind === 'column' ? null : false, err: res.err });
+                return;
+            }
+            // The table and its three needed columns answer: a save stopped on a missing table or column can go again.
+            if (ckBlockedRef.current && ckBlockedRef.current.kind !== 'denied' && !ckBlockedRef.current.short) ckBlockedRef.current = null;
+            let maxMod = S.readFrom || '';
+            res.rows.forEach(function(row) { const m = String(row.modifiedon || ''); if (m && (!maxMod || Date.parse(m) > Date.parse(maxMod))) maxMod = m; });
+            S.readFrom = maxMod || new Date(Date.now() - 5 * 60000).toISOString();
+            ckMerge(res.rows, C);
+            ckPublish({ readOk: true, lastReadAt: Date.now(), err: '' });
+        } finally {
+            ckReadBusyRef.current = false;
+            checkoffStoreSave(S);
+            if (Object.keys(S.pending).length) setTimeout(function() { if (ckFnRef.current.flush) ckFnRef.current.flush(); }, 300);
+        }
+    };
+    ckFnRef.current = { flush: ckFlush, read: ckRead };
+    useEffect(function() {
+        if (!IS_CURRENT || isLoading) return;
+        ckFnRef.current.read();
+        const tRead = setInterval(function() { ckFnRef.current.read(); }, CHECKOFF_READ_MS);
+        const tFlush = setInterval(function() { ckFnRef.current.flush(); }, CHECKOFF_FLUSH_MS);
+        const onShow = function() { if (document.visibilityState === 'visible') { ckFnRef.current.read(); ckFnRef.current.flush(); } };
+        const onOnline = function() { const S = ckRef.current; ckPauseRef.current = 0; Object.keys(S.pending).forEach(function(k) { S.pending[k].nextAt = 0; }); ckFnRef.current.flush(); ckFnRef.current.read(); };
+        document.addEventListener('visibilitychange', onShow);
+        window.addEventListener('online', onOnline);
+        return function() { clearInterval(tRead); clearInterval(tFlush); document.removeEventListener('visibilitychange', onShow); window.removeEventListener('online', onOnline); };
+    }, [isLoading, props.dataApi]);
+    // "Check again", or a table / column name typed in the columns card: use the names now, retry everything at once.
+    const ckColumnsChanged = function(picks, probe) {
+        const S = ckRef.current, before = ckNames().table;
+        if ((picks.table || '') !== (ckPicksRef.current.table || '')) ckTableRef.current = '';
+        ckPicksRef.current = picks; setCkPicks(picks);
+        if (probe && probe.tableState === 'found') ckTableRef.current = probe.table;
+        if (ckNames().table !== before) { S.readFrom = ''; S.known = {}; }
+        S.missing = {};
+        ckBlockedRef.current = null;
+        if (probe && probe.tableState === 'found') {
+            probe.missingOptional.forEach(function(k) { S.missing[probe.cols[k].logical] = Date.now(); });
+            if (probe.missingRequired.length) ckBlockedRef.current = { kind: 'columns', err: '', cols: probe.missingRequired.map(function(k) { return probe.cols[k].logical; }) };
+        } else if (probe && (probe.tableState === 'missing' || probe.tableState === 'denied')) ckBlockedRef.current = { kind: probe.tableState === 'missing' ? 'table' : 'denied', err: probe.why || '', cols: [] };
+        ckPauseRef.current = 0;
+        Object.keys(S.pending).forEach(function(k) { S.pending[k].nextAt = 0; });
+        checkoffStoreSave(S);
+        ckPublish();
+        ckFnRef.current.read();
+        ckFnRef.current.flush();
+    };
+    const ckRetryNow = function() {
+        const S = ckRef.current;
+        ckBlockedRef.current = null; ckPauseRef.current = 0;
+        Object.keys(S.pending).forEach(function(k) { S.pending[k].nextAt = 0; });
+        ckPublish();
+        ckFnRef.current.read();
+        ckFnRef.current.flush();
+    };
+    const ckShared = IS_CURRENT && ckSync.mode === 'shared';
+    // Where Start / Done are saved right now, in a few words (header chip, Startup board footer, the Save window).
+    const ckStateText = function() {
+        const c = ckSync, hm = function(ms) { const d = new Date(ms); let h = d.getHours(); const m = d.getMinutes(); const ap = h >= 12 ? 'PM' : 'AM'; h = h % 12 || 12; return h + ':' + (m < 10 ? '0' + m : m) + ' ' + ap; };
+        const wait = c.pending ? ' · ' + c.pending + ' waiting to save' : '';
+        if (c.mode === 'nodv') return 'On this computer only (no Dataverse on this page)';
+        if (c.mode === 'blocked') {
+            const b = c.blocked || {};
+            return 'Not saved to Dataverse yet: ' + (b.kind === 'table' ? 'the ' + CHECKOFF_SPEC.tableLabel + ' table is not there' : b.kind === 'denied' ? 'no permission to save' : b.short ? 'a column is too short' : 'a column is missing') + wait;
+        }
+        if (c.mode === 'nowrite') return 'Not saved to Dataverse: this page can read it but not save' + wait;
+        if (c.mode === 'offline') return 'Dataverse not answering, retrying' + wait;
+        if (c.mode === 'starting') return 'Checking Dataverse…';
+        return 'Saved in Dataverse' + (c.pending ? ' · ' + c.pending + ' saving' : '') + (c.lastReadAt ? ' · read ' + hm(c.lastReadAt) : '');
+    };
+    const ckFooterText = function(pv) { return 'Progress: Start / Done · ' + ckStateText().replace(/^(.)/, function(x) { return x.toLowerCase(); }); };
+
     useEffect(() => {
         const applyEdits = function(list) {
             return list.map(function(a) { return assetEdits[a.id] ? Object.assign({}, a, assetEdits[a.id]) : a; });
@@ -3222,6 +4332,15 @@ export default function App(props) {
     useEffect(function() { loadTaskRowsRef.current(); }, [props.dataApi, globalStartMs, planHorizonMins, taskSinceMs]);
 
     const lineIndex = useMemo(function() { return buildLineIndex(lineRows); }, [lineRows]);
+    // Each room's place on the line order (LINE_PRIORITY_NONE = not a listed line), worked out once per room.
+    const lineRankOf = useMemo(function() {
+        const cache = {};
+        return function(room) { const k = String(room); if (!(k in cache)) cache[k] = lineRankOfRoom(lineOrder.entries, lineIndex, k); return cache[k]; };
+    }, [lineOrder, lineIndex]);
+    const lineRankTitle = function(room) {
+        const e = lineOrder.entries[lineRankOf(room)];
+        return room + ' is #' + (lineRankOf(room) + 1) + ' on the line order' + (e && normS(e.name) !== normS(room) ? ' (' + e.name + ')' : '') + '. The order is set in Hub - manager (Line order) for every app' + (lineOrder.source === 'dataverse' ? '.' : '; until that table has rows the built-in order is used.');
+    };
     // Production or support: a room's own pick, else its MSS area's production / runs-product flags. When the area table has no
     // production flag anywhere (or could not be read) nothing is called support, so nothing is hidden by mistake.
     const prodKnown = useMemo(function() { return lineIndex.some(function(l) { return l.prod; }); }, [lineIndex]);
@@ -3249,11 +4368,13 @@ export default function App(props) {
     }, [assets, lineIndex, prodKnown, roomGroups]);
     const isSupportRoom = function(area) { return !!supportRooms[String(area)]; };
     const autoSupportRoom = function(area) { return !prodKnown ? false : autoSupportOf(String(area)); };
-    // Production rooms first, then support; inside each the rooms the planner moved come first in the order they were put in, then
-    // `fallback` (default: by name).
+    // Production rooms first, then support; inside each the listed production lines in Gerald's line order (Hub - manager), then the
+    // rooms the planner moved in the order they were put in, then `fallback` (default: by name).
     const roomCmp = function(a, b, fallback) {
         const sa = supportRooms[a] ? 1 : 0, sb = supportRooms[b] ? 1 : 0;
         if (sa !== sb) return sa - sb;
+        const la = lineRankOf(a), lb = lineRankOf(b);
+        if (la !== lb) return la - lb;
         const ia = roomOrder.indexOf(a), ib = roomOrder.indexOf(b);
         if (ia > -1 || ib > -1) { if (ia === -1) return 1; if (ib === -1) return -1; if (ia !== ib) return ia - ib; }
         return fallback ? fallback(a, b) : (a < b ? -1 : a > b ? 1 : 0);
@@ -4019,8 +5140,9 @@ export default function App(props) {
     };
     const coverage = weeklyCoverage(shiftRotation);
     const startNewPlan = function() {
-        if (!window.confirm('Clear all check-offs, manual moves, downtimes' + (IS_CURRENT ? ' and down lines' : ' and time blocks') + ' for a fresh plan? Room setup, crews and custom tasks are kept.')) return;
+        if (!window.confirm('Clear all check-offs, manual moves, downtimes' + (IS_CURRENT ? ' and down lines' : ' and time blocks') + ' for a fresh plan? Room setup, crews and custom tasks are kept.' + (IS_CURRENT && ckSync.mode !== 'nodv' && ckSync.mode !== 'nowrite' ? ' Check-offs are shared through Dataverse, so they are cleared on every computer' + (ckShared ? '' : ' as soon as Dataverse answers') + '.' : ''))) return;
         setOverrides({});
+        if (IS_CURRENT) Object.keys(taskStatus).forEach(function(id) { ckUndoneRef.current[checkoffKeyOf(id, taskStatus[id])] = true; });   // saved as 'undone' everywhere
         setTaskStatus({});
         setDowntimes([]);
         setTargetDowntimes([]);
@@ -4046,11 +5168,13 @@ export default function App(props) {
     // Move a room up or down inside its own group (production or support) of the list the planner is looking at (`shown`, default the
     // Setup list). The rooms of that list take, in their new order, the places they held in the whole order; every other room (one with
     // no work in the window, one hidden on this screen) keeps its own place.
+    // A listed production line keeps its place on the line order (it is moved in Hub - manager), so only the other rooms move.
     const moveRoom = function(room, dir, shown) {
+        if (lineRankOf(room) < LINE_PRIORITY_NONE) return;
         const cur = allUniqueRooms;
         const view = (shown || cur).filter(function(r) { return cur.indexOf(r) > -1; });
         const sup = !!supportRooms[room];
-        const same = view.filter(function(r) { return !!supportRooms[r] === sup; });
+        const same = view.filter(function(r) { return !!supportRooms[r] === sup && lineRankOf(r) === LINE_PRIORITY_NONE; });
         const i = same.indexOf(room), j = i + dir;
         if (i < 0 || j < 0 || j >= same.length) return;
         const next = view.slice();
@@ -5755,7 +6879,10 @@ export default function App(props) {
     const setBlockStatus = function(task, status) {
         if (!task) return;
         if (!status) {
-            setTaskStatus(function(prev) { const next = Object.assign({}, prev); delete next[task.id]; return next; });
+            setTaskStatus(function(prev) {
+                if (IS_CURRENT && prev[task.id]) ckUndoneRef.current[checkoffKeyOf(task.id, prev[task.id])] = true;   // saved as 'undone' in Dataverse
+                const next = Object.assign({}, prev); delete next[task.id]; return next;
+            });
             return;
         }
         setTaskStatus(function(prev) {
@@ -5779,6 +6906,8 @@ export default function App(props) {
             const stamps = !IS_CURRENT ? {} : status === 'started'
                 ? { startedAt: existing && existing.startedAt ? existing.startedAt : Date.now() }
                 : { startedAt: wasStarted ? (existing.startedAt || existing.updatedAt || null) : null, doneAt: Date.now(), noStart: !wasStarted };
+            // Ganttly: the check-off's key in Dataverse (kept for its life) and when it was last changed here (the newer change wins a merge).
+            if (IS_CURRENT) { stamps.syncKey = existing ? checkoffKeyOf(task.id, existing) : task.id + '~' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5); stamps.syncAt = Date.now(); }
             return Object.assign({}, prev, { [task.id]: Object.assign({
                 status: status,
                 parentId: task.parentId,
@@ -5802,7 +6931,9 @@ export default function App(props) {
         if (task.isFrozen) {
             setTaskStatus(function(prev) {
                 if (!prev[task.id]) return prev;
-                return Object.assign({}, prev, { [task.id]: Object.assign({}, prev[task.id], { startMs: globalStartMs + startMin * 60000, laneKeys: keys }) });
+                const moved = { startMs: globalStartMs + startMin * 60000, laneKeys: keys };
+                if (IS_CURRENT) { moved.syncKey = checkoffKeyOf(task.id, prev[task.id]); moved.syncAt = Date.now(); }
+                return Object.assign({}, prev, { [task.id]: Object.assign({}, prev[task.id], moved) });
             });
         } else {
             // A split part keeps only its own share of the work; the remainder keeps flowing (later this shift or on a later one).
@@ -6521,7 +7652,7 @@ export default function App(props) {
     // ============================================================================
     // STARTUP BOARD (Ganttly, Gerald Oct 9: "show if we are on track for startup or not, effort expended, and kudos / accountability
     // if it is not"). Per production room: when its line starts up again (a down line's restart, else the production schedule), the
-    // time its cleaning has to be done by (ready-by = startup minus the hand-back buffer, see READY_BY_*), when the plan says the
+    // time its cleaning has to be done by (ready-by = 2 h before startup, READY_BY_MINS), when the plan says the
     // cleaning will be done, and the spare between the two. The plant's verdict is its worst room. Effort = the standard hours of the
     // cleans checked off this shift (Start / Done); credit and follow-ups name rooms, crews and leads, never one person.
     // Display only: it never moves the plan. A plain function (no hooks: it runs after the loading return).
@@ -6595,22 +7726,19 @@ export default function App(props) {
             // A startup that has passed (the line runs again): kept for This Shift, and the row moves on to the line's next changeover.
             let past = null;
             if (R !== null && R <= nowMin) {
-                const pL = R - S0, pB = pL >= LONG_CHANGEOVER_MINS ? READY_BY_LONG_MINS : READY_BY_SHORT_MINS;
-                const pG = Math.max(R - pB, S0);
+                const pG = Math.max(R - READY_BY_MINS, S0);
                 const before = allTasks.filter(function(t) { return t.startMin < R && !(t.isNextCycle && t.earliestStart >= R); });
                 const left = before.filter(function(t) { return !t.isComplete; });
                 const pF = before.length ? Math.max.apply(null, before.map(doneEnd)) : null;
-                past = { R: R, G: pG, gateLabel: pL >= LONG_CHANGEOVER_MINS ? 'FSQ inspect' : 'preflight', planned: before.length, leftMins: sum(left, function(t) { return t.rawWorkloadMins; }), F: pF, met: before.length > 0 && !left.length && pF !== null && pF <= pG };
+                past = { R: R, G: pG, gateLabel: READY_BY_LABEL, planned: before.length, leftMins: sum(left, function(t) { return t.rawWorkloadMins; }), F: pF, met: before.length > 0 && !left.length && pF !== null && pF <= pG };
                 const nx = schedFrom(r, nowMs);
                 if (nx) { S0 = toMin(nx.realStopMs); S = Math.max(0, toMin(nx.stopMs)); R = known(nx.restart) ? toMin(nx.restart) : null; restartSrc = known(nx.restart) ? 'schedule' : 'none'; running = nx.state === 'handed' && nx.stopMs > nowMs; }
                 else { R = null; restartSrc = 'none'; running = false; }
                 stateText = 'started up ' + clock(past.R) + (running ? ' · running until ' + clock(S) : '');
             }
-            const L = R !== null ? R - S0 : null;
-            const long = L !== null && L >= LONG_CHANGEOVER_MINS;
-            const B = long ? READY_BY_LONG_MINS : READY_BY_SHORT_MINS;
-            const gateLabel = long ? 'FSQ inspect' : 'preflight';
-            const G = R !== null ? Math.max(R - B, S0) : null;   // may be before the view: an FSQ inspect that has already passed
+            const B = READY_BY_MINS;
+            const gateLabel = READY_BY_LABEL;
+            const G = R !== null ? Math.max(R - B, S0) : null;   // may be before the view when the line restarts soon after the view starts
             const shortWindow = R !== null && R - B < S0;
             // The next clean of a piece already cleaned is not part of this startup when it is due after it.
             const nextCleanOut = function(t) { return !!t.isNextCycle && (R === null || t.earliestStart >= R); };
@@ -6680,7 +7808,7 @@ export default function App(props) {
             const pieceDone = pieceIds.filter(function(id) { return !U.some(function(u) { return pidOf(u) === id; }) && T.every(function(t) { return pidOf(t) !== id || t.isComplete; }); }).length;
             const st = pieceIds.length ? { equipDone: pieceDone, equipCount: pieceIds.length } : allDone ? { equipDone: parentsHere.length, equipCount: parentsHere.length } : { equipDone: 0, equipCount: 0 };
             return {
-                room: r, status: status, S: S, R: R, G: G, F: F, spare: spare, est: est, wontFit: wontFit, uWork: uWork, gateLabel: gateLabel, long: long,
+                room: r, status: status, S: S, R: R, G: G, F: F, spare: spare, est: est, wontFit: wontFit, uWork: uWork, gateLabel: gateLabel,
                 shortWindow: shortWindow, restartSrc: restartSrc, down: down, running: running, stateText: stateText, lines: (h.lines || []).concat(h.schedLines || []).filter(function(x, i, a) { return x && a.indexOf(x) === i; }),
                 T: T, U: U, past: past, allDone: allDone, overruns: overruns, workAll: workAll, workDone: workDoneR, leftMins: leftMins,
                 pct: workAll > 0 ? Math.round(workDoneR / workAll * 100) : (allDone ? 100 : 0),
@@ -6724,7 +7852,7 @@ export default function App(props) {
         } else if (verdict === 'AT_RISK') {
             const x = first('AT_RISK');
             if (x) headline = x.spare > 0 ? x.room + ' has only ' + fmtMins(x.spare) + ' to spare' + (x.est ? ' (estimate)' : '') : x.room + ' may miss ' + x.gateLabel + (x.est ? ' (estimate)' : '');
-            else { const y = first('DONE_LATE'); headline = y.room + ' finished ' + fmtMins(y.F - y.G) + ' after its ' + y.gateLabel; }
+            else { const y = first('DONE_LATE'); headline = y.room + ' finished ' + fmtMins(y.F - y.G) + ' after ' + y.gateLabel; }
             if (nRisk + nDoneLate > 1) headline += ' and ' + (nRisk + nDoneLate - 1) + ' more';
         } else if (verdict === 'ON_TRACK') {
             const tight = rows.filter(function(x) { return x.status === 'ON_TRACK'; }).sort(function(a, b) { return a.spare - b.spare; })[0];
@@ -6789,7 +7917,7 @@ export default function App(props) {
 
         // ---- Needs Attention (worst first; rooms, crews and leads, never a person) ----
         const attention = [];
-        if (planOnly) attention.push({ tone: 'grey', key: 'trust', title: 'No Start / Done check-offs on this computer this shift', sub: 'Finish times assume nothing has been done yet. Check-offs made on another computer do not show here.' });
+        if (planOnly) attention.push({ tone: 'grey', key: 'trust', title: ckShared ? 'No Start / Done check-offs this shift' : 'No Start / Done check-offs on this computer this shift', sub: ckShared ? 'Finish times assume nothing has been done yet. Nobody has pressed Start or Done in Ganttly on any computer.' : 'Finish times assume nothing has been done yet. Check-offs are not being saved to Dataverse right now, so ones made on another computer do not show here.' });
         if (prodState.status === 'failed') attention.push({ tone: 'grey', key: 'sched', title: 'Production schedule could not be read', sub: prodState.readAt ? 'Startup times are from the read at ' + clockMs(prodState.readAt) + ' and from down lines.' : 'Startup times come from down lines only.' });
         const covered = {};
         rows.filter(function(x) { return x.status === 'LATE'; }).forEach(function(x) {
@@ -6840,7 +7968,7 @@ export default function App(props) {
                 if (x.past && x.past.R >= w.shiftStart) {
                     if (x.past.met) thisShift.push({ icon: 'star', text: x.room + ' ready ' + clock(x.past.F) + ' for its ' + clock(x.past.R) + ' startup', room: x.room });
                     else if (x.past.leftMins > 0) thisShift.push({ icon: 'alert', text: x.room + ' started up ' + clock(x.past.R) + ' with ' + fmtMins(x.past.leftMins) + ' of cleaning not done', room: x.room });
-                    else if (x.past.planned) thisShift.push({ icon: 'alert', text: x.room + ' finished ' + fmtMins(x.past.F - x.past.G) + ' after its ' + x.past.gateLabel + ' (startup ' + clock(x.past.R) + ')', room: x.room });
+                    else if (x.past.planned) thisShift.push({ icon: 'alert', text: x.room + ' finished ' + fmtMins(x.past.F - x.past.G) + ' after ' + x.past.gateLabel + ' (startup ' + clock(x.past.R) + ')', room: x.room });
                 }
                 if (x.status === 'READY' && inW(x.F)) { const ld = leadOfRoomDone(x); thisShift.push({ icon: 'star', text: x.room + ' ready ' + clock(x.F) + ' · ' + fmtMins(x.G - x.F) + ' before ' + x.gateLabel + (ld ? ' · lead ' + ld : ''), room: x.room }); }
                 else if (x.status === 'NO_STARTUP' && x.allDone && inW(x.F)) thisShift.push({ icon: 'star', text: x.room + ' finished ' + clock(x.F), room: x.room });
@@ -6859,7 +7987,8 @@ export default function App(props) {
         // ---- Where the numbers come from ----
         const activeDown = downLineList.filter(function(d) { const s = localInputMs(d.startStr), e = d.endStr ? localInputMs(d.endStr) : Infinity; return !(s > nowMs) && !(e <= nowMs); }).length;
         const provenance = {
-            checkoffs: shiftRecs.length, lastMs: lastAny, planOnly: planOnly,
+            checkoffs: shiftRecs.length, lastMs: lastAny, planOnly: planOnly, shared: ckShared, ck: ckSync,
+            remote: shiftRecs.filter(function(rec) { return !!rec.remote; }).length,
             schedStatus: prodState.status, schedReadAt: prodState.readAt, downActive: activeDown, liveReforecast: liveReforecast
         };
         // Scope empty: when this shift's production work is projected done.
@@ -6873,14 +8002,17 @@ export default function App(props) {
             if (x.spare === -Infinity) return "won't fit";
             return (x.spare >= 0 ? '+' : '-') + fmtMins(Math.abs(x.spare)) + (x.est ? ' est.' : '');
         };
+        // The lines as the board lists them: Gerald's line order (Hub - manager), then the other rooms worst first. The verdict,
+        // headline and Needs Attention stay worst first.
+        const lineRows = rows.slice().sort(function(a, b) { return roomCmp(a.room, b.room, function() { return rows.indexOf(a) - rows.indexOf(b); }); });
         const copyLines = ['Ganttly startup board · ' + DAY_NAMES[liveTime.getDay()] + ' ' + (liveTime.getMonth() + 1) + '/' + liveTime.getDate() + ' ' + clockMs(nowMs) + (w ? ' · ' + w.crew + ' crew on (' + clock(w.shiftStart) + ' - ' + clock(w.shiftEnd) + ')' : '')];
         copyLines.push((verdict === 'NONE' ? 'NO STARTUP TIMES' : statusWord[verdict]) + (planOnly ? ' (unconfirmed)' : '') + ': ' + headline);
         if (countLine) copyLines.push(countLine);
         copyLines.push('');
-        rows.forEach(function(x) {
+        lineRows.forEach(function(x) {
             const bits = [statusWord[x.status]];
             if (x.R !== null) bits.push('startup ' + clock(x.R));
-            if (x.G !== null && x.status !== 'RUNNING') bits.push('ready by ' + clock(x.G) + ' (' + x.gateLabel + ')');
+            if (x.G !== null && x.status !== 'RUNNING') bits.push('ready by ' + clock(x.G) + ' (' + readyByWhy(x) + ')');
             const sp = spareText(x);
             if (sp) bits.push(sp);
             bits.push(x.pct + '% done');
@@ -6891,10 +8023,10 @@ export default function App(props) {
         if (support.n) copyLines.push('- Support (' + support.n + ' areas): ' + support.pct + '% done');
         if (thisShift.length) { copyLines.push(''); copyLines.push('This shift:'); thisShift.forEach(function(s) { copyLines.push((s.icon === 'star' ? '* ' : s.icon === 'alert' ? '! ' : '- ') + s.text); }); }
         copyLines.push('');
-        copyLines.push('Progress from Start/Done on one computer (' + shiftRecs.length + ' check-offs this shift). Startups from down lines and the production schedule' + (prodState.readAt ? ' (read ' + clockMs(prodState.readAt) + ')' : '') + '.');
+        copyLines.push('Progress from Start/Done ' + (ckShared ? 'saved in Dataverse, every computer' : 'on one computer') + ' (' + shiftRecs.length + ' check-offs this shift). Startups from down lines and the production schedule' + (prodState.readAt ? ' (read ' + clockMs(prodState.readAt) + ')' : '') + '.');
 
         return {
-            rows: rows, support: support, clock: clock, clockMs: clockMs, spareText: spareText, statusWord: statusWord,
+            rows: rows, lineRows: lineRows, support: support, clock: clock, clockMs: clockMs, spareText: spareText, statusWord: statusWord,
             plant: { verdict: verdict, headline: headline, countLine: countLine, pill: pill, pillShort: pillShort, next: next, scope: scope.length, cleaning: cleaning, prodDoneBy: prodDoneBy },
             effort: effort, planOnly: planOnly, attention: attention, thisShift: thisShift.slice(0, 6), provenance: provenance, copyText: copyLines.join('\n'),
             w: w, nextWin: nextWin, H: H
@@ -7357,7 +8489,8 @@ export default function App(props) {
         const supOpen = isSupportOpen('gantt') || prodRows.length === 0;
         const placed = [];
         let top = 0;
-        const place = function(r, i, arr) { r.top = top; top += r.height + ROOM_GAP_PX; r.canUp = !r.duty && i > 0; r.canDown = !r.duty && i < arr.length - 1 && !arr[i + 1].duty; placed.push(r); };
+        const free = function(x) { return !!x && !x.duty && lineRankOf(x.g.name) === LINE_PRIORITY_NONE; };   // a listed line's place is set in Hub - manager
+        const place = function(r, i, arr) { r.top = top; top += r.height + ROOM_GAP_PX; r.listed = !r.duty && !free(r); r.canUp = free(r) && free(arr[i - 1]); r.canDown = free(r) && free(arr[i + 1]); placed.push(r); };
         prodRows.forEach(place);
         let band = null;
         if (supRows.length) {
@@ -7389,7 +8522,8 @@ export default function App(props) {
                                         <span className="text-[12px] font-black text-slate-800 truncate min-w-0">{r.g.name}</span>
                                         {!r.duty && <span className="text-[9px] font-black rounded px-1 py-0.5 bg-[#E6F1FB] text-[#00468B] border border-[#B3D4F2] flex-shrink-0" title="Room priority (1 = first)">P{r.priority}</span>}
                                         {r.duty && <span data-duty-room-tag className="text-[9px] font-black rounded px-1 py-0.5 bg-slate-200 text-slate-700 flex-shrink-0" title="Support duty: people who hold this role, and extra heads put on it (Crew tab)">DUTY</span>}
-                                        {!r.duty && <span className="ml-auto flex items-center gap-0.5 flex-shrink-0">
+                                        {r.listed && <span className="ml-auto flex items-center flex-shrink-0"><span data-line-rank={r.g.name} className="text-[9px] font-black rounded px-1 py-0.5 text-[#00468B] border border-[#00468B]/40 bg-white" title={lineRankTitle(r.g.name)}>#{lineRankOf(r.g.name) + 1}</span></span>}
+                                        {!r.duty && !r.listed && <span className="ml-auto flex items-center gap-0.5 flex-shrink-0">
                                             <button data-room-up={r.g.name} disabled={!r.canUp} onClick={function(e) { e.stopPropagation(); moveRoom(r.g.name, -1, lay.shown); }} title="Show this room higher" aria-label="Show this room higher" className="w-5 h-5 rounded text-[9px] leading-none font-black text-[#0072CE] hover:bg-[#E6F1FB] disabled:opacity-25 disabled:hover:bg-transparent no-pan">▲</button>
                                             <button data-room-down={r.g.name} disabled={!r.canDown} onClick={function(e) { e.stopPropagation(); moveRoom(r.g.name, 1, lay.shown); }} title="Show this room lower" aria-label="Show this room lower" className="w-5 h-5 rounded text-[9px] leading-none font-black text-[#0072CE] hover:bg-[#E6F1FB] disabled:opacity-25 disabled:hover:bg-transparent no-pan">▼</button>
                                         </span>}
@@ -7515,7 +8649,8 @@ export default function App(props) {
         const supOpen = isSupportOpen('gantt') || prodRows.length === 0;
         const placed = [];
         let top = 0;
-        const place = function(r, i, arr) { r.top = top; top += r.height + ROOM_GAP_PX; r.canUp = i > 0; r.canDown = i < arr.length - 1; placed.push(r); };
+        const free = function(x) { return !!x && lineRankOf(x.name) === LINE_PRIORITY_NONE; };   // a listed line's place is set in Hub - manager
+        const place = function(r, i, arr) { r.top = top; top += r.height + ROOM_GAP_PX; r.listed = !free(r); r.canUp = free(r) && free(arr[i - 1]); r.canDown = free(r) && free(arr[i + 1]); placed.push(r); };
         prodRows.forEach(place);
         let band = null;
         if (supRows.length) {
@@ -7551,10 +8686,11 @@ export default function App(props) {
                                         <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${getRoomColor(r.name)}`} style={bgOf(roomHex(r.name))} />
                                         <span className="text-[12px] font-black text-slate-800 truncate min-w-0">{r.name}</span>
                                         <span className="text-[9px] font-black rounded px-1 py-0.5 bg-[#E6F1FB] text-[#00468B] border border-[#B3D4F2] flex-shrink-0" title="Room priority (1 = first)">P{r.priority}</span>
-                                        <span className="ml-auto flex items-center gap-0.5 flex-shrink-0">
+                                        {r.listed && <span className="ml-auto flex items-center flex-shrink-0"><span data-line-rank={r.name} className="text-[9px] font-black rounded px-1 py-0.5 text-[#00468B] border border-[#00468B]/40 bg-white" title={lineRankTitle(r.name)}>#{lineRankOf(r.name) + 1}</span></span>}
+                                        {!r.listed && <span className="ml-auto flex items-center gap-0.5 flex-shrink-0">
                                             <button data-room-up={r.name} disabled={!r.canUp} onClick={function(e) { e.stopPropagation(); moveRoom(r.name, -1, lay.shown); }} title="Show this room higher" aria-label="Show this room higher" className="w-5 h-5 rounded text-[9px] leading-none font-black text-[#0072CE] hover:bg-[#E6F1FB] disabled:opacity-25 disabled:hover:bg-transparent no-pan">▲</button>
                                             <button data-room-down={r.name} disabled={!r.canDown} onClick={function(e) { e.stopPropagation(); moveRoom(r.name, 1, lay.shown); }} title="Show this room lower" aria-label="Show this room lower" className="w-5 h-5 rounded text-[9px] leading-none font-black text-[#0072CE] hover:bg-[#E6F1FB] disabled:opacity-25 disabled:hover:bg-transparent no-pan">▼</button>
-                                        </span>
+                                        </span>}
                                     </div>
                                     <div className="flex items-center gap-1 mt-0.5 min-w-0">
                                         <span className="text-[10px] font-bold text-slate-500 truncate min-w-0">{r.steps.length} {r.steps.length === 1 ? 'piece' : 'pieces'} · {fmtMins(r.work)} · up to {r.peak} {r.peak === 1 ? 'person' : 'people'}</span>
@@ -7621,12 +8757,16 @@ export default function App(props) {
     // The Crew tab's card for a shift whose crews were built automatically: one block per room, its leader and team inside.
     const renderAutoRooms = function(w, view) {
         const dayTag = function(n, h) { return n > 0 ? n + (n === 1 ? ' shift' : ' shifts') + ' here' + (h >= 1 ? ' (' + Math.round(h) + ' h)' : '') : 'new to it'; };
-        // Production rooms first, then the Support section at the bottom (folded in PBED). Inside each: the order the planner set in
-        // Setup / the Gantt arrows, the rooms nobody moved as the crews were built (priority, then work).
+        // Production rooms first, then the Support section at the bottom (folded in PBED). Inside each: the listed lines in Gerald's line
+        // order (Hub - manager), the order the planner set in Setup / the Gantt arrows, the rooms nobody moved as the crews were built
+        // (priority, then work).
         const manualIdx = function(r) { let best = -1; (r.labels || []).forEach(function(lb) { const i = roomOrder.indexOf(lb); if (i > -1 && (best === -1 || i < best)) best = i; }); return best; };
+        const lineIdx = function(r) { let best = LINE_PRIORITY_NONE; (r.labels || []).forEach(function(lb) { best = Math.min(best, lineRankOf(lb)); }); return best; };
         const ordered = view.rooms.map(function(r, i) { return { r: r, i: i }; }).sort(function(a, b) {
             const sa = a.r.support ? 1 : 0, sb = b.r.support ? 1 : 0;
             if (sa !== sb) return sa - sb;
+            const la = lineIdx(a.r), lb = lineIdx(b.r);
+            if (la !== lb) return la - lb;
             const ia = manualIdx(a.r), ib = manualIdx(b.r);
             if (ia > -1 || ib > -1) { if (ia === -1) return 1; if (ib === -1) return -1; if (ia !== ib) return ia - ib; }
             return a.i - b.i;
@@ -7736,7 +8876,7 @@ export default function App(props) {
         board.rows.forEach(function(x) {
             if (activeTab === 'focus' && focusRoom && x.room !== focusRoom) return;
             const tip = x.room + ': ' + board.statusWord[x.status] + (board.spareText(x) ? ' · ' + board.spareText(x) : '');
-            if (x.G !== null && x.status !== 'RUNNING' && x.G >= 0 && x.G <= planHorizonMins) out.push({ key: 'g-' + x.room, kind: 'readyby', room: x.room, min: x.G, ready: x.status === 'READY', title: tip + '\nReady by ' + board.clock(x.G) + ' (' + x.gateLabel + ')', name: x.room + ' ready by' });
+            if (x.G !== null && x.status !== 'RUNNING' && x.G >= 0 && x.G <= planHorizonMins) out.push({ key: 'g-' + x.room, kind: 'readyby', room: x.room, min: x.G, ready: x.status === 'READY', title: tip + '\nReady by ' + board.clock(x.G) + ' (' + readyByWhy(x) + ')', name: x.room + ' ready by' });
             if (x.R !== null && x.R >= 0 && x.R <= planHorizonMins) out.push({ key: 'r-' + x.room, kind: 'startup', room: x.room, min: x.R, title: tip + '\nStartup ' + board.clock(x.R), name: x.room + ' startup' });
         });
         out.forEach(function(f) { f.px = xOf(f.min); });
@@ -7953,7 +9093,7 @@ export default function App(props) {
                 {over.map(function(d, i) { return <div key={'o' + i} className="absolute top-1 bottom-1 rounded-sm" style={Object.assign(span(d.s, d.e), { background: HATCH_RED })} title="Running past its plan" />; })}
                 {x.uWork > 0 && <div className="absolute top-1 bottom-1 rounded-sm border-2 border-dashed flex items-center justify-center overflow-hidden" style={Object.assign(span(tailS, Math.min(H, tailS + tailLen)), { borderColor: '#E4002B', background: 'rgba(228,0,43,0.06)' })} title={fmtMins(x.uWork) + " of cleaning doesn't fit in the view" + (x.wontFit ? ' before startup' : '')}><span className="px-1 text-[9px] font-black text-[#B00020] truncate">+{fmtMins(x.uWork)} won't fit</span></div>}
                 {nowMin > 0 && nowMin < H && <div className="absolute -top-0.5 -bottom-0.5 w-0.5 bg-[#E4002B] z-[3]" style={{ left: pc(nowMin) + '%' }} title={'Now ' + board.clock(nowMin)} />}
-                {x.G !== null && x.G >= 0 && x.G < H && x.status !== 'RUNNING' && <div className="absolute -top-1 -bottom-1 z-[4]" style={{ left: pc(x.G) + '%' }} title={'Ready by ' + board.clock(x.G) + ' (' + x.gateLabel + ')'}>
+                {x.G !== null && x.G >= 0 && x.G < H && x.status !== 'RUNNING' && <div className="absolute -top-1 -bottom-1 z-[4]" style={{ left: pc(x.G) + '%' }} title={'Ready by ' + board.clock(x.G) + ' (' + readyByWhy(x) + ')'}>
                     <div className="absolute top-0 bottom-0 -ml-px w-[3px] rounded-full" style={{ background: '#FFB81C' }} />
                     {opts.labels && <span className="absolute -top-3.5 right-1 text-[9px] font-black text-[#8A5A00] whitespace-nowrap">ready by</span>}
                 </div>}
@@ -7992,7 +9132,7 @@ export default function App(props) {
         const label = 'text-[11px] font-extrabold uppercase tracking-[0.08em] text-slate-500';
         const tileNum = (tv ? 'text-[40px]' : 'text-[30px]') + ' font-black text-[#00468B] tabular-nums leading-none';
         const card = 'bg-white rounded-xl shadow-sm border border-slate-200';
-        const rows = b.rows;
+        const rows = b.lineRows;
         const rowH = tv && tvRowsH > 0 && rows.length ? Math.max(56, Math.min(88, Math.floor((tvRowsH - (b.support.n ? 44 : 0)) / rows.length))) : 56;
         const nx = pl.next;
         const attn = attnExpanded ? b.attention : b.attention.slice(0, 3);
@@ -8009,7 +9149,7 @@ export default function App(props) {
                 {/* Verdict band: the answer first, then the next startup, cleaning done and the effort this shift. */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-[1.15fr_1fr_1fr_1fr] gap-3 flex-shrink-0">
                     <div data-hero={pl.verdict} className="rounded-xl shadow-sm px-4 py-3 flex flex-col justify-center min-h-[104px] relative" style={heroLook}>
-                        {b.planOnly && pl.verdict !== 'NONE' && <span className="absolute top-2 right-2 px-1.5 py-0.5 rounded bg-slate-800 text-white text-[9px] font-black tracking-[0.12em]" title="No Start / Done check-offs on this computer this shift: this is the plan, not the floor">UNCONFIRMED</span>}
+                        {b.planOnly && pl.verdict !== 'NONE' && <span className="absolute top-2 right-2 px-1.5 py-0.5 rounded bg-slate-800 text-white text-[9px] font-black tracking-[0.12em]" title={'No Start / Done check-offs ' + (b.provenance.shared ? '' : 'on this computer ') + 'this shift: this is the plan, not the floor'}>UNCONFIRMED</span>}
                         <div className={(tv ? 'text-[56px]' : 'text-[40px]') + ' font-black leading-none tracking-tight'} style={b.planOnly && pl.verdict !== 'NONE' ? { color: vst.dot === '#FFB81C' ? '#8A5A00' : vst.dot } : null}>{vst.word}</div>
                         <div className={(tv ? 'text-[19px]' : 'text-[15px]') + ' font-bold mt-1 leading-snug'}>{pl.headline}</div>
                         {pl.countLine && <div className={(tv ? 'text-[14px]' : 'text-[12px]') + ' font-semibold opacity-90 mt-0.5'}>{pl.countLine}</div>}
@@ -8020,7 +9160,7 @@ export default function App(props) {
                         {nx ? (<React.Fragment>
                             <div className="flex items-baseline gap-2 mt-1"><span className={tileNum}>{b.clock(nx.R)}</span><span className="text-[12px] font-bold text-slate-500">in {fmtMins(nx.R - nowMin)}</span></div>
                             <div className="flex items-center gap-2 mt-1.5 min-w-0">{boardChip(nx.status)}<button onClick={function() { openBoardRoom(nx.room); }} className="text-[13px] font-bold text-slate-800 truncate hover:underline no-pan">{nx.room}</button></div>
-                            {nx.G !== null && nx.status !== 'RUNNING' && <div className="text-[11px] font-semibold text-slate-500 mt-0.5 truncate">ready by {b.clock(nx.G)} ({nx.gateLabel}){b.spareText(nx) ? ' · ' + b.spareText(nx) : ''}</div>}
+                            {nx.G !== null && nx.status !== 'RUNNING' && <div className="text-[11px] font-semibold text-slate-500 mt-0.5 truncate">ready by {b.clock(nx.G)}{b.spareText(nx) ? ' · ' + b.spareText(nx) : ''}</div>}
                             {nx.status === 'RUNNING' && <div className="text-[11px] font-semibold text-slate-500 mt-0.5 truncate">line running until {b.clock(nx.S)}</div>}
                         </React.Fragment>) : (<React.Fragment>
                             <div className={tileNum + ' mt-1 text-slate-300'}>—</div>
@@ -8038,7 +9178,7 @@ export default function App(props) {
                         {!w ? <div className="text-[12px] font-semibold text-slate-500 mt-2">No crew on now{b.nextWin ? ' · next ' + b.nextWin.crew + ' ' + b.clock(b.nextWin.start) : ''}</div>
                         : b.planOnly ? (<React.Fragment>
                             <div className={tileNum + ' mt-1 text-slate-300'}>—</div>
-                            <div className="text-[11px] font-semibold text-slate-500 mt-1">No Start / Done on this computer yet this shift</div>
+                            <div className="text-[11px] font-semibold text-slate-500 mt-1">{b.provenance.shared ? 'No Start / Done yet this shift' : 'No Start / Done on this computer yet this shift'}</div>
                         </React.Fragment>) : (<React.Fragment>
                             <div className="flex items-baseline gap-2 mt-1"><span className={tileNum}>{Math.round(ef.stdHrs * 10) / 10}</span><span className="text-[12px] font-bold text-slate-500">std hrs done</span></div>
                             <div className="text-[11px] font-semibold text-slate-600 mt-1 truncate">{ef.cleans} clean{ef.cleans === 1 ? '' : 's'}{ef.underWay ? ' · ' + ef.underWay + ' under way' : ''} · {ef.assigned} of {ef.onNow} on equipment now (plan)</div>
@@ -8051,7 +9191,7 @@ export default function App(props) {
                 <div className="flex-shrink-0 xl:flex-shrink xl:flex-1 xl:min-h-0 grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_360px] gap-3">
                     <div className={card + ' flex flex-col xl:min-h-0 overflow-hidden'}>
                         <div className="px-4 pt-3 pb-2 flex items-baseline justify-between gap-3 flex-shrink-0">
-                            <div className={label}>Ready for startup <span className="normal-case tracking-normal font-bold text-slate-400">· worst first{tv ? '' : ' · click a line to open it'}</span></div>
+                            <div className={label}>Ready for startup <span className="normal-case tracking-normal font-bold text-slate-400">· in line order{tv ? '' : ' · click a line to open it'}</span></div>
                             <div className="hidden md:flex items-center gap-3 text-[10px] font-bold text-slate-500">
                                 <span className="inline-flex items-center gap-1"><span className="w-3 h-2.5 rounded-sm bg-slate-400 opacity-70 complete-stripes" />done</span>
                                 <span className="inline-flex items-center gap-1"><span className="w-3 h-2.5 rounded-sm bg-[#0072CE]" />to do</span>
@@ -8164,9 +9304,9 @@ export default function App(props) {
 
                 {/* Where the numbers come from, and how the board judges. */}
                 <div className="flex-shrink-0 relative flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10.5px] font-semibold text-slate-500 leading-tight">
-                    <span>Progress: Start / Done pressed on this computer</span><span className="text-slate-300">·</span>
+                    <button data-ck-footer onClick={function() { setCkModal(true); }} className={'font-semibold hover:underline no-pan ' + (b.provenance.shared ? '' : 'text-[#8A5A00]')} title="Where Start / Done are saved, and the Dataverse columns Ganttly uses">{ckFooterText(b.provenance)}</button><span className="text-slate-300">·</span>
                     <span>Startups: down lines + production schedule{b.provenance.schedReadAt ? ' (read ' + b.clockMs(b.provenance.schedReadAt) + ')' : ''}</span><span className="text-slate-300">·</span>
-                    <span>Ready-by: startup − {READY_BY_SHORT_MINS / 60} h (preflight); startup − {READY_BY_LONG_MINS / 60} h (FSQ inspect) when the line is down {LONG_CHANGEOVER_MINS / 60} h or more</span>
+                    <span>Ready-by: {READY_BY_MINS / 60} h before the next run</span>
                     {!b.provenance.liveReforecast && <React.Fragment><span className="text-slate-300">·</span><span className="text-[#8A5A00]">Live Reforecast is off on this computer: finish times assume unstarted work began on plan</span></React.Fragment>}
                     <span className="text-slate-300">·</span>
                     <button data-how-judged onClick={function() { setJudgedOpen(!judgedOpen); }} className="font-black text-[#0072CE] hover:underline no-pan">How this is judged</button>
@@ -8175,11 +9315,11 @@ export default function App(props) {
                             <div className="flex items-center justify-between mb-2"><span className={label}>How this is judged</span><button onClick={function() { setJudgedOpen(false); }} className="text-slate-400 hover:text-slate-700 font-black no-pan">✕</button></div>
                             <ul className="list-disc pl-4 space-y-1">
                                 <li><b>Startup</b>: the end of a down line when one is entered, else the next run on the production schedule after the line stops.</li>
-                                <li><b>Ready by</b>: {READY_BY_SHORT_MINS} min before startup (preflight). When the line is down {LONG_CHANGEOVER_MINS / 60} h or more: {READY_BY_LONG_MINS / 60} h before (FSQ inspect). Never before the line stops.</li>
+                                <li><b>Ready by</b>: {READY_BY_MINS / 60} h before startup (the next run), on every changeover. Never before the line stops.</li>
                                 <li><b>Ready</b> = every piece in the room done by the ready-by time. <b>On track</b> = the plan finishes with {AT_RISK_MINS} min or more to spare. <b>At risk</b> = less than {AT_RISK_MINS} min to spare, or less than {OVERRUN_RISK_MINS / 60} h while a clean runs past its plan. <b>Late</b> = the plan finishes after the ready-by time, or work does not fit before it.</li>
                                 <li>A clean started and not checked off at its planned end keeps its people busy up to now and shows red as past plan.</li>
                                 <li>Done without Start counts as done, not timed. Pace only shows once {PACE_MIN_TIMED} cleans have both Start and Done.</li>
-                                <li>Progress comes from Start / Done pressed in Ganttly on this computer; with none this shift for {UNCONFIRMED_AFTER_MINS} min the verdict says unconfirmed.</li>
+                                <li>Progress comes from Start / Done pressed in Ganttly, saved in Dataverse (table {CHECKOFF_SPEC.table}) so every computer shows the same; while it cannot be saved it stays on the computer it was pressed on. With none this shift for {UNCONFIRMED_AFTER_MINS} min the verdict says unconfirmed.</li>
                                 <li>An unknown startup is never counted as on track or late. A support area has no startup.</li>
                                 <li>Credit and follow-ups are by room, crew and lead; no one person is named.</li>
                             </ul>
@@ -8300,7 +9440,7 @@ export default function App(props) {
                     <div data-focus-runway={fx.status} className="basis-full grid grid-cols-1 lg:grid-cols-[auto_minmax(0,1fr)_auto] gap-x-4 gap-y-1.5 items-center pt-1.5">
                         <div className="flex items-center gap-2 min-w-0">
                             {boardChip(fx.status)}
-                            <span className="text-[12px] font-semibold text-slate-600 truncate">{fx.R !== null ? 'startup ' + board.clock(fx.R) : fx.noStartupWhy}{fx.G !== null && fx.status !== 'RUNNING' ? ' · ready by ' + board.clock(fx.G) + ' (' + fx.gateLabel + ')' : ''}</span>
+                            <span className="text-[12px] font-semibold text-slate-600 truncate">{fx.R !== null ? 'startup ' + board.clock(fx.R) : fx.noStartupWhy}{fx.G !== null && fx.status !== 'RUNNING' ? ' · ready by ' + board.clock(fx.G) + ' (' + readyByWhy(fx) + ')' : ''}</span>
                         </div>
                         <div className="min-w-0 pt-2">{renderRunway(fx, { labels: true })}</div>
                         <div className="flex items-center gap-3 text-[12px] font-bold text-slate-600 whitespace-nowrap">
@@ -8392,19 +9532,19 @@ export default function App(props) {
                         {board && (function() {
                             // Where the numbers come from: the check-offs on this computer, and when the startup times were read.
                             const pv = board.provenance;
-                            const ckText = pv.planOnly ? 'No check-offs on this computer this shift' : 'This computer: ' + pv.checkoffs + ' check-off' + (pv.checkoffs === 1 ? '' : 's') + (pv.lastMs ? ' · last ' + board.clockMs(pv.lastMs) : '');
+                            const ckText = (pv.planOnly ? 'No check-offs' + (pv.shared ? '' : ' on this computer') + ' this shift' : (pv.shared ? 'Dataverse: ' : 'This computer: ') + pv.checkoffs + ' check-off' + (pv.checkoffs === 1 ? '' : 's') + (pv.lastMs ? ' · last ' + board.clockMs(pv.lastMs) : '')) + (pv.shared ? '' : ' · not shared');
                             const schedBad = pv.schedStatus === 'failed';
                             const scText = schedBad ? 'Schedule not read' + (pv.schedReadAt ? ' since ' + board.clockMs(pv.schedReadAt) : '') : pv.schedReadAt ? 'Schedule read ' + board.clockMs(pv.schedReadAt) : 'Reading the schedule';
                             const dlText = pv.downActive ? ' · ' + pv.downActive + ' down line' + (pv.downActive === 1 ? '' : 's') : '';
                             const chip = 'inline-flex items-center gap-1 px-2 py-1 rounded-lg border text-[10px] font-bold whitespace-nowrap';
-                            const tip = 'Progress (done, started, effort) comes from Start / Done pressed in Ganttly on this computer; another computer does not see them.\nStartup times come from down lines and the production schedule (re-read every 15 minutes).';
+                            const tip = 'Progress (done, started, effort) comes from Start / Done pressed in Ganttly. ' + ckStateText() + (pv.shared ? ': every computer shows the same check-offs' + (pv.remote ? ' (' + pv.remote + ' this shift from other computers)' : '') + '.' : '; until it is, check-offs stay on the computer they were pressed on.') + ' Click for the Dataverse columns.\nStartup times come from down lines and the production schedule (re-read every 15 minutes).';
                             return (
                                 <div className="ml-auto flex items-center gap-1.5 pl-2 flex-shrink-0">
                                     {activeTab === 'startup' && <button data-copy-teams onClick={function() { copyBoardText(board.copyText); }} className={chip + ' bg-white border-[#B3D4F2] text-[#0072CE] hover:bg-[#E6F1FB] no-pan'} title="Copy a plain-text summary of this board to paste into Teams or an email">{copiedAt ? <Check className="w-3.5 h-3.5" /> : <CopyIcon className="w-3.5 h-3.5" />}<span className={copiedAt ? 'inline' : 'hidden lg:inline'}>{copiedAt ? 'Copied' : 'Copy for Teams'}</span></button>}
                                     {activeTab === 'startup' && <button data-tv onClick={function() { setTvMode(true); }} className={chip + ' bg-white border-[#B3D4F2] text-[#0072CE] hover:bg-[#E6F1FB] no-pan'} title="TV mode: the Startup board alone, larger, for a screen on the wall"><Tv className="w-3.5 h-3.5" /><span className="hidden lg:inline">TV</span></button>}
-                                    <span data-prov-checkoffs className={chip + ' hidden xl:inline-flex ' + (pv.planOnly ? 'bg-[#FFF4D6] border-[#FFB81C] text-[#8A5A00]' : 'bg-slate-50 border-slate-200 text-slate-600')} title={tip}>{ckText}</span>
+                                    <button data-prov-checkoffs onClick={function() { setCkModal(true); }} className={chip + ' hidden xl:inline-flex no-pan hover:border-[#0072CE] ' + (pv.planOnly || !pv.shared ? 'bg-[#FFF4D6] border-[#FFB81C] text-[#8A5A00]' : 'bg-slate-50 border-slate-200 text-slate-600')} title={tip}>{ckText}</button>
                                     <span data-prov-schedule className={chip + ' hidden xl:inline-flex ' + (schedBad ? 'bg-[#FFF4D6] border-[#FFB81C] text-[#8A5A00]' : 'bg-slate-50 border-slate-200 text-slate-600')} title={tip}>{scText}{dlText}</span>
-                                    <span className={'xl:hidden inline-flex items-center justify-center w-7 h-7 rounded-full border ' + (pv.planOnly || schedBad ? 'bg-[#FFF4D6] border-[#FFB81C] text-[#8A5A00]' : 'bg-slate-50 border-slate-200 text-slate-500')} title={ckText + '\n' + scText + dlText + '\n\n' + tip}><Info className="w-3.5 h-3.5" /></span>
+                                    <button onClick={function() { setCkModal(true); }} className={'xl:hidden inline-flex items-center justify-center w-7 h-7 rounded-full border no-pan ' + (pv.planOnly || schedBad || !pv.shared ? 'bg-[#FFF4D6] border-[#FFB81C] text-[#8A5A00]' : 'bg-slate-50 border-slate-200 text-slate-500')} title={ckText + '\n' + scText + dlText + '\n\n' + tip} aria-label="Where the numbers come from"><Info className="w-3.5 h-3.5" /></button>
                                 </div>
                             );
                         })()}
@@ -8601,10 +9741,14 @@ export default function App(props) {
                                                     <MapPin className={`w-4 h-4 md:w-5 md:h-5 ${isSkipped ? 'text-slate-400' : 'text-[#0072CE]'}`}/>
                                                     <h3 className={`font-bold text-base md:text-[17px] tracking-wide ${isSkipped ? 'text-slate-500 line-through' : 'text-[#00468B]'}`}>{room}</h3>
                                                     <span className={`w-3 h-3 rounded-full flex-shrink-0 border border-black/10 ${getRoomColor(room)}`} style={bgOf(roomHex(room))} title="Room color" />
+                                                    {lineRankOf(room) < LINE_PRIORITY_NONE ? (
+                                                        <span className="inline-flex items-center ml-1"><span data-line-rank={room} className="text-[10px] font-black rounded px-1 py-0.5 text-[#00468B] border border-[#00468B]/40 bg-white" title={lineRankTitle(room)}>#{lineRankOf(room) + 1}</span></span>
+                                                    ) : (
                                                     <span className="inline-flex items-center gap-0.5 ml-1" title="Move the room up or down in every list and chart">
                                                         <button data-room-up={room} onClick={function() { moveRoom(room, -1, setupShown()); }} className="w-6 h-6 rounded border border-[#B3D4F2] bg-white text-[#0072CE] text-[11px] font-black hover:bg-[#E6F1FB] no-pan">▲</button>
                                                         <button data-room-down={room} onClick={function() { moveRoom(room, 1, setupShown()); }} className="w-6 h-6 rounded border border-[#B3D4F2] bg-white text-[#0072CE] text-[11px] font-black hover:bg-[#E6F1FB] no-pan">▼</button>
                                                     </span>
+                                                    )}
                                                 </div>
                                                 <div className="flex flex-wrap items-center gap-2 md:gap-3">
                                                     <select data-room-group={room} value={roomGroups[room] || ''} onChange={function(e) { handleRoomGroupChange(room, e.target.value); }} title="Production rooms are shown first; support rooms go in a folded section below them" className="text-[11px] font-bold outline-none bg-white cursor-pointer no-pan border border-[#B3D4F2] rounded-full px-2 py-1">
@@ -9169,7 +10313,7 @@ export default function App(props) {
                                                                                     <div className="font-black text-slate-800 text-sm truncate">{col.name}</div>
                                                                                     <span className="text-[10px] font-bold text-slate-400 flex-shrink-0">{col.isLead ? 'Lead' : 'Supervisor'}</span>
                                                                                 </div>
-                                                                                {col.lines.map(function(line) {
+                                                                                {col.lines.slice().sort(function(a, b) { return lineRankOf(a.name) - lineRankOf(b.name) || byNameNum(a, b); }).map(function(line) {
                                                                                     return (
                                                                                         <div key={line.lineId} className="mt-2 bg-white border border-slate-200 rounded-lg p-2">
                                                                                             <div className="flex items-center justify-between gap-2">
@@ -10437,6 +11581,49 @@ export default function App(props) {
                 </div>
             )}
 
+            {/* START / DONE IN DATAVERSE (Ganttly): where check-offs are saved, what is waiting, and the columns Ganttly writes */}
+            {IS_CURRENT && ckModal && (function() {
+                const c = ckSync, b = c.blocked || {};
+                const hm = function(ms) { const d = new Date(ms); let h = d.getHours(); const m = d.getMinutes(); const ap = h >= 12 ? 'PM' : 'AM'; h = h % 12 || 12; return h + ':' + (m < 10 ? '0' + m : m) + ' ' + ap; };
+                const good = c.mode === 'shared';
+                const why = c.mode === 'shared' ? 'Every Start, Done and Undo pressed in Ganttly is saved to the ' + CHECKOFF_SPEC.tableLabel + ' table, and this computer reads the other computers\' check-offs every ' + (CHECKOFF_READ_MS / 60000) + ' minutes, so every screen shows the same progress.'
+                    : c.mode === 'blocked' ? (b.kind === 'table' ? 'Ganttly saves Start / Done to a Dataverse table that is not there yet (' + ckNames().table + '). Until it is, check-offs stay on this computer; they are kept for up to 14 days and saved as soon as the table answers. Create it with the steps below, then press Check again.'
+                        : b.kind === 'denied' ? 'This account is not allowed to save to the ' + CHECKOFF_SPEC.tableLabel + ' table. Check-offs stay on this computer until it is. Ask for Read, Create and Write on the table, then press Save and read now.'
+                        : b.short ? 'Dataverse refused a check-off because a column is set too short' + (b.cols && b.cols.length ? ' (' + b.cols.join(', ') + ')' : '') + '. In Power Apps open that column and set its maximum character count to 1,048,576, then press Save and read now. Check-offs stay on this computer until then.'
+                        : 'The table is there, but a column Ganttly needs is missing' + (b.cols && b.cols.length ? ': ' + b.cols.join(', ') : '') + '. Check-offs stay on this computer until it is added (or its name is typed below).')
+                    : c.mode === 'offline' ? 'Dataverse did not answer just now. Ganttly keeps every check-off and tries again after 15 seconds, 30 seconds, 1, 2, then every 5 minutes.'
+                    : c.mode === 'nowrite' ? 'The page Ganttly is pasted in can read Dataverse but does not let it save. Other computers\' check-offs still show here; the ones pressed here stay on this computer (kept up to 14 days) and are saved once the page allows it.'
+                    : c.mode === 'nodv' ? 'This page has no Dataverse connection, so check-offs stay on this computer.'
+                    : 'Asking Dataverse…';
+                const S = ckRef.current, waiting = Object.keys(S.pending).map(function(k) { return S.pending[k]; });
+                const oldest = waiting.reduce(function(m, it) { return Math.min(m, it.at || Infinity); }, Infinity);
+                const lastErr = c.err || (b.err || '') || waiting.map(function(it) { return it.err; }).filter(Boolean)[0] || '';
+                return (
+                    <div data-ck-modal className="fixed inset-0 bg-slate-900/40 z-[100] flex items-center justify-center backdrop-blur-sm p-4" onPointerDown={function() { setCkModal(false); }}>
+                        <div className="bg-white p-5 rounded-2xl shadow-2xl w-full max-w-xl border border-slate-200 max-h-full overflow-y-auto" onPointerDown={function(e) { if (e && typeof e.stopPropagation === 'function') e.stopPropagation(); }}>
+                            <div className="flex justify-between items-center mb-3 border-b border-slate-100 pb-3">
+                                <h3 className="text-lg font-black text-slate-800">Start / Done in Dataverse</h3>
+                                <Button variant="outline" size="sm" onClick={function() { setCkModal(false); }} className="px-2 py-1 shadow-none text-slate-400 hover:text-slate-800">✕</Button>
+                            </div>
+                            <div data-ck-state={c.mode} className={'rounded-xl border px-4 py-3 ' + (good ? 'bg-[#E6F1FB] border-[#B3D4F2]' : 'bg-[#FFF6E0] border-[#FFB81C]')}>
+                                <div className={'text-sm font-black ' + (good ? 'text-[#00468B]' : 'text-[#7A4B00]')}>{ckStateText()}</div>
+                                <p className="text-[13px] font-medium text-slate-700 mt-1">{why}</p>
+                                <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-0.5 text-[12px] font-semibold text-slate-600">
+                                    <span>Waiting to save: <b className="text-slate-800">{waiting.length}</b>{waiting.length && isFinite(oldest) ? ' (oldest ' + hm(oldest) + ')' : ''}</span>
+                                    <span>Last saved: <b className="text-slate-800">{c.lastSaveAt ? hm(c.lastSaveAt) : 'not yet'}</b></span>
+                                    <span>Last read: <b className="text-slate-800">{c.lastReadAt ? hm(c.lastReadAt) : 'not yet'}</b></span>
+                                    <span>Table: <b className="text-slate-800 font-mono text-[11px] break-all">{ckNames().table}</b></span>
+                                </div>
+                                {c.missing.length > 0 && <p className="mt-1 text-[12px] font-semibold text-slate-600">Left out (optional, not in the table): <span className="font-mono">{c.missing.join(', ')}</span></p>}
+                                {!good && lastErr && <p className="mt-1 text-[11px] font-mono text-slate-500 break-words">Dataverse said: {lastErr}</p>}
+                                <div className="mt-3"><button data-ck-retry onClick={ckRetryNow} className="min-h-[40px] px-4 rounded-lg text-sm font-extrabold border bg-[#0072CE] text-white border-[#0072CE] hover:bg-[#00468B] no-pan">Save and read now</button></div>
+                            </div>
+                            <StillwellColumnsCard spec={CHECKOFF_SPEC} dataApi={props.dataApi} onChange={ckColumnsChanged} startOpen={true} className="mt-3" />
+                        </div>
+                    </div>
+                );
+            })()}
+
             {/* DOWN LINE MODAL (Ganttly) */}
             {downModal && (
                 <div data-down-modal className="fixed inset-0 bg-slate-900/40 z-[100] flex items-center justify-center backdrop-blur-sm p-4 touch-none" onPointerDown={function() { setDownModal(null); }}>
@@ -10453,7 +11640,7 @@ export default function App(props) {
                                     <option value="">Pick a line…</option>
                                     {lineIndex.some(function(l) { return l.prod; }) ? (
                                         <React.Fragment>
-                                            <optgroup label="Production lines">{lineIndex.filter(function(l) { return l.prod; }).sort(byNameNum).map(function(l) { return <option key={l.id} value={l.id}>{l.name}</option>; })}</optgroup>
+                                            <optgroup label="Production lines">{lineIndex.filter(function(l) { return l.prod; }).sort(function(a, b) { return lineRankOf(a.name) - lineRankOf(b.name) || byNameNum(a, b); }).map(function(l) { return <option key={l.id} value={l.id}>{l.name}</option>; })}</optgroup>
                                             <optgroup label="Other areas">{lineIndex.filter(function(l) { return !l.prod; }).sort(byNameNum).map(function(l) { return <option key={l.id} value={l.id}>{l.name}</option>; })}</optgroup>
                                         </React.Fragment>
                                     ) : lineIndex.slice().sort(byNameNum).map(function(l) { return <option key={l.id} value={l.id}>{l.name}</option>; })}
