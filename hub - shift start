@@ -901,13 +901,13 @@ function balancedMembers(h: History, rooms: { id: string; name: string; have: nu
 // with some time under the lead or in the room; Training = the reverse, everyone is a candidate and the people with the least time under that lead and in that
 // room come first.
 type Suggest = { id: string; name: string; days: number; withLead: number; role?: 'anchor' | 'learner'; topArea?: string; share?: number; total?: number };
-function suggestMembers(h: History | null, rooms: { id: string; name: string; have: number; lead: string; members?: { id: string; name: string }[] }[], staff: { id: string; name: string }[], atMin: number, mode: SuggestMode = 'normal'): Record<string, Suggest[]> {
+function suggestMembers(h: History | null, rooms: { id: string; name: string; have: number; lead: string; want?: number; members?: { id: string; name: string }[] }[], staff: { id: string; name: string }[], atMin: number, mode: SuggestMode = 'normal'): Record<string, Suggest[]> {
     const out: Record<string, Suggest[]> = {};
     if (!h || !rooms.length || !staff.length) return out;
     const once: Record<string, boolean> = {}; staff = staff.filter(s => { if (once[s.id]) return false; once[s.id] = true; return true; }).sort((a, b) => (normText(a.name) < normText(b.name) ? -1 : normText(a.name) > normText(b.name) ? 1 : 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     const sign = mode === 'training' ? -1 : 1, slots: number[] = [], pair: { days: number; withLead: number }[][] = [];   // slots: the room of each empty place
     rooms.forEach((r, ri) => {
-        const usual = typicalHeadcount(h, r.name, atMin) || typicalHeadcount(h, r.name), n = usual - r.have;
+        const usual = r.want !== undefined ? r.want : (typicalHeadcount(h, r.name, atMin) || typicalHeadcount(h, r.name)), n = usual - r.have;
         for (let k = 0; k < n; k++) slots.push(ri);
         pair[ri] = staff.map(s => ({ days: shiftsInArea(h, s.id, s.name, r.name), withLead: shiftsUnderLead(h, s.id, s.name, r.lead) }));
     });
@@ -1272,6 +1272,582 @@ function AreaSelectionScreen({ areas, selectedAreaIds, onSelectChange, onAddCust
         </div>
     );
 }
+
+// ============================================================================
+// CHAT (parse + plan): the supervisor types or pastes lines ("we finished ibl4", "sending a team to ibl5 with porfirio", "cy is sick", a pasted update)
+// and they become a list of board changes to look over. Everything in this block is pure: it reads a snapshot of the board and returns what it understood
+// and the changes it would make (ops); nothing here touches the board. The panel shows the list, and only Apply runs the ops. A line that is a question, is
+// negated ("not done yet"), is about later ("after break"), about an earlier shift, or is unsure never makes a change. A first name that fits two people is
+// asked, never guessed. The reader is plain rules (no AI): it knows the rooms and people on this board and a short list of words.
+// ============================================================================
+type ChatRoom = { id: string; name: string; onBoard: boolean; lead: string; people: string[]; done: boolean };
+type ChatPerson = { id: string; name: string; lead: boolean; here: boolean };   // name as stored ("Last, First"); lead: a lead on this board; here: on this crew (not an overtime pick)
+type ChatAsk = { word: string; options: { id: string; name: string }[] };
+type ChatNote = { field: 'left' | 'status'; value: string };
+type ChatClause = {
+    text: string; kind: 'done' | 'send' | 'away' | 'free' | 'note' | 'none'; why: string; show: boolean;
+    rooms: string[]; dest: string; src: string[]; people: string[]; asks: ChatAsk[]; roomAsks: ChatAsk[]; unknownRoom: string;
+    count: number; fill: boolean; more: boolean; team: boolean; fromPrev: boolean; status: string; note: ChatNote | null; noteRoom: string; neg: boolean; cond: boolean; hasSubject: boolean; verb: string; mention: string[];
+};
+type ChatOp =
+    | { op: 'room'; areaId: string; leadId: string }
+    | { op: 'lead'; areaId: string; leadId: string }
+    | { op: 'place'; empId: string; areaId: string }
+    | { op: 'free'; empIds: string[] }
+    | { op: 'detail'; areaId: string; status?: string; left?: string }
+    | { op: 'away'; empId: string; status: string }
+    | { op: 'overtime'; empId: string };
+type ChatItem = { ci: number; kind: 'done' | 'send' | 'away' | 'free' | 'note' | 'ask' | 'skip'; said: string; text: string; lines: string[]; warn: string[]; ops: ChatOp[]; asks: ChatAsk[] };
+type ChatBoard = {
+    rooms: ChatRoom[]; people: ChatPerson[]; free: string[]; supId: string; plan: boolean;
+    usual: (roomName: string) => number;                                         // how many people the room usually takes (0 = not known)
+    pick: (roomId: string, n: number, from: string[], have: string[]) => string[];   // n people out of `from` for the room (the preset ranks them)
+};
+type ChatEnv = { ridx: ChatRoomIdx; pidx: ChatPeopleIdx; rooms: ChatRoom[]; people: ChatPerson[]; supId: string };
+type ChatCarry = { room: string; person: string; verb: string };
+
+function chatSet(a: string[]): Record<string, boolean> { const o: Record<string, boolean> = {}; a.forEach(x => { o[x] = true; }); return o; }
+const CHAT_DONE = chatSet(['finished', 'finish', 'finishes', 'finnished', 'finshed', 'finishd', 'done', 'complete', 'completed', 'wrapped', 'wrap', 'cleaned', 'closed']);
+const CHAT_SEND = chatSet(['send', 'sending', 'sent', 'put', 'putting', 'move', 'moving', 'moved', 'assign', 'assigned', 'assigning', 'staff', 'staffing', 'bring', 'bringing', 'brought', 'transfer', 'transferred', 'reassign', 'reassigned', 'dispatch', 'heading', 'headed', 'deploy', 'deployed', 'deploying', 'throw', 'throwing', 'toss', 'give', 'giving', 'add', 'adding', 'swing', 'swinging', 'drop', 'dropping']);
+const CHAT_HELPV = chatSet(['helping', 'helps', 'covering', 'covers', 'working', 'works', 'go', 'goes', 'going', 'goin']);   // "porfirio is helping on ibl4"
+const CHAT_PULL = chatSet(['pull', 'pulled', 'pulling', 'take', 'took', 'taking', 'grab', 'grabbed', 'get', 'remove', 'removed']);
+const CHAT_NEED = chatSet(['need', 'needs', 'needed', 'short']);
+const CHAT_FREE = chatSet(['free', 'freed', 'release', 'released', 'releasing', 'available', 'spare', 'unassigned']);
+const CHAT_NEG = chatSet(['not', 'no', 'never', 'dont', "don't", 'doesnt', "doesn't", 'isnt', "isn't", 'wasnt', "wasn't", 'arent', "aren't", 'cant', "can't", 'cannot', 'wont', "won't", 'hasnt', "hasn't", 'havent', "haven't", 'didnt', "didn't", 'without', 'nobody', 'noone', 'none', 'neither', 'nor', 'stop', 'cancel', 'cancelled', 'canceled', 'undo', 'hold', 'wait']);
+const CHAT_LATER_HARD = chatSet(['tomorrow', 'tmrw', 'later', 'soon', 'after', 'afterwards', 'before', 'until', 'til', 'till', 'once', 'when', 'whenever', 'if', 'unless', 'should', 'shall', 'might', 'maybe', 'probably', 'plan', 'planning', 'planned', 'next', 'hopefully', 'eventually', 'whether', 'could', 'would']);
+const CHAT_LATER_SOFT = chatSet(['will', "i'll", "we'll", "they'll", "he'll", "she'll", "you'll", 'gonna', 'wanna']);   // fine for "gonna be late", not for "will finish"
+const CHAT_QWORD = chatSet(['who', 'what', 'where', 'when', 'why', 'how', 'which', 'is', 'are', 'was', 'were', 'did', 'does', 'do', 'can', 'could', 'should', 'would', 'whos', "who's", "what's", 'whats', 'anyone', 'any', 'anybody']);
+const CHAT_FILLER = chatSet(['ok', 'okay', 'so', 'hey', 'hi', 'hello', 'btw', 'fyi', 'also', 'and', 'um', 'uh', 'alright', 'well', 'yeah', 'yep', 'yes', 'please', 'pls', 'quick', 'just', 'then', 'now', 'reggie', 'regan', 'update', 'ok,']);
+const CHAT_STOP = chatSet(['a', 'an', 'the', 'to', 'on', 'in', 'at', 'and', 'or', 'is', 'are', 'with', 'of', 'from', 'for', 'it', 'we', 'i', 'you', 'he', 'she', 'they', 'that', 'this', 'those', 'these', 'them', 'done', 'late', 'sick', 'free', 'off', 'out', 'help', 'team', 'crew', 'guys', 'people', 'all', 'up', 'new', 'then', 'now', 'just', 'also', 'ok', 'okay', 'so', 'hey', 'line', 'room', 'area', 'my', 'our', 'their', 'his', 'her', 'be', 'been', 'am', 'was', 'were', 'has', 'have', 'had', 'got', 'get', 'go', 'goes', 'went', 'one', 'two', 'three', 'four', 'five', 'six', 'more', 'extra', 'another', 'some', 'there', 'here', 'over', 'back', 'down', 'into', 'onto', 'by', 'as', 'if', 'but', 'still', 'only', 'about', 'around', 'too', 'total', 'personnel']);
+const CHAT_FILL_ROOM = chatSet(['line', 'room', 'area', 'the', 'dept', 'department']);
+const CHAT_NUM: Record<string, number> = { one: 1, two: 2, couple: 2, pair: 2, three: 3, few: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
+const CHAT_COUNT_NOUN = chatSet(['guys', 'people', 'persons', 'person', 'folks', 'bodies', 'body', 'hands', 'hand', 'men', 'women', 'employees', 'operators', 'helpers', 'more', 'extra', 'workers', 'ppl', 'heads', 'of', 'guy', 'man', 'total', 'others', 'additional']);
+const CHAT_TEAM_NOUN = chatSet(['team', 'crew', 'group', 'help', 'helpers', 'people', 'guys', 'folks', 'bodies', 'hands', 'someone', 'somebody', 'anyone', 'anybody', 'whoever', 'whomever', 'staff', 'ppl', 'more', 'extra', 'men', 'operators', 'workers']);
+const CHAT_CREW_NOUN = chatSet(['crew', 'team', 'guys', 'people', 'folks', 'gang', 'group', 'bunch', 'staff', 'ppl']);
+const CHAT_PRON = chatSet(['that', 'those', 'them', 'these', 'same', 'everyone', 'everybody', 'they']);
+const CHAT_ELLIPSIS = chatSet(['is', 'are', 'too', 'also', 'as', 'well', 'does', 'did', 'has', 'have', 'now', 'either', 'same', 'then', 'done', 'finished', 'complete', 'completed', 'just', 'so']);
+const CHAT_ELLIPSIS_MARK = chatSet(['is', 'are', 'too', 'also', 'does', 'did', 'has', 'have', 'either', 'well', 'just', 'so']);
+const CHAT_ALLOW = chatSet(['to', 'on', 'in', 'at', 'into', 'and', 'the', 'a', 'an', 'with', 'w', 'for', 'ok', 'now', 'please', 'pls', 'then', 'over', 'onto', 'also', 'plus', 'is', 'are', 'line', 'room', 'area', 'team']);
+const CHAT_ING_BLOCK = chatSet(['looking', 'going', 'doing', 'being', 'getting', 'nothing', 'something', 'anything', 'everything', 'morning', 'evening', 'during', 'thing', 'string', 'building', 'ceiling', 'meeting', 'having', 'making', 'saying', 'coming', 'bring', 'wrapping', 'waiting']);
+const CHAT_ROOM_ALIASES: string[][] = [['wj', 'waterjet', 'waterjets'], ['hs', 'highspeed'], ['pack', 'packaging', 'packing'], ['chem', 'chemical', 'chemicals'], ['tote', 'totes'], ['smock', 'smocks'], ['dock', 'docks'], ['floor', 'floors'], ['slicer', 'slicers']];
+const CHAT_EMOJI_RE = /[\uD800-\uDBFF][\uDC00-\uDFFF]|[\u2190-\u2bff\ufe0e\ufe0f\u200d]/g;
+const CHAT_SICK_RE = /\b(sick|called (?:in|out|off)|call(?:ed)? (?:in|out|off)|out sick|calling in|stomach|flu|fever|migraine|headache|vomiting|nauseous|covid|food poisoning)\b|\b(?:is|was|are|feeling|feels|got|very|really|looks|seems)\s+ill\b|\bill\s*$/;
+const CHAT_HOMESICK_RE = /\b(?:home sick|left sick|leaving sick|went sick|sick and (?:went|left|going) home|sent (?:\w+ )?home sick)\b/;
+const CHAT_LATEP_RE = /\b(late|tardy|running behind|stuck in traffic|in traffic)\b/;
+const CHAT_EARLY_RE = /\b(?:left|leaves|leaving|leave|bounce|bounced|bouncing|clocked out|clocking out|punched out|headed out|heading out|went|gone|going|heading|headed|sent|taking off|took off)\s+(?:\w+\s+)?(?:early|home)\b|\bleft for (?:the day|home)\b|\bearly out\b/;
+const CHAT_PTO_RE = /\b(pto|vacation|day off|off today|off tonight|out today|out tonight|out again|took the day|personal day)\b/;
+const CHAT_POSSICK_RE = /\b(?:his|her|their|kid|kids|son|daughter|wife|husband|mom|dad|mother|father|baby|family|girlfriend|boyfriend)\b[^,.;]{0,24}\bsick\b/;
+const CHAT_HABIT_RE = /\b(always|usually|often|sometimes|typically|constantly|every (?:day|night|shift|time))\b/;
+const CHAT_TYPOS: [RegExp, string][] = [[/\b(?:sik|sikc|sck|siick|sicc)\b/g, 'sick'], [/\b(?:erly|earley|ealry|eraly|earlt)\b/g, 'early'], [/\b(?:lte|laet|latee)\b/g, 'late']];
+const CHAT_LATER_RE = /\b(about to|need(?:s|ed)? to|have to|has to|want(?:s|ed)?|wish(?:es)?|hope(?:s|d)?|hoping|expect(?:s|ed|ing)?|supposed to|got to|gotta|ought to|try to|trying to|plan to|planning to|is to|are to|next (?:shift|break|lunch|week|time|run|day)|by \d{1,2}(?::\d\d)?\s*(?:am|pm)?)\b/;
+const CHAT_COND = chatSet(['if', 'unless', 'when', 'whenever', 'once', 'whether']);
+const CHAT_PAST_RE = /\b(yesterday|last night|last week|last shift|earlier today|earlier this|this morning|day shift said|the weekend|last time)\b/;
+const CHAT_DOUBT_RE = /\b(i think|i guess|i believe|i suppose|not sure|idk|i dunno|dunno|no idea|supposedly|apparently|looks like|seems like|seems|imagine|pretend|hypothetically|just kidding|joking|jk)\b/;
+const CHAT_CLEAN_RE = /\b(?:is|are)\s+(?:(?:all|both|now)\s+)?(?:clean|cleaned up|good to go|all set|buttoned up)\b/;
+const CHAT_ALMOST_RE = /\b(almost|nearly|close to|mostly|half|partly|halfway|about (?:done|finished|complete|there)|just about|any minute)\b/;
+const CHAT_PLAN_WORD = /\b(plan|to-?do|todo|checklist|reminders?|note to self|agenda|draft)\b/i;
+const CHAT_IGNORE_HEAD = /\b(ignore (?:these|this|them)|disregard|old (?:notes|update|board|list)|for reference only|just for reference|example|sample|template)\b[^.]*:\s*$/i;
+const CHAT_PLAN_WHEN = /\b(after|later|tomorrow|tmrw|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next|dont apply|don't apply|do not apply|draft|not yet|before|someday)\b/i;
+const CHAT_SKIP_LINE = [/^\s*shift progress update\b/i, /^\s*headcount\s*:/i, /^\s*off-?shift employees/i, /^\s*attendance\s*:/i, /^\s*-{2,}.*-{2,}\s*$/, /^\s*(production areas|supporting tasks|time & attendance|everyday tasks)\s*$/i];
+const CHAT_NOTE_RES: { re: RegExp; field: 'left' | 'status'; plain: boolean; lead?: boolean; gerund?: boolean; needs?: boolean }[] = [
+    { re: /\b(?:what(?:'s| is)?\s+(?:left|remaining)\s+to\s+do|left\s+to\s+do|remaining\s+to\s+do)\s*[:\-–—]?\s*(.+)$/i, field: 'left', plain: false },
+    { re: /\b(?:what(?:'s| is)?\s+(?:left|remaining)|remaining|left)\s*[:\-–—]\s*(.+)$/i, field: 'left', plain: false },
+    { re: /\bstill\s+(?:needs?|has|have)\s+to\s+(.+)$/i, field: 'left', plain: false },
+    { re: /\bstill\s+needs?\s+(?!to\b)(.+)$/i, field: 'left', plain: false },
+    { re: /\b(?:what(?:'s| is)?\s+done|done\s+so\s+far|completed\s+so\s+far|status)\s*[:\-–—]\s*(.+)$/i, field: 'status', plain: false },
+    { re: /\b(?:working\s+on|in\s+progress|in\s+process)\s*[:\-–—]?\s*(.+)$/i, field: 'status', plain: true },
+    { re: /(?:^|[,;]|\s[-–—])\s*([^,;]+?)\s+still\s+to\s+go\b.*$/i, field: 'left', plain: false, lead: true },   // "rinse, foam and sanitize still to go"
+    { re: /\bneeds?\s+(?!to\b)(.+)$/i, field: 'left', plain: true, needs: true },   // "waterjet - disassembled, needs reassembly"
+    { re: /\s[-–—]\s*((?:still\s+|currently\s+|now\s+)?[a-z]+ing\b.*)$/i, field: 'status', plain: false, gerund: true },   // "ibl5 (ana, ben) - sanitizing now"
+    { re: /\(\s*(?:still\s+)?(?:needs?|has|have)\s+to\s+([^()]+)\)\s*$/i, field: 'left', plain: false },
+    { re: /\(\s*(?:what(?:'s| is)?\s+)?(?:left|remaining)(?:\s+to\s+do)?\s*[:\-]?\s*([^()]+)\)\s*$/i, field: 'left', plain: false },
+    { re: /\(\s*((?:still\s+|currently\s+)?[a-z]+ing\b[^()]*)\)\s*$/i, field: 'status', plain: false, gerund: true }
+];
+
+function chatCompact(s: string): string { return String(s == null ? '' : s).toLowerCase().replace(/[^a-z0-9]+/g, ''); }
+function chatEdit(a: string, b: string, max: number): number {   // edit distance, stopping early once it passes max
+    if (Math.abs(a.length - b.length) > max) return max + 1;
+    let prev: number[] = [], cur: number[] = [], i: number, j: number;
+    for (j = 0; j <= b.length; j++) prev.push(j);
+    for (i = 1; i <= a.length; i++) {
+        cur = [i]; let lo = i;
+        for (j = 1; j <= b.length; j++) { const v = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a.charAt(i - 1) === b.charAt(j - 1) ? 0 : 1)); cur.push(v); if (v < lo) lo = v; }
+        if (lo > max) return max + 1;
+        prev = cur;
+    }
+    return prev[b.length];
+}
+function chatWords(s: string): { w: string; at: number; end: number }[] {
+    const out: { w: string; at: number; end: number }[] = [], re = /[a-z0-9]+(?:'[a-z]+)?/gi; let m: RegExpExecArray | null;
+    while ((m = re.exec(s)) !== null) out.push({ w: m[0].toLowerCase(), at: m.index, end: m.index + m[0].length });
+    return out;
+}
+// "Last, First" -> "First Last" for what the supervisor reads.
+function chatFull(n: string): string { const p = String(n || '').split(','); return p.length > 1 ? (p.slice(1).join(',').trim() + ' ' + p[0].trim()).trim() : String(n || '').trim(); }
+// Emoji, [2h 10m] timers, (3) head counts and curly quotes out of what was typed or pasted.
+function chatTypo(s: string): string { CHAT_TYPOS.forEach(t => { s = s.replace(t[0], t[1]); }); return s; }
+function chatClean(s: string): string { return String(s == null ? '' : s).replace(/[\u2018\u2019]/g, "'").replace(/[\u2705\u2714\u2611]\uFE0F?/g, ' done ').replace(CHAT_EMOJI_RE, ' ').replace(/\[[^\]]*\]/g, ' ').replace(/\(\s*\d+\s*\)/g, ' '); }
+
+type ChatRoomIdx = { keys: Record<string, string[]>; fam: Record<string, string[]>; alpha: { key: string; ids: string[] }[] };
+function chatRoomIndex(rooms: ChatRoom[]): ChatRoomIdx {
+    const keys: Record<string, string[]> = {}, fam: Record<string, string[]> = {}, prefixes: Record<string, string[]> = {};
+    const add = (k: string, id: string, into: Record<string, string[]>) => { if (!k) return; const l = into[k] = into[k] || []; if (l.indexOf(id) < 0) l.push(id); };
+    rooms.forEach(r => {
+        const toks = chatWords(r.name).map(t => t.w), main = toks.filter(t => !CHAT_FILL_ROOM[t]).join(''), all = chatCompact(r.name);
+        const mine: string[] = [all, main];
+        const first = toks.filter(t => !CHAT_FILL_ROOM[t])[0] || '';
+        CHAT_ROOM_ALIASES.forEach(g => { if (g.indexOf(all) >= 0 || g.indexOf(main) >= 0 || g.indexOf(first) >= 0) g.forEach(a => { mine.push(a); }); });
+        mine.forEach(k => add(k, r.id, keys));
+        const m = /^([a-z]+)(\d+)$/.exec(main); if (m) add(m[1], r.id, fam);
+        if (/^[a-z]{6,}$/.test(main)) { add(main.slice(0, 4), r.id, prefixes); add(main.slice(0, 5), r.id, prefixes); }
+        if (/^[a-z]{6,}$/.test(first)) { add(first.slice(0, 4), r.id, prefixes); }
+    });
+    Object.keys(prefixes).forEach(k => { if (prefixes[k].length === 1 && !keys[k]) keys[k] = prefixes[k]; });
+    const famKeys = Object.keys(fam);
+    if (famKeys.length === 1) rooms.forEach(r => { const m = /^[a-z]+(\d+)$/.exec(toksMain(r.name)); if (m && fam[famKeys[0]].indexOf(r.id) >= 0) add('line' + m[1], r.id, keys); });   // "line 5" when IBL is the only numbered family
+    const alpha: { key: string; ids: string[] }[] = Object.keys(keys).filter(k => /^[a-z]{5,}$/.test(k)).map(k => ({ key: k, ids: keys[k] }));
+    return { keys, fam, alpha };
+}
+function toksMain(name: string): string { return chatWords(name).map(t => t.w).filter(t => !CHAT_FILL_ROOM[t]).join(''); }
+// The rooms a line mentions, left to right (token runs of one to three words; "ibl 4", "ibl-4", "ibl line 4", "IBL4" are one room; a one-letter slip is read as the room).
+function chatFindRooms(words: { w: string }[], used: boolean[], idx: ChatRoomIdx, rooms: ChatRoom[]): { id: string; from: number; to: number; ask?: ChatAsk }[] {
+    const out: { id: string; from: number; to: number; ask?: ChatAsk }[] = [], byId: Record<string, ChatRoom> = {}; rooms.forEach(r => { byId[r.id] = r; });
+    for (let i = 0; i < words.length; i++) {
+        if (used[i]) continue;
+        let hit = false;
+        for (let n = Math.min(3, words.length - i); n >= 1 && !hit; n--) {
+            let ok = true; for (let k = 0; k < n; k++) if (used[i + k]) ok = false; if (!ok) continue;
+            const run = words.slice(i, i + n).map(t => t.w), forms = [run.join('')];
+            const lean = run.filter(t => !CHAT_FILL_ROOM[t]).join(''); if (lean && lean !== forms[0]) forms.push(lean);
+            for (let f = 0; f < forms.length && !hit; f++) {
+                const ids = idx.keys[forms[f]];
+                if (ids && ids.length === 1) { out.push({ id: ids[0], from: i, to: i + n }); hit = true; }
+                else if (ids && ids.length > 1) { out.push({ id: '', from: i, to: i + n, ask: { word: run.join(' '), options: ids.map(id => ({ id, name: byId[id].name })) } }); hit = true; }
+            }
+            if (!hit && n <= 2) {   // a one-letter slip ("fryr", "lbl4"): letters near a room's letters, the number exactly the same
+                const j = run.join(''), m = /^([a-z]{3,})(\d*)$/.exec(j);
+                if (m) {
+                    const best: string[] = [];
+                    if (m[2]) { Object.keys(idx.fam).forEach(f => { if (f !== m[1] && chatEdit(m[1], f, 1) <= 1) idx.fam[f].forEach(id => { if (chatCompact(byId[id].name).replace(/line|room|area/g, '').slice(-m[2].length) === m[2] && /\d+$/.test(chatCompact(byId[id].name)) && best.indexOf(id) < 0) best.push(id); }); }); }
+                    else if ((n === 1 || (n === 2 && !!CHAT_FILL_ROOM[run[1]])) && m[1].length >= 5) { const cands = idx.alpha.map(a => ({ a, d: chatEdit(m[1], a.key, m[1].length >= 9 ? 2 : 1) })).filter(c => c.d <= (m[1].length >= 9 ? 2 : 1)).sort((x, y) => x.d - y.d); if (cands.length && (cands.length === 1 || cands[0].d < cands[1].d)) cands[0].a.ids.forEach(id => { best.push(id); }); }
+                    if (best.length === 1) { out.push({ id: best[0], from: i, to: i + n }); hit = true; }
+                }
+            }
+            if (!hit && n === 1 && idx.fam[words[i].w] && idx.fam[words[i].w].length > 1 && !(i + 1 < words.length && /^\d+$/.test(words[i + 1].w))) {   // "ibl" alone, with IBL4 and IBL5 on the board
+                out.push({ id: '', from: i, to: i + 1, ask: { word: words[i].w, options: idx.fam[words[i].w].map(id => ({ id, name: byId[id].name })) } }); hit = true;
+            }
+            if (hit) { const last = out[out.length - 1]; for (let k = last.from; k < last.to; k++) used[k] = true; }
+        }
+    }
+    return out;
+}
+type ChatPeopleIdx = { id: string; first: string; firstTok: string; full1: string; full2: string; here: boolean }[];
+function chatPeopleIndex(people: ChatPerson[]): ChatPeopleIdx {
+    return people.map(p => {
+        const s = String(p.name || ''), c = s.indexOf(','), last = chatCompact(c >= 0 ? s.slice(0, c) : s.split(/\s+/).slice(1).join(' ')), firstRaw = c >= 0 ? s.slice(c + 1) : s.split(/\s+/)[0];
+        const first = chatCompact(firstRaw), firstTok = chatCompact(String(firstRaw).trim().split(/\s+/)[0] || '');
+        return { id: p.id, first, firstTok, full1: first + last, full2: last + first, here: p.here };
+    }).filter(x => x.first.length > 0);
+}
+// The people a line names: "first last" (either order) is one person; a first name alone is that person when only one fits, else it is asked about.
+function chatFindPeople(words: { w: string }[], used: boolean[], pidx: ChatPeopleIdx, people: ChatPerson[], supId: string): { ids: string[]; asks: ChatAsk[] } {
+    const ids: string[] = [], asks: ChatAsk[] = [], byId: Record<string, ChatPerson> = {}; people.forEach(p => { byId[p.id] = p; });
+    const add = (id: string) => { if (id !== supId && ids.indexOf(id) < 0) ids.push(id); };
+    for (let i = 0; i < words.length; i++) {
+        if (used[i]) continue;
+        if (i + 1 < words.length && !used[i + 1]) {
+            const j = words[i].w + words[i + 1].w, hit = pidx.filter(p => p.full1 === j || p.full2 === j);
+            if (hit.length === 1) { add(hit[0].id); used[i] = used[i + 1] = true; continue; }
+            if (hit.length > 1) { asks.push({ word: words[i].w + ' ' + words[i + 1].w, options: hit.map(h => ({ id: h.id, name: byId[h.id].name })) }); used[i] = used[i + 1] = true; continue; }
+        }
+        const w = words[i].w.replace(/'s$/, ''); if (CHAT_STOP[w] || /^\d+$/.test(w) || w.length < 2) continue;
+        let cand = pidx.filter(p => p.firstTok === w || p.first === w);
+        if (!cand.length && w.length >= 5) {
+            const lim = w.length >= 9 ? 2 : 1, near = pidx.map(p => ({ p, d: chatEdit(w, p.firstTok, lim) })).filter(x => x.d <= lim && x.p.firstTok.charAt(0) === w.charAt(0));
+            if (near.length) { const best = Math.min.apply(null, near.map(x => x.d)); cand = near.filter(x => x.d === best).map(x => x.p); }
+        }
+        if (!cand.length) continue;
+        const here = cand.filter(p => p.here);
+        if (cand.length === 1) add(cand[0].id);
+        else if (here.length === 1) add(here[0].id);
+        else asks.push({ word: w, options: (here.length > 1 ? here : cand).map(h => ({ id: h.id, name: byId[h.id].name })) });
+        used[i] = true;
+    }
+    return { ids, asks };
+}
+
+function chatBlank(text: string): ChatClause {
+    return { text, kind: 'none', why: '', show: false, rooms: [], dest: '', src: [], people: [], asks: [], roomAsks: [], unknownRoom: '', count: 0, fill: false, more: false, team: false, fromPrev: false, status: '', note: null, noteRoom: '', neg: false, cond: false, hasSubject: false, verb: '', mention: [] };
+}
+// One clause (a single instruction) read against the rooms and people of the board. carry = what the lines before it were about ("still rinsing", "he is late", "ibl5 is too").
+function chatClause(raw: string, env: ChatEnv, carry: ChatCarry): ChatClause {
+    const c = chatBlank(raw.trim());
+    let text = chatClean(c.text), words = chatWords(text), polite = false, k = 0, ell = false;
+    const lead = /^\s*(?:and\s+)?(?:so\s+(?:is|are|does|did)|same\s+(?:for|with|on)|as\s+well\s+as)\s+/i.exec(text);   // "so is dock", "same for ibl5"
+    if (lead) { text = text.slice(lead[0].length); words = chatWords(text); ell = true; }
+    while (k < words.length && CHAT_FILLER[words[k].w]) k++;
+    if (k + 1 < words.length && /^(can|could|would|will)$/.test(words[k].w) && words[k + 1].w === 'you') { polite = true; k += 2; while (k < words.length && (words[k].w === 'please' || words[k].w === 'pls')) k++; }
+    if (k > 0) { text = k < words.length ? text.slice(words[k].at) : ''; words = chatWords(text); }
+    if (!words.length) { c.why = 'empty'; return c; }
+    const low = chatTypo(text.toLowerCase()), wset: Record<string, boolean> = {}; words.forEach(t => { wset[t.w] = true; });
+    const used: boolean[] = words.map(() => false), rooms = chatFindRooms(words, used, env.ridx, env.rooms);
+    // "the ibl5 crew" is the people in ibl5, not a place to send them
+    const crewOf: string[] = [], dests: { id: string; from: number; to: number }[] = [], srcs: string[] = [];
+    rooms.forEach(r => {
+        if (!r.id) { c.roomAsks.push(r.ask as ChatAsk); return; }
+        const next = r.to < words.length ? words[r.to].w : '';
+        const prep = r.from > 0 ? words[r.from - 1].w : '', prev2 = r.from > 1 ? words[r.from - 2].w : '';
+        if (c.mention.indexOf(r.id) < 0) c.mention.push(r.id);
+        if (CHAT_CREW_NOUN[next] && (rooms.length > 1 || /^(?:the|that|those|these|whole|entire|all|from|of)$/.test(prep))) { crewOf.push(r.id); used[r.to] = true; return; }   // "the ibl5 crew", but "ibl4 team with ben" is a team for ibl4
+        if (prep === 'from' || (prep === 'off' && prev2 !== 'to')) { srcs.push(r.id); return; }
+        dests.push(r);
+    });
+    const pe = chatFindPeople(words, used, env.pidx, env.people, env.supId);
+    const personOf: Record<string, ChatPerson> = {}; env.people.forEach(p => { personOf[p.id] = p; });
+    c.people = pe.ids; c.asks = pe.asks;
+    const roomIds: string[] = []; dests.forEach(d => { if (roomIds.indexOf(d.id) < 0) roomIds.push(d.id); });
+    c.rooms = roomIds; c.src = srcs.concat(crewOf).filter((v, i, a) => a.indexOf(v) === i);
+    // the room people are sent TO: the one after to / on / in / at / into / for, else the last one named
+    let dest = '', destPrep = ''; dests.forEach(d => { const p = d.from > 0 ? words[d.from - 1].w : ''; if (p === 'to' || p === 'on' || p === 'in' || p === 'at' || p === 'into' || p === 'for' || p === 'onto') { dest = d.id; destPrep = p; } });
+    if (!dest && dests.length) { dest = dests[dests.length - 1].id; destPrep = dests[dests.length - 1].from > 0 ? words[dests[dests.length - 1].from - 1].w : ''; }
+    c.dest = dest;
+    const anyRoom = roomIds.length > 0 || c.src.length > 0 || c.roomAsks.length > 0;
+    const nonLead = c.people.filter(id => !(personOf[id] && personOf[id].lead));
+    const hasPerson = nonLead.length > 0 || c.asks.length > 0, hasLead = c.people.length > nonLead.length;
+    const has = (re: RegExp) => re.test(low), anyW = (set: Record<string, boolean>) => words.some((t, i) => !used[i] && set[t.w]);
+    const doneW = anyW(CHAT_DONE) || CHAT_CLEAN_RE.test(low), pullW = anyW(CHAT_PULL), needW = anyW(CHAT_NEED), freeW = anyW(CHAT_FREE), helpW = anyW(CHAT_HELPV);
+    const sendW = words.some((t, i) => !used[i] && CHAT_SEND[t.w] && !(t.w === 'moving' && words[i + 1] && words[i + 1].w === 'on' && !(words[i + 2] && words[i + 2].w === 'to')));   // "moving on" is not a move
+    c.verb = doneW ? 'done' : sendW ? 'send' : '';
+    const blocked = (why: string): ChatClause => { c.kind = 'none'; c.why = why; c.show = anyRoom || c.people.length > 0 || doneW || sendW; c.asks = []; c.roomAsks = []; return c; };
+    // things that are not a report of what happened: questions, "not", plans, earlier shifts, doubt
+    if (text.indexOf('?') >= 0 || (!polite && CHAT_QWORD[words[0].w]) || /^(?:[a-z]+\s*){1,2}[-\u2013\u2014:]\s*(?:is|are|was|were|did|does|do|can|could|should|would|who|what|where|when|why|how|which)\b/i.test(text)) return blocked('a question');
+    const movingTo = (i: number) => { const j = words[i + 1] && words[i + 1].w === 'to' ? (words[i + 2] && words[i + 2].w === 'the' ? i + 3 : i + 2) : -1; return j >= 0 && rooms.some(r => r.from === j && !!r.id); };   // "jo is going to the dock" is a move, "going to finish" is a plan
+    const soft = words.some((t, i) => (CHAT_LATER_SOFT[t.w] && !(words[i + 1] && CHAT_NEED[words[i + 1].w])) || (t.w === 'going' && words[i + 1] && words[i + 1].w === 'to' && !movingTo(i)));
+    if (words.some(t => CHAT_LATER_HARD[t.w]) || CHAT_LATER_RE.test(low)) { c.cond = words.some(t => CHAT_COND[t.w]); return blocked('about later'); }
+    if (words.some(t => CHAT_NEG[t.w])) { c.neg = true; return blocked('said "not"'); }
+    if (CHAT_HABIT_RE.test(low)) return blocked('a habit, not tonight');
+    if (CHAT_PAST_RE.test(low)) return blocked('about an earlier time');
+    if (CHAT_DOUBT_RE.test(low)) return blocked('not sure');
+    if (CHAT_ALMOST_RE.test(low) && doneW) return blocked('not finished yet');
+    // count: "3 guys", "team of 4", "needs 2 more", "need 4 on ibl5"
+    let hasMore = false;
+    for (let i = 0; i < words.length; i++) {
+        if (used[i]) continue; const w = words[i].w, nx = i + 1 < words.length ? words[i + 1].w : '', pv = i > 0 ? words[i - 1].w : '';
+        if (w === 'more' || w === 'extra' || w === 'another') hasMore = true;
+        const n = /^\d{1,2}$/.test(w) ? parseInt(w, 10) : (CHAT_NUM[w] || 0); if (!n || c.count) continue;
+        if (CHAT_COUNT_NOUN[nx] || CHAT_NEED[pv] || (pv === 'of' && i > 1 && CHAT_TEAM_NOUN[words[i - 2].w]) || (pv === 'is' && i > 1 && !!CHAT_NEED[words[i - 2].w]) || ((CHAT_SEND[pv] || CHAT_PULL[pv]) && (nx === 'to' || nx === 'on' || nx === 'in' || nx === 'at' || nx === 'into' || nx === 'from'))) { c.count = n; used[i] = true; if (nx === 'more' || nx === 'extra') hasMore = true; }
+    }
+    c.more = hasMore && c.count > 0;
+    c.fill = needW && c.count > 0 && !hasMore && words.some((t, i) => CHAT_NEED[t.w] && !used[i] && t.w !== 'short');
+    c.team = anyW(CHAT_TEAM_NOUN) || /\b(a|an) (guy|person|body|man|helper|hand|operator|employee)\b/.test(low);
+    if (!c.count && (/\b(a|an) (guy|person|body|man|helper|hand|operator|employee)\b/.test(low) || wset['someone'] || wset['somebody'])) c.count = 1;
+    c.fromPrev = words.some((t, i) => !used[i] && CHAT_PRON[t.w]) && words.some(t => CHAT_CREW_NOUN[t.w] || t.w === 'them' || t.w === 'everyone' || t.w === 'everybody');
+    if (c.fromPrev || c.src.length) c.team = false;
+    // "he is late": a he / she that means the person just before
+    if (!c.people.length && !c.asks.length && carry.person && words.some(t => t.w === 'he' || t.w === 'she' || t.w === 'hes' || t.w === 'shes' || t.w === "he's" || t.w === "she's" || t.w === 'theyre' || t.w === "they're")) { c.people = [carry.person]; }
+    const room1 = roomIds.length === 1 ? roomIds[0] : (c.rooms.length === 0 && c.src.length === 1 ? c.src[0] : '');
+    const leftover = words.filter((t, i) => !used[i] && !CHAT_ALLOW[t.w] && !CHAT_COUNT_NOUN[t.w] && !CHAT_TEAM_NOUN[t.w] && !/^\d+$/.test(t.w) && !CHAT_FILL_ROOM[t.w]);
+    const poss = has(CHAT_POSSICK_RE), sickW = has(CHAT_SICK_RE) && !poss;   // "his kid was sick" is not him
+    const away = has(CHAT_HOMESICK_RE) ? 'Sick' : has(CHAT_EARLY_RE) ? (sickW ? 'Sick' : 'Left Early') : sickW ? 'Sick' : has(CHAT_PTO_RE) ? 'PTO' : has(CHAT_LATEP_RE) ? 'Late' : '';
+    const hasAnyPerson = hasPerson || c.people.length > 0;
+    const later = (kind: ChatClause['kind']): boolean => soft && kind !== 'away';
+    const make = (kind: ChatClause['kind']): ChatClause => { if (later(kind)) return blocked('about later'); c.kind = kind; c.show = true; return c; };
+    // 1) away: "cy is sick", "left early: ben carter", "sick: cy, ana lopez"
+    if (away && hasAnyPerson && (!sendW || has(/\bhome\b/)) && !(doneW && anyRoom && !wset['early'])) { c.status = away; return make('away'); }
+    // 2) "ibl5 is too" after a done: the same words again for another room
+    if (!hasAnyPerson && roomIds.length > 0 && !doneW && !sendW && !pullW && !needW && !freeW && carry.verb === 'done' && words.every((t, i) => used[i] || CHAT_ELLIPSIS[t.w] || CHAT_FILL_ROOM[t.w]) && (ell || words.some(t => CHAT_ELLIPSIS_MARK[t.w]))) { c.verb = 'done'; c.rooms = roomIds; return make('done'); }
+    // 3) a person with a place: "send ...", "put ...", "need 4 on ibl5", "give ibl4 two guys"
+    const strongDest = /^(to|on|in|at|into|for|onto)$/.test(destPrep);
+    const destCount = dest && !hasAnyPerson && (c.count > 0 || c.team) && !doneW && !leftover.length;   // "trash - 2 people", "team to trash"
+    if ((sendW && !(doneW && !strongDest && !hasAnyPerson && !c.count)) || (pullW && dest) || (needW && (c.count > 0 || c.team)) || (helpW && dest && hasAnyPerson && !doneW) || destCount) {
+        if (!dest && !c.roomAsks.length) { c.unknownRoom = chatUnknownAfter(words, used, null); return blocked('no room found'); }
+        if (!c.count && !hasAnyPerson && !c.fromPrev && !c.src.length) c.team = true;
+        return make('send');
+    }
+    // 4) done: a room is finished, or a person is ("gus is done", "gus is done in the cook room")
+    if (doneW && (anyRoom || hasAnyPerson)) {
+        const personPhrase = hasPerson && roomIds.length > 0 && (destPrep === 'in' || destPrep === 'on' || destPrep === 'at' || destPrep === 'with');
+        if ((roomIds.length || c.src.length || c.roomAsks.length) && !personPhrase) { c.rooms = roomIds.length ? roomIds : c.src.slice(); return make('done'); }
+        if (hasPerson) { c.rooms = []; return make('free'); }
+        return blocked('no room found');
+    }
+    if (doneW) { c.unknownRoom = chatUnknownAfter(words, used, CHAT_DONE); return blocked('no room found'); }
+    if (freeW && hasPerson && !sendW) return make('free');
+    if (pullW && hasPerson && (has(/\boff\b/) || has(/\bfrom\b/) || !anyRoom) && !dest) return make('free');
+    if (hasPerson && !dest && c.src.length && !leftover.filter(t => t.w !== 'off' && t.w !== 'from').length && has(/\b(?:off|from)\b/)) return make('free');   // "gus off cook"
+    // 5) no verb: "ana to ibl5", "ibl4 - ana lopez, ben carter, cy", "porfirio ibl4", "wj ned ivan mae", "Personnel: ..." under a room line
+    if (!dest && hasPerson && carry.room && /^\s*(?:personnel|people|team|crew|staff|employees|working)\s*[:\-]/i.test(text)) { c.dest = carry.room; c.rooms = [carry.room]; return make('send'); }
+    if (dest && hasPerson && !leftover.length) return make('send');
+    // 6) a note for a room: "ibl4 is rinsing", "ibl4 - rinsing", "still rinsing" (about the room just before)
+    const noteRoom = room1 || (!anyRoom && !c.people.length ? carry.room : '');
+    if (noteRoom && !hasAnyPerson && !c.count) {
+        let value = '';
+        const gi = words.findIndex((t, i) => !used[i] && /ing$/.test(t.w) && t.w.length >= 5 && !CHAT_ING_BLOCK[t.w] && !CHAT_SEND[t.w] && !CHAT_DONE[t.w]);
+        const aux = gi > 0 ? words[gi - 1].w : '', auxOk = gi >= 0 && (gi === 0 || aux === 'is' || aux === 'are' || aux === 'still' || aux === 'currently' || aux === 'now' || aux === 'just' || aux === 'of' || aux === 'being' || aux === 'all' || rooms.some(r => r.to === gi));
+        if (gi >= 0 && auxOk && (room1 || /^\s*(?:still|currently|now|just|all)?\s*[a-z]+ing\b/i.test(text))) value = text.slice(words[gi].at);
+        else if (room1) { const m = /^\s*[a-z0-9][a-z0-9 \-]*?\s*[:\-\u2013\u2014]\s*(.+)$/i.exec(text); if (m && m[1].trim() && !chatFindRooms(chatWords(m[1]), chatWords(m[1]).map(() => false), env.ridx, env.rooms).length) value = m[1]; }
+        value = value.replace(/[.,;!]+\s*$/, '').trim();
+        if (value && /[a-z]{3,}/i.test(value) && !later('note')) { c.kind = 'note'; c.show = true; c.note = { field: 'status', value }; c.noteRoom = noteRoom; c.rooms = [noteRoom]; return c; }
+    }
+    c.why = anyRoom || hasAnyPerson ? 'no instruction' : 'nothing about a room or a person'; c.show = false;
+    if (anyRoom || hasAnyPerson) c.hasSubject = true;
+    c.asks = []; c.roomAsks = [];
+    return c;
+}
+// The words after a finish / send verb or a to / on, when they name no room the board knows ("ibl9"), so the answer can say what was not found.
+function chatUnknownAfter(words: { w: string }[], used: boolean[], verbs: Record<string, boolean> | null): string {
+    for (let i = 0; i < words.length; i++) {
+        const w = words[i].w, next = i + 1 < words.length ? words[i + 1].w : '';
+        const hit = verbs ? !!verbs[w] : (w === 'to' || w === 'on' || w === 'into');
+        if (!hit || !next || used[i + 1] || CHAT_STOP[next] || CHAT_FILL_ROOM[next]) continue;
+        let out = next, j = i + 2; if (j < words.length && /^\d+$/.test(words[j].w)) out += ' ' + words[j].w;
+        return out;
+    }
+    return '';
+}
+const CHAT_SPLITTABLE = chatSet(['about later', 'said "not"', 'a question', 'not sure', 'not finished yet', 'about an earlier time']);
+function chatCarryCopy(c: ChatCarry): ChatCarry { return { room: c.room, person: c.person, verb: c.verb }; }
+function chatCarryUpdate(carry: ChatCarry, c: ChatClause): void {
+    if (c.verb) carry.verb = c.verb;
+    if (c.mention.length) carry.room = c.dest || c.mention[c.mention.length - 1];
+    if (c.people.length === 1) carry.person = c.people[0];
+}
+// Notes ("What is left to do: sanitize", "left: degrease", "(still need to sanitize)", "working on rinse", "foam still to go", "- sanitizing now") come off the end of a
+// sentence, last one first, before it is split into instructions.
+function chatExtractNote(s: string, env: ChatEnv): { head: string; notes: ChatNote[] } {
+    let t = chatClean(s); const notes: ChatNote[] = [];
+    const lo = /\b(?:still\s+)?left\s+(?:on|in|at|for)\s+(.+?)\s*[:\-–—]\s*(.+)$/i.exec(t);   // "still left on ibl5: sanitize and sweep"
+    if (lo && String(lo[2]).trim()) { notes.push({ field: 'left', value: String(lo[2]).replace(/[.,;!]+\s*$/, '').trim().slice(0, 160) }); t = (t.slice(0, lo.index) + ' ' + lo[1]).replace(/\s+/g, ' ').trim(); }
+    for (let pass = 0; pass < 3; pass++) {
+        let best: { at: number; note: ChatNote } | null = null;
+        CHAT_NOTE_RES.forEach(n => {
+            const m = n.re.exec(t); if (!m) return;
+            const value = String(m[1] || '').replace(/[.,;!]+\s*$/, '').replace(/\s+/g, ' ').trim(); if (!value) return;
+            const hw = chatWords(t.slice(0, m.index)), hu = hw.map(() => false), vw = chatWords(value), vroom = chatFindRooms(vw, vw.map(() => false), env.ridx, env.rooms).length > 0;
+            if (n.plain) {   // a note about a room only when the words before it hold a room and nobody is named, and what follows is not a room
+                if (!chatFindRooms(hw, hu, env.ridx, env.rooms).length) return;
+                const pp = chatFindPeople(hw, hu, env.pidx, env.people, env.supId); if (pp.ids.length || pp.asks.length) return;
+                if (vroom) return;
+            }
+            if (n.needs && vw.some(x => /^\d+$/.test(x.w) || CHAT_NUM[x.w] || CHAT_COUNT_NOUN[x.w] || CHAT_TEAM_NOUN[x.w])) return;
+            if (n.gerund) { const g = vw[0] ? vw[0].w : ''; const g2 = /^(?:still|currently|now)$/.test(g) && vw[1] ? vw[1].w : g; if (!/ing$/.test(g2) || g2.length < 5 || CHAT_ING_BLOCK[g2] || CHAT_SEND[g2] || CHAT_HELPV[g2] || CHAT_DONE[g2] || vroom) return; }
+            if (!best || m.index > best.at) best = { at: m.index, note: { field: n.field, value: value.slice(0, 160) } };
+        });
+        if (!best) break;
+        const b = best as { at: number; note: ChatNote }; notes.unshift(b.note); t = t.slice(0, b.at).replace(/[\s,;\-–—:]+$/, '');
+    }
+    // what is left in brackets names people or rooms: "IBL5 (Porfirio, Eli, Fay)" reads as "IBL5: Porfirio, Eli, Fay"
+    t = t.replace(/\(([^()]*[a-z][^()]*)\)/gi, (_m: string, inner: string) => ' : ' + inner + ' ');
+    return { head: t.replace(/\s+/g, ' ').trim(), notes };
+}
+// Where a sentence can be cut into instructions: after , or ; or before "and", "then", "but", before a send / pull verb, after a done / sick / late word, before he / she.
+function chatCandidates(s: string, env: ChatEnv): { at: number; skip: number; punct: boolean }[] {
+    const out: { at: number; skip: number; punct: boolean }[] = [], seen: Record<number, boolean> = {};
+    const push = (at: number, skip: number, punct?: boolean) => { if (at <= 0 || seen[at]) return; seen[at] = true; out.push({ at, skip, punct: !!punct }); };
+    let m: RegExpExecArray | null, re = /\s*[;,]\s*/g;
+    while ((m = re.exec(s)) !== null) push(m.index, m[0].length, true);
+    re = /\s+(?:and\s+then|then|but|also|so|and)\s+/gi;
+    while ((m = re.exec(s)) !== null) push(m.index, m[0].length);
+    const ws = chatWords(s), starts: Record<number, boolean> = {};
+    chatFindRooms(ws, ws.map(() => false), env.ridx, env.rooms).forEach(r => { starts[r.from] = true; });
+    const subject = (i: number) => !!starts[i] || env.pidx.some(p => p.firstTok === ws[i].w || p.first === ws[i].w) || /^(?:he|she|hes|shes|he's|she's|they|theyre)$/.test(ws[i].w);   // the next words open a new instruction
+    ws.forEach((t, i) => {
+        if (i === 0) return;
+        if (CHAT_SEND[t.w] || CHAT_PULL[t.w] || t.w === 'he' || t.w === 'she' || t.w === 'hes' || t.w === 'shes' || t.w === "he's" || t.w === "she's") push(t.at, 0);
+        if ((CHAT_DONE[t.w] || t.w === 'sick' || t.w === 'late' || t.w === 'pto' || t.w === 'early') && i + 1 < ws.length && subject(i + 1)) push(ws[i].end, 0);
+    });
+    return out.sort((a, b) => a.at - b.at || b.skip - a.skip);
+}
+// One sentence into clauses: cut only where the left part is already a whole instruction (or a "not") and the right part is one too, so "send cy and ivan to wj" stays whole.
+function chatSegment(s: string, env: ChatEnv, carry: ChatCarry): ChatClause[] {
+    const out: ChatClause[] = []; let rest = s.trim();
+    while (rest) {
+        const cands = chatCandidates(rest, env); let cut = false;
+        const leftWhole = (L: ChatClause) => L.kind !== 'none' || L.asks.length > 0 || L.roomAsks.length > 0 || (L.show && (L.neg || L.why === 'about an earlier time' || (L.why === 'about later' && !L.cond)));
+        const tryCut = (i: number, pass: number): boolean => {
+            const left = rest.slice(0, cands[i].at).trim(), right = rest.slice(cands[i].at + cands[i].skip).trim(); if (!left || !right) return false;
+            const L = chatClause(left, env, chatCarryCopy(carry)); if (!leftWhole(L)) return false;
+            const c2 = chatCarryCopy(carry); chatCarryUpdate(c2, L);
+            const R = chatClause(right, env, c2);
+            const positive = R.kind !== 'none' || R.asks.length > 0 || R.roomAsks.length > 0;
+            if (positive && R.kind === 'free' && !R.mention.length && L.mention.length && !L.verb) return false;   // "fryer line (omar, ulf) - done": the list goes on
+            const blockedTail = (R.show && !!CHAT_SPLITTABLE[R.why]) || (R.hasSubject && R.why === 'no instruction' && /\b(?:is|are|was|were|has|had|does|did|seems?)\b/.test(right.toLowerCase()));
+            if (!(pass === 1 ? positive : blockedTail)) return false;
+            out.push(L); chatCarryUpdate(carry, L); rest = right; return true;
+        };
+        for (let i = 0; i < cands.length && !cut; i++) cut = tryCut(i, 1);
+        for (let i = cands.length - 1; i >= 0 && !cut; i--) cut = tryCut(i, 2);   // a "not" / "later" tail is cut off as far right as it starts
+        if (!cut) {   // the whole thing reads as "not" or "later", but an instruction in front of a comma with only chatter after it still stands ("dock - need 3 more, nobody free on my side")
+            const whole = chatClause(rest, env, chatCarryCopy(carry));
+            if (whole.kind === 'none' && whole.show && whole.why !== 'a question') {
+                for (let i = 0; i < cands.length && !cut; i++) {
+                    if (!cands[i].punct) continue;
+                    const left = rest.slice(0, cands[i].at).trim(), right = rest.slice(cands[i].at + cands[i].skip).trim(); if (!left || !right) continue;
+                    const L = chatClause(left, env, chatCarryCopy(carry)); if (L.kind === 'none') continue;
+                    out.push(L); chatCarryUpdate(carry, L); rest = right; cut = true;
+                }
+            }
+        }
+        if (!cut) { const c = chatClause(rest, env, carry); out.push(c); chatCarryUpdate(carry, c); break; }
+    }
+    return out;
+}
+function chatParse(text: string, ctx: { rooms: ChatRoom[]; people: ChatPerson[]; supId: string }): ChatClause[] {
+    const env: ChatEnv = { ridx: chatRoomIndex(ctx.rooms), pidx: chatPeopleIndex(ctx.people), rooms: ctx.rooms, people: ctx.people, supId: ctx.supId }, out: ChatClause[] = [], carry: ChatCarry = { room: '', person: '', verb: '' };
+    let planBlock = false;
+    String(text || '').split(/\r?\n/).forEach(line => {
+        if (!line.trim()) { planBlock = false; return; }
+        carry.verb = '';
+        if (CHAT_SKIP_LINE.some(re => re.test(line))) return;
+        const bare = line.replace(/^[\s\-*•·>]+/, '').replace(/^\d+[.)]\s+/, '').trim(); if (!bare) return;
+        if (!planBlock && ((CHAT_PLAN_WORD.test(bare) && CHAT_PLAN_WHEN.test(bare)) || CHAT_IGNORE_HEAD.test(bare))) { planBlock = true; const c = chatBlank(bare); c.why = 'that reads as a plan or old notes, not what happened'; c.show = true; out.push(c); return; }
+        if (planBlock) { const c = chatBlank(bare); c.why = 'part of a plan'; out.push(c); return; }
+        bare.split(/(?:[.!?]+)\s+(?=\S)/).forEach(sent => {
+            const x = chatExtractNote(sent, env), head = x.head.replace(/[.!?]+\s*$/, '').trim(), cl = head ? chatSegment(head, env, carry) : [];
+            x.notes.forEach((note, ni) => {
+                let target = ''; for (let i = cl.length - 1; i >= 0 && !target; i--) target = cl[i].kind === 'note' ? '' : (cl[i].dest || cl[i].rooms[0] || cl[i].src[0] || (cl[i].kind === 'none' && cl[i].mention.length === 1 ? cl[i].mention[0] : ''));
+                if (!target) { const hw = chatWords(head), r = chatFindRooms(hw, hw.map(() => false), env.ridx, env.rooms).filter(q => !!q.id); target = r.length === 1 ? r[0].id : carry.room; }
+                const last = cl.length ? cl[cl.length - 1] : null;
+                if (target && last && last.kind === 'none' && !last.neg && !last.asks.length && !last.note) { last.kind = 'note'; last.show = true; last.why = ''; last.rooms = [target]; last.note = note; last.noteRoom = target; }
+                else if (target && last && last.kind !== 'none' && last.kind !== 'note' && !last.note) { last.note = note; last.noteRoom = target; }
+                else if (target) { const n = chatBlank(sent); n.kind = 'note'; n.show = true; n.rooms = [target]; n.mention = [target]; n.note = note; n.noteRoom = target; cl.push(n); }
+                else { const n = chatBlank(sent); n.why = 'no room for that note'; n.show = true; cl.push(n); }
+                if (target) carry.room = target;
+                void ni;
+            });
+            cl.forEach(c => { out.push(c); });
+        });
+    });
+    return out;
+}
+
+// The plan: the clauses run in order against a copy of the board (so "ibl4 is done, send that crew to ibl5" sees the people ibl4 just freed).
+function chatPlan(clauses: ChatClause[], board: ChatBoard): { items: ChatItem[]; ops: ChatOp[] } {
+    const items: ChatItem[] = [], ops: ChatOp[] = [];
+    const room: Record<string, { r: ChatRoom; people: string[]; onBoard: boolean; done: boolean; lead: string }> = {}, person: Record<string, ChatPerson> = {}, where: Record<string, string> = {}, status: Record<string, string> = {};
+    board.rooms.forEach(r => { room[r.id] = { r, people: r.people.slice(), onBoard: r.onBoard, done: r.done, lead: r.lead }; r.people.forEach(p => { where[p] = r.id; }); });
+    board.people.forEach(p => { person[p.id] = p; });
+    let free = board.free.slice(), lastFreed: string[] = [];
+    const nm = (id: string) => chatFull(person[id] ? person[id].name : id), rn = (id: string) => room[id] ? room[id].r.name : id;
+    const names = (ids: string[]) => ids.map(nm).join(', ');
+    const rm = (a: string[], id: string) => a.filter(x => x !== id);
+    const leave = (id: string) => { const w = where[id]; if (w && room[w]) room[w].people = rm(room[w].people, id); where[id] = ''; free = rm(free, id); };
+    const ensureRoom = (id: string, leadId: string, o: ChatOp[]) => { if (!room[id].onBoard) { room[id].onBoard = true; room[id].lead = leadId || board.supId; o.push({ op: 'room', areaId: id, leadId: room[id].lead }); } };
+    clauses.forEach((c, ci) => {
+        const mk = (kind: ChatItem['kind']): ChatItem => ({ ci, kind, said: c.text, text: '', lines: [], warn: [], ops: [], asks: [] });
+        const note = (): void => {   // the "left to do" / "doing now" that came with the clause
+            if (!c.note || !c.noteRoom || !room[c.noteRoom]) return;
+            const n = mk('note'), id = c.noteRoom;
+            if (board.plan) { n.kind = 'skip'; n.text = 'No change: this board is a setup for the next shift, so there is no progress to note yet'; items.push(n); return; }
+            ensureRoom(id, board.supId, n.ops);
+            n.ops.push(c.note.field === 'left' ? { op: 'detail', areaId: id, left: c.note.value } : { op: 'detail', areaId: id, status: c.note.value });
+            n.text = rn(id) + (c.note.field === 'left' ? ': left to do "' + c.note.value + '"' : ': ' + c.note.value);
+            n.ops.forEach(o => ops.push(o)); items.push(n);
+        };
+        if (c.kind === 'none') {
+            const it = mk('skip');
+            if (c.unknownRoom) it.text = 'No room called "' + c.unknownRoom + '" on this board';
+            else if (c.show && c.why && c.why !== 'empty') it.text = 'No change: ' + c.why;
+            if (it.text) items.push(it); return;
+        }
+        const asksAll = c.asks.concat(c.roomAsks);
+        if ((c.kind === 'away' || c.kind === 'done') && board.plan) { const it = mk('skip'); it.text = 'No change: this board is a setup for the next shift, so nothing is finished or off yet'; items.push(it); return; }
+        if (c.kind === 'note') { note(); return; }
+        if (c.kind === 'done') {
+            const it = mk('done'), ids = c.rooms.filter((v, i, a) => a.indexOf(v) === i), done: string[] = [];
+            ids.forEach(id => {
+                const st = room[id]; if (!st) return;
+                if (st.done && !st.people.length) { it.warn.push(st.r.name + ' was already marked finished'); return; }
+                ensureRoom(id, board.supId, it.ops); const freed = st.people.slice();
+                if (freed.length) it.ops.push({ op: 'free', empIds: freed });
+                it.ops.push({ op: 'detail', areaId: id, status: 'Completed' });
+                freed.forEach(p => { where[p] = ''; if (free.indexOf(p) < 0) free.push(p); }); st.people = []; st.done = true; done.push(id);
+                it.lines.push(freed.length ? st.r.name + ' finished: ' + names(freed) + (freed.length === 1 ? ' is' : ' are') + ' free' : st.r.name + ' finished');
+                lastFreed = freed;
+            });
+            if (!done.length && asksAll.length) { it.kind = 'ask'; it.asks = asksAll; it.text = 'Which room?'; items.push(it); note(); return; }
+            it.text = done.length ? done.map(rn).join(' and ') + (done.length === 1 ? ' is finished' : ' are finished') : (it.warn.shift() || 'Nothing to change');
+            it.asks = asksAll;
+            if (done.length) { it.ops.forEach(o => ops.push(o)); } else it.kind = 'skip';
+            items.push(it); note(); return;
+        }
+        if (c.kind === 'away') {
+            const it = mk('away');
+            c.people.forEach(id => {
+                if (person[id] && person[id].lead) { it.warn.push(nm(id) + ' leads a room; change leads in the Leads step'); return; }
+                if (status[id] === c.status) { it.warn.push(nm(id) + ' was already marked ' + c.status); return; }
+                const had = where[id] ? rn(where[id]) : ''; leave(id); status[id] = c.status; it.ops.push({ op: 'away', empId: id, status: c.status }); it.lines.push(nm(id) + ' is ' + c.status.toLowerCase() + (had ? ' (leaves ' + had + ')' : ''));
+            });
+            it.asks = c.asks;
+            if (!it.lines.length) { it.kind = c.asks.length ? 'ask' : 'skip'; it.text = c.asks.length ? 'Who?' : (it.warn.shift() || 'Nothing to change'); items.push(it); return; }
+            it.text = it.lines.length === 1 ? it.lines[0] : c.people.filter(id => it.ops.some(o => o.op === 'away' && o.empId === id)).map(nm).join(', ') + ': ' + c.status;
+            if (it.lines.length === 1) it.lines = [];
+            it.ops.forEach(o => ops.push(o)); items.push(it); return;
+        }
+        if (c.kind === 'free') {
+            const it = mk('free'), mv: string[] = [];
+            c.people.forEach(id => { if (person[id] && person[id].lead) return; if (!where[id]) { it.warn.push(nm(id) + ' is not in a room'); return; } const had = rn(where[id]); leave(id); free.push(id); mv.push(id); it.lines.push(nm(id) + ' leaves ' + had + ' and is free'); });
+            if (mv.length) { it.ops.push({ op: 'free', empIds: mv }); lastFreed = mv; }
+            it.asks = c.asks;
+            if (!mv.length) { it.kind = c.asks.length ? 'ask' : 'skip'; it.text = c.asks.length ? 'Who?' : (it.warn.shift() || 'Nothing to change'); items.push(it); return; }
+            it.text = mv.map(nm).join(', ') + (mv.length === 1 ? ' is free' : ' are free'); if (mv.length === 1) it.lines = [];
+            it.ops.forEach(o => ops.push(o)); items.push(it); return;
+        }
+        // send
+        const it = mk('send'), id = c.dest, st = room[id];
+        if (!st) { if (c.roomAsks.length) { it.kind = 'ask'; it.asks = asksAll; it.text = 'Which room?'; } else { it.kind = 'skip'; it.text = 'No change: no room to send them to'; } items.push(it); return; }
+        let named = c.people.slice();
+        if (c.fromPrev && !named.length) named = lastFreed.filter(p => !where[p] && !status[p]);
+        const srcPeople: string[] = []; c.src.forEach(sid => { if (sid !== id && room[sid]) room[sid].people.forEach(p => { if (srcPeople.indexOf(p) < 0) srcPeople.push(p); }); });
+        if (!named.length && srcPeople.length) named = c.count && c.count < srcPeople.length ? board.pick(id, c.count, srcPeople, st.people) : srcPeople;   // "send everyone from ibl5", "pull two from breading"
+        let leadPick = '';
+        const placed: string[] = [], already: string[] = [];
+        named.forEach(p => {
+            const pp = person[p]; if (!pp) return;
+            if (pp.lead) { leadPick = p; return; }
+            if (where[p] === id) { already.push(p); return; }
+            if (status[p]) it.warn.push(nm(p) + ' was marked ' + status[p].toLowerCase());
+            if (!pp.here) { it.warn.push(nm(p) + ' is from another crew (added as overtime)'); it.ops.push({ op: 'overtime', empId: p }); }
+            placed.push(p);
+        });
+        const wasDone = st.done;
+        const have = st.people.filter(p => placed.indexOf(p) < 0).concat(placed).length;
+        let want = 0;
+        if (c.fill && c.count) want = Math.max(0, c.count - have);
+        else if (c.count && c.more) want = c.count;
+        else if (c.count) want = Math.max(0, c.count - placed.length - already.length);
+        else if (c.team) { const usual = board.usual(st.r.name) || 3; want = Math.max(0, usual - have); }
+        const candidates = free.filter(p => placed.indexOf(p) < 0 && already.indexOf(p) < 0 && !(person[p] && person[p].lead));
+        let picked: string[] = []; if (want > 0) { picked = board.pick(id, want, candidates, st.people.concat(placed)); if (picked.length < want) it.warn.push(picked.length ? 'Only ' + picked.length + ' free ' + (picked.length === 1 ? 'person' : 'people') + ' for ' + want + ' places' : 'Nobody is free to send to ' + st.r.name); }
+        it.asks = asksAll;
+        if (!placed.length && !picked.length && !leadPick) {
+            if (asksAll.length) { it.kind = 'ask'; it.text = 'Who?'; items.push(it); note(); return; }
+            if (already.length) { it.kind = 'skip'; it.text = 'No change: ' + names(already) + (already.length === 1 ? ' is' : ' are') + ' already on ' + st.r.name; items.push(it); note(); return; }
+            it.kind = 'skip'; it.text = it.warn.length ? 'No change: ' + it.warn[0] : 'No change: nobody to send to ' + st.r.name; it.warn = []; items.push(it); note(); return;
+        }
+        ensureRoom(id, leadPick || board.supId, it.ops);
+        if (leadPick) { it.ops.push({ op: 'lead', areaId: id, leadId: leadPick }); st.lead = leadPick; it.lines.push(nm(leadPick) + ' leads ' + st.r.name); }
+        if (wasDone) { it.ops.push({ op: 'detail', areaId: id, status: '' }); st.done = false; it.warn.push(st.r.name + ' had been marked finished; it is working again'); }
+        placed.forEach(p => { const from = where[p] ? rn(where[p]) : ''; leave(p); where[p] = id; st.people.push(p); it.ops.push({ op: 'place', empId: p, areaId: id }); if (from) it.lines.push(nm(p) + ' moves from ' + from); });
+        picked.forEach(p => { leave(p); where[p] = id; st.people.push(p); it.ops.push({ op: 'place', empId: p, areaId: id }); });
+        if (picked.length) it.lines.push('Picked for the team: ' + names(picked) + (board.usual(st.r.name) ? '' : ' (no history for how many this room takes)'));
+        const all = placed.concat(picked); lastFreed = all;
+        it.text = 'Send ' + (all.length ? names(all) : (leadPick ? nm(leadPick) : '')) + ' to ' + st.r.name;
+        it.ops.forEach(o => ops.push(o)); items.push(it); note();
+    });
+    return { items, ops };
+}
+type ChatEntry = { id: number; text: string; at: number; items: ChatItem[]; ops: ChatOp[]; state: 'preview' | 'applied' | 'cleared' | 'undone'; appliedAt: number };
+type ChatLogRow = { at: number; kind: string; text: string };
+// The night log as text to paste: the time and what was done, oldest first.
+function chatLogText(rows: ChatLogRow[], title: string, clock: (ms: number) => string): string {
+    if (!rows.length) return title + ': nothing applied yet';
+    const icon: Record<string, string> = { done: '✅', send: '➡️', away: '🤒', free: '🔓', note: '📝' };
+    return title + '\n' + rows.map(r => clock(r.at) + '  ' + (icon[r.kind] || '•') + ' ' + r.text).join('\n');
+}
+// ============================================================================
+// END CHAT
+// ============================================================================
 
 // ============================================================================
 // MAIN COMPONENT
@@ -2020,6 +2596,199 @@ export function MainComponent(props: any) {
         copyTextToClipboard(txt); alert("Copied to clipboard!");
     }, [areaDetails, areaMap, activeBuckets, areaAssignments, assignments, employeeMap, boardCrew, clockCrew, clipboardFormat, employeeStartTimes, formatDuration]);
 
+    // CHAT UI (begin)
+    // ============================================================================
+    // CHAT: type or paste what happened ("we finished ibl4", "sending a team to ibl5 with porfirio", a pasted update). The lines are read into a list of board
+    // changes to look over; only Apply changes the board (nothing is saved until Save Progress, like any other edit). What was applied is kept in the night log on
+    // this computer, per board.
+    // ============================================================================
+    const [chatOpen, setChatOpen] = useState(false);
+    const [chatText, setChatText] = useState("");
+    const [chatBox, setChatBox] = useState<{ key: string; thread: ChatEntry[]; log: ChatLogRow[] }>({ key: "", thread: [], log: [] });
+    const [chatDirty, setChatDirty] = useState(false);                 // chat changes are on the board but not saved yet
+    const [chatLogOpen, setChatLogOpen] = useState(false);
+    const chatSeq = useRef(1);
+    const chatUndo = useRef<{ id: number; snap: any } | null>(null);
+    const chatBottom = useRef<HTMLDivElement | null>(null);
+    const chatKey = selectedSupervisorId && boardShiftStart ? `ss_chat_v1:${selectedSupervisorId}:${boardMode === 'next' && nextSlot ? 'n' + nextSlot.startMs : 'l' + boardShiftStart}` : "";
+    useEffect(() => {
+        let thread: ChatEntry[] = [], log: ChatLogRow[] = [];
+        if (chatKey) { try { const raw = window.localStorage.getItem(chatKey), o = raw ? JSON.parse(raw) : null; if (o && Array.isArray(o.thread)) thread = o.thread.slice(-30); if (o && Array.isArray(o.log)) log = o.log.slice(-200); } catch (e) { /* storage blocked: the chat still works for this session */ } }
+        chatSeq.current = thread.reduce((m, x) => Math.max(m, x.id), 0) + 1; chatUndo.current = null;
+        setChatBox({ key: chatKey, thread, log }); setChatDirty(false);
+    }, [chatKey]);
+    useEffect(() => {
+        if (!chatKey || chatBox.key !== chatKey) return;
+        try { window.localStorage.setItem(chatKey, JSON.stringify({ thread: chatBox.thread.slice(-30), log: chatBox.log.slice(-200) })); } catch (e) { /* storage blocked */ }
+    }, [chatKey, chatBox]);
+    useEffect(() => { if (saveSuccess) setChatDirty(false); }, [saveSuccess]);
+    useEffect(() => { if (chatOpen && chatBottom.current && chatBottom.current.scrollIntoView) chatBottom.current.scrollIntoView({ block: 'end' }); }, [chatOpen, chatBox.thread.length]);
+
+    // The board as the chat reads it: rooms (on the board or not), people (this crew and everyone else, so an overtime pick can be named), who is free right now.
+    const buildChatBoard = (): ChatBoard => {
+        const hereIds: Record<string, boolean> = {}, atMin = prdWindow ? minutesOfDay(prdWindow.from) : -1;
+        [...employees, ...leads, ...customEmployees, ...customLeads].forEach(e => { hereIds[String(getField(e, 'craa5__aa_employeeid') || "")] = true; });
+        Object.keys(assignments).forEach(k => (assignments[k] || []).forEach(id => { hereIds[String(id)] = true; }));
+        const people: ChatPerson[] = [], seen: Record<string, boolean> = {};
+        allKnownEmps.forEach(e => { const id = String(getField(e, 'craa5__aa_employeeid') || ""), nm = renderSafe(getField(e, 'craa5_name')); if (!id || !nm || id === selectedSupervisorId || seen[id]) return; seen[id] = true; people.push({ id, name: nm, lead: selectedLeadIds.has(id), here: !!hereIds[id] }); });
+        const rooms: ChatRoom[] = [];
+        areaMap.forEach((a: any, id: string) => { const nm = renderSafe(getField(a, 'craa5_area')); if (!nm || isStatusArea(nm)) return; rooms.push({ id: String(id), name: nm, onBoard: !!areaAssignments[id], lead: areaAssignments[id] || "", people: (assignments[id] || []).map(String), done: String((areaDetails[id] || {} as any).currentStatus || "").trim().toLowerCase() === "completed" }); });
+        const usual = (name: string) => typicalHeadcount(histNow, name, atMin) || typicalHeadcount(histNow, name);
+        const nameOf = (id: string) => renderSafe(getField(employeeMap.get(id), 'craa5_name'));
+        const pick = (roomId: string, n: number, from: string[], have: string[]): string[] => {
+            const staff = from.map(id => ({ id, name: nameOf(id) })).filter(s => !!s.name), roomName = renderSafe(getField(areaMap.get(roomId), 'craa5_area'));
+            const lead = renderSafe(getField(employeeMap.get(areaAssignments[roomId]) || activeSupervisorObj, 'craa5_name'));
+            const ranked = suggestMembers(histNow, [{ id: roomId, name: roomName, have: 0, want: n, lead, members: have.map(id => ({ id, name: nameOf(id) })) }], staff, atMin, suggestMode)[roomId] || [];
+            const out = ranked.map(s => s.id).slice(0, n);
+            staff.map(s => s.id).sort((x, y) => (normText(nameOf(x)) < normText(nameOf(y)) ? -1 : 1)).forEach(id => { if (out.length < n && out.indexOf(id) < 0) out.push(id); });   // no history for them: by name
+            return out;
+        };
+        return { rooms, people, free: availableStaff.map(e => String(getField(e, 'craa5__aa_employeeid') || "")).filter(Boolean), supId: selectedSupervisorId || "", plan: boardMode === 'next', usual, pick };
+    };
+    const chatRead = (text: string) => { const b = buildChatBoard(); return chatPlan(chatParse(text, { rooms: b.rooms, people: b.people, supId: b.supId }), b); };
+    const chatSend = (text0?: string) => {
+        const text = (text0 !== undefined ? text0 : chatText).trim(); if (!text) return;
+        const plan = chatRead(text), entry: ChatEntry = { id: chatSeq.current++, text, at: Date.now(), items: plan.items, ops: plan.ops, state: 'preview', appliedAt: 0 };
+        setChatBox(b => ({ ...b, thread: b.thread.concat([entry]).slice(-30) })); setChatText("");
+    };
+    const applyChatOps = (ops: ChatOp[]) => {
+        const stArea: Record<string, string> = {}, nowIso = new Date().toISOString();
+        ops.forEach(op => {
+            if (op.op !== 'away' || stArea[op.status]) return;
+            const found = [...areas, ...customAreas].find(a => renderSafe(getField(a, 'craa5_area')).toLowerCase() === op.status.toLowerCase());
+            if (found) { stArea[op.status] = String(getField(found, 'craa5_aa_mss_areaid')); return; }
+            const made = { craa5_aa_mss_areaid: `status_${compactKey(op.status)}_${Date.now()}`, craa5_area: op.status }; stArea[op.status] = made.craa5_aa_mss_areaid; setCustomAreas(p => p.concat([made]));
+        });
+        ops.forEach(op => {
+            if (op.op === 'room') {
+                setSelectedAreaIds(p => { const n = new Set(p); n.add(op.areaId); return n; });
+                setAreaAssignments(p => p[op.areaId] ? p : { ...p, [op.areaId]: op.leadId || selectedSupervisorId || "" });
+                if (op.leadId && op.leadId !== selectedSupervisorId) setSelectedLeadIds(p => { const n = new Set(p); n.add(op.leadId); return n; });
+            } else if (op.op === 'lead') {
+                setSelectedLeadIds(p => { const n = new Set(p); n.add(op.leadId); return n; });
+                setAreaAssignments(p => ({ ...p, [op.areaId]: op.leadId }));
+            } else if (op.op === 'place') addMembers([{ areaId: op.areaId, id: op.empId }]);
+            else if (op.op === 'free') removeFromAllAreas(op.empIds);
+            else if (op.op === 'detail') setAreaDetails(p => { const cur = p[op.areaId] || { currentStatus: "", futureNotes: "" }; return { ...p, [op.areaId]: { ...cur, currentStatus: op.status !== undefined ? op.status : cur.currentStatus, futureNotes: op.left !== undefined ? op.left : cur.futureNotes } }; });
+            else if (op.op === 'overtime') { const emp = employeeMap.get(op.empId); if (emp) setCustomEmployees(p => p.some(x => getField(x, 'craa5__aa_employeeid') === op.empId) ? p : p.concat([emp])); }
+            else if (op.op === 'away') {
+                const aId = stArea[op.status];
+                setEmployeeStartTimes(p => ({ ...p, [op.empId]: nowIso }));
+                setSelectedAreaIds(p => { const n = new Set(p); n.add(aId); return n; });
+                setAreaAssignments(p => p[aId] ? p : { ...p, [aId]: selectedSupervisorId || "" });
+                setAssignments(prev => { const next: Record<string, string[]> = {}; Object.keys(prev).forEach(k => { next[k] = prev[k].filter(id => id !== op.empId); }); next[aId] = (next[aId] || []).concat([op.empId]); return next; });
+            }
+        });
+    };
+    const chatApply = (entryId: number) => {
+        const e = chatBox.thread.find(x => x.id === entryId); if (!e || e.state !== 'preview') return;
+        const plan = chatRead(e.text), now = Date.now();
+        if (!plan.ops.length) { setChatBox(b => ({ ...b, thread: b.thread.map(x => x.id === entryId ? { ...x, items: plan.items, ops: plan.ops } : x) })); return; }
+        chatUndo.current = { id: entryId, snap: { selectedAreaIds, areaAssignments, assignments, areaDetails, employeeStartTimes, customEmployees, customAreas, selectedLeadIds } };
+        applyChatOps(plan.ops);
+        const rows = plan.items.filter(i => i.ops.length).map(i => ({ at: now, kind: i.kind, text: i.text }));
+        setChatBox(b => ({ ...b, thread: b.thread.map(x => x.id === entryId ? { ...x, items: plan.items, ops: plan.ops, state: 'applied', appliedAt: now } : x), log: b.log.concat(rows) }));
+        setChatDirty(true);
+    };
+    const chatUndoLast = () => {
+        const u = chatUndo.current; if (!u) return; const s = u.snap;
+        setSelectedAreaIds(s.selectedAreaIds); setAreaAssignments(s.areaAssignments); setAssignments(s.assignments); setAreaDetails(s.areaDetails); setEmployeeStartTimes(s.employeeStartTimes); setCustomEmployees(s.customEmployees); setCustomAreas(s.customAreas); setSelectedLeadIds(s.selectedLeadIds);
+        const at = (chatBox.thread.find(x => x.id === u.id) || { appliedAt: -1 }).appliedAt;
+        setChatBox(b => ({ ...b, thread: b.thread.map(x => x.id === u.id ? { ...x, state: 'undone' } : x), log: b.log.filter(r => r.at !== at) })); chatUndo.current = null;
+    };
+    const chatAnswer = (entry: ChatEntry, ask: ChatAsk, opt: { id: string; name: string }) => {   // the answer goes into the line in place of the word, and the line is read again
+        const esc = ask.word.replace(/[^a-z0-9 ]/gi, '').trim(), re = new RegExp('\\b' + esc.split(/\s+/).join('[^a-z0-9]+') + '\\b', 'i');
+        const fixed = entry.text.replace(re, chatFull(opt.name));
+        if (entry.state === 'preview') setChatBox(b => ({ ...b, thread: b.thread.map(x => x.id === entry.id ? { ...x, state: 'cleared' } : x) }));
+        chatSend(fixed);
+    };
+    const chatCopyLog = () => { copyTextToClipboard(chatLogText(chatBox.log, `Shift ${boardCrew || currentShift || ''} so far`, clockTime)); };
+
+    const chatIcon: Record<string, string> = { done: '✅', send: '➡️', away: '🤒', free: '🔓', note: '📝', ask: '❓', skip: '•' };
+    const chatExamples = (): string[] => {
+        const b = buildChatBoard(), on = b.rooms.filter(r => r.onBoard && !isStatusArea(r.name)), off = b.rooms.filter(r => !r.onBoard);
+        const pool = b.people.filter(p => !p.lead && b.free.indexOf(p.id) >= 0), first = (n: string) => chatFull(n).split(' ')[0];
+        const ex: string[] = [];
+        if (on[0]) ex.push(`we finished ${on[0].name}`);
+        if (off[0] || on[1]) ex.push(`sending a team to ${(off[0] || on[1]).name}${pool[0] ? ' with ' + first(pool[0].name) : ''}`);
+        if (pool[1]) ex.push(`${first(pool[1].name)} is sick`);
+        return ex;
+    };
+    const chatLastApplied = (() => { const l = chatBox.thread.filter(x => x.state === 'applied'); return l.length ? l[l.length - 1].id : -1; })();
+    const chatPanel = chatOpen && selectedSupervisorId && currentUser ? (
+        <div role="dialog" aria-label="Shift chat" data-chat-panel className="absolute z-40 right-3 bottom-3 top-3 flex flex-col bg-white rounded-2xl border border-slate-300 shadow-2xl overflow-hidden" style={{ width: 'min(420px, calc(100% - 24px))' }}>
+            <div className="px-3 py-2 flex items-center justify-between gap-2 border-b-4 shrink-0" style={{ borderColor: BRAND.yellow, background: BRAND.blueSoft }}>
+                <div className="min-w-0">
+                    <div className="text-sm font-black leading-tight" style={{ color: BRAND.blueDark }}>Shift chat</div>
+                    <div className="text-[10px] font-bold text-slate-500 truncate">Nothing changes until you press Apply</div>
+                </div>
+                <div className="flex items-center gap-1 shrink-0">
+                    <button data-chat-log-toggle aria-pressed={chatLogOpen} className="px-2 py-1 text-[11px] font-extrabold rounded-lg border border-slate-300 bg-white hover:bg-slate-50" onClick={() => setChatLogOpen(v => !v)}>{chatLogOpen ? 'Back to chat' : `Night log (${chatBox.log.length})`}</button>
+                    <button data-chat-close aria-label="Close chat" className="px-2 py-1 text-sm font-black rounded-lg hover:bg-slate-200" onClick={() => setChatOpen(false)}>✕</button>
+                </div>
+            </div>
+            <div className="flex-1 overflow-y-auto p-3 flex flex-col gap-3 min-h-0" style={{ background: '#F7F9FC' }}>
+                {chatLogOpen ? (
+                    <div data-chat-log className="flex flex-col gap-1.5">
+                        <div className="flex items-center justify-between"><span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-500">What was done this shift</span><button data-chat-copy className="px-2 py-1 text-[11px] font-extrabold rounded-lg border border-[#0072CE] text-[#00468B] bg-white hover:bg-[#E6F1FB]" onClick={() => { chatCopyLog(); }}>Copy log</button></div>
+                        {chatBox.log.length === 0 ? <div className="text-[12px] text-slate-500">Nothing applied yet. Lines you apply in the chat are listed here with the time.</div> : chatBox.log.map((r, i) => (
+                            <div key={i} data-chat-log-row className="flex gap-2 text-[12px] bg-white rounded-lg border border-slate-200 px-2 py-1.5"><span className="font-bold text-slate-500 shrink-0 w-[62px]">{clockTime(r.at)}</span><span aria-hidden="true">{chatIcon[r.kind] || '•'}</span><span className="min-w-0">{r.text}</span></div>
+                        ))}
+                        <div className="text-[10px] text-slate-500 mt-1">Kept on this computer for this board. Save Progress is what keeps the board itself.</div>
+                    </div>
+                ) : (
+                    <>
+                        {chatBox.thread.length === 0 && (
+                            <div data-chat-empty className="text-[12px] text-slate-600 flex flex-col gap-2">
+                                <div>Say what happened in your own words, one line or a whole pasted update. I read it, show what I would change, and you press Apply.</div>
+                                <div className="flex flex-wrap gap-1.5">{chatExamples().map(ex => <button key={ex} data-chat-example className="text-[11px] px-2 py-1 rounded-full border border-[#0072CE] text-[#00468B] bg-white hover:bg-[#E6F1FB]" onClick={() => setChatText(ex)}>{ex}</button>)}</div>
+                                <div className="text-[11px] text-slate-500">Finished a room, sent people (or a team I pick for you) to a room, someone sick, late, on PTO or left early, someone free, or a note like "ibl4 left: sanitize".</div>
+                            </div>
+                        )}
+                        {chatBox.thread.map(e => {
+                            const doing = e.items.filter(i => i.ops.length).length, live = e.state === 'preview';
+                            return (
+                                <div key={e.id} data-chat-entry={e.id} data-chat-state={e.state} className="flex flex-col gap-1.5">
+                                    <div className="self-end max-w-[88%] rounded-2xl rounded-br-sm px-3 py-1.5 text-[12px] text-white whitespace-pre-wrap break-words" style={{ background: BRAND.blue }}>{e.text}</div>
+                                    <div className={`rounded-xl border p-2 shadow-sm flex flex-col gap-1.5 ${e.state === 'applied' ? 'bg-[#F1FAF3] border-green-200' : 'bg-white border-slate-200'}`}>
+                                        {e.items.length === 0 && <div className="text-[12px] text-slate-500">I did not find anything to do in that.</div>}
+                                        {e.items.map((it, i) => (
+                                            <div key={i} data-chat-item data-chat-kind={it.kind} className={`flex gap-1.5 ${it.kind === 'skip' ? 'opacity-70' : ''}`}>
+                                                <span aria-hidden="true" className="shrink-0">{chatIcon[it.kind] || '•'}</span>
+                                                <div className="min-w-0 flex-1">
+                                                    <div className={`text-[12px] break-words ${it.kind === 'skip' ? 'text-slate-500' : 'font-bold'}`}>{it.text}</div>
+                                                    {it.lines.map((l, j) => <div key={j} className="text-[11px] text-slate-600 break-words">{l}</div>)}
+                                                    {it.warn.map((w, j) => <div key={j} data-chat-warn className="text-[11px] font-bold break-words" style={{ color: '#9A6700' }}>{w}</div>)}
+                                                    {(live || e.state === 'applied') && it.asks.map((a, j) => (
+                                                        <div key={j} className="flex flex-wrap items-center gap-1 mt-1"><span className="text-[11px] text-slate-600">Which "{a.word}"?</span>{a.options.map(o => <button key={o.id} data-chat-answer className="text-[11px] px-2 py-0.5 rounded-full border border-[#0072CE] text-[#00468B] bg-white hover:bg-[#E6F1FB]" onClick={() => chatAnswer(e, a, o)}>{chatFull(o.name)}</button>)}</div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        ))}
+                                        {live && doing > 0 && <div className="flex items-center gap-2 pt-1"><button data-chat-apply className="px-3 py-1 text-[11px] font-extrabold rounded-lg text-white" style={{ background: BRAND.blue }} onClick={() => chatApply(e.id)}>Apply {doing === 1 ? 'this change' : `${doing} changes`}</button><button data-chat-clear className="px-2 py-1 text-[11px] font-extrabold rounded-lg border border-slate-300 bg-white hover:bg-slate-50" onClick={() => setChatBox(b => ({ ...b, thread: b.thread.map(x => x.id === e.id ? { ...x, state: 'cleared' } : x) }))}>Clear</button></div>}
+                                        {e.state === 'applied' && <div className="flex items-center gap-2 text-[11px] font-bold text-green-800">Applied {clockTime(e.appliedAt)}{e.id === chatLastApplied && chatUndo.current && chatUndo.current.id === e.id && <button data-chat-undo className="px-2 py-0.5 text-[11px] font-extrabold rounded-lg border border-slate-300 bg-white text-slate-700 hover:bg-slate-50" onClick={() => chatUndoLast()}>Undo</button>}</div>}
+                                        {e.state === 'cleared' && <div className="text-[11px] text-slate-500">Cleared, nothing changed</div>}
+                                        {e.state === 'undone' && <div className="text-[11px] text-slate-500">Undone, the board is back as it was</div>}
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </>
+                )}
+                <div ref={chatBottom} />
+            </div>
+            {chatDirty && <div data-chat-dirty className="px-3 py-1.5 text-[11px] font-bold border-t flex items-center justify-between gap-2 shrink-0" style={{ background: BRAND.yellowSoft, color: '#8A5A00', borderColor: BRAND.yellow }}><span>On the board, not saved yet</span><button data-chat-save className="px-3 py-1 text-[11px] font-extrabold rounded-lg text-white" style={{ background: BRAND.blue }} onClick={() => handleSubmission()}>{boardMode === 'next' ? 'Save Setup' : 'Save Progress'}</button></div>}
+            <div className="p-2 border-t border-slate-200 bg-white shrink-0">
+                <textarea data-chat-input rows={2} value={chatText} onChange={e => setChatText(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chatSend(); } }} placeholder='Try: "we finished ibl4" or "sending a team to ibl5 with porfirio"' className="w-full text-sm rounded-lg border border-slate-300 p-2 outline-none focus:border-[#0072CE] resize-none" />
+                <div className="flex items-center justify-between gap-2 mt-1">
+                    <span className="text-[10px] text-slate-500">Enter reads it. Shift+Enter adds a line. You can paste a whole update.</span>
+                    <button data-chat-send disabled={!chatText.trim()} className="px-3 py-1 text-[11px] font-extrabold rounded-lg text-white disabled:opacity-40" style={{ background: BRAND.blue }} onClick={() => chatSend()}>Read it</button>
+                </div>
+            </div>
+        </div>
+    ) : null;
+    // CHAT UI (end)
+
     // ============================================================================
     // SAVE PROGRESS — closes the shift's open rows and writes the current board
     // through the new_BulkUpsertTaskAssignments plugin.
@@ -2412,6 +3181,7 @@ export function MainComponent(props: any) {
                                 ))}
                             </div>
                             <div className="flex items-center gap-2 flex-wrap">
+                                <button data-chat-open aria-pressed={chatOpen} onClick={() => setChatOpen(v => !v)} title="Type or paste what happened (we finished ibl4, sending a team to ibl5 with porfirio). You look it over before anything changes on the board" className={`relative px-3 py-1 text-[11px] font-extrabold rounded-lg border whitespace-nowrap ${chatOpen ? 'bg-[#0072CE] text-white border-[#0072CE]' : 'text-[#00468B] border-[#0072CE] bg-white hover:bg-[#E6F1FB]'}`}>💬 Chat{chatDirty && <span aria-hidden="true" style={{ position: 'absolute', top: -3, right: -3, width: 8, height: 8, borderRadius: 8, background: BRAND.yellow }} />}</button>
                                 <div className="flex items-center gap-1.5" aria-label="Shift selector">
                                     {crewLetters.length > 1 && <span className="text-[11px] font-extrabold text-slate-500">Shift</span>}
                                     {crewLetters.map(l => { const how = crewOpens(l), off = how === 'none'; return (
@@ -2436,7 +3206,7 @@ export function MainComponent(props: any) {
                 )}
 
                 {showData && <DataCheckPanel onClose={() => setShowData(false)} msUser={msUser} currentUser={currentUser} slotCount={(GLOBAL_DATA_CACHE?.slots || []).length} currentShift={currentShift} shiftStartMs={shiftStartMs} upNextShift={upNextShift} teams={GLOBAL_DATA_CACHE?.teams || []} teamsRead={GLOBAL_DATA_CACHE?.teamsRead || 0} employees={allEmployees} supervisors={supervisors} taskStatus={taskStatus} areaCount={areas.length} boardCrew={boardCrew} ownerName={ownerLabel} presets={presets} presetStore={presetStore} presetLog={presetLog} prd={prd.keyOf === prdKey ? prd : PRD_IDLE} prdWindow={prdWindow} hist={histNow} histStatus={histStatus.key === histKey ? histStatus : HIST_IDLE} histNames={histNames} remembered={rememberedLog} onReread={() => { histForce.current = true; setHistReload(n => n + 1); }} suggestMode={suggestMode} leadSuggestCount={leadSuggestCount} memberSuggestCount={suggestionCount} />}
-                <main style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", position: 'relative' }}>{SC}</main>
+                <main style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", position: 'relative' }}>{SC}{chatPanel}</main>
             </div>
         </FluentProvider>
     );
