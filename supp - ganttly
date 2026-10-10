@@ -628,6 +628,7 @@ const LOG_GAP_MINS = 90;                 // people planned on a room and no Star
 const UNCONFIRMED_AFTER_MINS = 90;       // this long into a shift with no Start / Done on this computer: the board says it is plan only
 const PACE_MIN_TIMED = 5;                // timed cleans (Start and Done pressed) needed before a pace is shown
 const PROD_REREAD_MS = 15 * 60000;       // Ganttly re-reads the production schedule at most this often
+const PROD_BACK_MS = 3 * 86400000;       // Ganttly also reads this far back, to know when a line that is already down last ran
 const NOT_LOGGED_MINS = 30;              // a stretch on shift before now this long with nothing started or done is drawn as "not logged"
 // The statuses in brand colours only (no green): blue = good, yellow = watch, red = act, grey = not known. chip = the small label,
 // hero = the big verdict card and the header pill.
@@ -713,6 +714,14 @@ function roomRestart(lines, fromMs) {
             const r = L.runs[i];
             if (!r.maint && r.s >= fromMs) { if (best === null || r.s < best) best = r.s; break; }
         }
+    });
+    return best;
+}
+// Ganttly: when the last production run on a room's lines ended at or before ms (maintenance rows don't count), or null.
+function lastRunEndBefore(lines, ms) {
+    let best = null;
+    (lines || []).forEach(function(L) {
+        L.runs.forEach(function(r) { if (!r.maint && r.e <= ms && (best === null || r.e > best)) best = r.e; });
     });
     return best;
 }
@@ -2783,7 +2792,9 @@ export default function App(props) {
         ssBusyRef.current = true; ssAttemptRef.current = Date.now();
         setShiftStartLoading(true);
         try {
-            const res = await Promise.all([fetchBoardRows(props.dataApi), fetchAllActiveRecords("craa5_aa_mss_area", props.dataApi), loadTaskRowsRef.current ? loadTaskRowsRef.current() : null, loadProdRunsRef.current && (!IS_CURRENT || Date.now() - prodReadAtRef.current > PROD_REREAD_MS) ? loadProdRunsRef.current() : null]);
+            const prodDue = !!loadProdRunsRef.current && (!IS_CURRENT || Date.now() - prodReadAtRef.current > PROD_REREAD_MS);
+            if (IS_CURRENT && prodDue) loadProdRunsRef.current();   // Ganttly: the schedule is only shown, so the crews never wait for it
+            const res = await Promise.all([fetchBoardRows(props.dataApi), fetchAllActiveRecords("craa5_aa_mss_area", props.dataApi), loadTaskRowsRef.current ? loadTaskRowsRef.current() : null, !IS_CURRENT && prodDue ? loadProdRunsRef.current() : null]);
             applyShiftStartRows(res[0], res[1]);
         } finally { ssBusyRef.current = false; setShiftStartLoading(false); }
     };
@@ -3274,7 +3285,7 @@ export default function App(props) {
         // Ganttly reads it too, for the startup (restart) of each room only: its plan never waits for the schedule (see handoffInfo).
         if (!IS_CURRENT && handoffSource !== 'schedule') return Promise.resolve();
         const req = ++prodReqRef.current;
-        const from = globalStartMs, to = globalStartMs + planHorizonMins * 60000 + Math.max(PROD_AFTER_MS, PROD_RESTART_AHEAD_MS);   // far enough to see the restart
+        const from = globalStartMs - (IS_CURRENT ? PROD_BACK_MS : 0), to = globalStartMs + planHorizonMins * 60000 + Math.max(PROD_AFTER_MS, PROD_RESTART_AHEAD_MS);   // far enough to see the restart
         const win = from + '|' + to;
         setProdState(function(prev) { return { status: 'loading', readAt: prev.readAt, truncated: prev.truncated }; });
         return fetchProductionRuns(props.dataApi, from, to).then(function(rows) {
@@ -3327,12 +3338,16 @@ export default function App(props) {
                 // Ganttly: the plan only waits for what was typed (and down lines, below). The production schedule gives each room's
                 // stop and startup for the Startup board alone (display only, so it can never move the plan).
                 const ln0 = lineForArea(lineIndex, area);
-                const m0 = linesForRoom([area, ln0 ? ln0.name : ''], prodLines, roomProdLines[area]);
+                // Matched against every run read (a line idle for days is still the room's line).
+                const m0 = linesForRoom([area, ln0 ? ln0.name : ''], prodLinesWide, roomProdLines[area]);
                 const h0 = m0.lines.length ? roomHandoff(m0.lines, w0, gapMs) : null;
                 const stopMs = h0 && h0.ms !== null && h0.ms !== undefined ? h0.ms : null;
-                const rs0 = m0.lines.length ? roomRestart(wideOf(m0.lines), stopMs !== null ? stopMs : w0) : null;
+                const rs0 = m0.lines.length ? roomRestart(m0.lines, stopMs !== null ? stopMs : w0) : null;
+                // Already down at the plan start: when its last run ended (read up to PROD_BACK_MS back; none = down at least that long).
+                const last0 = h0 && h0.state !== 'handed' ? lastRunEndBefore(m0.lines, w0) : null;
+                const stopReal = h0 && h0.state !== 'handed' ? (last0 !== null ? last0 : w0 - PROD_BACK_MS) : stopMs;
                 const base = isNaN(hv) ? { ms: null, src: 'hand-none' } : { ms: hv, src: 'hand' };
-                out[area] = Object.assign(base, { lines: m0.lines.map(function(L) { return prodLineLabel(L); }), how: m0.how, stopMs: stopMs, stopState: h0 ? h0.state : (m0.lines.length ? 'norun' : (roomProdLines[area] === 'none' ? 'nolines' : 'nomatch')), restart: rs0, restartSrc: rs0 !== null ? 'schedule' : 'none' });
+                out[area] = Object.assign(base, { lines: m0.lines.map(function(L) { return prodLineLabel(L); }), how: m0.how, stopMs: stopMs, stopReal: stopReal, stopRealExact: !(h0 && h0.state !== 'handed' && last0 === null), stopState: h0 ? h0.state : (m0.lines.length ? 'norun' : (roomProdLines[area] === 'none' ? 'nolines' : 'nomatch')), restart: rs0, restartSrc: rs0 !== null ? 'schedule' : 'none' });
                 return;
             }
             if (handoffSource !== 'schedule') { out[area] = withRestart(area, isNaN(hv) ? { ms: null, src: 'hand-none' } : { ms: hv, src: 'hand' }, []); return; }   // PBED set to hand: only what was typed
@@ -4437,6 +4452,13 @@ export default function App(props) {
             if (!statusByParent[b.parentId]) statusByParent[b.parentId] = [];
             statusByParent[b.parentId].push(b);
         });
+        // Ganttly: per person (lane key), when each check-off they pressed Start on began, so a clean left without Done stops growing
+        // past plan once the same person has started something else.
+        const frozenStartsByLane = {};
+        if (IS_CURRENT) Object.keys(taskStatus).forEach(function(blockId) {
+            const b = taskStatus[blockId];
+            (b && Array.isArray(b.laneKeys) ? b.laneKeys : []).forEach(function(k) { (frozenStartsByLane[k] = frozenStartsByLane[k] || []).push(Number(b.startMs) || 0); });
+        });
 
         // Workers whose role allows this kind of task, and the biggest group of them on one crew.
         const isNightAt = function(min) { return isNightHour(new Date(startMs + min * 60000).getHours()); };
@@ -4600,7 +4622,12 @@ export default function App(props) {
                 blk.appliedHeads = b.heads || 1;
                 blk.finalDuration = b.durationMins;
                 if (IS_CURRENT && blk.startMin < 0) { blk.finalDuration = Math.max(1, blk.finalDuration + blk.startMin); blk.startMin = 0; }   // started before the window: its part inside it
-                if (IS_CURRENT && blk.isInProgress && overrunTo > 0 && blk.startMin + blk.finalDuration < overrunTo) { blk.overrunFrom = blk.startMin + blk.finalDuration; blk.finalDuration = overrunTo - blk.startMin; }   // still on it past its plan
+                if (IS_CURRENT && blk.isInProgress && overrunTo > 0 && blk.startMin + blk.finalDuration < overrunTo) {
+                    // Still on it past its plan: stretched to the next quarter hour, but never past the next clean the same person started.
+                    let capMin = overrunTo;
+                    (b.laneKeys || []).forEach(function(k) { (frozenStartsByLane[k] || []).forEach(function(ms) { if (ms > b.startMs) capMin = Math.min(capMin, Math.round((ms - startMs) / 60000)); }); });
+                    if (capMin > blk.startMin + blk.finalDuration) { blk.overrunFrom = blk.startMin + blk.finalDuration; blk.finalDuration = capMin - blk.startMin; }
+                }
                 blk.assignedLanes = resolveLanes(b.laneKeys, blk.appliedHeads, blk.kind);
                 blk.lostWorkers = blk.assignedLanes.length < (b.laneKeys || []).length;
                 blk.segments = [{ startMin: blk.startMin, duration: blk.finalDuration }];
@@ -6523,13 +6550,16 @@ export default function App(props) {
         const distinct = function(list) { return list.filter(function(x, i, a) { return a.indexOf(x) === i; }); };
         // The room's next stop and startup on the production schedule from a moment on (once a startup has passed, the board
         // looks at the line's next changeover).
+        // { stopMs, realStopMs (when it really stopped, which may be before fromMs), state ('handed' = a run is on, else stopped), restart }.
         const schedFrom = function(r, fromMs) {
             const ln = lineForArea(lineIndex, r);
-            const m = linesForRoom([r, ln ? ln.name : ''], prodLines, roomProdLines[r]);
+            const m = linesForRoom([r, ln ? ln.name : ''], prodLinesWide, roomProdLines[r]);
             if (!m.lines.length) return null;
             const h = roomHandoff(m.lines, fromMs, handoffGapMins * 60000);
             const stop = h && known(h.ms) ? h.ms : fromMs;
-            return { stopMs: stop, restart: roomRestart(m.lines.map(function(L) { return prodLinesWide[L.key] || L; }), stop) };
+            const handed = !!h && h.state === 'handed';
+            const last = handed ? null : lastRunEndBefore(m.lines, fromMs);
+            return { stopMs: stop, realStopMs: handed ? stop : (last !== null ? last : stop), state: handed ? 'handed' : 'stopped', restart: roomRestart(m.lines, stop) };
         };
         const absentN = w && absentByShift[w.key] ? Object.keys(absentByShift[w.key]).filter(function(k) { return absentByShift[w.key][k]; }).length : 0;
         const statOf = {};
@@ -6539,32 +6569,34 @@ export default function App(props) {
         const rows = shownRooms.filter(function(r) { return !isSupportRoom(r); }).map(function(r) {
             const h = handoffInfo[r] || { ms: null, src: 'hand-none' };
             const down = h.src === 'down';
-            let S = Math.max(0, (down || h.src === 'hand') && known(h.ms) ? toMin(h.ms) : (known(h.stopMs) ? toMin(h.stopMs) : 0));
+            // S0 = when the line really stopped (may be before the view; it decides a long or a short changeover); S = the same, kept inside the view.
+            let S0 = (down || h.src === 'hand') && known(h.ms) ? toMin(h.ms) : known(h.stopReal) ? toMin(h.stopReal) : (known(h.stopMs) ? toMin(h.stopMs) : 0);
+            let S = Math.max(0, S0);
             let R = known(h.restart) ? toMin(h.restart) : null;
             let restartSrc = h.restartSrc || 'none';
-            let running = !down && h.src !== 'hand' && known(h.stopMs) && toMin(h.stopMs) > nowMin;
-            let stateText = down ? 'down line since ' + clockMs(h.ms) : running ? 'running until ' + clock(S) : S > 0 ? 'stopped ' + clock(S) : 'stopped before ' + clock(0);
+            let running = !down && h.src !== 'hand' && h.stopState === 'handed' && known(h.stopMs) && h.stopMs > nowMs;
+            let stateText = down ? 'down line since ' + clockMs(h.ms) : running ? 'running until ' + clock(S) : S0 > 0 ? 'stopped ' + clock(S0) : known(h.stopReal) ? (h.stopRealExact ? 'stopped ' : 'stopped before ') + clockMs(h.stopReal) : 'stopped before ' + clock(0);
             const allTasks = groupByName[r] ? groupByName[r].tasks : [];
             // A startup that has passed (the line runs again): kept for This Shift, and the row moves on to the line's next changeover.
             let past = null;
             if (R !== null && R <= nowMin) {
-                const pL = R - S, pB = pL >= LONG_CHANGEOVER_MINS ? READY_BY_LONG_MINS : READY_BY_SHORT_MINS;
-                const pG = Math.max(R - pB, S);
+                const pL = R - S0, pB = pL >= LONG_CHANGEOVER_MINS ? READY_BY_LONG_MINS : READY_BY_SHORT_MINS;
+                const pG = Math.max(R - pB, S0);
                 const before = allTasks.filter(function(t) { return t.startMin < R && !(t.isNextCycle && t.earliestStart >= R); });
                 const left = before.filter(function(t) { return !t.isComplete; });
                 const pF = before.length ? Math.max.apply(null, before.map(doneEnd)) : null;
                 past = { R: R, G: pG, gateLabel: pL >= LONG_CHANGEOVER_MINS ? 'FSQ inspect' : 'preflight', planned: before.length, leftMins: sum(left, function(t) { return t.rawWorkloadMins; }), F: pF, met: before.length > 0 && !left.length && pF !== null && pF <= pG };
                 const nx = schedFrom(r, nowMs);
-                if (nx) { S = Math.max(0, toMin(nx.stopMs)); R = known(nx.restart) ? toMin(nx.restart) : null; restartSrc = known(nx.restart) ? 'schedule' : 'none'; running = toMin(nx.stopMs) > nowMin; }
+                if (nx) { S0 = toMin(nx.realStopMs); S = Math.max(0, toMin(nx.stopMs)); R = known(nx.restart) ? toMin(nx.restart) : null; restartSrc = known(nx.restart) ? 'schedule' : 'none'; running = nx.state === 'handed' && nx.stopMs > nowMs; }
                 else { R = null; restartSrc = 'none'; running = false; }
                 stateText = 'started up ' + clock(past.R) + (running ? ' · running until ' + clock(S) : '');
             }
-            const L = R !== null ? R - S : null;
+            const L = R !== null ? R - S0 : null;
             const long = L !== null && L >= LONG_CHANGEOVER_MINS;
             const B = long ? READY_BY_LONG_MINS : READY_BY_SHORT_MINS;
             const gateLabel = long ? 'FSQ inspect' : 'preflight';
-            const G = R !== null ? Math.max(R - B, S) : null;
-            const shortWindow = R !== null && R - B < S;
+            const G = R !== null ? Math.max(R - B, S0) : null;   // may be before the view: an FSQ inspect that has already passed
+            const shortWindow = R !== null && R - B < S0;
             // The next clean of a piece already cleaned is not part of this startup when it is due after it.
             const nextCleanOut = function(t) { return !!t.isNextCycle && (R === null || t.earliestStart >= R); };
             let T = allTasks.filter(function(t) { return !nextCleanOut(t); });
@@ -6574,7 +6606,7 @@ export default function App(props) {
             const parentsHere = scheduleData.parents.filter(function(p) { return String(p.area) === r && !p.removed; });
             const allDone = U.length === 0 && (T.length ? T.every(function(t) { return t.isComplete; }) : (!past && parentsHere.length > 0 && parentsHere.every(function(p) { return p.lastDoneMs > 0; })));
             let F = null, est = false;
-            const wontFit = !allDone && U.length > 0 && (G === null || G <= H);
+            const wontFit = !allDone && U.length > 0 && G !== null && G <= H;   // a room with no startup has nothing to miss
             if (allDone) F = T.length ? Math.max.apply(null, T.map(doneEnd)) : toMin(Math.max.apply(null, parentsHere.map(function(p) { return p.lastDoneMs; })));
             else if (wontFit) F = Infinity;
             else if (U.length) {
@@ -6584,7 +6616,7 @@ export default function App(props) {
                 est = true;
             } else if (T.length) F = Math.max.apply(null, T.map(endOf));
             const spare = G !== null && F !== null ? (F === Infinity ? -Infinity : G - F) : null;
-            const overruns = T.filter(function(t) { return known(t.overrunFrom) && !t.isComplete; });
+            const overruns = T.filter(function(t) { return known(t.overrunFrom) && t.overrunFrom < nowMin && !t.isComplete; });
             let status;
             if (R === null) status = 'NO_STARTUP';
             else if (running) status = 'RUNNING';
@@ -6707,7 +6739,7 @@ export default function App(props) {
         const recs = Object.keys(taskStatus).map(function(k) { return Object.assign({ id: k }, taskStatus[k]); });
         const areaOfRec = function(rec) { const p = parentById[rec.parentId]; return p ? String(p.area) : ''; };
         const doneRecs = w ? recs.filter(function(rec) { const at = rec.doneAt || rec.updatedAt || 0; return rec.status === 'done' && at >= clockInMs && at <= nowMs + 60000; }) : [];
-        const timed = doneRecs.filter(function(rec) { return rec.startedAt && !rec.noStart && rec.doneAt > rec.startedAt; });
+        const timed = doneRecs.filter(function(rec) { return rec.startedAt && rec.startedAt >= clockInMs && !rec.noStart && rec.doneAt > rec.startedAt; });   // started by this crew: a clean the last crew started is done, not timed
         const laborOf = function(rec) { return (rec.doneAt - rec.startedAt) / 60000 * Math.max(1, Number(rec.heads) || 1); };
         const timedWork = sum(timed, function(rec) { return rec.workMins; }), timedLabor = sum(timed, laborOf);
         const crewLanes = w ? laneRoster.filter(function(l) { return l.crew === w.crew && !l.isLead; }).map(function(l) { return l.lane; }) : [];
@@ -7704,7 +7736,7 @@ export default function App(props) {
         board.rows.filter(function(x) { return x.status === 'LATE'; }).forEach(function(x) {
             out.push({ key: 'late-' + x.room, kind: 'late', tone: 'red', text: x.room + (x.wontFit ? ": " + fmtMins(x.uWork) + " won't fit before startup" : ' late for ' + x.gateLabel + ' by ' + fmtMins(-x.spare)), onClick: function() { openBoardRoom(x.room); } });
         });
-        allBlocks.filter(function(t) { return t.overrunFrom !== undefined && t.overrunFrom !== null && !t.isComplete; }).sort(function(a, b) { return a.overrunFrom - b.overrunFrom; }).forEach(function(t) {
+        allBlocks.filter(function(t) { return t.overrunFrom !== undefined && t.overrunFrom !== null && t.overrunFrom < nowMin && !t.isComplete; }).sort(function(a, b) { return a.overrunFrom - b.overrunFrom; }).forEach(function(t) {
             const who = (t.assignedLanes || []).map(function(i) { return laneRoster[i] ? laneRoster[i].name : ''; }).filter(Boolean);
             out.push({ key: 'over-' + t.id, kind: 'overrun', tone: 'red', text: (t.baseName || t.name) + ' · ' + t.originalArea + (who.length ? ' · ' + who[0] + (who.length > 1 ? ' +' + (who.length - 1) : '') : '') + ' · +' + fmtMins(nowMin - t.overrunFrom) + ' over plan',
                 onClick: function() {
@@ -7841,7 +7873,7 @@ export default function App(props) {
         const rec = taskStatus[task.id];
         const at = function(ms) { return board ? board.clockMs(ms) : formatDayClock(ms); };
         if (task.isComplete && rec) return '\nDone ' + (rec.doneAt ? at(rec.doneAt) : 'at ' + at(rec.startMs + (Number(rec.durationMins) || 0) * 60000)) + (rec.startedAt ? ' · started ' + at(rec.startedAt) : ' · start not logged (counted, not timed)');
-        if (task.isInProgress && rec) return '\nStarted ' + at(rec.startedAt || rec.startMs) + (known0(task.overrunFrom) ? ' · ' + fmtMins(nowMin - task.overrunFrom) + ' past its plan' : '');
+        if (task.isInProgress && rec) return '\nStarted ' + at(rec.startedAt || rec.startMs) + (known0(task.overrunFrom) && task.overrunFrom < nowMin ? ' · ' + fmtMins(nowMin - task.overrunFrom) + ' past its plan' : '');
         return '';
     };
     const openBoardRoom = function(room) { if (tvMode) return; setFocusRoom(room); setGanttShift(''); goTab('focus'); };
@@ -7899,7 +7931,7 @@ export default function App(props) {
                 {over.map(function(d, i) { return <div key={'o' + i} className="absolute top-1 bottom-1 rounded-sm" style={Object.assign(span(d.s, d.e), { background: HATCH_RED })} title="Running past its plan" />; })}
                 {x.uWork > 0 && <div className="absolute top-1 bottom-1 rounded-sm border-2 border-dashed flex items-center justify-center overflow-hidden" style={Object.assign(span(tailS, Math.min(H, tailS + tailLen)), { borderColor: '#E4002B', background: 'rgba(228,0,43,0.06)' })} title={fmtMins(x.uWork) + " of cleaning doesn't fit in the view" + (x.wontFit ? ' before startup' : '')}><span className="px-1 text-[9px] font-black text-[#B00020] truncate">+{fmtMins(x.uWork)} won't fit</span></div>}
                 {nowMin > 0 && nowMin < H && <div className="absolute -top-0.5 -bottom-0.5 w-0.5 bg-red-500 z-[3]" style={{ left: pc(nowMin) + '%' }} title={'Now ' + board.clock(nowMin)} />}
-                {x.G !== null && x.G < H && x.status !== 'RUNNING' && <div className="absolute -top-1 -bottom-1 z-[4]" style={{ left: pc(x.G) + '%' }} title={'Ready by ' + board.clock(x.G) + ' (' + x.gateLabel + ')'}>
+                {x.G !== null && x.G >= 0 && x.G < H && x.status !== 'RUNNING' && <div className="absolute -top-1 -bottom-1 z-[4]" style={{ left: pc(x.G) + '%' }} title={'Ready by ' + board.clock(x.G) + ' (' + x.gateLabel + ')'}>
                     <div className="absolute top-0 bottom-0 -ml-px w-[3px] rounded-full" style={{ background: '#FFB81C' }} />
                     {opts.labels && <span className="absolute -top-3.5 right-1 text-[9px] font-black text-[#8A5A00] whitespace-nowrap">ready by</span>}
                 </div>}
@@ -10114,7 +10146,7 @@ export default function App(props) {
                                                                     {!isSimpleBlock && baseOverlap && <div className={`absolute top-0 bottom-0 ${getRoomColor(task.originalArea)} ${task.isComplete ? 'complete-stripes' : ''}`} style={bgOf(taskHex(task), { left: `${baseOverlap.leftPct}%`, width: `${baseOverlap.widthPct}%` })} />}
                                                                     {!isSimpleBlock && allergenOverlap && <div className={`absolute top-0 bottom-0 ${getRoomColor(task.originalArea)} opacity-40 ${task.isComplete ? 'complete-stripes' : ''}`} style={bgOf(taskHex(task), { left: `${allergenOverlap.leftPct}%`, width: `${allergenOverlap.widthPct}%` })} title="Allergen Extra Time" />}
                                                                     {!isSimpleBlock && inspectOverlap && <div className="absolute top-0 bottom-0 bg-slate-900" style={{ left: `${inspectOverlap.leftPct}%`, width: `${inspectOverlap.widthPct}%` }} title="Inspection" />}
-                                                                    {IS_CURRENT && !isDraggingMe && task.overrunFrom !== undefined && task.overrunFrom !== null && activeDuration > 0 && (function() {
+                                                                    {IS_CURRENT && !isDraggingMe && task.overrunFrom !== undefined && task.overrunFrom !== null && task.overrunFrom < nowMin && activeDuration > 0 && (function() {
                                                                         // Ganttly: the part of a clean past its planned end (still on it) is red-hatched, with how far over.
                                                                         const lp = Math.max(0, Math.min(100, (task.overrunFrom - rMin) / activeDuration * 100));
                                                                         const overPx = widthPx * (100 - lp) / 100;
