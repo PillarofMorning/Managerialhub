@@ -80,6 +80,19 @@ import {
     craa5_lastcleanedby     = initials, upper case, "/" separated
     craa5_hoursworked       = number (the order's hours split across equipment, in whole hours)
 
+  PAPERWORK (SAP sheets)
+  The Paperwork field of a row takes a picture, a PDF, or several of either (pages). One picture is attached
+  as the JPG it always was, one PDF as it is, several pages are joined into one PDF; the file goes to the
+  craa5_pictureorfileofpaperwork File column of every entry saved from the row. The sheet is also read (when
+  "Read the sheet when it is added" is ticked): a PDF's own text, or the pictures with OCR. The order, date,
+  total hours and initials found are offered as buttons; only what is certain is filled in, and only into
+  fields that are still empty (order: one code that is exactly in the SAP list, never a close match; date: one
+  clear best date with a completion label, month first for 10/07/2026; hours: the only "actual work" line, or
+  the sheet's own single "Total hours" line; initials never), marked "from the sheet". Other paperwork than
+  before clears what the old sheet filled in. Reading uses pdf.js and Tesseract.js, loaded from a CDN when
+  first needed (about 7 MB, kept by the browser). If they cannot be loaded the paperwork is still attached and
+  the form works as before. No new Dataverse columns are used.
+
   FIX MISSING IDS
   Repair IDs: scans the log page by page for entries whose craa5_equipmentguid
   is empty, points at equipment that no longer exists, or points at equipment
@@ -924,6 +937,18 @@ const makeStore = (api) => {
         .slice(0, 10)
         .map(x => ({ code: x.code, count: x.ids.size, names: Array.from(x.names).slice(0, 2).join(', ') }));
       return { items, truncated: entry.truncated };
+    },
+
+    // Every SAP code that contains this text (from one small capped query, cached): used to check what was read off a paperwork sheet
+    sheetCodes(text) {
+      const key = normCode(text).replace(/[^A-Z0-9_\-]/g, '');
+      if (key.length < 3 || key.length > 40) return Promise.resolve([]);
+      return once(cache.orderPending, `sheet|${key}`, async () => {
+        const rows = await queryMs(codeFilter('contains', key), LIMITS.orderSuggest);
+        const codes = [];
+        rows.forEach(r => r.codes.forEach(c => { if (c.code.includes(key) && codes.indexOf(c.code) < 0) codes.push(c.code); }));
+        return codes;
+      });
     },
 
     // One SAP order's rows, with the equipment their craa5_asset lookup points at
@@ -1822,6 +1847,743 @@ const compressImage = (file) => pictureToJpegDataUrl(file).then(
   (err) => ({ error: (err && err.message) || 'That picture could not be read.' })
 );
 
+// ===== SHEET READER (paperwork: several pages and PDFs, and reading the order, date and hours off the sheet) =====
+// The paperwork for an order can be one picture, one PDF, or several pictures and PDFs together (they are joined into one PDF).
+// The sheet can also be read: the order, date, hours and initials printed on it are offered to the form and the admin decides.
+// Reading needs two small libraries, loaded from a CDN the first time and then kept by the browser (pdf.js for PDFs, about 1 MB;
+// Tesseract for pictures, about 7 MB). Attaching never needs them, except to join a PDF with other pages.
+const SHEET_MAX_PAGES = 40;        // pages in one paperwork file (more are left out)
+const SHEET_READ_PAGES = 8;        // pages that are read for details (every page is still attached)
+const SHEET_ATTACH_SIDE = 1800;    // px, long side of a page that is attached as part of a joined PDF
+const SHEET_READ_SIDE = 2600;      // px, long side of a page while it is read (small print needs more pixels than the copy that is kept)
+const SHEET_PDF_MAX_BYTES = 24 * 1024 * 1024;
+const PDFJS_VERSION = '3.11.174';
+const PDFJS_URLS = [
+  `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDFJS_VERSION}/pdf.min.js`,
+  `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.min.js`,
+  `https://unpkg.com/pdfjs-dist@${PDFJS_VERSION}/build/pdf.min.js`
+];
+const PDFJS_WORKER_URLS = [
+  `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDFJS_VERSION}/pdf.worker.min.js`,
+  `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.js`,
+  `https://unpkg.com/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.js`
+];
+const PDFJS_ASSETS = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/`;
+const TESSERACT_URLS = [
+  'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js',
+  'https://unpkg.com/tesseract.js@5.1.1/dist/tesseract.min.js'
+];
+const OCR_SOURCES = [
+  { worker: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js', core: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1', lang: 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/eng@1.0.0/4.0.0_best_int' },
+  { worker: 'https://unpkg.com/tesseract.js@5.1.1/dist/worker.min.js', core: 'https://unpkg.com/tesseract.js-core@5.1.1', lang: 'https://unpkg.com/@tesseract.js-data/eng@1.0.0/4.0.0_best_int' }
+];
+const READER_HELP = 'the reader that reads the sheet could not be loaded (the network may block it). The paperwork is still attached; type the details as before';
+
+const isPdfFile = (f) => /^application\/(x-)?pdf$/i.test((f && f.type) || '') || /\.pdf$/i.test((f && f.name) || '');
+const isPdfBytes = (b) => !!b && b.length > 8 && b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46; // "%PDF"
+
+const readFileBytes = (file) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onerror = () => reject(new Error('That file could not be read.'));
+  reader.onload = () => resolve(new Uint8Array(reader.result));
+  try { reader.readAsArrayBuffer(file); } catch (e) { reject(new Error('That file could not be read.')); }
+});
+
+// A script from the first CDN that answers; one try per address, and a later call may try again after a failure
+const libraryLoads = {};
+function loadLibrary(key, urls, ready) {
+  const have = ready();
+  if (have) return Promise.resolve(have);
+  if (libraryLoads[key]) return libraryLoads[key];
+  const tryUrl = (url) => new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    let done = false;
+    const end = (fn, arg) => { if (done) return; done = true; clearTimeout(timer); if (fn === reject && s.parentNode) s.parentNode.removeChild(s); fn(arg); };
+    const timer = setTimeout(() => end(reject, new Error('slow')), 25000);
+    s.src = url;
+    s.async = true;
+    s.onload = () => { const lib = ready(); if (lib) end(resolve, lib); else end(reject, new Error('empty')); };
+    s.onerror = () => end(reject, new Error('blocked'));
+    document.head.appendChild(s);
+  });
+  libraryLoads[key] = (async () => {
+    for (let i = 0; i < urls.length; i += 1) {
+      try { return await tryUrl(urls[i]); } catch (e) { /* try the next address */ }
+    }
+    libraryLoads[key] = null;
+    const err = new Error(READER_HELP);
+    err.reader = true; // not the sheet's fault: reading can be tried again later
+    throw err;
+  })();
+  return libraryLoads[key];
+}
+
+let pdfWorkerReady = null; // one setup of the PDF worker, shared by every row that asks at the same time
+async function setUpPdfWorker(lib) {
+  let set = false;
+  // The worker script sits on another site, which a browser will not start as a worker directly: fetch it and start a copy of it
+  for (let i = 0; i < PDFJS_WORKER_URLS.length && !set; i += 1) {
+    try {
+      const res = await fetch(PDFJS_WORKER_URLS[i]);
+      if (!res.ok) continue;
+      const code = await res.text();
+      lib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+      set = true;
+    } catch (e) { /* try the next address */ }
+  }
+  if (!set) {
+    // pdf.js needs some address; when the worker cannot be started it runs the worker script on the page itself (slower, still works)
+    lib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URLS[0];
+    try { await loadLibrary('pdfworker', PDFJS_WORKER_URLS, () => (typeof window !== 'undefined' && window.pdfjsWorker) || null); } catch (e) { /* nothing more to try */ }
+  }
+}
+async function loadPdfJs() {
+  const lib = await loadLibrary('pdfjs', PDFJS_URLS, () => (typeof window !== 'undefined' && window.pdfjsLib) || null);
+  if (lib.GlobalWorkerOptions && !lib.GlobalWorkerOptions.workerSrc) {
+    if (!pdfWorkerReady) pdfWorkerReady = setUpPdfWorker(lib);
+    await pdfWorkerReady;
+  }
+  return lib;
+}
+
+async function openPdf(file) {
+  const lib = await loadPdfJs();
+  const bytes = await readFileBytes(file);
+  if (!isPdfBytes(bytes)) throw new Error('That file is not a PDF.');
+  const task = lib.getDocument({ data: bytes, cMapUrl: `${PDFJS_ASSETS}cmaps/`, cMapPacked: true, standardFontDataUrl: `${PDFJS_ASSETS}standard_fonts/`, isEvalSupported: false, verbosity: 0 });
+  try {
+    return await task.promise;
+  } catch (e) {
+    try { task.destroy(); } catch (e2) { /* the worker thread is freed when it can be */ }
+    throw new Error(e && e.name === 'PasswordException' ? 'That PDF is protected with a password.' : 'That PDF could not be opened.');
+  }
+}
+
+// The text of one PDF page as lines: items on the same height are one line, left to right
+function pdfLinesOf(items) {
+  const rows = [];
+  (items || []).forEach((it) => {
+    if (!it || typeof it.str !== 'string' || !it.str) return;
+    const x = it.transform ? it.transform[4] : 0;
+    const y = it.transform ? it.transform[5] : 0;
+    let row = null;
+    for (let i = 0; i < rows.length; i += 1) { if (Math.abs(rows[i].y - y) <= 3) { row = rows[i]; break; } }
+    if (!row) { row = { y, cells: [] }; rows.push(row); }
+    row.cells.push({ x, s: it.str, w: it.width || 0 });
+  });
+  rows.sort((a, b) => b.y - a.y);
+  return rows.map((r) => {
+    r.cells.sort((a, b) => a.x - b.x);
+    let out = '';
+    let end = null;
+    r.cells.forEach((c) => {
+      if (end !== null && c.x - end > 3 && !/\s$/.test(out) && !/^\s/.test(c.s)) out += c.x - end > 14 ? '   ' : ' ';
+      out += c.s;
+      end = c.x + c.w;
+    });
+    return out.replace(/\s+$/, '');
+  }).filter(Boolean).join('\n');
+}
+
+async function renderPdfPage(page, side) {
+  const v1 = page.getViewport({ scale: 1 });
+  const scale = Math.min(4, side / Math.max(v1.width, v1.height));
+  const vp = page.getViewport({ scale });
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(vp.width));
+  canvas.height = Math.max(1, Math.round(vp.height));
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  await page.render({ canvasContext: ctx, viewport: vp }).promise;
+  return canvas;
+}
+
+// A picked picture (HEIC too) on a canvas, as large as `side` px on its long side and never enlarged
+async function decodeFilePicture(file) {
+  try { return await decodePicture(file); } catch (e) {
+    if (!(looksLikeHeic(file) || await sniffHeic(file))) throw new Error('That file is not a picture this browser can open. Try a JPG or PNG.');
+    const jpeg = await heicToJpegBlob(file);
+    try { return await decodePicture(jpeg); } catch (e2) { throw new Error('this HEIC photo could not be converted. Save or share it as a JPG first, then add it again'); }
+  }
+}
+async function pictureCanvas(file, side) {
+  const img = await decodeFilePicture(file);
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  if (!w || !h) throw new Error('That picture has no size this browser can read.');
+  const scale = Math.min(1, side / Math.max(w, h));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(w * scale));
+  canvas.height = Math.max(1, Math.round(h * scale));
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+const canvasJpeg = (canvas, quality) => ({ b64: canvas.toDataURL('image/jpeg', quality).split(',')[1], w: canvas.width, h: canvas.height });
+
+// --- Joining pages into one PDF (each page is a JPEG; no library needed) ---
+function jpegPagesToPdf(pages) {
+  const chunks = [];
+  const offsets = [];
+  let length = 0;
+  const text = (s) => { const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i += 1) b[i] = s.charCodeAt(i) & 255; return b; };
+  const push = (b) => { chunks.push(b); length += b.length; };
+  const object = (n, head, body) => {
+    offsets[n] = length;
+    push(text(`${n} 0 obj\n${head}`));
+    if (body) { push(text('\nstream\n')); push(body); push(text('\nendstream')); }
+    push(text('\nendobj\n'));
+  };
+  push(text('%PDF-1.4\n%\xE2\xE3\xCF\xD3\n'));
+  const kids = pages.map((p, i) => `${3 + i * 3} 0 R`).join(' ');
+  object(1, '<< /Type /Catalog /Pages 2 0 R >>');
+  object(2, `<< /Type /Pages /Kids [${kids}] /Count ${pages.length} >>`);
+  pages.forEach((p, i) => {
+    const n = 3 + i * 3;
+    const k = 792 / Math.max(p.w, p.h);          // the long side is 792 points (11 inches)
+    const W = Math.round(p.w * k * 100) / 100;
+    const H = Math.round(p.h * k * 100) / 100;
+    const content = `q ${W} 0 0 ${H} 0 0 cm /Im0 Do Q`;
+    object(n, `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${W} ${H}] /Resources << /XObject << /Im0 ${n + 2} 0 R >> >> /Contents ${n + 1} 0 R >>`);
+    object(n + 1, `<< /Length ${content.length} >>`, text(content));
+    object(n + 2, `<< /Type /XObject /Subtype /Image /Width ${p.w} /Height ${p.h} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${p.bytes.length} >>`, p.bytes);
+  });
+  const count = 3 + pages.length * 3;
+  const xref = length;
+  let table = `xref\n0 ${count}\n0000000000 65535 f \n`;
+  for (let n = 1; n < count; n += 1) table += `${String(offsets[n]).padStart(10, '0')} 00000 n \n`;
+  push(text(`${table}trailer\n<< /Size ${count} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`));
+  const out = new Uint8Array(length);
+  let at = 0;
+  chunks.forEach((c) => { out.set(c, at); at += c.length; });
+  return out;
+}
+
+// All pages of one picked file as JPEGs (a picture is one page; a PDF is drawn page by page)
+async function pageJpegsOf(file, maxPages) {
+  const out = [];
+  if (isPdfFile(file)) {
+    const doc = await openPdf(file);
+    try {
+      const n = Math.min(doc.numPages, maxPages);
+      for (let i = 1; i <= n; i += 1) {
+        const page = await doc.getPage(i);
+        const j = canvasJpeg(await renderPdfPage(page, SHEET_ATTACH_SIDE), 0.8);
+        out.push({ b64: j.b64, w: j.w, h: j.h });
+        if (page.cleanup) page.cleanup();
+      }
+      out.cut = doc.numPages > n ? doc.numPages - n : 0;
+    } finally { try { doc.destroy(); } catch (e) { /* already closed */ } }
+  } else {
+    const j = canvasJpeg(await pictureCanvas(file, SHEET_ATTACH_SIDE), 0.8);
+    out.push({ b64: j.b64, w: j.w, h: j.h });
+    out.cut = 0;
+  }
+  return out;
+}
+
+// What is attached for the picked files. One picture goes up as the JPG it always was and one PDF as it is; anything else is joined
+// into one PDF. Resolves { data (base64), mime, ext, pages, cut, skipped: [{ name, why }] } (no data when nothing could be used)
+async function buildPaperwork(files, cache) {
+  const skipped = [];
+  const why = (e) => String((e && e.message) || 'That file could not be read.').replace(/\.$/, '');
+  if (files.length === 1 && !isPdfFile(files[0])) {
+    const r = await compressImage(files[0]);
+    return r.data ? { data: r.data, mime: 'image/jpeg', ext: 'jpg', pages: 1, cut: 0, skipped } : { skipped: [{ name: files[0].name, file: files[0], why: why({ message: r.error }) }] };
+  }
+  if (files.length === 1) {
+    try {
+      const bytes = await readFileBytes(files[0]);
+      if (!isPdfBytes(bytes)) throw new Error('That file is not a PDF.');
+      if (bytes.length > SHEET_PDF_MAX_BYTES) throw new Error('This PDF is larger than 24 MB. Scan it at a lower quality or split it');
+      return { data: bytesToBase64(bytes), mime: 'application/pdf', ext: 'pdf', pages: 0, cut: 0, skipped };
+    } catch (e) { return { skipped: [{ name: files[0].name, file: files[0], why: why(e) }] }; }
+  }
+  const pages = [];
+  let cut = 0;
+  for (let i = 0; i < files.length; i += 1) {
+    const file = files[i];
+    if (pages.length >= SHEET_MAX_PAGES) { cut += 1; skipped.push({ name: file.name, file, why: `Only the first ${SHEET_MAX_PAGES} pages are attached` }); continue; }
+    try {
+      let got = cache.get(file);
+      if (!got) { got = await pageJpegsOf(file, SHEET_MAX_PAGES); cache.set(file, got); }
+      let taken = 0;
+      for (let j = 0; j < got.length && pages.length < SHEET_MAX_PAGES; j += 1) { pages.push(got[j]); taken += 1; }
+      cut += (got.length - taken) + (got.cut || 0);
+    } catch (e) {
+      skipped.push({ name: file.name, file, why: isPdfFile(file) && e && e.reader ? 'A PDF can only be joined with other pages when the PDF reader loads (the network may block it). Attach the PDF on its own' : why(e) });
+    }
+  }
+  if (!pages.length) return { skipped };
+  const bytes = jpegPagesToPdf(pages.map(p => ({ w: p.w, h: p.h, bytes: base64ToBytes(p.b64) })));
+  return { data: bytesToBase64(bytes), mime: 'application/pdf', ext: 'pdf', pages: pages.length, cut, skipped };
+}
+
+// --- Reading a picture (OCR with Tesseract; one reader is kept for a couple of minutes, then let go to free memory) ---
+let ocrJob = null;
+let ocrIdle = null;
+let ocrLog = null;     // called with Tesseract's progress while a sheet is being read
+let ocrWarm = false;   // the reader is loaded and ready, so reading starts at once
+async function getOcrWorker() {
+  if (ocrIdle) { clearTimeout(ocrIdle); ocrIdle = null; }
+  if (ocrJob) return ocrJob;
+  const job = (async () => {
+    const T = await loadLibrary('tesseract', TESSERACT_URLS, () => (typeof window !== 'undefined' && window.Tesseract) || null);
+    let last = null;
+    for (let i = 0; i < OCR_SOURCES.length; i += 1) {
+      const src = OCR_SOURCES[i];
+      try { const w = await T.createWorker('eng', 1, { workerPath: src.worker, corePath: src.core, langPath: src.lang, logger: (m) => { if (ocrLog) ocrLog(m); } }); ocrWarm = true; return w; }
+      catch (e) { last = e; }
+    }
+    const err = new Error(READER_HELP);
+    err.reader = true;
+    err.detail = errText(last);
+    throw err;
+  })();
+  ocrJob = job;
+  job.catch(() => { if (ocrJob === job) ocrJob = null; });
+  return job;
+}
+function releaseOcrLater() {
+  if (ocrIdle) clearTimeout(ocrIdle);
+  ocrIdle = setTimeout(() => {
+    const job = ocrJob;
+    ocrJob = null;
+    ocrIdle = null;
+    ocrWarm = false;
+    if (job) job.then(w => { try { w.terminate(); } catch (e) { /* gone already */ } }, () => {});
+  }, 120000);
+}
+const rotateCanvas = (canvas, quarter) => {
+  const out = document.createElement('canvas');
+  const turned = quarter % 2 === 1;
+  out.width = turned ? canvas.height : canvas.width;
+  out.height = turned ? canvas.width : canvas.height;
+  const ctx = out.getContext('2d');
+  ctx.translate(out.width / 2, out.height / 2);
+  ctx.rotate(quarter * Math.PI / 2);
+  ctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
+  return out;
+};
+const ocrOnce = async (worker, canvas) => {
+  const blob = await new Promise((resolve) => { try { canvas.toBlob(resolve, 'image/png'); } catch (e) { resolve(null); } });
+  if (!blob) throw new Error('That page could not be prepared for reading.');
+  const res = await Promise.race([
+    worker.recognize(blob),
+    new Promise((resolve, reject) => { setTimeout(() => reject(new Error('Reading this page took too long.')), 120000); })
+  ]);
+  const data = (res && res.data) || {};
+  const text = String(data.text || '');
+  const words = (text.match(/[A-Za-z0-9]{2,}/g) || []).length;
+  return { text, conf: Number(data.confidence) || 0, words };
+};
+// A page that comes out as noise is turned a quarter each way, and the best reading is kept (a sheet photographed sideways)
+async function ocrCanvas(canvas) {
+  const worker = await getOcrWorker();
+  try {
+    let best = await ocrOnce(worker, canvas);
+    if (best.conf < 45 || best.words < 15) {
+      for (let q = 1; q <= 3 && (best.conf < 45 || best.words < 15); q += 2) {
+        let r = null;
+        try { r = await ocrOnce(worker, rotateCanvas(canvas, q)); } catch (e) { r = null; }
+        if (r && r.words * r.conf > best.words * best.conf) best = r;
+      }
+    }
+    return best.text;
+  } catch (e) {
+    if (ocrJob) { const job = ocrJob; ocrJob = null; ocrWarm = false; job.then(w => { try { w.terminate(); } catch (e2) { /* gone */ } }, () => {}); } // a reader that failed is not reused
+    throw e;
+  } finally { releaseOcrLater(); }
+}
+
+// How much of a PDF page one or more pictures cover (0 to 1): a scanned sheet is one big picture, a logo is a small one. Used to tell a
+// scanned page with only a small printed stamp from a page that is plain text.
+async function pdfPictureShare(page) {
+  try {
+    const lib = typeof window !== 'undefined' ? window.pdfjsLib : null;
+    const ops = (lib && lib.OPS) || {};
+    const pictures = [ops.paintImageXObject || 85, ops.paintInlineImageXObject || 86, ops.paintJpegXObject || 82];
+    const list = await page.getOperatorList();
+    const box = page.view || [0, 0, 612, 792];
+    const area = Math.abs((box[2] - box[0]) * (box[3] - box[1])) || 1;
+    let scale = 1; // the area one picture covers is the determinant of the matrices applied before it
+    const stack = [];
+    let covered = 0;
+    for (let i = 0; i < list.fnArray.length; i += 1) {
+      const op = list.fnArray[i];
+      if (op === (ops.save || 10)) stack.push(scale);
+      else if (op === (ops.restore || 11)) { if (stack.length) scale = stack.pop(); }
+      else if (op === (ops.transform || 12)) { const a = list.argsArray[i] || []; scale *= Math.abs(a[0] * a[3] - a[1] * a[2]) || 0; }
+      else if (pictures.indexOf(op) >= 0) covered += scale;
+    }
+    return Math.min(1, covered / area);
+  } catch (e) { return 0; } // cannot tell: treat as text only
+}
+
+// The text of one picked file, page by page: a PDF's own text where it has any, otherwise the pictures are read.
+// ctx: { left (pages that may still be read), stop() true to give up, page(n, of) before a page is read, ocr() before a picture is read }.
+// Resolves { texts, total, unread } (unread: pages that needed the picture reader when it could not be loaded; their text-layer pages are still returned)
+async function readFileText(file, ctx) {
+  const texts = [];
+  if (isPdfFile(file)) {
+    const doc = await openPdf(file);
+    try {
+      const total = doc.numPages;
+      const n = Math.min(total, ctx.left);
+      let unread = 0;
+      let blocked = null;
+      for (let i = 1; i <= n; i += 1) {
+        if (ctx.stop()) break;
+        ctx.page(i, n);
+        const page = await doc.getPage(i);
+        let text = '';
+        try { const tc = await page.getTextContent(); text = pdfLinesOf(tc.items); } catch (e) { text = ''; }
+        const chars = text.replace(/\s+/g, '').length;
+        // a scanned page has no text of its own (or only a small printed stamp next to the picture)
+        if (chars < 25 || (chars < 600 && await pdfPictureShare(page) >= 0.35)) {
+          if (blocked) unread += 1;
+          else {
+            try {
+              ctx.ocr();
+              const seen = await ocrCanvas(await renderPdfPage(page, SHEET_READ_SIDE));
+              text = text ? `${text}\n${seen}` : seen;
+            } catch (e) { blocked = e; unread += 1; } // the pages that have text are still used
+          }
+        }
+        texts.push(text);
+        if (page.cleanup) page.cleanup();
+      }
+      if (blocked && !texts.some(t => t.replace(/\s+/g, '').length >= 25)) throw blocked; // nothing at all could be read: say why
+      return { texts, total, unread };
+    } finally { try { doc.destroy(); } catch (e) { /* already closed */ } }
+  }
+  if (!ctx.stop()) {
+    ctx.page(1, 1);
+    ctx.ocr();
+    texts.push(await ocrCanvas(await pictureCanvas(file, SHEET_READ_SIDE)));
+  }
+  return { texts, total: 1, unread: 0 };
+}
+
+// --- Finding the order, date, hours and initials in the text of the sheet (plain text in, suggestions out) ---
+const SHEET_MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+const SHEET_MONTH_RE = 'jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?';
+const SHEET_MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const SHEET_WORDS = /^(ORDER|NUMBER|DESCRIPTION|MAINTENANCE|SANITATION|PLANT|EQUIPMENT|LOCATION|PRIORITY|STATUS|OPERATION|OPERATIONS|ACTIVITY|WORKCENTER|CONFIRMATION|COMPLETED|SCHEDULED|FINISH|START|ACTUAL|PERFORMED|SIGNATURE|COMMENTS|COMMENT|PAGE|PRINTED|CREATED|CHANGED|REVISION|PLANNER|PLANNING|REQUIREMENT|REQUIREMENTS|PROCEDURE|INSTRUCTIONS|WORKORDER|DEPARTMENT|SUPERVISOR|TECHNICIAN|INSPECTION|VERIFIED|FUNCTIONAL|TEMPERATURE|CHEMICAL|CONCENTRATION|PREVENTIVE|CORRECTIVE|INTERNAL|MATERIAL|MATERIALS|COMPONENT|COMPONENTS|WEEKLY|MONTHLY|QUARTERLY|ANNUALLY|DAILY|LUBRICATION|CLEANING|SANITIZE)$/;
+const sheetIso = (y, m, d) => {
+  if (y < 100) y += 2000;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return '';
+  return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+};
+const sheetDateWords = (iso) => { const p = iso.split('-'); return `${SHEET_MONTH_NAMES[Number(p[1]) - 1]} ${Number(p[2])}, ${p[0]}`; };
+// Letters that are really digits (O for 0, l or I for 1) inside something that has the shape of a date or a time
+const sheetDigits = (s) => s.replace(/[Oo]/g, '0').replace(/[lI|]/g, '1');
+const sheetLines = (text) => String(text || '').replace(/\r/g, '').split('\n');
+
+function sheetDatesIn(line, ctx) {
+  const found = [];
+  const inRange = (iso) => !!iso && iso >= ctx.minDate && iso <= ctx.today;
+  // weak: the date only exists when read the other way round than the plant's usual way (so it is never filled in by itself)
+  const add = (iso, at, end, o) => {
+    const opt = o || {};
+    if (inRange(iso) && !found.some(f => f.iso === iso && Math.abs(f.at - at) < 6)) found.push({ iso, at, end, amb: !!opt.amb, alt: !!opt.alt, pair: opt.pair || '', weak: !!opt.weak });
+  };
+  let m;
+  const iso = /(?:^|[^0-9A-Za-z])((?:19|20)\d{2})[\/.\-](\d{1,2})[\/.\-](\d{1,2})(?![0-9])/g;
+  while ((m = iso.exec(line))) add(sheetIso(Number(m[1]), Number(m[2]), Number(m[3])), m.index, m.index + m[0].length);
+  const num = /(?:^|[^0-9A-Za-z])([0-9OolI|]{1,2})([\/.\-])([0-9OolI|]{1,2})\2((?:[0-9OolI|]{4})|(?:[0-9OolI|]{2}))(?![0-9])/g;
+  while ((m = num.exec(line))) {
+    const a = Number(sheetDigits(m[1]));
+    const b = Number(sheetDigits(m[3]));
+    const y = Number(sheetDigits(m[4]));
+    const end = m.index + m[0].length;
+    // 10/07/2026 is month first (a US plant); 07.10.2026 is day first (the usual SAP style with dots). When the other way round is a
+    // real day too (a and b both 12 or less), it is offered as well, one point lower, and the panel says which way it was read.
+    const us = sheetIso(y, a, b);
+    const eu = sheetIso(y, b, a);
+    const first = m[2] === '.' ? eu : us;
+    const second = m[2] === '.' ? us : eu;
+    const both = inRange(first) && inRange(second) && first !== second;
+    if (inRange(first)) { add(first, m.index, end, { amb: both, pair: both ? second : '' }); if (both) add(second, m.index + 1, end, { amb: true, alt: true, pair: first }); }
+    else add(second, m.index, end, { weak: !!first && !!second }); // 12/03 with 12/03 in the future: Mar 12 is a guess, 13/10 can only be Oct 13
+  }
+  const named = new RegExp(`(?:^|[^A-Za-z0-9])(${SHEET_MONTH_RE})\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?,?\\s+(\\d{4})(?![0-9])`, 'gi');
+  while ((m = named.exec(line))) add(sheetIso(Number(m[3]), SHEET_MONTHS[m[1].slice(0, 3).toLowerCase()], Number(m[2])), m.index, m.index + m[0].length);
+  const named2 = new RegExp(`(?:^|[^A-Za-z0-9])(\\d{1,2})(?:st|nd|rd|th)?\\s+(${SHEET_MONTH_RE})\\.?,?\\s+(\\d{4})(?![0-9])`, 'gi');
+  while ((m = named2.exec(line))) add(sheetIso(Number(m[3]), SHEET_MONTHS[m[2].slice(0, 3).toLowerCase()], Number(m[1])), m.index, m.index + m[0].length);
+  return found;
+}
+
+// The words that belong to a date: after the last blank to fill in ("Date: ____  10/09/2026" is a stamp, not the answer) or column line
+const sheetDateWindow = (before) => { const parts = before.split(/_{2,}|\||\t/); return parts[parts.length - 1]; };
+
+// How much a label in front of a date says it is the day the work was done
+function sheetDateScore(before) {
+  const b = sheetDateWindow(before).toLowerCase();
+  let s = 0;
+  if (/(actual|complet|confirm|perform|execut|done|closed|cleaned|sanitized)/.test(b)) s += 4;
+  else if (/(finish|\bend)/.test(b)) s += 2;
+  else if (/\bdate\b/.test(b)) s += 1;
+  if (/(basic|schedul|plan|due|target|request|latest|earliest)/.test(b)) s -= 2;
+  if (/(start|begin)/.test(b)) s -= /(finish|\bend|complet|done|closed)/.test(b) ? 1 : 3; // "Actual start" is not the day it was finished
+  if (/(print|creat|enter|chang|issued|generat|releas|revis|\brev\b|\blast\b|previous|prior|\bnext\b|expir|renew|expected|forecast)/.test(b)) s -= 3;
+  return s;
+}
+
+// "3.5", "3,5" and "3.500" are hours; "1,250" has a thousand separator (far too many hours), and anything else is not a number
+const sheetNumber = (t) => {
+  const m = /^(\d{1,3})(?:([.,])(\d{1,3}))?$/.exec(t);
+  if (!m || (m[2] === ',' && m[3].length === 3)) return NaN;
+  return Number(m[3] ? `${m[1]}.${m[3]}` : m[1]);
+};
+const round2 = (v) => Math.round(v * 100) / 100;
+const HOUR_UNIT = /^(?:hours?|hrs?|h|std)$/i;
+const MINUTE_UNIT = /^(?:mins?|minutes?)$/i;
+
+// The hours written right after a label such as "Actual work:" (only spaces, colons and dots in between, so it is that field's
+// number). Understands 3.5 H, 3.500 H, 30 min, 1 h 30 min, 03:30 and 06:00 - 09:30. A number that is cut, has noise in it or has an
+// unknown unit after it (3.S H, 2 5 H, 30 MlN) is not read: a wrong hours figure is worse than an empty box.
+// Resolves { value, unit (true when the sheet wrote one) } or null
+function sheetHoursAfter(rest, labelText) {
+  const text = rest.replace(/\.{2,}/g, ' ');
+  const at = /^[\s:=_\-\u2013]{0,12}/.exec(text)[0].length;
+  const body = text.slice(at);
+  let m = /^(\d{1,2}):(\d{2})\s*(?:-|\u2013|\u2014|to)\s*(\d{1,2}):(\d{2})(?![\d:])/i.exec(body);
+  if (m) { const v = ((Number(m[3]) * 60 + Number(m[4])) - (Number(m[1]) * 60 + Number(m[2])) + 1440) % 1440 / 60; return v > 0 ? { value: round2(v), unit: true } : null; }
+  m = /^(\d{1,2})\s*(?:h|hrs?|hours?)\s*(\d{1,2})\s*(?:mins?|minutes?|m)(?![A-Za-z0-9])/i.exec(body);
+  if (m) return { value: round2(Number(m[1]) + Number(m[2]) / 60), unit: true };
+  m = /^(\d{1,2}):(\d{2})(?![\d:A-Za-z])/.exec(body);
+  if (m) return /hou?rs?|hrs?|duration|spent|taken|worked|labou?r|work/i.test(labelText) ? { value: round2(Number(m[1]) + Number(m[2]) / 60), unit: true } : null; // 06:00 after "Actual time" is a clock time
+  m = /^\d+(?:[.,]\d+)*/.exec(body);
+  if (!m) return null;
+  const n = sheetNumber(m[0]);
+  if (!(n >= 0)) return null;
+  const after = body.slice(m[0].length);
+  const next = /^\s*(.?)/.exec(after)[1];
+  if (/[0-9:]/.test(next)) return null;                                    // 2 5 H, 1 :30
+  if (/^\s*[.,]\S/.test(after)) return null;                               // 3.S H, 1 .5 H
+  const word = /^\s*([A-Za-z]+)(?![A-Za-z0-9])/.exec(after);
+  if (word) {
+    if (HOUR_UNIT.test(word[1])) return { value: round2(n), unit: true };
+    if (MINUTE_UNIT.test(word[1])) return { value: round2(n / 60), unit: true };
+    return null;                                                           // 1 day, 10 USD, 30 MlN
+  }
+  if (/[A-Za-z0-9]/.test(next)) return null;
+  return { value: round2(n), unit: false };
+}
+
+function sheetHoursIn(line) {
+  const found = [];
+  const label = /(?:(?:actual|act\.?)\s*(?:work|labou?r|hours?|hrs?|time|duration)|(?:work|labou?r)\s*(?:actual|hours?)|hours?\s*(?:worked|spent|actual|taken)|time\s*(?:spent|taken)|total\s*(?:hours?|hrs?|time|work)|duration|hrs?\.?\s*worked|man\s*hours?)/ig;
+  const plannedRe = /plan|estimat|target|budget|standard|expected|forecast|required|scheduled|remaining/i;
+  let m;
+  while ((m = label.exec(line))) {
+    const head = line.slice(0, m.index + m[0].length);
+    const got = sheetHoursAfter(line.slice(m.index + m[0].length, m.index + m[0].length + 40), m[0]);
+    if (!got) continue;
+    const planned = plannedRe.test(head);
+    // Without a unit the number can be anything (an operation number): it needs a label that says hours
+    const certain = got.unit || /hou?rs?|hrs?/i.test(m[0]);
+    found.push({ value: got.value, score: planned ? 1 : certain ? 5 : 3, labeled: !planned && certain, total: /^total/i.test(m[0]) });
+  }
+  const unit = /(?:^|[^0-9A-Za-z.,:])(\d{1,3}(?:[.,]\d{1,3})?)\s*(hours?|hrs?|h|std)(?![A-Za-z0-9])/ig;
+  while ((m = unit.exec(line))) {
+    const n = sheetNumber(m[1]);
+    if (!(n >= 0)) continue;
+    const value = round2(n);
+    if (!found.some(f => f.value === value)) found.push({ value, score: plannedRe.test(line) ? 0 : 2, labeled: false, total: false });
+  }
+  return found.filter(f => f.value > 0 && f.value <= 200);
+}
+
+// Initials after a label: "Initials: EL/LH", "Completed by EL, LH", "Done by Erica Lopez" (names become initials)
+function sheetInitialsIn(line) {
+  const out = [];
+  const label = /(?:initials?|completed\s*by|done\s*by|performed\s*by|cleaned\s*by|sanitized\s*by|technician|operator|signed(?:\s*by)?|signature|entered\s*by|employee|worker)\s*[:\-]?\s*([^\n]{1,40})/ig;
+  let m;
+  while ((m = label.exec(line))) {
+    const tail = m[1].replace(/[_.]{2,}/g, ' ').replace(/\s+[A-Za-z]+\s*:.*$/, '').trim(); // up to the next label ("Signature:")
+    if (!tail || /^(n\/?a|none|no|yes|date|time|\d)/i.test(tail)) continue;
+    const head = tail.split(/\s{3,}|\s{2,}(?=[A-Z][a-z]+:)/)[0];
+    // groups of 1-4 capital letters ("EL/LH", "EL, LH", "EL & LH")
+    const caps = head.replace(/\band\b/ig, '/').replace(/[,&;]+/g, '/').replace(/\s*\/\s*/g, '/').trim();
+    const groups = caps.split(/[\/ ]+/).filter(Boolean);
+    if (groups.length && groups.length <= 4 && groups.every(g => /^[A-Z]{1,4}$/.test(g))) {
+      out.push({ value: groups.join('/'), who: '' });
+      continue;
+    }
+    // names: the capital letters that start each name
+    const names = head.split(/\s*(?:\/|,|&|\band\b)\s*/i).map(s => s.trim()).filter(Boolean);
+    const initials = names.map((nm) => {
+      const parts = nm.split(/\s+/).filter(w => /^[A-Z][a-z'\-]+$/.test(w));
+      return parts.length >= 2 ? parts.map(w => w.charAt(0)).join('').slice(0, 4) : '';
+    });
+    if (names.length && names.length <= 4 && initials.every(Boolean)) out.push({ value: initials.join('/'), who: names.join(', ') });
+  }
+  return out;
+}
+
+// texts: the text of each page read. ctx: { today, minDate } as 'YYYY-MM-DD'.
+// Resolves { orders: [{ token, score, labeled }], dates: [{ iso, words, score }], hours: [{ value, score, labeled }], hoursSum, initials: [{ value, who }] }
+function extractSheet(texts, ctx) {
+  const orders = new Map();
+  const dates = new Map();
+  const hours = new Map();
+  const initials = new Map();
+  const labeledHours = []; // every 'actual work' line on every page, one entry per line (the same figure on two pages is two lines)
+  const label = /(?:\border\b|\bord\.?\b|\bauftrag\b|\bw\/?o\b|work\s*order|notification|task\s*list|\bplan\b|\bjob\b|\bshort\s*text\b|\bdescription\b)/i;
+  (texts || []).forEach((text, pageIndex) => {
+    const lines = sheetLines(text);
+    lines.forEach((line, li) => {
+      // Order codes: letters and digits, five or more characters, not a date, a plain number that is too short, or a heading word
+      const re = /[A-Za-z0-9][A-Za-z0-9_\-]{3,22}[A-Za-z0-9]/g;
+      let m;
+      while ((m = re.exec(line))) {
+        const raw = m[0];
+        const token = raw.toUpperCase();
+        if (token.length < 5 || token.length > 24) continue;
+        if (/^\d+$/.test(token) && token.length < 6) continue;
+        if (SHEET_WORDS.test(token)) continue;
+        const hasDigit = /\d/.test(token);
+        const allCaps = raw === raw.toUpperCase() && /^[A-Z]+$/.test(token);
+        if (!hasDigit && !(allCaps && token.length >= 8)) continue;
+        const before = line.slice(Math.max(0, m.index - 60), m.index) + (li > 0 && !line.slice(0, m.index).trim() ? lines[li - 1].slice(-60) : '');
+        const labeled = label.test(before);
+        const prev = orders.get(token) || { token, score: 0, labeled: false, count: 0, first: pageIndex * 1000 + li };
+        prev.count += 1;
+        prev.score = Math.max(prev.score, (labeled ? 3 : 0) + (/^\d{8,12}$/.test(token) ? 1 : 0) + (hasDigit && /[A-Z]/.test(token) ? 1 : 0) + 1);
+        if (labeled) prev.labeled = true;
+        orders.set(token, prev);
+      }
+      sheetDatesIn(line, ctx).forEach((d) => {
+        const score = sheetDateScore(line.slice(Math.max(0, d.at - 50), d.at)) - (d.alt ? 1 : 0) - (d.weak ? 2 : 0);
+        const prev = dates.get(d.iso);
+        if (!prev) dates.set(d.iso, { iso: d.iso, words: sheetDateWords(d.iso), score, amb: d.amb, alt: d.alt, pair: d.pair });
+        else { if (score > prev.score) prev.score = score; if (!d.amb) prev.amb = false; if (!d.alt) prev.alt = false; if (d.pair && !prev.pair) prev.pair = d.pair; }
+      });
+      sheetHoursIn(line).forEach((h) => {
+        const prev = hours.get(h.value);
+        if (!prev || h.score > prev.score) hours.set(h.value, { value: h.value, score: h.score, labeled: h.labeled || !!(prev && prev.labeled) });
+        else if (h.labeled) prev.labeled = true;
+        if (h.labeled) labeledHours.push(h);
+      });
+      sheetInitialsIn(line).forEach((x) => { if (INITIALS_RE.test(normalizeInitials(x.value)) && !initials.has(x.value)) initials.set(x.value, x); });
+    });
+  });
+  orders.forEach((o) => { o.score += Math.min(4, o.count - 1); });
+  const orderList = Array.from(orders.values()).sort((a, b) => b.score - a.score || a.first - b.first);
+  const dateList = Array.from(dates.values()).sort((a, b) => b.score - a.score || (a.iso < b.iso ? 1 : -1));
+  const hourList = Array.from(hours.values()).sort((a, b) => b.score - a.score || a.value - b.value);
+  // Several "actual work" lines (one per operation, on one page or on several) add up to the order's hours; offered, never filled in.
+  // Filled in by itself: the sheet's own "Total hours" line when there is exactly one (and the lines agree with it), or the only
+  // "actual work" line on the whole sheet
+  const totals = labeledHours.filter(h => h.total);
+  const parts = labeledHours.filter(h => !h.total);
+  const partsSum = round2(parts.reduce((t, x) => t + x.value, 0));
+  let hoursSum = null;
+  if (parts.length >= 2 && partsSum > 0 && partsSum <= 200) hoursSum = { value: partsSum, lines: parts.length };
+  let hoursAuto = null;
+  if (totals.length === 1 && (!parts.length || Math.abs(partsSum - totals[0].value) < 0.01)) hoursAuto = totals[0].value;
+  else if (!totals.length && parts.length === 1) hoursAuto = parts[0].value;
+  return { orders: orderList, dates: dateList, hours: hourList, hoursSum, hoursAuto, labeledCount: labeledHours.length, initials: Array.from(initials.values()) };
+}
+
+// Looks like OCR got a letter wrong: O for 0, I or L for 1, S for 5, B for 8, Z for 2, G for 6
+const sheetFold = (s) => s.replace(/[OQD]/g, '0').replace(/[IL|]/g, '1').replace(/S/g, '5').replace(/B/g, '8').replace(/Z/g, '2').replace(/G/g, '6');
+const sheetDistance = (a, b) => {
+  if (Math.abs(a.length - b.length) > 1) return 2;
+  const d = [];
+  for (let i = 0; i <= a.length; i += 1) { d[i] = [i]; }
+  for (let j = 1; j <= b.length; j += 1) d[0][j] = j;
+  for (let i = 1; i <= a.length; i += 1) {
+    for (let j = 1; j <= b.length; j += 1) d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a.charAt(i - 1) === b.charAt(j - 1) ? 0 : 1));
+  }
+  return d[a.length][b.length];
+};
+
+// Which of the candidate order codes are SAP orders in the list? 'exact' is the code as read; 'close' differs by one character
+// (a wrong letter, a missing end). A few small, capped lookups: the sheet's tokens are never searched all at once.
+// Resolves [{ code, kind: 'exact' | 'close', from, score }] best first; .failed counts the lookups that did not answer
+async function checkSheetOrders(store, tokens, memo) {
+  const hits = new Map();
+  let failed = 0;
+  const keep = (code, kind, from, score) => {
+    const old = hits.get(code);
+    if (!old || (old.kind === 'close' && kind === 'exact') || (old.kind === kind && score > old.score)) hits.set(code, { code, kind, from, score });
+  };
+  const top = tokens.slice(0, 14);
+  const rs = await pool(top, 3, async (t) => {
+    let known = memo.get(t.token);
+    if (!known) {
+      const here = await store.sheetCodes(t.token);
+      known = { exact: here.indexOf(t.token) >= 0, prefixed: here.filter(c => c !== t.token && c.indexOf(t.token) === 0 && c.length - t.token.length <= 2).slice(0, 3), close: null };
+      memo.set(t.token, known);
+    }
+    return known;
+  });
+  rs.forEach((r) => { if (!r.ok) failed += 1; });
+  top.forEach((t, i) => {
+    const known = rs[i] && rs[i].ok ? rs[i].value : null;
+    if (!known) return;
+    if (known.exact) keep(t.token, 'exact', t.token, t.score);
+    known.prefixed.forEach(c => keep(c, 'close', t.token, t.score));
+    (known.close || []).forEach(c => keep(c, 'close', t.token, t.score));
+  });
+  // A code with one wrong character: look for the half of it that is likely to be right
+  const lost = top.filter((t, i) => rs[i] && rs[i].ok && !rs[i].value.exact && !rs[i].value.prefixed.length && rs[i].value.close === null && t.token.length >= 7 && (/\d/.test(t.token) || /^[A-Z]{8,}$/.test(t.token))).slice(0, 4);
+  const rs2 = await pool(lost, 2, async (t) => {
+    const known = memo.get(t.token);
+    const n = t.token.length;
+    const halves = [t.token.slice(0, Math.ceil(n / 2)), t.token.slice(Math.floor(n / 2))].filter(h => h.length >= 4);
+    const lists = await Promise.all(halves.map(h => store.sheetCodes(h)));
+    const pooled = [];
+    lists.forEach(l => l.forEach(c => { if (pooled.indexOf(c) < 0) pooled.push(c); }));
+    known.close = pooled.filter(c => sheetDistance(sheetFold(c), sheetFold(t.token)) <= 1).slice(0, 3);
+    known.close.forEach(c => keep(c, 'close', t.token, t.score));
+  });
+  rs2.forEach((r) => { if (!r.ok) failed += 1; });
+  const out = Array.from(hits.values()).sort((a, b) => (a.kind === b.kind ? 0 : a.kind === 'exact' ? -1 : 1) || b.score - a.score);
+  out.failed = failed;
+  return out;
+}
+
+// What the panel shows, and what is filled in without asking: the codes found in the SAP list first, then close ones, then
+// order numbers that are not in the list; one date, hours and initials suggestion list
+function sheetView(found, checked) {
+  const used = {};
+  const orders = [];
+  checked.forEach((h) => { used[h.from] = true; used[h.code] = true; orders.push({ code: h.code, kind: h.kind, from: h.from, score: h.score }); });
+  found.orders.forEach((o) => {
+    if (used[o.token] || orders.filter(x => x.kind === 'unchecked').length >= 4) return;
+    if (o.labeled || /^\d{8,12}$/.test(o.token)) orders.push({ code: o.token, kind: 'unchecked', from: o.token, score: o.score });
+  });
+  const exact = orders.filter(o => o.kind === 'exact');
+  const auto = {};
+  // Only a code in the SAP list that is exactly what was read. A close match is never filled in by itself: orders that differ by one
+  // character (the frequency letter at the end, IBL4 and IBL5) are different orders, so it is only offered as a button
+  // ...and no better-labelled order number on the sheet that is not in the list ("Order: 4000123456" beats a number elsewhere that happens to be in it)
+  const rival = exact.length > 0 && found.orders.some(o => o.labeled && !used[o.token] && o.score > exact[0].score);
+  if (!rival && (exact.length === 1 || (exact.length > 1 && exact[0].score >= 2 * exact[1].score))) auto.code = exact[0].code;
+  // The other reading of a date (Jul 10 for 10/07) is listed only for the best date; for the rest the first reading is enough
+  const d = found.dates.filter((x, i) => !x.alt || (found.dates[0] && found.dates[0].pair === x.iso));
+  if (d.length && d[0].score >= 3 && (d.length === 1 || d[0].score > d[1].score)) auto.date = d[0].iso;
+  if (found.hoursAuto) auto.hours = found.hoursAuto;
+  return {
+    orders,
+    dates: d.slice(0, 5),
+    hours: found.hours.slice(0, 6),
+    hoursSum: found.hoursSum,
+    initials: found.initials.slice(0, 4),
+    auto,
+    empty: !orders.length && !d.length && !found.hours.length && !found.hoursSum && !found.initials.length,
+  };
+}
+// ===== END SHEET READER =====
+
 // --- STYLES ---
 const DISABLED = { backgroundColor: '#F0F0F0', color: '#A0A0A0', border: '1px solid #E0E0E0' };
 const useStyles = makeStyles({
@@ -1900,6 +2662,12 @@ const useStyles = makeStyles({
   stickyTh: { position: 'sticky', top: 0, zIndex: 1, backgroundColor: '#FFFFFF' },
   changePanel: { padding: '10px', backgroundColor: '#F5F9FE', border: `1px solid ${BRAND.line}`, borderLeft: `4px solid ${BRAND.yellow}`, borderRadius: '6px' },
   hint: { fontSize: '12px', color: '#5B6F86' },
+  // The panel that shows what was read off the paperwork sheet, and the page pills under the paperwork picker
+  sheetBox: { marginTop: '8px', padding: '8px 10px', backgroundColor: '#F5F9FE', border: `1px solid ${BRAND.line}`, borderLeft: `4px solid ${BRAND.blue}`, borderRadius: '6px' },
+  sheetRow: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap', marginTop: '4px' },
+  sheetLabel: { width: '70px', fontSize: '12px', fontWeight: 700, color: '#41566E', flexShrink: 0 },
+  filePills: { display: 'flex', gap: '4px', flexWrap: 'wrap', marginTop: '2px', maxWidth: '360px' },
+  filePill: { display: 'inline-flex', alignItems: 'center', gap: '2px', fontSize: '12px', padding: '0 2px 0 8px', border: `1px solid ${BRAND.line}`, borderRadius: '10px', backgroundColor: '#F2F6FB', maxWidth: '180px' },
   dashboardGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px', marginBottom: '16px' },
   metricCard: { backgroundColor: '#FFFFFF', padding: '16px', borderRadius: '10px', boxShadow: '0 2px 8px rgba(16,35,58,.15)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' },
   metricValue: { fontSize: '34px', fontWeight: 800, color: BRAND.navy, marginTop: '6px' },
@@ -2016,6 +2784,66 @@ const lineStatus = (l, dupe) => {
   return [l.how || 'ready', 'ok'];
 };
 
+// --- WHAT WAS READ OFF THE PAPERWORK SHEET: the admin picks what belongs in the form ---
+const SHEET_FIELD = { code: 'SAP order', date: 'date', hours: 'total hours', initials: 'initials' };
+const sheetAuto0 = () => { try { return window.localStorage.getItem('mss-log-read-sheet') !== '0'; } catch (e) { return true; } };
+const SheetPanel = ({ sheet, values, disabled, onPick, onStop, onRead, onHide }) => {
+  const styles = useStyles();
+  const view = sheet.view;
+  const busy = sheet.status === 'loading' || sheet.status === 'reading';
+  const chip = (kind, value, text, active, tip) => (
+    <Button key={`${kind}|${value}|${text}`} size="small" appearance={active ? 'primary' : 'outline'} className={active ? styles.btnPrimary : undefined} disabled={disabled}
+      aria-label={`Use ${text} as the ${SHEET_FIELD[kind]}`} aria-pressed={active} title={tip} onClick={() => onPick(kind, value)}>{active ? '✓ ' : ''}{text}</Button>
+  );
+  const orderText = (o) => (o.kind === 'exact' ? o.code : o.kind === 'close' ? `${o.code} (close to ${o.from})` : `${o.code} (not in the SAP list)`);
+  const orderTip = (o) => (o.kind === 'exact' ? 'This SAP order is in the list' : o.kind === 'close' ? `Read as ${o.from}. This order in the list is one character different: check the paperwork before using it` : 'Not in the SAP list. Check the number against the paperwork');
+  const status = sheet.status === 'loading' ? 'Getting the reader ready (about 7 MB the first time, kept after that)…'
+    : sheet.status === 'reading' ? `Reading ${sheet.file || 'the paperwork'}${sheet.pageTotal > 1 ? `, page ${sheet.page} of ${sheet.pageTotal}` : ''}…`
+    : sheet.status === 'stopped' ? 'Stopped.'
+    : sheet.status === 'done' ? `Read ${plural(sheet.pages || 0, 'page', 'pages')}${sheet.cut ? ` (only the first ${SHEET_READ_PAGES} pages are read; all of them are attached)` : ''}.`
+    : '';
+  const ambiguous = !!view && view.dates.some(d => d.amb);
+  return (
+    <div className={styles.sheetBox} role="region" aria-label="Details read from the paperwork">
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <Text size={200} weight="semibold">Read from the paperwork</Text>
+        <Text className={styles.hint} role="status" aria-live="polite">{status}</Text>
+        {busy ? <Button size="small" appearance="subtle" onClick={onStop}>Stop</Button> : <Button size="small" appearance="subtle" disabled={disabled} onClick={onRead}>Read again</Button>}
+        <Button size="small" appearance="subtle" onClick={onHide}>Hide</Button>
+      </div>
+      {(sheet.status === 'unavailable' || sheet.status === 'error') && (
+        <Text className={styles.warnText} block role="status" style={{ marginTop: 2 }}>
+          {sheet.status === 'unavailable' ? `Could not read the sheet: ${sheet.msg}.` : `Could not read the sheet: ${sheet.msg}. The paperwork is still attached.`}
+        </Text>
+      )}
+      {sheet.applied && sheet.applied.length > 0 && (
+        <Text size={200} block style={{ color: '#0A6A33', fontWeight: 700, marginTop: 4 }}>Filled in from the sheet: {sheet.applied.join(', ')}. Please check {sheet.applied.length === 1 ? 'it' : 'them'} against the paperwork.</Text>
+      )}
+      {sheet.checkFailed ? <Text className={styles.hint} block style={{ marginTop: 2 }}>The SAP list could not be checked for some order numbers, so they are not marked.</Text> : null}
+      {sheet.unread ? <Text className={styles.warnText} block style={{ marginTop: 2 }}>{plural(sheet.unread, 'page', 'pages')} of scanned paper could not be read because the picture reader could not be loaded (the network may block it). The pages with text were read, and everything is attached.</Text> : null}
+      {view && view.orders.length > 0 && (
+        <div className={styles.sheetRow}><span className={styles.sheetLabel}>SAP order</span>{view.orders.map(o => chip('code', o.code, orderText(o), values.code === o.code, orderTip(o)))}</div>
+      )}
+      {view && view.dates.length > 0 && (
+        <div className={styles.sheetRow}><span className={styles.sheetLabel}>Date</span>{view.dates.map(d => chip('date', d.iso, d.words, values.date === d.iso, d.amb ? 'A date like 10/07 can be read two ways; both are listed' : 'Date found on the sheet'))}</div>
+      )}
+      {ambiguous && <Text className={styles.hint} block style={{ marginLeft: 76 }}>A date such as 10/07/2026 is read month first (Oct 7); with dots (10.07.2026) day first. The other reading is listed too.</Text>}
+      {view && (view.hours.length > 0 || view.hoursSum) && (
+        <div className={styles.sheetRow}><span className={styles.sheetLabel}>Hours</span>
+          {view.hoursSum && chip('hours', view.hoursSum.value, `${view.hoursSum.value} h (adds up ${view.hoursSum.lines} lines)`, values.hours === view.hoursSum.value, 'The hours of the "actual work" lines on the sheet, added together')}
+          {view.hours.map(h => chip('hours', h.value, `${h.value} h`, values.hours === h.value, h.labeled ? 'Hours next to an actual work label' : 'A number of hours found on the sheet'))}
+        </div>
+      )}
+      {view && view.initials.length > 0 && (
+        <div className={styles.sheetRow}><span className={styles.sheetLabel}>Initials</span>{view.initials.map(x => chip('initials', x.value, x.who ? `${x.value} (${x.who})` : x.value, values.initials === x.value, 'Initials found next to a name or signature line'))}</div>
+      )}
+      {view && view.empty && sheet.status === 'done' && (
+        <Text className={styles.hint} block style={{ marginTop: 4 }}>Nothing that looks like an order, date or hours was found. Handwriting cannot be read, and a clear, straight, well-lit picture of printed text works best. The paperwork is still attached.</Text>
+      )}
+    </div>
+  );
+};
+
 // --- ENTRY ROW: one SAP order, one or more equipment ---
 const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initialInitials, onRemove, onEnter, canRemove, saving }, ref) {
   const styles = useStyles();
@@ -2033,6 +2861,16 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   const [photoName, setPhotoName] = useState('');
   const [photoNote, setPhotoNote] = useState(''); // why the last picture could not be used (gone as soon as another is picked)
   const [photoBusy, setPhotoBusy] = useState(false);
+  const [photoMime, setPhotoMime] = useState('image/jpeg'); // image/jpeg for a picture, application/pdf for a PDF or several pages
+  const [photoPages, setPhotoPages] = useState(0);
+  const [paperFiles, setPaperFiles] = useState([]);   // the files picked for the paperwork, in page order
+  const [sheet, setSheet] = useState({ status: 'idle' }); // what reading the paperwork found: { status, view, applied, ... }
+  const [sheetAuto, setSheetAuto] = useState(sheetAuto0); // read the sheet as soon as paperwork is added
+  const [stamp, setStamp] = useState({});             // field -> the value that came from the sheet (marked "from the sheet" while it stays)
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [sheetHidden, setSheetHidden] = useState(false);
+  const previewEntry = useMemo(() => ({ equipment: 'Paperwork to attach', sap: normCode(code), date: dateStr }), [code, dateStr]);
+  const previewLocal = useMemo(() => (photo ? { name: `paperwork.${photoMime === 'application/pdf' ? 'pdf' : 'jpg'}`, mime: photoMime, data: photo } : null), [photo, photoMime]);
   const [excluded, setExcluded] = useState({});
   const [chosen, setChosen] = useState({});          // lineKey -> equipment picked instead of the automatic one
   const [hoursOverride, setHoursOverride] = useState({}); // lineKey -> hours as typed
@@ -2069,6 +2907,12 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   const wrapRef = useRef(null);                      // the lines box, to move the focus into a pieces editor that was just opened
   const focusTo = useRef('');                        // selector (inside the lines box) of the control that takes the focus after the next render
   const photoSeq = useRef(0);
+  const readSeq = useRef(0);                         // a reading is stale when this has moved on (stopped, new paperwork, row removed)
+  const pageCache = useRef(new Map());               // file -> its pages as JPEGs (when pages are joined into a PDF)
+  const readMemo = useRef(new Map());                // file -> its text, already read
+  const orderMemo = useRef(new Map());               // order code read off a sheet -> what the SAP list said about it
+  const dateTouched = useRef(false);                 // the admin chose the date: the sheet does not change it by itself
+  const latest = useRef({});                         // the form values now, for a reading that finishes later
   const retroSeq = useRef({});
   const listRef = useRef(null);
 
@@ -2593,23 +3437,128 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     if (Object.keys(add).length) setEdits(p => ({ ...add, ...p }));
   }, [lines, editMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // A picture (PNG, WebP, an iPhone HEIC ...) is turned into a JPG once; one that cannot be read is reported, not dropped silently
-  const onPhoto = async (file) => {
+  // --- Paperwork: pictures and PDFs are attached as one file (one picture stays a JPG, one PDF stays as it is, several pages become
+  // one PDF) and, when asked, read for the order, date, hours and initials. A file that cannot be used is reported, not dropped silently.
+  latest.current = { code: normalizedCode, totalHours, dateStr, initials };
+  const lowerFirst = (t) => { const w = String(t || '').replace(/\.$/, ''); return `${w.charAt(0).toLowerCase()}${w.slice(1)}`; };
+  useEffect(() => () => { readSeq.current += 1; }, []);
+  const setPaper = async (files) => {
     const n = ++photoSeq.current;
+    readSeq.current += 1;
     setPhoto(null);
     setPhotoNote('');
-    if (!file) { setPhotoName(''); setPhotoBusy(false); return; }
-    setPhotoName(file.name);
+    setPhotoMime('image/jpeg');
+    setPhotoPages(0);
+    setSheet({ status: 'idle' });
+    setSheetHidden(false);
+    // Other paperwork than before: what was filled in from the old sheet goes too (unless the admin changed it), so a sheet and
+    // its order never end up mixed. Adding or taking away one page of the same paperwork keeps everything.
+    let clearedNote = '';
+    if (!files.some(f => paperFiles.indexOf(f) >= 0)) {
+      const cur = latest.current;
+      const cleared = [];
+      if (stamp.code && cur.code === stamp.code) { selectCode(''); cleared.push('SAP order'); }
+      if (stamp.date && cur.dateStr === stamp.date) { setDateStr(initialDate || maxDate); dateTouched.current = false; cleared.push('date'); }
+      if (stamp.hours && String(cur.totalHours) === String(stamp.hours)) { setTotalHours(''); cleared.push('hours'); }
+      if (stamp.initials && cur.initials === stamp.initials) { setInitials(''); cleared.push('initials'); }
+      if (cleared.length) clearedNote = `Cleared the ${cleared.join(', ')} that came from the earlier sheet.`;
+      setStamp({});
+    }
+    if (!files.length) { setPaperFiles([]); setPhotoName(''); setPhotoBusy(false); setPhotoNote(clearedNote); return; }
+    setPaperFiles(files);
+    setPhotoName(files.length === 1 ? files[0].name : `${files.length} files`);
     setPhotoBusy(true);
-    const res = await compressImage(file);
+    const res = await buildPaperwork(files, pageCache.current);
     if (n !== photoSeq.current) return;
     setPhotoBusy(false);
+    const bad = res.skipped || [];
+    const usable = files.filter(f => !bad.some(b => b.file === f));
+    setPaperFiles(usable);
+    [pageCache.current, readMemo.current].forEach((m) => { m.forEach((v, k) => { if (usable.indexOf(k) < 0) m.delete(k); }); });
     setPhoto(res.data || null);
-    if (!res.data) {
-      const why = String(res.error || 'that picture could not be read').replace(/\.$/, '');
-      setPhotoName('');
-      setPhotoNote(`Could not use ${file.name}: ${why.charAt(0).toLowerCase()}${why.slice(1)}. It will not be attached.`);
+    if (res.data) { setPhotoMime(res.mime); setPhotoPages(res.pages); setPhotoName(usable.length === 1 ? usable[0].name : `${usable.length} files`); } else setPhotoName('');
+    const notes = [];
+    if (bad.length) {
+      if (files.length === 1 && !res.data) notes.push(`Could not use ${bad[0].name}: ${lowerFirst(bad[0].why)}. It will not be attached.`);
+      else notes.push(`${bad.map(b => `Could not use ${b.name}: ${lowerFirst(b.why)}.`).join(' ')} ${res.data ? 'The rest is attached.' : 'Nothing will be attached.'}`);
     }
+    if (res.cut && res.data) notes.push(`Only the first ${SHEET_MAX_PAGES} pages are attached.`);
+    if (clearedNote) notes.push(clearedNote);
+    setPhotoNote(notes.join(' '));
+    if (res.data && sheetAuto) startReading(usable);
+  };
+  const addPaper = (list) => { setPaper(paperFiles.concat(list)); };
+  const removePaper = (i) => { setPaper(paperFiles.filter((f, k) => k !== i)); };
+  const stopReading = () => { readSeq.current += 1; setSheet(s => ({ ...s, status: 'stopped' })); };
+  const changeSheetAuto = (on) => { setSheetAuto(on); try { window.localStorage.setItem('mss-log-read-sheet', on ? '1' : '0'); } catch (e) { /* only a remembered choice */ } };
+
+  // Fills the empty fields with what the sheet says for certain; the rest is left as suggestions in the panel
+  const applySheet = (auto) => {
+    const cur = latest.current;
+    const applied = [];
+    const marks = {};
+    if (auto.code && !cur.code) { selectCode(auto.code); applied.push(`SAP order ${auto.code}`); marks.code = auto.code; }
+    if (auto.date && !dateTouched.current && auto.date !== cur.dateStr) { setDateStr(auto.date); applied.push(`date ${sheetDateWords(auto.date)}`); marks.date = auto.date; }
+    if (auto.hours && !String(cur.totalHours).trim()) { setTotalHours(String(auto.hours)); applied.push(`${auto.hours} hours`); marks.hours = auto.hours; }
+    if (applied.length) setStamp(st => ({ ...st, ...marks }));
+    return applied;
+  };
+  const startReading = async (files) => {
+    const seq = ++readSeq.current;
+    const stale = () => seq !== readSeq.current;
+    const all = [];
+    let cut = false; // there are more pages than the ones that are read
+    let unread = 0;  // pages that are pictures while the picture reader could not be loaded
+    setSheet({ status: 'reading' });
+    setSheetHidden(false);
+    const mine = (m) => { if (!stale() && m && m.status === 'recognizing text') setSheet(s => (s.status === 'loading' ? { ...s, status: 'reading' } : s)); };
+    const publish = async (final) => {
+      const found = extractSheet(all, { today: maxDate, minDate });
+      let checked;
+      try { checked = await checkSheetOrders(store, found.orders, orderMemo.current); } catch (e) { checked = []; checked.failed = 1; }
+      if (stale()) return;
+      const view = sheetView(found, checked);
+      if (!final) { setSheet(s => (stale() ? s : { ...s, view, pages: all.length })); return; }
+      const applied = applySheet(view.auto);
+      setSheet({ status: 'done', view, applied, pages: all.length, cut, unread, checkFailed: checked.failed || 0 });
+    };
+    try {
+      let left = SHEET_READ_PAGES;
+      for (let i = 0; i < files.length && left > 0; i += 1) {
+        if (stale()) return;
+        const file = files[i];
+        let got = readMemo.current.get(file);
+        if (got && got.texts.length < Math.min(got.total, left)) got = null; // read before with fewer pages left to read: read it again
+        if (!got) {
+          got = await readFileText(file, {
+            left,
+            stop: stale,
+            page: (p, t) => { if (!stale()) setSheet(s => ({ ...s, status: s.status === 'loading' ? 'loading' : 'reading', file: file.name, page: p, pageTotal: t })); },
+            ocr: () => { ocrLog = mine; if (!ocrWarm && !stale()) setSheet(s => ({ ...s, status: 'loading' })); },
+          });
+          if (stale()) return;
+          if (!got.unread) readMemo.current.set(file, got); // a page the reader could not read is tried again next time
+        }
+        unread += got.unread || 0;
+        got.texts.forEach(t => all.push(t));
+        left -= got.texts.length;
+        if (got.total > got.texts.length || (left <= 0 && i < files.length - 1)) cut = true;
+        await publish(false);
+      }
+      if (stale()) return;
+      await publish(true);
+    } catch (e) {
+      if (!stale()) setSheet(s => ({ ...s, status: e && e.reader ? 'unavailable' : 'error', msg: lowerFirst(errText(e)) }));
+    } finally { if (ocrLog === mine) ocrLog = null; }
+  };
+  const pickFromSheet = (kind, value) => {
+    if (kind === 'code') {
+      if (normalizedCode && normalizedCode !== value && !window.confirm(`Replace ${normalizedCode} with ${value}? Changes made to its lines will be cleared.`)) return;
+      if (normalizedCode !== value) selectCode(value);
+    } else if (kind === 'date') { dateTouched.current = true; setDateStr(value); }
+    else if (kind === 'hours') setTotalHours(String(value));
+    else if (kind === 'initials') setInitials(value);
+    setStamp(st => ({ ...st, [kind]: value }));
   };
 
   const validate = () => {
@@ -2666,6 +3615,8 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   const commit = async (seen) => {
     const notes = [];
     const info = [];
+    readSeq.current += 1; // a sheet still being read does not change the form while it is saved
+    setSheet(s => (s.status === 'reading' || s.status === 'loading' ? { ...s, status: 'stopped' } : s));
     const ini = normalizeInitials(initials);
     // 0. Earlier entries to move for changed lines: read before anything is written, and each entry claimed by one line only
     const retroRows = {};
@@ -2789,13 +3740,15 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
       else failedNames.push(toLog[i].name);
     });
     if (savedIds.length) setDupes(prev => new Set(Array.from(prev).concat(results.map((r, i) => (r.ok ? toLog[i].asset.id : null)).filter(Boolean))));
-    // The paperwork picture is compressed once and uploaded to each saved entry's file column
+    // The paperwork (a JPG, a PDF, or the pages joined into one PDF) is prepared once and uploaded to each saved entry's file column
     if (photo && savedIds.length) {
-      const fileName = `paperwork-${normalizedCode}-${dateStr}.jpg`.replace(/[^A-Za-z0-9._-]/g, '_');
-      const pr = await pool(savedIds, 3, (id) => api.uploadFile(LOG_TABLE, id, PAPERWORK_COL, photo, fileName, 'image/jpeg'));
+      const isPdf = photoMime === 'application/pdf';
+      const fileName = `paperwork-${normalizedCode}-${dateStr}.${isPdf ? 'pdf' : 'jpg'}`.replace(/[^A-Za-z0-9._-]/g, '_');
+      const what = isPdf ? 'paperwork PDF' : 'paperwork picture';
+      const pr = await pool(savedIds, 3, (id) => api.uploadFile(LOG_TABLE, id, PAPERWORK_COL, photo, fileName, isPdf ? 'application/pdf' : 'image/jpeg'));
       const bad = pr.filter(r => !r.ok);
-      if (bad.length) notes.push(`Entries saved, but the paperwork picture was not attached to ${bad.length === pr.length ? (pr.length === 1 ? 'it' : 'them') : plural(bad.length, 'of them', 'of them')} (${errText(bad[0].error)}). To add it, delete the entries whose Paperwork shows "none" in the Log Table and submit them again.`);
-      else info.push(`Paperwork picture attached to ${plural(pr.length, 'entry', 'entries')}.`);
+      if (bad.length) notes.push(`Entries saved, but the ${what} was not attached to ${bad.length === pr.length ? (pr.length === 1 ? 'it' : 'them') : plural(bad.length, 'of them', 'of them')} (${errText(bad[0].error)}). To add it, delete the entries whose Paperwork shows "none" in the Log Table and submit them again.`);
+      else info.push(`${isPdf ? 'Paperwork PDF' : 'Paperwork picture'} attached to ${plural(pr.length, 'entry', 'entries')}.`);
     }
     store.dropOrders();
     if (failedNames.length) {
@@ -2805,7 +3758,9 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     return { saved: savedIds.length, notes, info };
   };
 
-  useImperativeHandle(ref, () => ({ validate, commit, getShared: () => ({ date: dateStr, initials: normalizeInitials(initials) }) }));
+  // freeze: a sheet still being read must not change this row once Submit has started on any row
+  const freeze = () => { readSeq.current += 1; setSheet(s => (s.status === 'reading' || s.status === 'loading' ? { ...s, status: 'stopped' } : s)); };
+  useImperativeHandle(ref, () => ({ validate, commit, freeze, getShared: () => ({ date: dateStr, initials: normalizeInitials(initials) }) }));
 
   // Summary values for the read-only Room / Area / Equipment fields
   const live = lines.filter(l => !excluded[l.key]);
@@ -2816,6 +3771,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   const needCount = live.filter(l => !l.asset).length;
   const dupeCount = live.filter(l => isDupe(l)).length;
   const listedAgain = matches.filter(e => !lines.some(l => (l.parent || l.key) === e.key)).length;   // SAP rows that are the same equipment as another row
+  const fromSheet = (kind, now) => (stamp[kind] !== undefined && stamp[kind] === now ? <span className={mergeClasses(styles.tag, styles.tagInfo)} style={{ marginLeft: 6 }}>from the sheet</span> : null);
   const tagClass = (k) => mergeClasses(styles.tag, k === 'ok' ? styles.tagOk : k === 'warn' ? styles.tagWarn : k === 'bad' ? styles.tagBad : k === 'info' ? styles.tagInfo : undefined);
 
   const renderPanel = (l) => {
@@ -2950,7 +3906,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     <div className={styles.rowCard}>
       <div className={styles.rowFields}>
         <div className={styles.field}>
-          <Text className={styles.label}>SAP Order (Req)</Text>
+          <Text className={styles.label}>SAP Order (Req){fromSheet('code', normalizedCode)}</Text>
           <Input
             data-row={index}
             data-col="sap"
@@ -3018,27 +3974,55 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
           <Input aria-label="Equipment" className={styles.readOnly} value={live.length > 1 ? `${live.length} equipment` : summarize('name')} readOnly tabIndex={-1} placeholder={code ? 'Auto-filled' : ''} style={{ minWidth: '140px' }} />
         </div>
         <div className={styles.field}>
-          <Text className={styles.label}>Date (Req)</Text>
-          <Input aria-label="Date completed" type="date" value={dateStr} min={minDate} max={maxDate} disabled={saving} onChange={(e, d) => setDateStr(d.value)} style={{ minWidth: '140px' }} />
+          <Text className={styles.label}>Date (Req){fromSheet('date', dateStr)}</Text>
+          <Input aria-label="Date completed" type="date" value={dateStr} min={minDate} max={maxDate} disabled={saving} onChange={(e, d) => { dateTouched.current = true; setDateStr(d.value); }} style={{ minWidth: '140px' }} />
         </div>
         <div className={styles.field}>
-          <Text className={styles.label}>Total Hours (Req)</Text>
+          <Text className={styles.label}>Total Hours (Req){fromSheet('hours', parseFloat(totalHours))}</Text>
           <Input aria-label="Total hours" type="number" min="0" step="0.25" placeholder="Ex: 2.5" value={totalHours} disabled={saving} onChange={(e, d) => setTotalHours(d.value)} style={{ width: '100px' }} />
         </div>
         <div className={styles.field}>
-          <Text className={styles.label}>Initials (Req)</Text>
+          <Text className={styles.label}>Initials (Req){fromSheet('initials', normalizeInitials(initials))}</Text>
           <Input aria-label="Initials" placeholder="Ex: EL/LH" value={initials} disabled={saving} onChange={(e, d) => setInitials(d.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); onEnter(index); } }} style={{ minWidth: '90px' }} />
         </div>
         <div className={styles.field}>
-          <Text className={styles.label}>Paperwork Picture</Text>
-          <input type="file" accept="image/*,.heic,.heif" aria-label="Paperwork picture" disabled={saving} onChange={(e) => { const f = e.target.files && e.target.files[0]; e.target.value = ''; onPhoto(f); }} style={{ minWidth: '150px', padding: '4px' }} />
-          {photoName && <span className={styles.hint}>{photoName}{photoBusy ? ' (converting to a JPG…)' : ''}</span>}
+          <Text className={styles.label}>Paperwork Picture or PDF</Text>
+          <input type="file" multiple accept="image/*,.heic,.heif,.pdf,application/pdf" aria-label="Paperwork picture" disabled={saving}
+            onChange={(e) => { const fs = Array.from(e.target.files || []); e.target.value = ''; setPaper(fs); }} style={{ minWidth: '150px', padding: '4px' }} />
+          {photoName && <span className={styles.hint}>{paperFiles.length > 1 ? `${paperFiles.length} files${photoPages ? `, ${plural(photoPages, 'page', 'pages')}` : ''}` : photoName}{photoBusy ? (paperFiles.length === 1 && !isPdfFile(paperFiles[0]) ? ' (converting to a JPG…)' : ' (preparing the pages…)') : ''}</span>}
+          {paperFiles.length > 1 && (
+            <div className={styles.filePills}>
+              {paperFiles.map((f, i) => (
+                <span key={`${f.name}|${i}`} className={styles.filePill} title={f.name}>
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{i + 1}. {f.name}</span>
+                  <Button size="small" appearance="subtle" aria-label={`Remove ${f.name}`} disabled={saving} onClick={() => removePaper(i)} style={{ minWidth: 0, padding: '0 4px' }}>×</Button>
+                </span>
+              ))}
+            </div>
+          )}
           {photoNote && <Text className={styles.warnText} block role="status" style={{ marginTop: 2 }}>{photoNote}</Text>}
+          {paperFiles.length > 0 && (
+            <div className={styles.sheetRow} style={{ marginTop: 2 }}>
+              <label className={styles.hint} style={{ cursor: saving ? 'default' : 'pointer' }}>Add more pages: <input type="file" multiple accept="image/*,.heic,.heif,.pdf,application/pdf" aria-label="Add more paperwork pages" disabled={saving || photoBusy}
+                onChange={(e) => { const fs = Array.from(e.target.files || []); e.target.value = ''; if (fs.length) addPaper(fs); }} style={{ maxWidth: '170px' }} /></label>
+              {photo && <Button size="small" appearance="subtle" onClick={() => setPreviewOpen(true)}>Preview</Button>}
+              {photo && sheet.status === 'idle' && <Button size="small" appearance="subtle" disabled={saving || photoBusy} onClick={() => startReading(paperFiles)}>Read the sheet</Button>}
+              <Checkbox label={<Text size={200}>Read the sheet when it is added</Text>} checked={sheetAuto} disabled={saving} onChange={(e, d) => changeSheetAuto(!!d.checked)} />
+            </div>
+          )}
         </div>
         <Button appearance="subtle" style={{ alignSelf: 'flex-start', marginTop: '16px' }} aria-label={`Remove row ${index + 1}`} disabled={!canRemove || saving} onClick={onRemove}>Remove</Button>
       </div>
 
+      {paperFiles.length > 0 && sheet.status !== 'idle' && !sheetHidden && (
+        <SheetPanel sheet={sheet} disabled={saving}
+          values={{ code: normalizedCode, date: dateStr, hours: parseFloat(totalHours), initials: normalizeInitials(initials) }}
+          onPick={pickFromSheet} onStop={stopReading} onRead={() => startReading(paperFiles)} onHide={() => setSheetHidden(true)} />
+      )}
+      {previewOpen && previewLocal && (
+        <PaperworkViewer api={api} entry={previewEntry} local={previewLocal} onClose={() => setPreviewOpen(false)} />
+      )}
       {order && order.status === 'loading' && order.code === normalizedCode && (
         <Text className={styles.hint} block style={{ marginTop: 8 }}>Loading {normalizedCode} and finding its equipment…</Text>
       )}
@@ -4106,25 +5090,37 @@ const FixIdsTab = ({ ctx, onCount }) => {
 
 // --- LOG TABLE (one filtered, limited page; "Load More" asks for 50 more) ---
 // --- PAPERWORK PICTURE (downloaded only when an entry is opened) ---
-const PaperworkViewer = ({ api, entry, onClose }) => {
+const PaperworkViewer = ({ api, entry, onClose, local }) => {
   const styles = useStyles();
   const [file, setFile] = useState({ status: 'loading' });
   const [actual, setActual] = useState(false);
+  const [pdfUrl, setPdfUrl] = useState('');
   useEffect(() => {
     let live = true;
     setActual(false);
+    // The paperwork that is about to be attached (the Preview button on the Add tab): shown from memory, nothing is downloaded
+    if (local) { setFile({ status: 'ready', name: local.name, mime: local.mime, data: local.data, url: `data:${local.mime};base64,${local.data}` }); return undefined; }
     if (!entry.picture && entry.pictureKnown) { setFile({ status: 'none' }); return undefined; }
     setFile({ status: 'loading' });
     api.downloadFile(LOG_TABLE, entry.id, PAPERWORK_COL)
       .then((f) => {
         if (!live) return;
         const mime = fileMime(f, entry.picture);
-        setFile({ status: 'ready', name: f.name || entry.picture, mime, url: `data:${mime};base64,${f.data}` });
+        setFile({ status: 'ready', name: f.name || entry.picture, mime, data: f.data, url: `data:${mime};base64,${f.data}` });
       })
       .catch((e) => { if (live) setFile(!entry.picture && /no file is attached/i.test(errText(e)) ? { status: 'none' } : { status: 'error', error: errText(e) }); });
     return () => { live = false; };
-  }, [api, entry]);
+  }, [api, entry, local]);
+  // A PDF is shown from a blob address (browsers do not open big data addresses in a frame)
+  useEffect(() => {
+    if (!(file.status === 'ready' && file.mime === 'application/pdf')) { setPdfUrl(''); return undefined; }
+    let url = '';
+    try { url = URL.createObjectURL(new Blob([base64ToBytes(file.data)], { type: 'application/pdf' })); } catch (e) { url = ''; }
+    setPdfUrl(url);
+    return () => { if (url) URL.revokeObjectURL(url); };
+  }, [file]);
   const isImage = file.status === 'ready' && /^image\//.test(file.mime);
+  const isPdf = file.status === 'ready' && file.mime === 'application/pdf';
   const title = [entry.equipment || entry.sap || 'Log entry', entry.date].filter(Boolean).join(' · ');
   const openedAt = useRef(Date.now());
   // A double-click on View opens the viewer with its first click; its second click lands outside and must not close it
@@ -4153,11 +5149,16 @@ const PaperworkViewer = ({ api, entry, onClose }) => {
                   style={actual ? { display: 'block', cursor: 'zoom-out' } : { display: 'block', margin: '0 auto', maxWidth: '100%', maxHeight: '66vh', objectFit: 'contain', cursor: 'zoom-in' }} />
               </div>
             )}
-            {file.status === 'ready' && !isImage && <Text block>The attached file ({file.name}) is not a picture. Use Download to open it.</Text>}
+            {isPdf && pdfUrl && (
+              <iframe title={`Paperwork PDF: ${file.name}`} src={pdfUrl} style={{ width: '100%', height: '68vh', border: `1px solid ${BRAND.line}`, borderRadius: '4px', backgroundColor: '#F7F9FC' }} />
+            )}
+            {isPdf && <Text className={styles.hint} block style={{ marginTop: 4 }}>If the PDF does not show here, use Open in new tab or Download.</Text>}
+            {file.status === 'ready' && !isImage && !isPdf && <Text block>The attached file ({file.name}) is not a picture. Use Download to open it.</Text>}
           </DialogContent>
           <DialogActions>
             {isImage && <Button onClick={() => setActual(a => !a)}>{actual ? 'Fit to window' : 'Actual size'}</Button>}
-            {file.status === 'ready' && <Button as="a" href={file.url} download={file.name || 'paperwork'}>Download</Button>}
+            {isPdf && pdfUrl && <Button as="a" href={pdfUrl} target="_blank" rel="noopener noreferrer">Open in new tab</Button>}
+            {file.status === 'ready' && <Button as="a" href={isPdf && pdfUrl ? pdfUrl : file.url} download={file.name || 'paperwork'}>Download</Button>}
             <Button appearance="primary" className={styles.btnPrimary} onClick={onClose}>Close</Button>
           </DialogActions>
         </DialogBody>
@@ -4600,6 +5601,7 @@ export default function GeneratedComponent(props) {
       const err = h ? h.validate() : 'Row is not ready.';
       if (err) { setErrorMessage(`Row ${i + 1}: ${err}`); return; }
     }
+    rows.forEach((r) => { const h = refs.current[r.key]; if (h && h.freeze) h.freeze(); });
     setSaving(true);
     const snapshot = rows.slice();
     const done = [];
