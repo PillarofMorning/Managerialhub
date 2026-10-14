@@ -71,8 +71,24 @@ import {
   becomes a line of its own with its own equipment ID. The line's hours are shared
   out among its pieces, so the other lines keep theirs. Nothing in the SAP rows
   changes.
-  Missing equipment can also be added to the order. One craa5__log_ row is
-  written per equipment:
+  Missing equipment can also be added to the order.
+  NUMBERED COPIES AND REPEAT RUNS (Gerald, Oct 10): an order with a number at its
+  end that is not in the SAP list itself (SSANGP1, SSANGP2) uses the equipment and
+  best fits of the order without the number (SSANGP) and is saved as typed, so an
+  order done 2-3 times a day keeps one entry per run. Typing the number after the
+  lines were changed keeps the changes. Equipment added to a copy is stored on the
+  order it copies, never as the copy's own code. When equipment is already logged
+  for the order and date, "Another run today" switches the row to the first free
+  number (one that is not an order of its own, has none of it logged that day and
+  is not on another row of the form). Two rows with the same order, date and
+  equipment are stopped at Submit with the number to give the second run. A plain
+  number (4000123456) never gets a run number.
+  MISSED: equipment that was not cleaned is coded with a number on the sheet (8,
+  or another). Typing that number in the small box next to a line's tick drops the
+  line as missed: it is not logged (the log has no column for a miss, and every
+  entry counts as cleaned), its hours go to the other lines, and the submit says
+  which lines were dropped.
+  One craa5__log_ row is written per equipment:
     craa5_equipmentguid     = craa5_aa_assetsid (what mss - calendar matches on)
     craa5_equipment/room/area = display copies taken from the asset
     craa5_sap               = SAP order entered (upper case)
@@ -92,6 +108,14 @@ import {
   before clears what the old sheet filled in. Reading uses pdf.js and Tesseract.js, loaded from a CDN when
   first needed (about 7 MB, kept by the browser). If they cannot be loaded the paperwork is still attached and
   the form works as before. No new Dataverse columns are used.
+  READING AREAS (Gerald, Oct 10): "Set reading areas" shows a page of the paperwork; a box is drawn around the
+  order, the date, the hours and the initials. Only the boxes are read then: the PDF's own text inside a box, or
+  the picture inside the box cut out, enlarged and read on its own. A box decides its field (filled in only when
+  it gives one answer); fields without a box, or a box that finds nothing, are looked for on the whole sheet as
+  before, which is skipped when the boxes gave the order, date and hours. Layouts are named, kept in this browser
+  (localStorage mss-log-sheet-layouts, not Dataverse), picked per row under Paperwork ("Read"), and the last one
+  used is the default for every row that has not read a sheet yet. "Try the boxes" shows what each box reads
+  before saving. Pictures are read one at a time, so one row's sheet never times out waiting for another's.
 
   FIX MISSING IDS
   Repair IDs: scans the log page by page for entries whose craa5_equipmentguid
@@ -181,6 +205,22 @@ const LIMITS = {
 // --- HELPERS ---
 const safeString = (v) => (v === null || v === undefined ? '' : String(v).trim());
 const normCode = (s) => safeString(s).toUpperCase().replace(/\s+/g, '');
+// A numbered copy of an order (Gerald, Oct 10): SSANGP1 is not in the SAP list but SSANGP is, so SSANGP1 uses SSANGP's equipment and
+// best fits and is saved as SSANGP1 (an order run 2-3 times a day). The orders a code can be a copy of: the code without its last
+// one or two digits, never a plain number (SAP order numbers such as 4000123456) and never shorter than 3 characters. A code that
+// is in the SAP list itself is always that order, so SSANIBL4 stays SSANIBL4 even when SSANIBL exists.
+const copyBases = (code) => {
+  const c = normCode(code);
+  const out = [];
+  [1, 2].forEach((n) => {
+    if (c.length <= n || !/^\d+$/.test(c.slice(-n))) return;
+    const base = c.slice(0, -n);
+    if (base.length >= 3 && /[A-Z]/.test(base) && out.indexOf(base) < 0) out.push(base);
+  });
+  return out;
+};
+// The same order typed with another number at the end (or without one): the row keeps its lines and changes while it is typed
+const sameCopyFamily = (code, base) => !!base && (normCode(code) === base || copyBases(code).indexOf(base) >= 0);
 const normName = (s) => safeString(s).toLowerCase().replace(/[^a-z0-9]/g, '');
 const sameText = (a, b) => normName(a) === normName(b);
 const escOData = (s) => String(s).replace(/'/g, "''");
@@ -199,6 +239,8 @@ const caseVariants = (s) => {
 };
 const ciEq = (col, s) => `(${caseVariants(s).map(v => `${col} eq '${escOData(v)}'`).join(' or ')})`;
 const ciContains = (col, s) => `(${caseVariants(s).map(v => `contains(${col},'${escOData(v)}')`).join(' or ')})`;
+// craa5_sap is one of these codes (a numbered copy and the order it copies); the blanks and repeats are left out
+const sapEq = (codes) => { const list = []; (Array.isArray(codes) ? codes : [codes]).forEach((c) => { const n = normCode(c); if (n && list.indexOf(n) < 0) list.push(n); }); return list.length <= 1 ? ciEq('craa5_sap', list[0] || '') : `(${list.map(c => ciEq('craa5_sap', c)).join(' or ')})`; };
 const ciStarts = (col, s) => `(${caseVariants(s).map(v => `startswith(${col},'${escOData(v)}')`).join(' or ')})`;
 // craa5_equipmentguid is a text column: match the id written in lower or upper case
 const guidEq = (col, id) => `(${Array.from(new Set([cleanGuid(id), cleanGuid(id).toUpperCase()])).map(v => `${col} eq '${v}'`).join(' or ')})`;
@@ -887,11 +929,12 @@ const makeStore = (api) => {
     return out;
   };
 
-  // Earlier log entries of one SAP order that carry a known equipment ID (the newest few hundred)
-  const prevForOrder = (code) => once(cache.prev, code, async () => {
+  // Earlier log entries of one SAP order that carry a known equipment ID (the newest few hundred). A numbered copy (SSANGP1) also
+  // learns from the order it copies (SSANGP), so its best fits are the same.
+  const prevForOrder = (code, base) => once(cache.prev, base && base !== code ? `${code}|${base}` : code, async () => {
     const rows = await api.query(LOG_TABLE, {
       select: ['craa5__log_id', 'craa5_equipmentguid', 'craa5_equipment', 'craa5_room', 'craa5_area'],
-      filter: `${ciEq('craa5_sap', code)} and craa5_equipmentguid ne null and craa5_equipmentguid ne ''`,
+      filter: `${sapEq([code, base])} and craa5_equipmentguid ne null and craa5_equipmentguid ne ''`,
       orderBy: 'craa5_lastcleaned desc', top: LIMITS.prevEntries,
     });
     await resolve(rows.map(r => r.craa5_equipmentguid));
@@ -966,18 +1009,32 @@ const makeStore = (api) => {
       });
     },
 
-    // One SAP order for the entry form: linked equipment, and the best fit for every row without a link
+    // The rows of an order, or of the order it is a numbered copy of (SSANGP1 -> SSANGP): { code, capped, rows, base }
+    async findOrderRows(code) {
+      const c = normCode(code);
+      const own = await store.loadOrderRows(c);
+      if (own.rows.length) return { ...own, base: c };
+      const bases = copyBases(c);
+      for (let i = 0; i < bases.length; i += 1) {
+        const got = await store.loadOrderRows(bases[i]);
+        if (got.rows.length) return { ...got, base: bases[i] };
+      }
+      return { ...own, base: c };
+    },
+
+    // One SAP order for the entry form: linked equipment, and the best fit for every row without a link.
+    // base: the order whose equipment it has (itself, or the order a numbered copy such as SSANGP1 copies)
     loadOrder(code) {
       const c = normCode(code);
       return once(cache.orders, c, async () => {
-        const base = await store.loadOrderRows(c);
+        const base = await store.findOrderRows(c);
         const entries = base.rows.map(r => ({
           key: r.id, msId: r.id, col: r.col, equipment: r.equipment, room: r.room, area: r.area,
           linked: r.asset, asset: r.asset, how: r.asset ? 'linked' : '', tier: r.asset ? 'linked' : 'none', ranked: [], partial: false, reason: '',
         }));
         const loose = entries.filter(e => !e.linked);
         if (loose.length) {
-          const [prev, exact] = await Promise.all([prevForOrder(c).catch(() => []), assetsByNames(loose)]);
+          const [prev, exact] = await Promise.all([prevForOrder(c, base.base).catch(() => []), assetsByNames(loose)]);
           const single = entries.length === 1;
           const rs = await pool(loose, 3, async (e, i) => {
             e.partial = i >= LIMITS.fuzzyLines;
@@ -987,12 +1044,12 @@ const makeStore = (api) => {
           if (bad) throw bad.error;
           assignBestFits(entries);
         }
-        return { code: c, entries, capped: base.capped };
+        return { code: c, base: base.base, entries, capped: base.capped };
       });
     },
     // Candidates for one SAP row on demand (rows past the first few dozen of a big order, or "Look for similar names")
-    async rankLine(code, line, single) {
-      const prev = await prevForOrder(normCode(code)).catch(() => []);
+    async rankLine(code, line, single, base) {
+      const prev = await prevForOrder(normCode(code), base ? normCode(base) : '').catch(() => []);
       const exact = await assetsByNames([line]);
       return rankForLine(store, line, { prev, exact, single, fuzzy: true, force: true });
     },
@@ -1302,7 +1359,7 @@ const rankCandidates = async (store, g) => {
   let settled = false;
   // 1. SAP order: only its rows and their linked equipment are loaded
   if (g.sap) {
-    const ord = await store.loadOrderRows(g.sap);
+    const ord = await store.findOrderRows(g.sap); // an entry saved under a numbered copy (SSANGP1) uses SSANGP's rows
     const list = uniqueById(ord.rows.filter(r => r.asset).map(r => r.asset));
     const whole = !ord.capped && ord.rows.length > 0 && ord.rows.every(r => r.asset);
     if (list.length === 1 && whole) {
@@ -1408,7 +1465,7 @@ const placeDiffers = (r, a) => {
 // of the order still uses it), saved under this order with no ID and the line's name, or carrying the old ID while
 // naming the line's own room and area.
 const retroFilter = (code, from, ms, fromStillUsed) => {
-  const sap = ciEq('craa5_sap', code);
+  const sap = sapEq(code); // one code, or a numbered copy and the order it copies
   const parts = [];
   if (from && !fromStillUsed) parts.push(`(${sap} and ${guidEq('craa5_equipmentguid', from.id)})`);
   if (normName(ms.equipment)) {
@@ -1985,6 +2042,20 @@ function pdfLinesOf(items) {
   }).filter(Boolean).join('\n');
 }
 
+// PDF text pieces in their own frame (x along the text, y up its letters), so text printed turned on a turned page (a landscape sheet
+// saved as a portrait page) is put in lines the way it reads; upright text is unchanged
+function pdfFrameItems(items) {
+  return (items || []).map((it) => {
+    if (!it || !it.transform) return it;
+    const t = it.transform;
+    const sx = Math.sqrt(t[0] * t[0] + t[1] * t[1]);
+    const ux = sx ? t[0] / sx : 1;
+    const uy = sx ? t[1] / sx : 0;
+    const side = t[0] * t[3] - t[1] * t[2] < 0 ? -1 : 1;
+    return { str: it.str, width: it.width, transform: [1, 0, 0, 1, t[4] * ux + t[5] * uy, (t[5] * ux - t[4] * uy) * side] };
+  });
+}
+
 async function renderPdfPage(page, side) {
   const v1 = page.getViewport({ scale: 1 });
   const scale = Math.min(4, side / Math.max(v1.width, v1.height));
@@ -2127,7 +2198,10 @@ let ocrJob = null;
 let ocrIdle = null;
 let ocrLog = null;     // called with Tesseract's progress while a sheet is being read
 let ocrWarm = false;   // the reader is loaded and ready, so reading starts at once
-async function getOcrWorker() {
+let ocrQueue = Promise.resolve(); // pictures are read one at a time on the shared reader (see ocrRecognize)
+let ocrPending = 0;               // readings waiting for the reader or using it: it is not let go while there are any
+let ocrLoadFail = null;           // { at, err }: the last time the reader could not be loaded
+function getOcrWorker() {
   if (ocrIdle) { clearTimeout(ocrIdle); ocrIdle = null; }
   if (ocrJob) return ocrJob;
   const job = (async () => {
@@ -2144,18 +2218,54 @@ async function getOcrWorker() {
     throw err;
   })();
   ocrJob = job;
-  job.catch(() => { if (ocrJob === job) ocrJob = null; });
+  job.catch((e) => { if (ocrJob === job) ocrJob = null; ocrLoadFail = { at: Date.now(), err: e }; });
   return job;
+}
+// A reader that failed or ran out of time is never used again (it may still be busy): the next reading loads a fresh one
+function dropOcrWorker(job) {
+  if (ocrJob === job) { ocrJob = null; ocrWarm = false; }
+  job.then(w => { try { w.terminate(); } catch (e) { /* gone already */ } }, () => {});
 }
 function releaseOcrLater() {
   if (ocrIdle) clearTimeout(ocrIdle);
+  ocrIdle = null;
+  if (ocrPending > 0) return; // another reading is waiting for it
   ocrIdle = setTimeout(() => {
+    ocrIdle = null;
+    if (ocrPending > 0) return;
     const job = ocrJob;
     ocrJob = null;
-    ocrIdle = null;
     ocrWarm = false;
     if (job) job.then(w => { try { w.terminate(); } catch (e) { /* gone already */ } }, () => {});
   }, 120000);
+}
+// One picture read on the shared reader. Readings take turns, so a time limit starts when the reading itself starts (not while it
+// waits behind another row's sheet), and a reader that fails is let go without breaking a reading another row is waiting on.
+// stop() true skips a reading that is no longer wanted (its sheet was replaced while it waited).
+function ocrRecognize(canvas, params, output, limit, tooLong, stop) {
+  ocrPending += 1;
+  const queued = Math.min(Date.now(), (stop && stop.since) || Infinity); // when the reading began (stop.since), or now
+  const run = async () => {
+    if (stop && stop()) { const e = new Error('This reading was replaced.'); e.stopped = true; throw e; }
+    // the reader could not be loaded while this reading waited: the same answer at once, not another long try per waiting row
+    if (ocrLoadFail && ocrLoadFail.at >= queued) throw ocrLoadFail.err;
+    const blob = await new Promise((resolve) => { try { canvas.toBlob(resolve, 'image/png'); } catch (e) { resolve(null); } });
+    if (!blob) throw new Error('That page could not be prepared for reading.');
+    const job = getOcrWorker();
+    const worker = await job;
+    let timer = null;
+    try {
+      return await Promise.race([
+        worker.recognize(blob, params, output),
+        new Promise((resolve, reject) => { timer = setTimeout(() => reject(new Error(tooLong)), limit); }),
+      ]);
+    } catch (e) { dropOcrWorker(job); throw e; }
+    finally { if (timer) clearTimeout(timer); }
+  };
+  const go = ocrQueue.then(run);
+  ocrQueue = go.then(() => {}, () => {});
+  const done = () => { ocrPending -= 1; releaseOcrLater(); };
+  return go.then((v) => { done(); return v; }, (e) => { done(); throw e; });
 }
 const rotateCanvas = (canvas, quarter) => {
   const out = document.createElement('canvas');
@@ -2168,35 +2278,23 @@ const rotateCanvas = (canvas, quarter) => {
   ctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
   return out;
 };
-const ocrOnce = async (worker, canvas) => {
-  const blob = await new Promise((resolve) => { try { canvas.toBlob(resolve, 'image/png'); } catch (e) { resolve(null); } });
-  if (!blob) throw new Error('That page could not be prepared for reading.');
-  const res = await Promise.race([
-    worker.recognize(blob),
-    new Promise((resolve, reject) => { setTimeout(() => reject(new Error('Reading this page took too long.')), 120000); })
-  ]);
+const ocrOnce = async (canvas, stop) => {
+  const res = await ocrRecognize(canvas, undefined, undefined, 120000, 'Reading this page took too long.', stop);
   const data = (res && res.data) || {};
   const text = String(data.text || '');
   const words = (text.match(/[A-Za-z0-9]{2,}/g) || []).length;
   return { text, conf: Number(data.confidence) || 0, words };
 };
 // A page that comes out as noise is turned a quarter each way, and the best reading is kept (a sheet photographed sideways)
-async function ocrCanvas(canvas) {
-  const worker = await getOcrWorker();
-  try {
-    let best = await ocrOnce(worker, canvas);
-    if (best.conf < 45 || best.words < 15) {
-      for (let q = 1; q <= 3 && (best.conf < 45 || best.words < 15); q += 2) {
-        let r = null;
-        try { r = await ocrOnce(worker, rotateCanvas(canvas, q)); } catch (e) { r = null; }
-        if (r && r.words * r.conf > best.words * best.conf) best = r;
-      }
-    }
-    return best.text;
-  } catch (e) {
-    if (ocrJob) { const job = ocrJob; ocrJob = null; ocrWarm = false; job.then(w => { try { w.terminate(); } catch (e2) { /* gone */ } }, () => {}); } // a reader that failed is not reused
-    throw e;
-  } finally { releaseOcrLater(); }
+async function ocrCanvas(canvas, stop) {
+  let best = await ocrOnce(canvas, stop);
+  for (let q = 1; q <= 3 && (best.conf < 45 || best.words < 15); q += 2) {
+    if (stop && stop()) break;
+    let r = null;
+    try { r = await ocrOnce(rotateCanvas(canvas, q), stop); } catch (e) { break; } // a turn that fails or runs out of time: the next would too
+    if (r && r.words * r.conf > best.words * best.conf) best = r;
+  }
+  return best.text;
 }
 
 // How much of a PDF page one or more pictures cover (0 to 1): a scanned sheet is one big picture, a logo is a small one. Used to tell a
@@ -2235,12 +2333,14 @@ async function readFileText(file, ctx) {
       const n = Math.min(total, ctx.left);
       let unread = 0;
       let blocked = null;
+      let failed = null; // a page that could not be read (it took too long): the next pages are still tried
+      let slow = 0;
       for (let i = 1; i <= n; i += 1) {
         if (ctx.stop()) break;
         ctx.page(i, n);
         const page = await doc.getPage(i);
         let text = '';
-        try { const tc = await page.getTextContent(); text = pdfLinesOf(tc.items); } catch (e) { text = ''; }
+        try { const tc = await page.getTextContent(); text = pdfLinesOf(pdfFrameItems(tc.items)); } catch (e) { text = ''; }
         const chars = text.replace(/\s+/g, '').length;
         // a scanned page has no text of its own (or only a small printed stamp next to the picture)
         if (chars < 25 || (chars < 600 && await pdfPictureShare(page) >= 0.35)) {
@@ -2248,22 +2348,26 @@ async function readFileText(file, ctx) {
           else {
             try {
               ctx.ocr();
-              const seen = await ocrCanvas(await renderPdfPage(page, SHEET_READ_SIDE));
+              const seen = await ocrCanvas(await renderPdfPage(page, SHEET_READ_SIDE), ctx.stop);
               text = text ? `${text}\n${seen}` : seen;
-            } catch (e) { blocked = e; unread += 1; } // the pages that have text are still used
+            } catch (e) { // the pages that have text are still used
+              if (ctx.stop()) break;
+              if (e && e.reader) { blocked = e; unread += 1; } else { failed = e; slow += 1; }
+            }
           }
         }
         texts.push(text);
         if (page.cleanup) page.cleanup();
       }
-      if (blocked && !texts.some(t => t.replace(/\s+/g, '').length >= 25)) throw blocked; // nothing at all could be read: say why
-      return { texts, total, unread };
+      // nothing at all could be read: say why (with other files picked, they are still read and the reason goes back as err)
+      if ((blocked || failed) && !ctx.many && !texts.some(t => t.replace(/\s+/g, '').length >= 25)) throw blocked || failed;
+      return { texts, total, unread, slow, err: blocked || failed };
     } finally { try { doc.destroy(); } catch (e) { /* already closed */ } }
   }
   if (!ctx.stop()) {
     ctx.page(1, 1);
     ctx.ocr();
-    texts.push(await ocrCanvas(await pictureCanvas(file, SHEET_READ_SIDE)));
+    texts.push(await ocrCanvas(await pictureCanvas(file, SHEET_READ_SIDE), ctx.stop));
   }
   return { texts, total: 1, unread: 0 };
 }
@@ -2364,7 +2468,7 @@ function sheetHoursAfter(rest, labelText) {
   if (!(n >= 0)) return null;
   const after = body.slice(m[0].length);
   const next = /^\s*(.?)/.exec(after)[1];
-  if (/[0-9:]/.test(next)) return null;                                    // 2 5 H, 1 :30
+  if (/[0-9:]/.test(next) || /^\s*\/\s*\d/.test(after) || /^\s*[-\u2013]\s*\d{1,2}\s*\/\s*\d{1,2}(?![\d\/])/.test(after)) return null; // 2 5 H, 1 :30, 1/2 H, 1-1/2 H (not "4 /" or "8 - 10/09/2026")
   if (/^\s*[.,]\S/.test(after)) return null;                               // 3.S H, 1 .5 H
   const word = /^\s*([A-Za-z]+)(?![A-Za-z0-9])/.exec(after);
   if (word) {
@@ -2390,7 +2494,7 @@ function sheetHoursIn(line) {
     const certain = got.unit || /hou?rs?|hrs?/i.test(m[0]);
     found.push({ value: got.value, score: planned ? 1 : certain ? 5 : 3, labeled: !planned && certain, total: /^total/i.test(m[0]) });
   }
-  const unit = /(?:^|[^0-9A-Za-z.,:])(\d{1,3}(?:[.,]\d{1,3})?)\s*(hours?|hrs?|h|std)(?![A-Za-z0-9])/ig;
+  const unit = /(?:^|[^0-9A-Za-z.,:\/])(\d{1,3}(?:[.,]\d{1,3})?)\s*(hours?|hrs?|h|std)(?![A-Za-z0-9])/ig; // not the 2 of "1/2 H"
   while ((m = unit.exec(line))) {
     const n = sheetNumber(m[1]);
     if (!(n >= 0)) continue;
@@ -2582,7 +2686,368 @@ function sheetView(found, checked) {
     empty: !orders.length && !d.length && !found.hours.length && !found.hoursSum && !found.initials.length,
   };
 }
+// --- READING AREAS (Gerald, Oct 10: "point Tesseract at the areas the information is in") ---
+// A layout is one box per field (SAP order, date, hours, initials) drawn on a page of the sheet with "Set reading areas". Boxes are
+// fractions of the page as it is shown upright (0 to 1), so they fit the same form at any size. Only the boxes are read: a PDF's own
+// text inside a box (whole words), or the picture inside a box cut out, enlarged when the print is small, and read on its own as a
+// block. What a box finds goes first in the panel and decides that field; a field the boxes did not find is still looked for on the
+// whole sheet. Layouts are kept in this browser (not in Dataverse), so each computer draws its own once.
+const AREA_FIELDS = [
+  { key: 'code', label: 'SAP order', color: '#006ECD' },
+  { key: 'date', label: 'Date', color: '#0A7A3B' },
+  { key: 'hours', label: 'Hours', color: '#D97E00' },
+  { key: 'initials', label: 'Initials', color: '#8E3FB0' },
+];
+const areaLabel = (k) => (AREA_FIELDS.find(f => f.key === k) || {}).label || k;
+const LAYOUT_KEY = 'mss-log-sheet-layouts';
+const layoutListeners = [];
+let layoutMemory = null; // the newest layouts, also when this browser does not let the page keep them
+const isAreaBox = (b) => !!b && typeof b === 'object' && [b.x, b.y, b.w, b.h].every(v => typeof v === 'number' && v >= 0 && v <= 1)
+  && b.w >= 0.005 && b.h >= 0.005 && b.x + b.w <= 1.0001 && b.y + b.h <= 1.0001 && Math.floor(b.page) === b.page && b.page >= 1 && b.page <= SHEET_READ_PAGES;
+const isLayout = (l) => !!l && typeof l.id === 'string' && !!l.id && typeof l.name === 'string' && !!l.fields && typeof l.fields === 'object';
+const layoutBoxes = (layout) => (layout ? AREA_FIELDS.filter(f => isAreaBox(layout.fields[f.key])).map(f => ({ field: f.key, box: layout.fields[f.key] })) : []);
+function readSheetLayouts() {
+  if (layoutMemory) return layoutMemory;
+  try {
+    const raw = JSON.parse(window.localStorage.getItem(LAYOUT_KEY) || 'null');
+    if (raw && Array.isArray(raw.layouts)) return { last: typeof raw.last === 'string' ? raw.last : '', layouts: raw.layouts.filter(isLayout) };
+  } catch (e) { /* nothing kept yet, or not readable */ }
+  return { last: '', layouts: [] };
+}
+// Saves the layouts and tells every open row. Resolves false when the browser would not keep them (they last until the page is closed)
+function writeSheetLayouts(next) {
+  const state = { last: next.last || '', layouts: next.layouts.filter(isLayout) };
+  layoutMemory = state;
+  let kept = true;
+  try { window.localStorage.setItem(LAYOUT_KEY, JSON.stringify({ v: 1, last: state.last, layouts: state.layouts })); } catch (e) { kept = false; }
+  layoutListeners.slice().forEach((fn) => { try { fn(state); } catch (e) { /* a row that is gone */ } });
+  return kept;
+}
+const useSheetLayouts = () => {
+  const [state, setState] = useState(readSheetLayouts);
+  useEffect(() => {
+    const fn = (s) => setState(s);
+    layoutListeners.push(fn);
+    return () => { const i = layoutListeners.indexOf(fn); if (i >= 0) layoutListeners.splice(i, 1); };
+  }, []);
+  return state;
+};
+
+// The pages of the paperwork in the order the sheet is read (the page numbers the boxes use): [{ file, n (page in its file), pdf }]
+async function sheetPageList(files, max) {
+  const out = [];
+  for (let i = 0; i < files.length && out.length < max; i += 1) {
+    const f = files[i];
+    if (!isPdfFile(f)) { out.push({ file: f, n: 1, pdf: false }); continue; }
+    const doc = await openPdf(f);
+    try { for (let n = 1; n <= doc.numPages && out.length < max; n += 1) out.push({ file: f, n, pdf: true }); }
+    finally { try { doc.destroy(); } catch (e) { /* already closed */ } }
+  }
+  return out;
+}
+
+// Where each letter of a piece of PDF text starts, along the text (the piece's width shared by the letters' measured widths, so wide
+// capitals and narrow digits land where they are printed; evenly when they cannot be measured). Returns len + 1 offsets.
+let pdfMeasure = null;
+function pdfLetterOffsets(str, width, family) {
+  const len = str.length;
+  const even = () => { const o = []; for (let i = 0; i <= len; i += 1) o.push((width * i) / len); return o; };
+  try {
+    if (!pdfMeasure) pdfMeasure = document.createElement('canvas').getContext('2d');
+    if (!pdfMeasure) return even();
+    pdfMeasure.font = `100px ${family || 'sans-serif'}`;
+    const full = pdfMeasure.measureText(str).width;
+    if (!(full > 0)) return even();
+    const o = [0];
+    for (let i = 1; i <= len; i += 1) o.push(i === len ? width : (width * pdfMeasure.measureText(str.slice(0, i)).width) / full);
+    return o;
+  } catch (e) { return even(); }
+}
+// The PDF's own text inside a box (fractions of the page as shown). A piece of text is split into words ("WORK:12.5" is the label
+// "WORK:" and "12.5"; also after "=", "#" and "-": "TOTAL=12.5", "WO#SSANGP", "ORDER-SSANGP"), and a word is kept whole when its middle is inside the box, so a box edge in the gap after a label never cuts
+// off a value's first digit. Letters are placed along the text's own direction (text printed turned on a turned page), and
+// convertToViewportPoint takes care of turned pages and the PDF's upside-down y axis. styles: getTextContent's fonts, for measuring.
+function pdfTextInBox(page, items, r, styles) {
+  const vp = page.getViewport({ scale: 1 });
+  const keep = [];
+  (items || []).forEach((it) => {
+    if (!it || typeof it.str !== 'string' || !it.str.trim() || !it.transform) return;
+    const t = it.transform;
+    const str = it.str;
+    const w = it.width || 0;
+    const sx = Math.sqrt(t[0] * t[0] + t[1] * t[1]);
+    const sy = Math.sqrt(t[2] * t[2] + t[3] * t[3]);
+    const ux = sx ? t[0] / sx : 1;   // along the text
+    const uy = sx ? t[1] / sx : 0;
+    const vx = sy ? t[2] / sy : -uy; // up the letters
+    const vy = sy ? t[3] / sy : ux;
+    const fh = sy || it.height || 0;
+    const style = styles && it.fontName ? styles[it.fontName] : null;
+    const off = pdfLetterOffsets(str, w, style && style.fontFamily);
+    const inside = (d) => {
+      const p = vp.convertToViewportPoint(t[4] + ux * d + vx * fh / 3, t[5] + uy * d + vy * fh / 3);
+      const fx = p[0] / vp.width;
+      const fy = p[1] / vp.height;
+      return fx >= r.x && fx <= r.x + r.w && fy >= r.y && fy <= r.y + r.h;
+    };
+    let a = -1;
+    let b = -1;
+    const re = /[^\s:=#\-]+[:=#\-]?|[:=#\-]/g;
+    let m;
+    while ((m = re.exec(str))) {
+      const s0 = m.index;
+      const s1 = s0 + m[0].length;
+      if (inside((off[s0] + off[s1]) / 2)) { if (a < 0) a = s0; b = s1; }
+    }
+    if (a < 0) return;
+    // The kept part in the text's own frame (x along it, y up its letters), so pdfLinesOf puts turned text in lines as it reads
+    const ox = t[4] + ux * off[a];
+    const oy = t[5] + uy * off[a];
+    const side = t[0] * t[3] - t[1] * t[2] < 0 ? -1 : 1; // y at right angles to the text, also for slanted (oblique) letters
+    keep.push({ str: str.slice(a, b), transform: [1, 0, 0, 1, ox * ux + oy * uy, (oy * ux - ox * uy) * side], width: off[b] - off[a] });
+  });
+  return pdfLinesOf(keep);
+}
+
+// The part of a page inside a box, with a little room around it and a white border, enlarged when the print is small
+function cropCanvas(src, r) {
+  const padX = r.w * 0.03 + 0.004;
+  const padY = r.h * 0.1 + 0.004;
+  const x0 = Math.max(0, Math.floor((r.x - padX) * src.width));
+  const y0 = Math.max(0, Math.floor((r.y - padY) * src.height));
+  const x1 = Math.min(src.width, Math.ceil((r.x + r.w + padX) * src.width));
+  const y1 = Math.min(src.height, Math.ceil((r.y + r.h + padY) * src.height));
+  const w = Math.max(1, x1 - x0);
+  const h = Math.max(1, y1 - y0);
+  const k = h < 80 ? Math.min(2.5, 80 / h) : 1;
+  const border = 12;
+  const out = document.createElement('canvas');
+  out.width = Math.round(w * k) + border * 2;
+  out.height = Math.round(h * k) + border * 2;
+  const c = out.getContext('2d');
+  c.fillStyle = '#FFFFFF';
+  c.fillRect(0, 0, out.width, out.height);
+  c.drawImage(src, x0, y0, w, h, border, border, Math.round(w * k), Math.round(h * k));
+  return out;
+}
+
+// Reads one cut-out box as a block of text (a form cell often prints its label above the value, so a box is never read as a single
+// line by its shape); a box that gives nothing as a block is tried once as one line. A box that cannot be read upright (a photo taken
+// on its side) is turned a quarter each way, and a turned reading is only taken when it is clearly better: comparing the number of
+// letters would trade a clean "4" for a longer misreading of the box on its side.
+const ocrAreaOnce = async (canvas, mode, stop) => {
+  const res = await ocrRecognize(canvas, { tessedit_pageseg_mode: mode }, { text: true, blocks: false, hocr: false, tsv: false }, 60000, 'Reading this area took too long.', stop);
+  const data = (res && res.data) || {};
+  const text = String(data.text || '').trim();
+  return { text, conf: Number(data.confidence) || 0, chars: text.replace(/[^A-Za-z0-9]/g, '').length };
+};
+async function ocrArea(canvas, stop) {
+  const upright = async (c) => {
+    const r = await ocrAreaOnce(c, '6', stop);
+    if (r.chars || (stop && stop())) return r;
+    return ocrAreaOnce(c, '7', stop);
+  };
+  const best = await upright(canvas);
+  if (best.conf >= 40 && best.chars) return best;
+  let turned = null;
+  for (let q = 1; q <= 3; q += 2) {
+    if (stop && stop()) break;
+    let r = null;
+    try { r = await ocrAreaOnce(rotateCanvas(canvas, q), '6', stop); } catch (e) { break; } // a turn that fails or runs out of time: the next would too
+    if (r && r.chars && (!turned || r.conf > turned.conf)) turned = r;
+  }
+  return turned && turned.conf >= 60 && (!best.chars || turned.conf >= best.conf + 15) ? turned : best;
+}
+
+// Reads only the boxes of a layout. ctx: { stop() true to give up, ocr() before the picture reader is used }.
+// Resolves { read: { field: { text, page, how ('text' | 'picture'), conf } }, off: [fields drawn on a page of another shape],
+// missing: [fields whose page the paperwork does not have], unread: [fields not read because the picture reader could not be loaded] }
+async function readSheetAreas(files, layout, ctx) {
+  const boxes = layoutBoxes(layout);
+  const out = { read: {}, off: [], missing: [], unread: [] };
+  if (!boxes.length) return out;
+  const last = Math.max.apply(null, boxes.map(x => x.box.page));
+  const pages = await sheetPageList(files, last);
+  let blocked = null;
+  for (let p = 1; p <= last; p += 1) {
+    const here = boxes.filter(x => x.box.page === p);
+    if (!here.length) continue;
+    if (ctx.stop()) return out;
+    const ref = pages[p - 1];
+    if (!ref) { here.forEach(x => out.missing.push(x.field)); continue; }
+    let doc = null;
+    let page = null;
+    let big = null;   // the page as a picture, made once and only when a box has to be read as a picture
+    try {
+      let aspect = 0;
+      let items = null;
+      let styles = null;
+      if (ref.pdf) {
+        doc = await openPdf(ref.file);
+        page = await doc.getPage(ref.n);
+        const vp = page.getViewport({ scale: 1 });
+        aspect = vp.width / vp.height;
+        try { const tc = await page.getTextContent(); items = tc.items; styles = tc.styles; } catch (e) { items = null; }
+      }
+      for (let i = 0; i < here.length; i += 1) {
+        if (ctx.stop()) return out;
+        const x = here[i];
+        let text = items ? pdfTextInBox(page, items, x.box, styles) : '';
+        let how = 'text';
+        let conf = 100;
+        if (text.replace(/[^A-Za-z0-9]/g, '').length < 1) {
+          // a scanned page or a picture: the box is cut out and read (a PDF's own "4" in an hours box is used as it is)
+          if (blocked) { out.unread.push(x.field); continue; }
+          try {
+            ctx.ocr();
+            if (!big) big = ref.pdf ? await renderPdfPage(page, SHEET_READ_SIDE) : await pictureCanvas(ref.file, SHEET_READ_SIDE);
+            if (!aspect) aspect = big.width / big.height;
+            const got = await ocrArea(cropCanvas(big, x.box), ctx.stop);
+            text = got.text;
+            conf = got.conf;
+            how = 'picture';
+          } catch (e) {
+            if (ctx.stop()) return out;
+            if (e && e.reader) { blocked = e; out.unread.push(x.field); continue; }
+            throw e;
+          }
+        }
+        if (aspect && x.box.aspect > 0 && Math.abs(aspect / x.box.aspect - 1) > 0.06) out.off.push(x.field);
+        out.read[x.field] = { text, page: p, how, conf };
+      }
+    } finally {
+      if (big) { big.width = 0; big.height = 0; }
+      if (page && page.cleanup) { try { page.cleanup(); } catch (e) { /* freed later */ } }
+      if (doc) { try { doc.destroy(); } catch (e) { /* already closed */ } }
+    }
+  }
+  if (blocked && !Object.keys(out.read).length) throw blocked; // nothing could be read at all: say why
+  return out;
+}
+
+// What each box says, as suggestions. The box is the label, so a code-shaped word in the order box counts as labeled, a lone number
+// in the hours box is hours, and a date in the date box is the date. Filled in by itself only when the box gives exactly one answer
+// (an order only when it is exactly in the SAP list); initials are never filled in.
+// Resolves { orders: [{ code, kind, from, score, area }], dates, hours, initials, auto: { code, date, hours }, had: { field: true } }
+async function areaSuggestions(read, store, memo, ctx) {
+  const out = { orders: [], dates: [], hours: [], initials: [], auto: {}, had: {}, failed: 0 };
+  const code = read.code ? read.code.text : '';
+  if (code) {
+    const tokens = [];
+    const add = (raw) => {
+      const token = raw.toUpperCase();
+      if (token.length < 4 || token.length > 24 || SHEET_WORDS.test(token) || tokens.some(t => t.token === token)) return;
+      if (/^\d+$/.test(token) && token.length < 6) return;
+      if (!/\d/.test(token) && raw !== raw.toUpperCase()) return; // a word in small letters ("Order", "number") is the label
+      tokens.push({ token, score: Math.max(1, 6 - tokens.length), labeled: true });
+    };
+    sheetLines(code).forEach((line) => {
+      const re = /[A-Za-z0-9][A-Za-z0-9_\-]{2,22}[A-Za-z0-9]/g;
+      let m;
+      while ((m = re.exec(line))) add(m[0]);
+      // "SSAN GP" read with a space: the line without its label, joined up
+      const value = line.replace(/^[^:]*:/, '').trim();
+      const joined = value.replace(/[^A-Za-z0-9_\-]/g, '');
+      if (/\s/.test(value) && joined.length >= 5 && joined.length <= 24 && /[A-Za-z]/.test(joined)) add(joined.toUpperCase());
+    });
+    if (tokens.length) {
+      out.had.code = true;
+      let checked;
+      try { checked = await checkSheetOrders(store, tokens, memo); } catch (e) { checked = []; checked.failed = 1; }
+      out.failed = checked.failed || 0;
+      out.orders = checked.map(h => ({ ...h, area: true }));
+      const exact = out.orders.filter(o => o.kind === 'exact');
+      // Nothing in the box is in the SAP list: what was read is still shown, to check against the paperwork
+      if (!out.orders.length) tokens.slice(0, 3).forEach(t => out.orders.push({ code: t.token, kind: 'unchecked', from: t.token, score: t.score, area: true }));
+      if (exact.length === 1) out.auto.code = exact[0].code;
+    }
+  }
+  if (read.date && read.date.text) {
+    const seen = {};
+    sheetLines(read.date.text).forEach((line) => {
+      sheetDatesIn(line, ctx).forEach((d) => {
+        if (seen[d.iso]) return;
+        seen[d.iso] = true;
+        out.dates.push({ iso: d.iso, words: sheetDateWords(d.iso), score: d.alt ? 9 : d.weak ? 8 : 10, amb: d.amb, alt: d.alt, weak: d.weak, pair: d.pair, area: true });
+      });
+    });
+    if (out.dates.length) out.had.date = true;
+    const firsts = out.dates.filter(d => !d.alt && !(d.weak));
+    if (firsts.length === 1) out.auto.date = firsts[0].iso;
+  }
+  if (read.hours && read.hours.text) {
+    const vals = [];
+    sheetLines(read.hours.text).forEach((line) => {
+      let got = sheetHoursIn(line).filter(h => h.score >= 2).map(h => h.value);
+      // a lone number is hours, unless the line says they are planned ("Planned 4.0 H")
+      if (!got.length && !/plan|estimat|target|budget|standard|expected|forecast|required|scheduled|remaining/i.test(line)) {
+        // ".75" is three quarters of an hour, not 75: a point that starts the number (not after a letter, a digit or another point, so
+        // not the dot of "Hrs.4" or of a dotted leader "Hours.....4"; "__.5__" and "|.5" are 0.5, and "O.5" is read for 0.5); "1/2" is not 1 hour
+        const ln = line.replace(/(^|[^A-Za-z])[Oo](?=[.,]\d)/g, (m, p) => `${p}0`).replace(/\.(?:\s*\.){2,}(?=\d)/g, ' '); // a dotted leader, spaced or not
+        const lead = /(^|[^A-Za-z0-9.,])([.,]\d)|\d/.exec(ln);
+        const at = lead ? lead.index + (lead[2] ? lead[1].length : 0) : -1;
+        const rest = at >= 0 ? ln.slice(at) : '';
+        const h = at >= 0 && !/^\d+\s*\/\s*\d/.test(rest) ? sheetHoursAfter(/^[.,]/.test(rest) ? `0.${rest.slice(1)}` : rest, 'hours worked') : null;
+        if (h && h.value > 0 && h.value <= 200) got = [h.value];
+      }
+      got.forEach((v) => { if (vals.indexOf(v) < 0) vals.push(v); });
+    });
+    out.hours = vals.map(v => ({ value: v, score: 10, labeled: true, area: true }));
+    if (vals.length) out.had.hours = true;
+    // A picture read can drop the point (2.5 read as 25, .75 as 75): more than 24 hours read from a picture is offered, not filled in
+    if (vals.length === 1 && !(read.hours.how === 'picture' && vals[0] > 24)) out.auto.hours = vals[0];
+  }
+  if (read.initials && read.initials.text) {
+    const seen = {};
+    const keep = (value, who) => { if (value && !seen[value] && INITIALS_RE.test(value)) { seen[value] = true; out.initials.push({ value, who: who || '', area: true }); } };
+    sheetLines(read.initials.text).forEach((line) => {
+      sheetInitialsIn(line).forEach(x => keep(normalizeInitials(x.value), x.who));
+      const bare = line.replace(/^.*?\b(?:initials?|by|signed|signature)\b\s*[:\-]?\s*/i, '').trim();
+      if (bare.length <= 14) keep(normalizeInitials(bare), '');
+    });
+    if (out.initials.length) out.had.initials = true;
+  }
+  return out;
+}
+
+// The panel's suggestions with what the boxes found first. A field a box found something for is decided by the box (filled in only
+// when the box gives one answer); a field no box found anything for keeps what the whole sheet says.
+function mergeAreaView(view, area) {
+  const firstBy = (list, more, same) => list.concat(more.filter(x => !list.some(a => same(a, x))));
+  const auto = { ...view.auto };
+  ['code', 'date', 'hours'].forEach((k) => {
+    if (area.auto[k] !== undefined) auto[k] = area.auto[k];
+    else if (area.had[k]) { delete auto[k]; if (k === 'hours') auto.hoursOffered = true; } // the box offers hours but fills none in
+  });
+  const orders = firstBy(area.orders, view.orders, (a, b) => a.code === b.code);
+  const dates = firstBy(area.dates, view.dates, (a, b) => a.iso === b.iso);
+  const hours = firstBy(area.hours, view.hours, (a, b) => a.value === b.value);
+  const initials = firstBy(area.initials, view.initials, (a, b) => a.value === b.value);
+  return {
+    ...view,
+    orders, dates: dates.slice(0, 6), hours: hours.slice(0, 7), initials: initials.slice(0, 5), auto,
+    hoursSum: area.had.hours ? null : view.hoursSum,
+    empty: !orders.length && !dates.length && !hours.length && !(area.had.hours ? null : view.hoursSum) && !initials.length,
+  };
+}
 // ===== END SHEET READER =====
+
+// --- RUNS: the next free run number of an order for a day ---
+// base1, base2 ... the first that is not the code itself, not an order of its own in the SAP list, has none of this equipment logged
+// that day, and is not another row of the form for that day with this equipment (onForm() is read again after the lookups, so a row
+// that took the number meanwhile is seen). Resolves '' when base1 to base9 are all taken.
+async function nextRunNumber(store, api, run) {
+  const taken = (next) => (run.onForm ? run.onForm() : []).some(r => r && r.code === next && r.date === run.day && r.ids.some(id => run.ids.indexOf(id) >= 0));
+  for (let n = 1; n <= 9; n += 1) {
+    const next = `${run.base}${n}`;
+    if (next === run.from || taken(next)) continue;
+    if ((await store.loadOrderRows(next)).rows.length) continue; // an order of its own (SSANGP2 in the SAP list), not a copy
+    const logged = await fetchDupes(api, next, run.day);
+    if (run.ids.some(id => logged.has(id)) || taken(next)) continue;
+    return next;
+  }
+  return '';
+}
 
 // --- STYLES ---
 const DISABLED = { backgroundColor: '#F0F0F0', color: '#A0A0A0', border: '1px solid #E0E0E0' };
@@ -2773,7 +3238,8 @@ const useSuggest = (store, col, text, ctxRoom) => {
 };
 
 // Status chip of an order line: [text, style key]
-const lineStatus = (l, dupe) => {
+const lineStatus = (l, dupe, miss) => {
+  if (miss) return [`missed (${miss})`, 'bad'];
   if (dupe) return ['already logged', 'warn'];
   if (l.splitting) return ['add pieces', 'warn'];
   if (l.parent) return [`piece ${l.piece} of ${l.pieceCount}`, 'info'];
@@ -2800,8 +3266,10 @@ const SheetPanel = ({ sheet, values, disabled, onPick, onStop, onRead, onHide })
   const status = sheet.status === 'loading' ? 'Getting the reader ready (about 7 MB the first time, kept after that)…'
     : sheet.status === 'reading' ? `Reading ${sheet.file || 'the paperwork'}${sheet.pageTotal > 1 ? `, page ${sheet.page} of ${sheet.pageTotal}` : ''}…`
     : sheet.status === 'stopped' ? 'Stopped.'
-    : sheet.status === 'done' ? `Read ${plural(sheet.pages || 0, 'page', 'pages')}${sheet.cut ? ` (only the first ${SHEET_READ_PAGES} pages are read; all of them are attached)` : ''}.`
+    : sheet.status === 'done' ? `${sheet.areas && !sheet.areas.error ? `Read the ${sheet.areas.name} areas${sheet.pages ? ` and ${plural(sheet.pages, 'page', 'pages')} of the whole sheet for the rest` : ''}` : `Read ${plural(sheet.pages || 0, 'page', 'pages')}`}${sheet.cut ? ` (only the first ${SHEET_READ_PAGES} pages are read; all of them are attached)` : ''}.`
     : '';
+  const areaTip = (x, kind, tip) => (x.area ? `Read from the ${areaLabel(kind)} area. ${tip}` : tip);
+  const areas = sheet.areas;
   const ambiguous = !!view && view.dates.some(d => d.amb);
   return (
     <div className={styles.sheetBox} role="region" aria-label="Details read from the paperwork">
@@ -2816,31 +3284,324 @@ const SheetPanel = ({ sheet, values, disabled, onPick, onStop, onRead, onHide })
           {sheet.status === 'unavailable' ? `Could not read the sheet: ${sheet.msg}.` : `Could not read the sheet: ${sheet.msg}. The paperwork is still attached.`}
         </Text>
       )}
+      {sheet.applied && sheet.applied.hoursCleared && (
+        <Text className={styles.warnText} block style={{ marginTop: 2 }}>The hours an earlier reading filled in were cleared: the Hours area reads something else. Pick the right hours below or type them.</Text>
+      )}
       {sheet.applied && sheet.applied.length > 0 && (
         <Text size={200} block style={{ color: '#0A6A33', fontWeight: 700, marginTop: 4 }}>Filled in from the sheet: {sheet.applied.join(', ')}. Please check {sheet.applied.length === 1 ? 'it' : 'them'} against the paperwork.</Text>
       )}
+      {areas && areas.read.length > 0 && (
+        <Text className={styles.hint} block style={{ marginTop: 2 }} data-areas-read="">
+          Areas ({areas.name}): {areas.read.map(r => `${areaLabel(r.field)} “${r.text === null ? 'not read' : shortText(r.text, 40) || 'empty'}”`).join(' · ')}
+        </Text>
+      )}
+      {sheet.rest && <Text className={styles.warnText} block style={{ marginTop: 2 }}>The rest of the sheet could not be read ({sheet.rest}); what the areas found is shown.</Text>}
+      {areas && areas.error && <Text className={styles.warnText} block style={{ marginTop: 2 }}>The {areas.name} areas could not be read ({areas.error}), so the whole sheet was read.</Text>}
+      {areas && areas.off.length > 0 && <Text className={styles.warnText} block style={{ marginTop: 2 }}>This page has another shape than the one the {areas.off.map(areaLabel).join(', ')} {areas.off.length === 1 ? 'area was' : 'areas were'} drawn on: check {areas.off.length === 1 ? 'it still fits' : 'they still fit'} with Set reading areas.</Text>}
+      {areas && areas.missing.length > 0 && <Text className={styles.warnText} block style={{ marginTop: 2 }}>The paperwork has fewer pages than the {areas.missing.map(areaLabel).join(', ')} {areas.missing.length === 1 ? 'area needs' : 'areas need'}.</Text>}
+      {areas && areas.unread && areas.unread.length > 0 && <Text className={styles.warnText} block style={{ marginTop: 2 }}>The {areas.unread.map(areaLabel).join(', ')} {areas.unread.length === 1 ? 'area' : 'areas'} could not be read because the picture reader could not be loaded (the network may block it).</Text>}
       {sheet.checkFailed ? <Text className={styles.hint} block style={{ marginTop: 2 }}>The SAP list could not be checked for some order numbers, so they are not marked.</Text> : null}
       {sheet.unread ? <Text className={styles.warnText} block style={{ marginTop: 2 }}>{plural(sheet.unread, 'page', 'pages')} of scanned paper could not be read because the picture reader could not be loaded (the network may block it). The pages with text were read, and everything is attached.</Text> : null}
+      {sheet.slow ? <Text className={styles.warnText} block style={{ marginTop: 2 }}>{plural(sheet.slow, 'page', 'pages')} of scanned paper could not be read (reading took too long); the rest was read, and everything is attached.</Text> : null}
       {view && view.orders.length > 0 && (
-        <div className={styles.sheetRow}><span className={styles.sheetLabel}>SAP order</span>{view.orders.map(o => chip('code', o.code, orderText(o), values.code === o.code, orderTip(o)))}</div>
+        <div className={styles.sheetRow}><span className={styles.sheetLabel}>SAP order</span>{view.orders.map(o => chip('code', o.code, orderText(o), values.code === o.code || (!!values.base && values.base === o.code), values.base === o.code ? areaTip(o, 'code', `${values.code} is a numbered copy of ${o.code}: it uses ${o.code}'s equipment and is saved as ${values.code}. To save it as ${o.code}, remove the number at the end of the order.`) : areaTip(o, 'code', orderTip(o))))}</div>
       )}
       {view && view.dates.length > 0 && (
-        <div className={styles.sheetRow}><span className={styles.sheetLabel}>Date</span>{view.dates.map(d => chip('date', d.iso, d.words, values.date === d.iso, d.amb ? 'A date like 10/07 can be read two ways; both are listed' : 'Date found on the sheet'))}</div>
+        <div className={styles.sheetRow}><span className={styles.sheetLabel}>Date</span>{view.dates.map(d => chip('date', d.iso, d.words, values.date === d.iso, areaTip(d, 'date', d.amb ? 'A date like 10/07 can be read two ways; both are listed' : 'Date found on the sheet')))}</div>
       )}
       {ambiguous && <Text className={styles.hint} block style={{ marginLeft: 76 }}>A date such as 10/07/2026 is read month first (Oct 7); with dots (10.07.2026) day first. The other reading is listed too.</Text>}
       {view && (view.hours.length > 0 || view.hoursSum) && (
         <div className={styles.sheetRow}><span className={styles.sheetLabel}>Hours</span>
           {view.hoursSum && chip('hours', view.hoursSum.value, `${view.hoursSum.value} h (adds up ${view.hoursSum.lines} lines)`, values.hours === view.hoursSum.value, 'The hours of the "actual work" lines on the sheet, added together')}
-          {view.hours.map(h => chip('hours', h.value, `${h.value} h`, values.hours === h.value, h.labeled ? 'Hours next to an actual work label' : 'A number of hours found on the sheet'))}
+          {view.hours.map(h => chip('hours', h.value, `${h.value} h`, values.hours === h.value, areaTip(h, 'hours', h.labeled ? 'Hours next to an actual work label' : 'A number of hours found on the sheet')))}
         </div>
       )}
       {view && view.initials.length > 0 && (
-        <div className={styles.sheetRow}><span className={styles.sheetLabel}>Initials</span>{view.initials.map(x => chip('initials', x.value, x.who ? `${x.value} (${x.who})` : x.value, values.initials === x.value, 'Initials found next to a name or signature line'))}</div>
+        <div className={styles.sheetRow}><span className={styles.sheetLabel}>Initials</span>{view.initials.map(x => chip('initials', x.value, x.who ? `${x.value} (${x.who})` : x.value, values.initials === x.value, areaTip(x, 'initials', 'Initials found next to a name or signature line')))}</div>
       )}
       {view && view.empty && sheet.status === 'done' && (
         <Text className={styles.hint} block style={{ marginTop: 4 }}>Nothing that looks like an order, date or hours was found. Handwriting cannot be read, and a clear, straight, well-lit picture of printed text works best. The paperwork is still attached.</Text>
       )}
     </div>
+  );
+};
+
+// --- SET READING AREAS: a box is drawn on a page of the paperwork for each field; the boxes are kept in this browser as a layout ---
+const AREA_VIEW_SIDE = 1400; // px, long side of the page shown for drawing
+const lowerText = (t) => { const w = String(t || '').replace(/\.$/, ''); return `${w.charAt(0).toLowerCase()}${w.slice(1)}`; };
+const shortText = (t, n) => { const s = String(t || '').replace(/\s+/g, ' ').trim(); return s.length > n ? `${s.slice(0, n - 1)}…` : s; };
+const SheetAreasDialog = ({ files, startId, store, dates, onClose, onSaved }) => {
+  const styles = useStyles();
+  const saved = useSheetLayouts();
+  const first = saved.layouts.find(l => l.id === startId) || null;
+  const [pages, setPages] = useState({ status: 'loading', list: [] });
+  const [at, setAt] = useState(0);
+  const [img, setImg] = useState({ status: 'loading' });
+  const [editId, setEditId] = useState(first ? first.id : '');
+  const [name, setName] = useState(first ? first.name : (saved.layouts.length ? `Sheet layout ${saved.layouts.length + 1}` : 'SAP order sheet'));
+  const [fields, setFields] = useState(first ? { ...first.fields } : {});
+  const [active, setActive] = useState('code');
+  const [drag, setDrag] = useState(null);
+  const [trial, setTrial] = useState(null);
+  const [msg, setMsg] = useState('');
+  const [zoom, setZoom] = useState(false); // the page at full size (scrolls), for small print
+  const [moving, setMoving] = useState(false); // a finger moves the page instead of drawing (phones and tablets)
+  const imgCache = useRef(new Map());
+  const surface = useRef(null);
+  const pan = useRef(null); // { id, x, y, left, top } while the page is dragged with a mouse in Move mode
+  const trialSeq = useRef(0);
+  const memo = useRef(new Map());
+  useEffect(() => () => { trialSeq.current += 1; }, []);
+
+  useEffect(() => {
+    let live = true;
+    sheetPageList(files, SHEET_READ_PAGES)
+      .then((list) => { if (live) setPages({ status: list.length ? 'ready' : 'error', list, error: list.length ? '' : 'the paperwork has no pages' }); })
+      .catch((e) => { if (live) setPages({ status: 'error', list: [], error: lowerText(errText(e)) }); });
+    return () => { live = false; };
+  }, [files]);
+
+  useEffect(() => {
+    if (pages.status !== 'ready' || !pages.list[at]) return undefined;
+    const kept = imgCache.current.get(at);
+    if (kept) { setImg(kept); return undefined; }
+    let live = true;
+    setImg({ status: 'loading' });
+    (async () => {
+      const ref = pages.list[at];
+      let doc = null;
+      let canvas = null;
+      try {
+        if (ref.pdf) { doc = await openPdf(ref.file); canvas = await renderPdfPage(await doc.getPage(ref.n), AREA_VIEW_SIDE); }
+        else canvas = await pictureCanvas(ref.file, AREA_VIEW_SIDE);
+        const v = { status: 'ready', url: canvas.toDataURL('image/jpeg', 0.85), aspect: canvas.width / canvas.height };
+        imgCache.current.set(at, v);
+        if (live) setImg(v);
+      } catch (e) {
+        if (live) setImg({ status: 'error', error: lowerText(errText(e)) });
+      } finally {
+        if (canvas) { canvas.width = 0; canvas.height = 0; }
+        if (doc) { try { doc.destroy(); } catch (e) { /* already closed */ } }
+      }
+    })();
+    return () => { live = false; };
+  }, [pages, at]);
+
+  const pick = (id) => {
+    const l = saved.layouts.find(x => x.id === id) || null;
+    setEditId(l ? l.id : '');
+    setName(l ? l.name : `Sheet layout ${saved.layouts.length + 1}`);
+    setFields(l ? { ...l.fields } : {});
+    setActive('code');
+    trialSeq.current += 1; // a reading of the boxes still running was for the other layout
+    setTrial(null);
+    setMsg('');
+  };
+  // Where the pointer is, as fractions of the page shown
+  const frac = (e) => {
+    const r = surface.current.getBoundingClientRect();
+    return { x: Math.min(1, Math.max(0, (e.clientX - r.left) / (r.width || 1))), y: Math.min(1, Math.max(0, (e.clientY - r.top) / (r.height || 1))) };
+  };
+  // One box is drawn by one pointer: a second finger does not start another box
+  const down = (e) => {
+    if (moving) {
+      // a finger moves the page by itself (touch-action); a mouse drags it here
+      if (e.pointerType === 'mouse' && e.button === 0 && surface.current && surface.current.parentElement) {
+        const sc = surface.current.parentElement;
+        pan.current = { id: e.pointerId, x: e.clientX, y: e.clientY, left: sc.scrollLeft, top: sc.scrollTop };
+        try { e.currentTarget.setPointerCapture(e.pointerId); } catch (err) { /* still moves inside the page */ }
+        e.preventDefault();
+      }
+      return;
+    }
+    if (drag || img.status !== 'ready' || (e.button !== undefined && e.button > 0)) return;
+    e.preventDefault();
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch (err) { /* drawing still works inside the page */ }
+    const p = frac(e);
+    setDrag({ id: e.pointerId, x0: p.x, y0: p.y, x1: p.x, y1: p.y });
+  };
+  const mine = (e) => !!drag && (drag.id === undefined || e.pointerId === undefined || e.pointerId === drag.id);
+  const move = (e) => {
+    const pn = pan.current;
+    if (pn && e.pointerId === pn.id) {
+      if (e.buttons !== undefined && !(e.buttons & 1)) { pan.current = null; return; } // the release was lost (a menu or another window)
+      const sc = surface.current && surface.current.parentElement;
+      if (sc) { sc.scrollLeft = pn.left - (e.clientX - pn.x); sc.scrollTop = pn.top - (e.clientY - pn.y); }
+      return;
+    }
+    if (!mine(e)) return;
+    const p = frac(e);
+    setDrag(d => (d ? { ...d, x1: p.x, y1: p.y } : d));
+  };
+  const up = (e) => {
+    if (pan.current && e.pointerId === pan.current.id) { pan.current = null; return; }
+    if (!mine(e)) return;
+    const p = frac(e);
+    setDrag(null);
+    const r4 = (v) => Math.round(v * 10000) / 10000;
+    const box = { page: at + 1, x: r4(Math.min(drag.x0, p.x)), y: r4(Math.min(drag.y0, p.y)), w: r4(Math.abs(p.x - drag.x0)), h: r4(Math.abs(p.y - drag.y0)), aspect: r4(img.aspect) };
+    if (box.w < 0.01 || box.h < 0.006) { setMsg('Press and drag across the part of the page to draw a box.'); return; }
+    setFields(f => ({ ...f, [active]: box }));
+    trialSeq.current += 1; // a reading still running was for the box as it was
+    setTrial(null);
+    setMsg('');
+    const next = AREA_FIELDS.find(f => f.key !== active && !isAreaBox(fields[f.key]));
+    if (next) setActive(next.key);
+  };
+  const clearBox = () => { setFields(f => { const x = { ...f }; delete x[active]; return x; }); trialSeq.current += 1; setTrial(null); };
+  const draft = () => { const boxes = {}; AREA_FIELDS.forEach((f) => { if (isAreaBox(fields[f.key])) boxes[f.key] = fields[f.key]; }); return boxes; };
+  const boxCount = Object.keys(draft()).length;
+
+  const save = () => {
+    const nm = name.trim().slice(0, 60);
+    if (!nm) { setMsg('Give the layout a name, for example SAP order sheet.'); return; }
+    const boxes = draft();
+    if (!Object.keys(boxes).length) { setMsg('Draw at least one box first.'); return; }
+    const cur = readSheetLayouts();
+    if (cur.layouts.some(l => l.id !== editId && l.name.trim().toLowerCase() === nm.toLowerCase())) { setMsg(`There is already a layout called ${nm}. Pick it above to change it, or use another name.`); return; }
+    const id = editId || `L${Date.now().toString(36)}${Math.floor(Math.random() * 1296).toString(36)}`;
+    const layout = { id, name: nm, fields: boxes, updated: new Date().toISOString() };
+    const list = cur.layouts.slice();
+    const i = list.findIndex(l => l.id === id);
+    if (i >= 0) list[i] = layout; else list.push(layout);
+    const kept = writeSheetLayouts({ last: id, layouts: list });
+    onSaved(id, kept);
+  };
+  const remove = () => {
+    if (!editId || !window.confirm(`Delete the reading areas "${name}"? Rows that use them read the whole sheet again.`)) return;
+    const cur = readSheetLayouts();
+    writeSheetLayouts({ last: cur.last === editId ? '' : cur.last, layouts: cur.layouts.filter(l => l.id !== editId) });
+    onClose();
+  };
+  // Reads the boxes as drawn (not saved yet) and shows what each one gives, so a box can be moved until it reads right
+  const tryAreas = async () => {
+    const n = ++trialSeq.current;
+    const stale = () => n !== trialSeq.current;
+    setTrial({ status: 'reading' });
+    try {
+      const got = await readSheetAreas(files, { id: 'draft', name, fields: draft() }, { stop: stale, ocr: () => {} });
+      if (stale()) return;
+      const sug = await areaSuggestions(got.read, store, memo.current, dates);
+      if (stale()) return;
+      setTrial({ status: 'done', got, sug });
+    } catch (e) { if (!stale()) setTrial({ status: 'error', error: lowerText(errText(e)) }); }
+  };
+  const gives = (k, sug) => {
+    if (k === 'code') {
+      if (sug.auto.code) return `${sug.auto.code} (in the SAP list, filled in)`;
+      if (!sug.orders.length) return 'no order number';
+      return `${sug.orders.map(o => (o.kind === 'exact' ? o.code : o.kind === 'close' ? `${o.code}?` : `${o.code} (not in the SAP list)`)).join(', ')}: offered, not filled in`;
+    }
+    if (k === 'date') return sug.auto.date ? `${sheetDateWords(sug.auto.date)} (filled in)` : sug.dates.length ? `${sug.dates.map(d => d.words).join(', ')}: offered` : 'no date in range';
+    if (k === 'hours') return sug.auto.hours !== undefined ? `${sug.auto.hours} h (filled in)` : sug.hours.length ? `${sug.hours.map(h => `${h.value} h`).join(', ')}: offered` : 'no hours';
+    return sug.initials.length ? `${sug.initials.map(x => x.value).join(', ')}: offered (initials are never filled in)` : 'no initials';
+  };
+
+  const rect = (b) => ({ position: 'absolute', left: `${b.x * 100}%`, top: `${b.y * 100}%`, width: `${b.w * 100}%`, height: `${b.h * 100}%`, boxSizing: 'border-box', pointerEvents: 'none' });
+  const activeField = AREA_FIELDS.find(f => f.key === active) || AREA_FIELDS[0];
+  const pageCount = pages.list.length;
+  const onOpenChange = (e, d) => { if (!d.open && d.type !== 'backdropClick') onClose(); };
+  return (
+    <Dialog open onOpenChange={onOpenChange}>
+      <DialogSurface style={{ width: '1040px', maxWidth: '96vw' }} aria-label="Set reading areas">
+        <DialogBody>
+          <DialogTitle>Set reading areas</DialogTitle>
+          <DialogContent>
+            <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'flex-start' }}>
+              <div style={{ flex: '1 1 480px', minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, flexWrap: 'wrap' }}>
+                  <Button size="small" disabledFocusable={at <= 0} onClick={() => setAt(a => a - 1)}>Previous page</Button>
+                  <Text size={200}>{pageCount ? `Page ${at + 1} of ${pageCount}` : 'Opening the paperwork…'}</Text>
+                  <Button size="small" disabledFocusable={at >= pageCount - 1} onClick={() => setAt(a => a + 1)}>Next page</Button>
+                  <Button size="small" appearance="subtle" aria-pressed={zoom} disabledFocusable={img.status !== 'ready'} onClick={() => setZoom(z => !z)}>{zoom ? 'Fit the page' : 'Zoom in'}</Button>
+                  <Button size="small" appearance="subtle" data-areas-move="" disabledFocusable={img.status !== 'ready'} onClick={() => setMoving(m => !m)}
+                    title="On a phone or tablet: Move the page lets a finger scroll the page; Draw boxes lets it draw again">{moving ? 'Draw boxes' : 'Move the page'}</Button>
+                </div>
+                <div style={{ maxHeight: '66vh', overflow: 'auto', backgroundColor: '#F7F9FC', border: `1px solid ${BRAND.line}`, borderRadius: 4, textAlign: 'center' }}>
+                  {(pages.status === 'error' || img.status === 'error') && <Text className={styles.errorText} block role="alert" style={{ padding: 8 }}>Could not show the page: {pages.error || img.error}.</Text>}
+                  {pages.status === 'loading' || (pages.status === 'ready' && img.status === 'loading') ? <Text block style={{ padding: 24 }}>Getting the page ready…</Text> : null}
+                  {img.status === 'ready' && (
+                    <div ref={surface} data-areas-page="" style={{ position: 'relative', display: 'inline-block', lineHeight: 0, touchAction: moving ? 'pan-x pan-y' : 'none', userSelect: 'none', cursor: moving ? 'grab' : 'crosshair' }}
+                      onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={() => { pan.current = null; setDrag(null); }} onLostPointerCapture={() => { pan.current = null; }}>
+                      <img src={img.url} alt={`Page ${at + 1} of the paperwork`} draggable={false} onDragStart={(e) => e.preventDefault()}
+                        style={zoom ? { display: 'block' } : { display: 'block', maxWidth: '100%', maxHeight: '64vh' }} />
+                      {AREA_FIELDS.map((f) => {
+                        const b = fields[f.key];
+                        if (!isAreaBox(b) || b.page !== at + 1) return null;
+                        return (
+                          <div key={f.key} data-area-box={f.key} style={{ ...rect(b), border: `2px solid ${f.color}`, backgroundColor: `${f.color}22` }}>
+                            <span style={{ position: 'absolute', left: 0, top: b.y > 0.03 ? -17 : 0, fontSize: 11, lineHeight: '15px', fontWeight: 700, color: '#FFFFFF', backgroundColor: f.color, padding: '0 4px', borderRadius: 3, whiteSpace: 'nowrap' }}>{f.label}</span>
+                          </div>
+                        );
+                      })}
+                      {drag && <div style={{ ...rect({ x: Math.min(drag.x0, drag.x1), y: Math.min(drag.y0, drag.y1), w: Math.abs(drag.x1 - drag.x0), h: Math.abs(drag.y1 - drag.y0) }), border: `2px dashed ${activeField.color}`, backgroundColor: `${activeField.color}18` }} />}
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div style={{ flex: '0 1 300px', minWidth: 240, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <Text size={200}>Pick a field, then press and drag on the page around where the sheet prints it. Only the boxes are read: the PDF's own text inside a box, or the picture in the box, enlarged and read on its own. Give each box a little room: a phone photo is never in quite the same place.</Text>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }} role="radiogroup" aria-label="Field to draw a box for">
+                  {AREA_FIELDS.map((f) => {
+                    const b = fields[f.key];
+                    const has = isAreaBox(b);
+                    const on = active === f.key;
+                    return (
+                      <Button key={f.key} size="small" role="radio" aria-checked={on} onClick={() => { setActive(f.key); setMoving(false); }}
+                        style={on ? { backgroundColor: f.color, borderColor: f.color, color: '#FFFFFF' } : { borderColor: f.color, color: f.color }}>
+                        {has ? '✓ ' : ''}{f.label}{has && b.page !== at + 1 ? ` (page ${b.page})` : ''}
+                      </Button>
+                    );
+                  })}
+                </div>
+                {moving
+                  ? <Text size={200}>Moving the page: drag it to see the rest. Press <strong>Draw boxes</strong> (or a field) to draw again.</Text>
+                  : <Text size={200}>Drawing: <strong style={{ color: activeField.color }}>{activeField.label}</strong>{isAreaBox(fields[active]) ? ' (drawing again replaces its box)' : ''}</Text>}
+                <div><Button size="small" appearance="subtle" disabledFocusable={!isAreaBox(fields[active])} onClick={clearBox}>Clear the {activeField.label} box</Button></div>
+                <div className={styles.field}>
+                  <Text className={styles.label}>Layout</Text>
+                  <Select size="small" aria-label="Layout to change" value={editId} onChange={(e, d) => pick(d.value)}>
+                    <option value="">New layout</option>
+                    {saved.layouts.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
+                  </Select>
+                </div>
+                <div className={styles.field}>
+                  <Text className={styles.label}>Name</Text>
+                  <Input size="small" aria-label="Layout name" value={name} maxLength={60} onChange={(e, d) => setName(d.value)} />
+                </div>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  <Button size="small" disabledFocusable={!boxCount || (trial && trial.status === 'reading')} onClick={tryAreas}>{trial && trial.status === 'reading' ? 'Reading…' : 'Try the boxes'}</Button>
+                  {editId && <Button size="small" appearance="subtle" onClick={remove}>Delete layout</Button>}
+                </div>
+                <div aria-live="polite">
+                  {msg && <Text className={styles.warnText} block>{msg}</Text>}
+                  {trial && trial.status === 'error' && <Text className={styles.errorText} block>Could not read the boxes: {trial.error}.</Text>}
+                  {trial && trial.status === 'done' && (
+                    <div data-areas-trial="" style={{ fontSize: 12, lineHeight: '17px' }}>
+                      {layoutBoxes({ fields: draft() }).map((x) => {
+                        const r = trial.got.read[x.field];
+                        return (
+                          <div key={x.field} style={{ marginTop: 4 }}>
+                            <strong style={{ color: (AREA_FIELDS.find(f => f.key === x.field) || {}).color }}>{areaLabel(x.field)}</strong>
+                            {r ? <> ({r.how === 'text' ? 'the PDF\'s own text' : 'read from the picture'}): “{shortText(r.text, 60) || 'nothing'}” → {gives(x.field, trial.sug)}</> : trial.got.missing.indexOf(x.field) >= 0 ? `: the paperwork has no page ${x.box.page}` : ': not read (the picture reader could not be loaded)'}
+                            {trial.got.off.indexOf(x.field) >= 0 && <span style={{ color: '#8A5300' }}> · drawn on a page of another shape</span>}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+                <Text className={styles.hint} block>Areas are kept in this browser. Pick them under Paperwork with “Read”, and the next sheets are read the same way.</Text>
+              </div>
+            </div>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={onClose}>Cancel</Button>
+            <Button appearance="primary" className={styles.btnPrimary} disabled={!boxCount} onClick={save}>Save and use these areas</Button>
+          </DialogActions>
+        </DialogBody>
+      </DialogSurface>
+    </Dialog>
   );
 };
 
@@ -2869,9 +3630,19 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   const [stamp, setStamp] = useState({});             // field -> the value that came from the sheet (marked "from the sheet" while it stays)
   const [previewOpen, setPreviewOpen] = useState(false);
   const [sheetHidden, setSheetHidden] = useState(false);
+  // Reading areas: boxes drawn on the sheet so only those parts are read (a layout kept in this browser), or the whole sheet
+  const layoutsState = useSheetLayouts();
+  // null: the areas last used in this browser, also when they are saved in another row later (the row's own pick once it reads a sheet)
+  const [layoutId, setLayoutId] = useState(null);
+  const layout = layoutsState.layouts.find(l => l.id === (layoutId === null ? layoutsState.last : layoutId)) || null;
+  const layoutRef = useRef(layout);
+  layoutRef.current = layout;
+  const [areasOpen, setAreasOpen] = useState(false);
+  const [areasNote, setAreasNote] = useState('');   // the browser would not keep the reading areas (stays while the order changes)
   const previewEntry = useMemo(() => ({ equipment: 'Paperwork to attach', sap: normCode(code), date: dateStr }), [code, dateStr]);
   const previewLocal = useMemo(() => (photo ? { name: `paperwork.${photoMime === 'application/pdf' ? 'pdf' : 'jpg'}`, mime: photoMime, data: photo } : null), [photo, photoMime]);
   const [excluded, setExcluded] = useState({});
+  const [missed, setMissed] = useState({});          // lineKey -> the number written for equipment that was not cleaned (8): dropped, not logged
   const [chosen, setChosen] = useState({});          // lineKey -> equipment picked instead of the automatic one
   const [hoursOverride, setHoursOverride] = useState({}); // lineKey -> hours as typed
   const [editMode, setEditMode] = useState(false);
@@ -2915,10 +3686,19 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   const latest = useRef({});                         // the form values now, for a reading that finishes later
   const retroSeq = useRef({});
   const listRef = useRef(null);
+  const copyFor = useRef('');                        // the order the lines on screen belong to: typing another number at its end keeps them
+  const [runBusy, setRunBusy] = useState(false);     // looking for the next free number for another run today
+  const runFor = useRef(null);                       // { code, from, day }: the run number Another run today gave (SSANGP1 for SSANGP on that day)
+  const [arrowed, setArrowed] = useState(false);    // an order in the suggestion list was picked with the arrow keys, so Enter takes it
 
   const normalizedCode = normCode(code);
   const ready = !!order && order.status === 'ready' && order.code === normalizedCode;
   const matches = useMemo(() => (ready ? order.entries : []), [ready, order]);
+  // The order whose equipment the lines are: itself, or the order a numbered copy copies (SSANGP for SSANGP1)
+  const orderBase = ready && order.base ? order.base : normalizedCode;
+  const isCopy = ready && orderBase !== normalizedCode && matches.length > 0;
+  // A number can be put at the end of the order for another run (not of a plain number such as 4000123456: SAP numbers its own)
+  const canNumber = copyBases(`${orderBase}1`).indexOf(orderBase) >= 0;
   const listId = `sap-list-${index}`;
 
   // Order suggestions: debounced server search, only while the box is open
@@ -2940,7 +3720,15 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     // Reloading the same order (after a Fix tab change) keeps its lines on screen until the new ones arrive
     setOrder(o => (o && o.status === 'ready' && o.code === normalizedCode ? { ...o, refreshing: true } : { status: 'loading', code: normalizedCode, entries: [] }));
     const t = setTimeout(async () => {
-      try { const r = await store.loadOrder(normalizedCode); if (live) setOrder({ status: 'ready', ...r }); }
+      try {
+        const r = await store.loadOrder(normalizedCode);
+        if (!live) return;
+        // The lines on screen were kept while another number was typed at the end of the order: they stay only when the order
+        // that came back has the same equipment (SSANGP -> SSANGP1), not when it is another order of its own (SSANIBL4 -> SSANIBL45 in the list)
+        if (copyFor.current && r.base !== copyFor.current) clearOrderState();
+        copyFor.current = r.entries.length ? r.base : '';
+        setOrder({ status: 'ready', ...r });
+      }
       catch (e) { if (live) setOrder({ status: 'error', code: normalizedCode, entries: [], error: errText(e) }); }
     }, 350);
     return () => { live = false; clearTimeout(t); };
@@ -2951,6 +3739,10 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   const suggestOpen = showSuggest && normalizedCode.length >= 2 && !(suggestions.length === 1 && suggestions[0].code === normalizedCode && !sugg.busy);
   const listOpen = suggestOpen && suggestions.length > 0;
   const hiIndex = Math.min(hi, Math.max(0, suggestions.length - 1));
+  // Enter keeps the order that is typed and loaded (a numbered copy too) until another is picked with the arrow keys, so the list then
+  // highlights only that order, when it is listed
+  const enterKeeps = listOpen && !arrowed && ready && matches.length > 0;
+  const shownHi = enterKeeps ? suggestions.findIndex(x => x.code === normalizedCode) : hiIndex;
 
   useEffect(() => {
     const el = listRef.current && listRef.current.querySelector('[aria-selected="true"]');
@@ -2960,7 +3752,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   // Include ticks, typed hours and edits made on the pieces of a row go with the pieces: a piece added again starts fresh
   const dropPieceState = (isPiece) => {
     const drop = (p) => { const x = {}; Object.keys(p).forEach((k) => { if (!isPiece(k)) x[k] = p[k]; }); return x; };
-    setExcluded(drop); setHoursOverride(drop); setEdits(drop);
+    setExcluded(drop); setMissed(drop); setHoursOverride(drop); setEdits(drop);
   };
   // Manual picks and earlier-entry scans; orderGen makes any lookup still running for them stale
   const resetPicks = () => {
@@ -2971,10 +3763,14 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   };
   const clearOrderState = () => {
     resetPicks();
-    setExcluded({}); setHoursOverride({}); setExtras([]); setEdits({});
+    setExcluded({}); setMissed({}); setHoursOverride({}); setExtras([]); setEdits({});
+    copyFor.current = '';
+    runFor.current = null;
     setAddOpen(null); setLinesOpen(true); setEditMode(false); setNote(''); setNewFor({});
   };
-  const selectCode = (c) => { setCode(c); setShowSuggest(false); clearOrderState(); };
+  const selectCode = (c) => { setCode(c); setShowSuggest(false); setArrowed(false); clearOrderState(); };
+  // An order picked from the suggestion list: the order already loaded keeps the changes made to its lines
+  const pickListed = (c) => { if (normCode(c) === normalizedCode) { setCode(c); setShowSuggest(false); setArrowed(false); } else selectCode(c); };
   // IDs changed on the Fix tab: picks made by hand may point at equipment that was just unified away, so they are dropped
   const seenVer = useRef(dataVer);
   useEffect(() => {
@@ -3099,6 +3895,16 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     return l && key && l.key === key ? 'on this line now' : 'on another line of this order';
   };
   const included = lines.filter(l => !excluded[l.key] && l.asset);
+  const missedCount = lines.filter(l => missed[l.key]).length;
+  // Equipment that was not cleaned is coded with a number on the sheet (8, or another): typing it drops the line as missed. It is not
+  // logged (the MSS log has no column for a miss, and any entry counts as cleaned) and its hours go to the lines that were done.
+  // Clearing the number ticks the line again only when the number was what unticked it.
+  const setMissedCode = (l, v) => {
+    const c = String(v || '').replace(/[^0-9]/g, '').slice(0, 2);
+    if (!c && !missed[l.key]) return; // a letter typed in an empty box: nothing changes
+    setMissed(p => { const x = { ...p }; if (c) x[l.key] = c; else delete x[l.key]; return x; });
+    setExcluded(p => ({ ...p, [l.key]: c ? (p[l.key] || 'missed') : (p[l.key] === 'missed' ? false : p[l.key]) }));
+  };
   // The order's hours are shared out in whole hours by SAP row: a row broken up shares its part among its pieces, so breaking one up never
   // changes the hours of the other rows. Hours typed by hand come off the part they were typed for: a line's (or a broken-up row's,
   // if typed before it was broken up) off the order total, a piece's off the part of its own row.
@@ -3140,6 +3946,43 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     fetchDupes(api, normalizedCode, dateStr).then(s => { if (!cancelled) setDupes(s); }).catch(() => {});
     return () => { cancelled = true; };
   }, [api, normalizedCode, dateStr, ready, hasLines]);
+
+  // Another run of the order on the same day (Gerald, Oct 10: some orders are done 2-3 times a day). The equipment of a run that is
+  // already logged is skipped as a duplicate, so the next run is saved as a numbered copy: SSANGP1, SSANGP2 ... the first number that
+  // is not a SAP order of its own, has none of this equipment logged for the day, and is not on another row of the form for that day
+  // with the same equipment. The lines and changes on screen stay.
+  // (new equipment by its name and place, the way check() tells two lines apart)
+  const runIds = () => included.map(l => (l.asset.isNew ? `new|${normName(l.name)}|${normName(l.room)}|${normName(l.area)}` : l.asset.id));
+  const anotherRun = async () => {
+    if (!ready || runBusy || !matches.length || !canNumber) return;
+    const from = normalizedCode;
+    const base = orderBase;
+    const day = dateStr;
+    const ids = runIds();
+    const stale = () => latest.current.code !== from || latest.current.dateStr !== day;
+    setRunBusy(true);
+    try {
+      const next = await nextRunNumber(store, api, { base, from, day, ids, onForm: ctx.runsOnForm });
+      if (stale()) return;
+      if (!next) { setNote(`${base}1 to ${base}9 are all taken for ${sheetDateWords(day)} (logged, SAP orders of their own, or on other rows). Type the order with another number at its end.`); return; }
+      copyFor.current = base;
+      runFor.current = { code: next, from, day, ids, base }; // read by the other rows at once (getRun), before this row shows the new number
+      setCode(next);
+      setShowSuggest(false);
+      setNote(`Saving this run as ${next}: the same equipment as ${base}, logged as a run of its own (${from} is already logged for ${sheetDateWords(day)}).`);
+    } catch (e) { if (!stale()) setNote(`Could not check which runs are already logged: ${errText(e)}`); }
+    finally { setRunBusy(false); }
+  };
+
+  // The run number was picked for one day: when the date changes, the order goes back to what it was (on the new day the first run may
+  // not be logged yet; Another run today shows again if it is)
+  useEffect(() => {
+    const r = runFor.current;
+    if (!r || r.code !== normalizedCode || r.day === dateStr) return;
+    runFor.current = null;
+    setCode(r.from);
+    setNote(`The date changed, so the order is ${r.from} again (${r.code} was the next run of ${r.from} on ${sheetDateWords(r.day)}).`);
+  }, [dateStr, normalizedCode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // While the typeahead is still offering orders, don't claim the typed text is unknown or open the add panel
   const settling = matches.length === 0 && suggestOpen && (sugg.busy || suggestions.length > 0);
@@ -3193,7 +4036,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     if (from && to && !to.isNew && from.id === to.id) { setRetro(p => { const x = { ...p }; delete x[l.key]; return x; }); return; }
     // Only a line that still has its automatic equipment keeps the old ID's entries; a changed line brings its own
     const stillUsed = !!from && lines.some(x => x.key !== l.key && !chosen[x.key] && x.asset && x.asset.id === from.id);
-    const filter = retroFilter(normalizedCode, from, l.ms, stillUsed);
+    const filter = retroFilter([normalizedCode, orderBase], from, l.ms, stillUsed);
     if (!filter) { setRetro(p => ({ ...p, [l.key]: { status: 'ready', count: 0, from, stillUsed, filter: null, apply: false } })); return; }
     setRetro(p => ({ ...p, [l.key]: { status: 'scanning', count: 0, from, stillUsed, filter, apply: p[l.key] ? p[l.key].apply : true } }));
     try {
@@ -3261,7 +4104,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   const rankMore = async (l) => {
     setMoreRank(p => ({ ...p, [l.key]: { busy: true, ranked: [] } }));
     try {
-      const ranked = await store.rankLine(normalizedCode, l.ms, matches.length === 1);
+      const ranked = await store.rankLine(normalizedCode, l.ms, matches.length === 1, orderBase);
       setMoreRank(p => ({ ...p, [l.key]: { busy: false, ranked } }));
       return ranked;
     } catch (e) { setMoreRank(p => ({ ...p, [l.key]: { busy: false, ranked: [], error: errText(e) } })); return []; }
@@ -3439,7 +4282,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
 
   // --- Paperwork: pictures and PDFs are attached as one file (one picture stays a JPG, one PDF stays as it is, several pages become
   // one PDF) and, when asked, read for the order, date, hours and initials. A file that cannot be used is reported, not dropped silently.
-  latest.current = { code: normalizedCode, totalHours, dateStr, initials };
+  latest.current = { code: normalizedCode, totalHours, dateStr, initials, stamp };
   const lowerFirst = (t) => { const w = String(t || '').replace(/\.$/, ''); return `${w.charAt(0).toLowerCase()}${w.slice(1)}`; };
   useEffect(() => () => { readSeq.current += 1; }, []);
   const setPaper = async (files) => {
@@ -3457,7 +4300,9 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     if (!files.some(f => paperFiles.indexOf(f) >= 0)) {
       const cur = latest.current;
       const cleared = [];
-      if (stamp.code && cur.code === stamp.code) { selectCode(''); cleared.push('SAP order'); }
+      // (also the order the sheet filled in with a run number Another run today put at its end)
+      const run = runFor.current;
+      if (stamp.code && (cur.code === stamp.code || (run && run.code === cur.code && run.from === stamp.code))) { selectCode(''); cleared.push('SAP order'); }
       if (stamp.date && cur.dateStr === stamp.date) { setDateStr(initialDate || maxDate); dateTouched.current = false; cleared.push('date'); }
       if (stamp.hours && String(cur.totalHours) === String(stamp.hours)) { setTotalHours(''); cleared.push('hours'); }
       if (stamp.initials && cur.initials === stamp.initials) { setInitials(''); cleared.push('initials'); }
@@ -3490,75 +4335,154 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   const addPaper = (list) => { setPaper(paperFiles.concat(list)); };
   const removePaper = (i) => { setPaper(paperFiles.filter((f, k) => k !== i)); };
   const stopReading = () => { readSeq.current += 1; setSheet(s => ({ ...s, status: 'stopped' })); };
+  // Another layout of reading areas (or the whole sheet): remembered for the next rows, and a sheet already read is read again with it
+  const chooseLayout = (id) => {
+    const cur = readSheetLayouts();
+    const next = cur.layouts.find(l => l.id === id) || null;
+    setLayoutId(next ? next.id : '');
+    writeSheetLayouts({ last: next ? next.id : '', layouts: cur.layouts });
+    if (photo && !photoBusy && (sheet.status !== 'idle' || sheetAuto)) startReading(paperFiles, next);
+  };
+  const areasSaved = (id, kept) => {
+    setAreasOpen(false);
+    const next = readSheetLayouts().layouts.find(l => l.id === id) || null;
+    setLayoutId(next ? next.id : '');
+    setAreasNote(kept ? '' : 'This browser would not keep the reading areas, so they last until the page is closed.');
+    if (photo && !photoBusy) startReading(paperFiles, next);
+  };
   const changeSheetAuto = (on) => { setSheetAuto(on); try { window.localStorage.setItem('mss-log-read-sheet', on ? '1' : '0'); } catch (e) { /* only a remembered choice */ } };
 
-  // Fills the empty fields with what the sheet says for certain; the rest is left as suggestions in the panel
+  // Fills the empty fields with what the sheet says for certain; the rest is left as suggestions in the panel. Hours an earlier reading
+  // filled in by itself (and nobody changed or picked since) are replaced by a new reading, such as one with reading areas; hours
+  // picked from the panel and an order never are.
   const applySheet = (auto) => {
     const cur = latest.current;
     const applied = [];
     const marks = {};
+    const hoursFromSheet = cur.stamp && cur.stamp.autoHours !== undefined && String(cur.totalHours) === String(cur.stamp.autoHours);
     if (auto.code && !cur.code) { selectCode(auto.code); applied.push(`SAP order ${auto.code}`); marks.code = auto.code; }
     if (auto.date && !dateTouched.current && auto.date !== cur.dateStr) { setDateStr(auto.date); applied.push(`date ${sheetDateWords(auto.date)}`); marks.date = auto.date; }
-    if (auto.hours && !String(cur.totalHours).trim()) { setTotalHours(String(auto.hours)); applied.push(`${auto.hours} hours`); marks.hours = auto.hours; }
-    if (applied.length) setStamp(st => ({ ...st, ...marks }));
+    if (auto.hours && (!String(cur.totalHours).trim() || (hoursFromSheet && String(auto.hours) !== String(cur.totalHours)))) { setTotalHours(String(auto.hours)); applied.push(`${auto.hours} hours`); marks.hours = auto.hours; marks.autoHours = auto.hours; }
+    // The Hours area only offers values (several, or a picture read over 24): hours an earlier reading filled in by itself go, so the
+    // whole sheet's total is not saved by mistake; hours typed or picked stay
+    else if (!auto.hours && auto.hoursOffered && hoursFromSheet && String(cur.totalHours).trim()) {
+      setTotalHours('');
+      marks.hours = undefined;
+      marks.autoHours = undefined;
+      applied.hoursCleared = true;
+    }
+    if (applied.length || applied.hoursCleared) setStamp(st => ({ ...st, ...marks }));
     return applied;
   };
-  const startReading = async (files) => {
+  // useLayout: the reading areas to use (null for the whole sheet); left out, the row's own choice
+  const startReading = async (files, useLayout) => {
     const seq = ++readSeq.current;
     const stale = () => seq !== readSeq.current;
+    stale.since = Date.now(); // a reader load that fails during this reading is not tried again by its later steps
+    const lay = useLayout !== undefined ? useLayout : layoutRef.current;
+    if (layoutId === null) setLayoutId(lay ? lay.id : ''); // the row keeps the areas its sheet was read with
     const all = [];
     let cut = false; // there are more pages than the ones that are read
     let unread = 0;  // pages that are pictures while the picture reader could not be loaded
+    let slow = 0;    // pages that took too long to read (the other pages were still read)
+    let area = null;   // what the boxes of the reading areas found
+    let areas = null;  // for the panel: { name, read: [{ field, text, how }], off, missing, error }
     setSheet({ status: 'reading' });
     setSheetHidden(false);
     const mine = (m) => { if (!stale() && m && m.status === 'recognizing text') setSheet(s => (s.status === 'loading' ? { ...s, status: 'reading' } : s)); };
+    const ocrStarts = () => { ocrLog = mine; if (!ocrWarm && !stale()) setSheet(s => ({ ...s, status: 'loading' })); };
     const publish = async (final) => {
       const found = extractSheet(all, { today: maxDate, minDate });
       let checked;
       try { checked = await checkSheetOrders(store, found.orders, orderMemo.current); } catch (e) { checked = []; checked.failed = 1; }
       if (stale()) return;
-      const view = sheetView(found, checked);
-      if (!final) { setSheet(s => (stale() ? s : { ...s, view, pages: all.length })); return; }
+      const view = area ? mergeAreaView(sheetView(found, checked), area) : sheetView(found, checked);
+      const checkFailed = (checked.failed || 0) + (area ? area.failed : 0);
+      if (!final) { setSheet(s => (stale() ? s : { ...s, view, areas, pages: all.length })); return; }
       const applied = applySheet(view.auto);
-      setSheet({ status: 'done', view, applied, pages: all.length, cut, unread, checkFailed: checked.failed || 0 });
+      setSheet({ status: 'done', view, areas, applied, pages: all.length, cut, unread, slow, checkFailed });
     };
     try {
-      let left = SHEET_READ_PAGES;
+      // 1. The boxes of the reading areas, when a layout is picked: small and quick, and what they find decides those fields
+      if (lay && layoutBoxes(lay).length) {
+        setSheet(s => ({ ...s, file: `the ${lay.name} areas`, page: 0, pageTotal: 0 }));
+        try {
+          const got = await readSheetAreas(files, lay, { stop: stale, ocr: ocrStarts });
+          if (stale()) return;
+          area = await areaSuggestions(got.read, store, orderMemo.current, { today: maxDate, minDate });
+          if (stale()) return;
+          areas = { name: lay.name, read: layoutBoxes(lay).map(x => ({ field: x.field, text: got.read[x.field] ? got.read[x.field].text : null, how: got.read[x.field] ? got.read[x.field].how : '' })), off: got.off, missing: got.missing, unread: got.unread, error: '' };
+          await publish(false);
+          if (stale()) return;
+        } catch (e) {
+          if (stale()) return;
+          areas = { name: lay.name, read: [], off: [], missing: [], unread: [], error: lowerFirst(errText(e)) };
+        }
+      }
+      // 2. The whole sheet, as before; skipped when the boxes already gave the order, date and hours for certain
+      const enough = !!area && ['code', 'date', 'hours'].every(k => area.auto[k] !== undefined);
+      let left = enough ? 0 : SHEET_READ_PAGES;
+      let fileBlocked = null; // a picture that could not be read (no reader, or too slow): the other files are still read
+      let fileFailed = null;
       for (let i = 0; i < files.length && left > 0; i += 1) {
         if (stale()) return;
         const file = files[i];
         let got = readMemo.current.get(file);
         if (got && got.texts.length < Math.min(got.total, left)) got = null; // read before with fewer pages left to read: read it again
+        if (!got && fileBlocked && !isPdfFile(file)) { unread += 1; all.push(''); left -= 1; if (left <= 0 && i < files.length - 1) cut = true; continue; }
         if (!got) {
-          got = await readFileText(file, {
-            left,
-            stop: stale,
-            page: (p, t) => { if (!stale()) setSheet(s => ({ ...s, status: s.status === 'loading' ? 'loading' : 'reading', file: file.name, page: p, pageTotal: t })); },
-            ocr: () => { ocrLog = mine; if (!ocrWarm && !stale()) setSheet(s => ({ ...s, status: 'loading' })); },
-          });
+          try {
+            got = await readFileText(file, {
+              left,
+              many: files.length > 1,
+              stop: stale,
+              page: (p, t) => { if (!stale()) setSheet(s => ({ ...s, status: s.status === 'loading' ? 'loading' : 'reading', file: file.name, page: p, pageTotal: t })); },
+              ocr: () => { ocrLog = mine; if (!ocrWarm && !stale()) setSheet(s => ({ ...s, status: 'loading' })); },
+            });
+          } catch (e) {
+            if (stale()) return;
+            if (isPdfFile(file) || files.length === 1) throw e;
+            if (e && e.reader) { fileBlocked = e; unread += 1; } else { fileFailed = e; slow += 1; }
+            all.push('');
+            left -= 1;
+            if (left <= 0 && i < files.length - 1) cut = true;
+            await publish(false);
+            continue;
+          }
           if (stale()) return;
-          if (!got.unread) readMemo.current.set(file, got); // a page the reader could not read is tried again next time
+          if (!got.unread && !got.slow) readMemo.current.set(file, got); // a page the reader could not read is tried again next time
+          if (got.err) { if (got.err.reader) fileBlocked = fileBlocked || got.err; else fileFailed = fileFailed || got.err; }
         }
         unread += got.unread || 0;
+        slow += got.slow || 0;
         got.texts.forEach(t => all.push(t));
         left -= got.texts.length;
         if (got.total > got.texts.length || (left <= 0 && i < files.length - 1)) cut = true;
         await publish(false);
       }
       if (stale()) return;
+      if ((fileBlocked || fileFailed) && !all.some(t => t.replace(/\s+/g, '').length >= 25)) throw fileBlocked || fileFailed; // nothing could be read: say why
       await publish(true);
     } catch (e) {
-      if (!stale()) setSheet(s => ({ ...s, status: e && e.reader ? 'unavailable' : 'error', msg: lowerFirst(errText(e)) }));
+      if (stale()) return;
+      // The boxes were read but the rest of the sheet could not be: what the boxes found still counts
+      if (area) {
+        try { await publish(true); } catch (e2) { /* the message below says what happened */ }
+        if (!stale()) setSheet(s => ({ ...s, rest: lowerFirst(errText(e)) }));
+        return;
+      }
+      setSheet(s => ({ ...s, status: e && e.reader ? 'unavailable' : 'error', msg: lowerFirst(errText(e)) }));
     } finally { if (ocrLog === mine) ocrLog = null; }
   };
   const pickFromSheet = (kind, value) => {
     if (kind === 'code') {
+      if (isCopy && value === orderBase) return; // SSANGP on the sheet, SSANGP1 typed: already that order's equipment
       if (normalizedCode && normalizedCode !== value && !window.confirm(`Replace ${normalizedCode} with ${value}? Changes made to its lines will be cleared.`)) return;
       if (normalizedCode !== value) selectCode(value);
     } else if (kind === 'date') { dateTouched.current = true; setDateStr(value); }
     else if (kind === 'hours') setTotalHours(String(value));
     else if (kind === 'initials') setInitials(value);
-    setStamp(st => ({ ...st, [kind]: value }));
+    setStamp(st => ({ ...st, [kind]: value, ...(kind === 'hours' ? { autoHours: undefined } : {}) })); // picked: a later reading leaves it
   };
 
   const validate = () => {
@@ -3580,10 +4504,14 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     if (lines.some(l => !excluded[l.key] && l.splitting)) return 'Add at least two pieces for the highlighted line, or choose One piece only.';
     if (lines.some(l => !excluded[l.key] && !l.asset)) return 'Choose the equipment for the highlighted line(s), or untick them.';
     if (lines.some(l => !excluded[l.key] && (!safeString(l.name) || !safeString(l.room) || !safeString(l.area)))) return 'Every equipment line needs a name, room and area. Tick Edit pre-filled details to fill in what is missing, or untick the line.';
-    if (included.length === 0) return 'Nothing to log: no equipment selected.';
+    if (included.length === 0) return missedCount ? 'Every line is dropped as missed or unticked: nothing to log.' : 'Nothing to log: no equipment selected.';
     const sigs = included.map(l => (l.asset.isNew ? `new|${normName(l.name)}|${normName(l.room)}|${normName(l.area)}` : l.asset.id));
     if (sigs.some((x, i) => sigs.indexOf(x) !== i)) return 'Two lines use the same equipment. Change one of them.';
-    if (included.every(isDupe)) return 'Every selected equipment already has this order logged for that date.';
+    if (included.every(isDupe)) {
+      if (matches.length && canNumber) return `Every selected equipment already has this order logged for that date. If this is another run of it that day, use Another run today (it is saved as ${orderBase}1 or the next free number).`;
+      if (canNumber) return `Every selected equipment already has ${normalizedCode} logged for that date. If this is another run of it that day, type the order with a number at its end (${normalizedCode}1) and add its equipment again.`;
+      return 'Every selected equipment already has this order logged for that date.';
+    }
     // A line can get 0 hours from the whole-hour split (more lines than hours); only an hours box that is blank or not a number is a problem
     if (included.some(l => hoursOverride[l.key] !== undefined && !(parseFloat(hoursOverride[l.key]) >= 0))) return 'Every selected equipment needs hours (0 or more).';
     if (Math.abs(hoursSum - total) > 0.01) return `Line hours add up to ${hoursSum} but the order total is ${total}.`;
@@ -3592,21 +4520,27 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     return '';
   };
 
-  // Write the SAP order onto an equipment's SAP row (update its frequency column, or create the row)
+  // Write the SAP order onto an equipment's SAP row (update its frequency column, or create the row). Equipment added to a numbered
+  // copy (SSANGP1) joins the order it copies (SSANGP): the copy's own number is never stored, or SSANGP1 would become an order of its own.
+  // An earlier row of the same submit may just have added the order a run number belongs to (SSANNEWX for SSANNEWX1): the run joins it.
   const storeCode = async (asset, col, notes) => {
+    let code = orderBase;
+    if (!matches.length && copyBases(code).length) {
+      try { const now = await store.findOrderRows(code); if (now.rows.length && now.base !== code) code = now.base; } catch (e) { /* as it loaded */ }
+    }
     const row = await store.findMsForAsset(asset);
     const existing = row && (row.codes.find(c => c.col === col) || {}).code;
-    if (row && existing === normalizedCode) return;
-    if (row && existing && !window.confirm(`${asset.name} already has ${existing} as its ${freqLabel(col)} code. Replace it with ${normalizedCode}?`)) {
-      notes.push(`${asset.name}: kept ${existing}; ${normalizedCode} was not stored on it.`);
+    if (row && existing === code) return;
+    if (row && existing && !window.confirm(`${asset.name} already has ${existing} as its ${freqLabel(col)} code. Replace it with ${code}?`)) {
+      notes.push(`${asset.name}: kept ${existing}; ${code} was not stored on it.`);
       return;
     }
     if (row) {
-      const r = await store.writeMs(row.id, { [col]: normalizedCode }, row.assetId ? null : asset);
+      const r = await store.writeMs(row.id, { [col]: code }, row.assetId ? null : asset);
       if (r.tried && !r.linked) notes.push(`${asset.name}: SAP order saved without its equipment lookup (craa5_asset).`);
       return;
     }
-    const r = await store.writeMs(null, { craa5_title: normalizedCode, [col]: normalizedCode, craa5_equipment: asset.name, craa5_textroom: asset.room, craa5_textarea: asset.area }, asset);
+    const r = await store.writeMs(null, { craa5_title: code, [col]: code, craa5_equipment: asset.name, craa5_textroom: asset.room, craa5_textarea: asset.area }, asset);
     if (r.tried && !r.linked) notes.push(`${asset.name}: SAP order saved without its equipment lookup (craa5_asset).`);
   };
 
@@ -3625,7 +4559,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
       const r = retro[l.key];
       if (!r || !r.apply || !r.count) continue;
       const stillUsed = !!r.from && lines.some(x => x.key !== l.key && !chosen[x.key] && x.asset && x.asset.id === r.from.id);
-      const filter = retroFilter(normalizedCode, r.from, l.ms, stillUsed);
+      const filter = retroFilter([normalizedCode, orderBase], r.from, l.ms, stillUsed);
       if (!filter) continue;
       try {
         const got = await api.query(LOG_TABLE, { select: RETRO_SELECT, filter, top: LIMITS.countCap + 1 });
@@ -3642,8 +4576,10 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     }
     lines.forEach(l => {
       const r = retro[l.key];
-      if (excluded[l.key] && !l.splitting && r && r.apply && r.count) notes.push(`${l.name}: ${plural(r.count, 'earlier entry was', 'earlier entries were')} not moved because the line is unticked.`);
+      if (excluded[l.key] && !l.splitting && r && r.apply && r.count) notes.push(`${l.name}: ${plural(r.count, 'earlier entry was', 'earlier entries were')} not moved because the line is ${missed[l.key] ? 'dropped as missed' : 'unticked'}.`);
     });
+    const missedLines = lines.filter(l => missed[l.key]);
+    if (missedLines.length) info.push(`Dropped as missed, not logged: ${missedLines.slice(0, 6).map(l => `${l.name || '(unnamed)'} (${missed[l.key]})`).join(', ')}${missedLines.length > 6 ? ` and ${missedLines.length - 6} more` : ''}.`);
     // 1. Equipment edits made through "Edit pre-filled details" (only for the equipment each edit was made for)
     const edited = {};
     for (const l of lines) {
@@ -3711,14 +4647,23 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     const toLog = [];
     const at = {};
     let merged = 0;
+    let earlierRow = 0; // equipment an earlier row of this submit logged for the same order and date
     included.forEach((l) => {
       const a = assetOf(l);
+      if (seen.has(seenKey(a.id))) earlierRow += 1; // seen only holds what this submit logged
       if (already.has(a.id) || seen.has(seenKey(a.id))) return;
       if (at[a.id] !== undefined) { toLog[at[a.id]].hours = Math.round((toLog[at[a.id]].hours + lineHours(l)) * 100) / 100; merged += 1; return; }
       at[a.id] = toLog.length;
       const fromAsset = !!resolved[l.key];
       toLog.push({ asset: a, name: fromAsset ? a.name : l.name, room: fromAsset ? a.room : l.room, area: fromAsset ? a.area : l.area, hours: lineHours(l) });
     });
+    if (earlierRow) {
+      let next = '';
+      if (canNumber) { try { next = await nextRunNumber(store, api, { base: orderBase, from: normalizedCode, day: dateStr, ids: runIds(), onForm: ctx.runsOnForm }); } catch (e) { next = ''; } }
+      const how = !canNumber ? `${normalizedCode} can only be logged once a day for the same equipment.`
+        : `If this is another run, change its order to ${next || `${orderBase} with another number at its end`}, check its equipment, then submit again.`;
+      return { saved: 0, notes, info, keep: `an earlier row logged ${normalizedCode} on ${sheetDateWords(dateStr)} for the same equipment, so nothing of this row was saved. ${how}` };
+    }
     const skipped = included.length - toLog.length - merged;
     if (skipped) notes.push(`${plural(skipped, 'equipment', 'equipment')} skipped: already logged for this order and date.`);
     if (merged) notes.push(`${plural(merged, 'line named', 'lines named')} equipment that another line has too, so ${merged === 1 ? 'it was' : 'they were'} saved with that entry and the hours added.`);
@@ -3760,7 +4705,16 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
 
   // freeze: a sheet still being read must not change this row once Submit has started on any row
   const freeze = () => { readSeq.current += 1; setSheet(s => (s.status === 'reading' || s.status === 'loading' ? { ...s, status: 'stopped' } : s)); };
-  useImperativeHandle(ref, () => ({ validate, commit, freeze, getShared: () => ({ date: dateStr, initials: normalizeInitials(initials) }) }));
+  useImperativeHandle(ref, () => ({
+    validate, commit, freeze,
+    getShared: () => ({ date: dateStr, initials: normalizeInitials(initials) }),
+    // This row's run: the order as saved, the order whose equipment it uses, the date and the equipment that would be logged
+    // (a run number Another run today just gave counts at once, also while the row is still loading it)
+    getRun: () => {
+      const r = runFor.current && runFor.current.day === dateStr ? runFor.current : null;
+      return { code: r ? r.code : normalizedCode, base: r ? r.base : orderBase, canNumber, known: r ? true : matches.length > 0, date: dateStr, ids: ready ? runIds() : (r ? r.ids : []) };
+    },
+  }));
 
   // Summary values for the read-only Room / Area / Equipment fields
   const live = lines.filter(l => !excluded[l.key]);
@@ -3906,7 +4860,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     <div className={styles.rowCard}>
       <div className={styles.rowFields}>
         <div className={styles.field}>
-          <Text className={styles.label}>SAP Order (Req){fromSheet('code', normalizedCode)}</Text>
+          <Text className={styles.label}>SAP Order (Req){fromSheet('code', normalizedCode)}{isCopy && <span className={mergeClasses(styles.tag, styles.tagInfo)} style={{ marginLeft: 6 }} title={`Uses the equipment of ${orderBase} and is saved as ${normalizedCode}`}>copy of {orderBase}</span>}</Text>
           <Input
             data-row={index}
             data-col="sap"
@@ -3915,22 +4869,33 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
             aria-autocomplete="list"
             aria-expanded={listOpen}
             aria-controls={listOpen ? listId : undefined}
-            aria-activedescendant={listOpen ? `${listId}-opt-${hiIndex}` : undefined}
+            aria-activedescendant={listOpen && shownHi >= 0 ? `${listId}-opt-${shownHi}` : undefined}
             autoComplete="off"
             placeholder="Start typing the SAP order…"
             value={code}
             disabled={saving}
             style={{ minWidth: '210px' }}
-            onChange={(e, d) => { setCode(d.value); setShowSuggest(true); setHi(0); clearOrderState(); }}
-            onFocus={() => setShowSuggest(true)}
+            onChange={(e, d) => {
+              // Another number at the end of the same order (SSANGP -> SSANGP1 -> SSANGP12, or back) keeps the lines and the changes made to them
+              // (a note about the run number Another run today gave goes, as the order is now typed by hand)
+              const keep = sameCopyFamily(d.value, copyFor.current);
+              setCode(d.value); setShowSuggest(true); setHi(0); setArrowed(false);
+              if (!keep) clearOrderState();
+              else { runFor.current = null; setNote(''); }
+            }}
+            onFocus={() => { setShowSuggest(true); setArrowed(false); }}
             onBlur={() => setTimeout(() => setShowSuggest(false), 150)}
             onKeyDown={(e) => {
               if (e.key === 'ArrowDown' && !showSuggest) { e.preventDefault(); setShowSuggest(true); }
-              else if (listOpen && e.key === 'ArrowDown') { e.preventDefault(); setHi(h => Math.min(h + 1, suggestions.length - 1)); }
-              else if (listOpen && e.key === 'ArrowUp') { e.preventDefault(); setHi(h => Math.max(h - 1, 0)); }
+              else if (listOpen && e.key === 'ArrowDown') { e.preventDefault(); setArrowed(true); setHi(enterKeeps ? (shownHi >= 0 ? Math.min(shownHi + 1, suggestions.length - 1) : 0) : Math.min(hiIndex + 1, suggestions.length - 1)); }
+              else if (listOpen && e.key === 'ArrowUp') { e.preventDefault(); setArrowed(true); setHi(Math.max((enterKeeps ? Math.max(shownHi, 0) : hiIndex) - 1, 0)); }
               else if (e.key === 'Enter' && suggestOpen && sugg.busy) e.preventDefault(); // wait for the search to finish
-              else if (listOpen && e.key === 'Enter') { e.preventDefault(); selectCode(suggestions[hiIndex].code); }
-              else if (e.key === 'Escape') setShowSuggest(false);
+              // Enter keeps an order that loaded (SSANDL1, a copy of SSANDL, is not swapped for SSANDL15 in the list) unless one was
+              // picked with the arrow keys; a numbered copy still loading is waited for
+              else if (e.key === 'Enter' && listOpen && !arrowed && order && order.code === normalizedCode && (order.status === 'loading' || order.refreshing) && copyBases(normalizedCode).length) e.preventDefault();
+              else if (e.key === 'Enter' && enterKeeps) { e.preventDefault(); setShowSuggest(false); onEnter(index); }
+              else if (listOpen && e.key === 'Enter') { e.preventDefault(); pickListed(suggestions[hiIndex].code); }
+              else if (e.key === 'Escape') { setShowSuggest(false); setArrowed(false); }
               else if (e.key === 'Enter') { e.preventDefault(); setShowSuggest(false); onEnter(index); }
             }}
           />
@@ -3939,9 +4904,9 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
               {suggestions.length > 0 && (
                 <div className={styles.suggestList} role="listbox" id={listId} aria-label="Matching SAP orders" ref={listRef}>
                   {suggestions.map((s, i) => (
-                    <button key={s.code} id={`${listId}-opt-${i}`} type="button" role="option" tabIndex={-1} aria-selected={i === hiIndex} className={styles.suggestItem}
-                      style={i === hiIndex ? { backgroundColor: '#E6F1FC' } : undefined}
-                      onMouseDown={(e) => e.preventDefault()} onClick={() => selectCode(s.code)}>
+                    <button key={s.code} id={`${listId}-opt-${i}`} type="button" role="option" tabIndex={-1} aria-selected={i === shownHi} className={styles.suggestItem}
+                      style={i === shownHi ? { backgroundColor: '#E6F1FC' } : undefined}
+                      onMouseDown={(e) => e.preventDefault()} onClick={() => pickListed(s.code)}>
                       <span><strong>{s.code}</strong>{s.names && <span className={styles.hint}> · {s.names}{s.count > 2 ? '…' : ''}</span>}</span>
                       <span className={styles.hint}>{s.count}{sugg.truncated ? '+' : ''} equipment</span>
                     </button>
@@ -3949,9 +4914,12 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
                 </div>
               )}
               <div aria-live="polite">
+                {enterKeeps && shownHi < 0 && <div className={styles.suggestNote}>Enter keeps {normalizedCode}{isCopy ? ` (copy of ${orderBase})` : ''}. Use the arrow keys to pick another order.</div>}
                 {sugg.busy && <div className={styles.suggestNote}>Searching…</div>}
                 {sugg.error && <div className={styles.suggestNote} style={{ color: BRAND.redText }}>Search failed: {sugg.error}</div>}
-                {!sugg.busy && !sugg.error && suggestions.length === 0 && <div className={styles.suggestNote}>No SAP orders match “{normalizedCode}”.</div>}
+                {!sugg.busy && !sugg.error && suggestions.length === 0 && (isCopy
+                  ? <div className={styles.suggestNote}>{normalizedCode} is a numbered copy of {orderBase}: it uses {orderBase}'s equipment and is saved as {normalizedCode}.</div>
+                  : <div className={styles.suggestNote}>No SAP orders match “{normalizedCode}”.{copyBases(normalizedCode).length ? ' A number at the end of an order (SSANGP1) uses that order’s equipment.' : ''}</div>)}
                 {!sugg.busy && sugg.truncated && <div className={styles.suggestNote}>Many matches. Keep typing to narrow the list.</div>}
               </div>
             </div>
@@ -3979,7 +4947,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
         </div>
         <div className={styles.field}>
           <Text className={styles.label}>Total Hours (Req){fromSheet('hours', parseFloat(totalHours))}</Text>
-          <Input aria-label="Total hours" type="number" min="0" step="0.25" placeholder="Ex: 2.5" value={totalHours} disabled={saving} onChange={(e, d) => setTotalHours(d.value)} style={{ width: '100px' }} />
+          <Input aria-label="Total hours" type="number" min="0" step="0.25" placeholder="Ex: 2.5" value={totalHours} disabled={saving} onChange={(e, d) => { setTotalHours(d.value); setStamp(st => (st.autoHours === undefined ? st : { ...st, autoHours: undefined })); }} style={{ width: '100px' }} />
         </div>
         <div className={styles.field}>
           <Text className={styles.label}>Initials (Req){fromSheet('initials', normalizeInitials(initials))}</Text>
@@ -4008,26 +4976,47 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
                 onChange={(e) => { const fs = Array.from(e.target.files || []); e.target.value = ''; if (fs.length) addPaper(fs); }} style={{ maxWidth: '170px' }} /></label>
               {photo && <Button size="small" appearance="subtle" onClick={() => setPreviewOpen(true)}>Preview</Button>}
               {photo && sheet.status === 'idle' && <Button size="small" appearance="subtle" disabled={saving || photoBusy} onClick={() => startReading(paperFiles)}>Read the sheet</Button>}
+              {photo && sheet.status !== 'idle' && sheetHidden && <Button size="small" appearance="subtle" onClick={() => setSheetHidden(false)}>Show what was read</Button>}
               <Checkbox label={<Text size={200}>Read the sheet when it is added</Text>} checked={sheetAuto} disabled={saving} onChange={(e, d) => changeSheetAuto(!!d.checked)} />
             </div>
           )}
+          {paperFiles.length > 0 && (
+            <div className={styles.sheetRow} style={{ marginTop: 2 }}>
+              <Text className={styles.hint}>Read</Text>
+              <Select size="small" aria-label="Which parts of the sheet are read" value={layout ? layout.id : ''} disabled={saving} onChange={(e, d) => chooseLayout(d.value)} style={{ maxWidth: 200 }}>
+                <option value="">the whole sheet</option>
+                {layoutsState.layouts.map(l => <option key={l.id} value={l.id}>areas: {l.name}</option>)}
+              </Select>
+              <Button size="small" appearance="subtle" disabled={saving || photoBusy || !photo} onClick={() => setAreasOpen(true)} title="Draw a box around the order, date, hours and initials on this sheet, so only those parts are read">Set reading areas…</Button>
+            </div>
+          )}
+          {paperFiles.length > 0 && areasNote && <Text className={styles.warnText} block role="status" style={{ marginTop: 2 }}>{areasNote}</Text>}
         </div>
         <Button appearance="subtle" style={{ alignSelf: 'flex-start', marginTop: '16px' }} aria-label={`Remove row ${index + 1}`} disabled={!canRemove || saving} onClick={onRemove}>Remove</Button>
       </div>
 
       {paperFiles.length > 0 && sheet.status !== 'idle' && !sheetHidden && (
         <SheetPanel sheet={sheet} disabled={saving}
-          values={{ code: normalizedCode, date: dateStr, hours: parseFloat(totalHours), initials: normalizeInitials(initials) }}
+          values={{ code: normalizedCode, base: isCopy ? orderBase : '', date: dateStr, hours: parseFloat(totalHours), initials: normalizeInitials(initials) }}
           onPick={pickFromSheet} onStop={stopReading} onRead={() => startReading(paperFiles)} onHide={() => setSheetHidden(true)} />
       )}
       {previewOpen && previewLocal && (
         <PaperworkViewer api={api} entry={previewEntry} local={previewLocal} onClose={() => setPreviewOpen(false)} />
+      )}
+      {areasOpen && paperFiles.length > 0 && (
+        <SheetAreasDialog files={paperFiles} startId={layout ? layout.id : ''} store={store} dates={{ today: maxDate, minDate }}
+          onClose={() => setAreasOpen(false)} onSaved={areasSaved} />
       )}
       {order && order.status === 'loading' && order.code === normalizedCode && (
         <Text className={styles.hint} block style={{ marginTop: 8 }}>Loading {normalizedCode} and finding its equipment…</Text>
       )}
       {order && order.status === 'error' && order.code === normalizedCode && (
         <Text className={styles.errorText} block role="alert">Could not load {normalizedCode}: {order.error}</Text>
+      )}
+      {isCopy && (
+        <Text className={styles.hint} block style={{ marginTop: 8 }}>
+          {normalizedCode} is not in the SAP list, so it uses the equipment and best fits of {orderBase} (the same order with a number at its end). It is saved as {normalizedCode}.
+        </Text>
       )}
       {isUnknown && (
         <Text size={200} weight="semibold" block style={{ color: '#8A5300', marginTop: '8px' }}>
@@ -4046,8 +5035,13 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
             {linesOpen ? `Hide equipment list (${lines.length})` : `Show equipment list (${lines.length})`}
           </Button>
           <Text className={styles.hint}>
-            {live.length} included{needCount ? ` · ${needCount} need equipment` : ''}{dupeCount ? ` · ${dupeCount} already logged` : ''}{listedAgain ? ` · ${plural(listedAgain, 'more SAP row is', 'more SAP rows are')} the same equipment as another line` : ''}
+            {live.length} included{missedCount ? ` · ${missedCount} missed` : ''}{needCount ? ` · ${needCount} need equipment` : ''}{dupeCount ? ` · ${dupeCount} already logged` : ''}{listedAgain ? ` · ${plural(listedAgain, 'more SAP row is', 'more SAP rows are')} the same equipment as another line` : ''}
           </Text>
+          {ready && dupeCount > 0 && matches.length > 0 && canNumber && (
+            <Button size="small" appearance="secondary" disabled={saving || runBusy} data-another-run=""
+              title={`${normalizedCode} is already logged for this date. Save this run as ${orderBase}1 (or the next free number) so both runs are kept.`}
+              onClick={anotherRun}>{runBusy ? 'Checking the runs…' : 'Another run today'}</Button>
+          )}
         </div>
       )}
       {lines.length > 0 && linesOpen && (
@@ -4072,11 +5066,18 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
                 const differs = l.ms && l.asset && !(l.piece > 1) && !(sameText(l.ms.equipment, l.asset.name) && samePlace(l.ms.room, l.asset.room) && samePlace(l.ms.area, l.asset.area));
                 // A SAP row that lists several things but is matched to one piece of equipment
                 const lists = !split && !l.extra && !off && !!l.ms && !!l.asset && textParts(l.ms.equipment).length > 1 && !sameText(l.ms.equipment, l.name);
-                const [statusText, statusKind] = lineStatus(l, dupe);
+                const miss = missed[l.key] || '';
+                const [statusText, statusKind] = lineStatus(l, dupe, miss);
                 rows.push(
                   <React.Fragment key={l.key}>
                     <tr style={off ? { color: '#94A3B8' } : !l.asset ? { backgroundColor: '#FFF6E6' } : l.parent ? { backgroundColor: '#F3F8FE' } : undefined}>
-                      <td className={styles.td}><input type="checkbox" aria-label={`Include ${l.name}`} checked={!off} disabled={saving} onChange={(e) => setExcluded(p => ({ ...p, [l.key]: !e.target.checked }))} /></td>
+                      <td className={styles.td} style={{ whiteSpace: 'nowrap' }}>
+                        <input type="checkbox" aria-label={`Include ${l.name}`} checked={!off} disabled={saving} onChange={(e) => { const on = e.target.checked; setExcluded(p => ({ ...p, [l.key]: !on })); if (on) setMissed(p => { const x = { ...p }; delete x[l.key]; return x; }); }} />
+                        <input type="text" inputMode="numeric" aria-label={`Missed code for ${l.name}`} data-missed={l.key} placeholder="#" value={miss} disabled={saving}
+                          title="Not cleaned? Type the number written on the sheet for it (8, or another). The line is dropped as missed: it is not logged and its hours go to the other lines."
+                          onChange={(e) => setMissedCode(l, e.target.value)}
+                          style={{ width: 26, marginLeft: 4, padding: '1px 2px', textAlign: 'center', fontSize: 12, border: `1px solid ${miss ? BRAND.redText : BRAND.line}`, borderRadius: 4, backgroundColor: miss ? '#FDD9DA' : '#FFFFFF', color: miss ? '#A5161B' : BRAND.ink, fontWeight: miss ? 700 : 400 }} />
+                      </td>
                       <td className={styles.td}>
                         {editing ? (
                           <Input size="small" aria-label={`Name for ${l.name}`} value={edits[l.key].name} disabled={saving} onChange={(e, d) => setEdits(p => ({ ...p, [l.key]: { ...p[l.key], name: d.value } }))} />
@@ -4122,7 +5123,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
       )}
       {lines.length > 0 && linesOpen && (
         <Text className={styles.hint} block style={{ marginTop: 6 }}>
-          Equipment is picked automatically (linked, or the best fit in the same room and area); use Change to pick another. Use Break up when one line covers several pieces of equipment: each piece gets its own entry and the pieces share the line's hours. Total hours are shared out in whole hours across the lines: the decimals carry from one line to the next and a line gets the extra hour once they make a whole one, so a line can get 0 when there are more lines than hours. Edit a line to override it. Lines sum to {hoursSum}.
+          Equipment is picked automatically (linked, or the best fit in the same room and area); use Change to pick another. Use Break up when one line covers several pieces of equipment: each piece gets its own entry and the pieces share the line's hours. Total hours are shared out in whole hours across the lines: the decimals carry from one line to the next and a line gets the extra hour once they make a whole one, so a line can get 0 when there are more lines than hours. Edit a line to override it. Equipment that was not cleaned: type the number written on the sheet for it (8, or another) in the small box next to its tick; the line is dropped as missed, is not logged, and its hours go to the other lines. Lines sum to {hoursSum}.
           {dupeShare > 0 ? ` ${dupeShare} h is on equipment already logged for this date and will not be saved again.` : ''}
         </Text>
       )}
@@ -5519,7 +6520,11 @@ export default function GeneratedComponent(props) {
   const dataChanged = useCallback(() => { store.dropOrders(); setDataVer(v => v + 1); }, [store]);
   const [saving, setSaving] = useState(false);
   // saving: the Fix tab waits while the Add tab is writing, so the two never move the same entries at once
-  const ctx = useMemo(() => ({ api, store, maxDate, minDate, dataVer, dataChanged, saving }), [api, store, maxDate, minDate, dataVer, dataChanged, saving]);
+  const refs = useRef({});
+  // The run on every row of the form (order, date, equipment), read when it is needed: two rows never get the same run number
+  const submitSeq = useRef(0); // a later Submit makes an earlier one's checks stale
+  const runsOnForm = useCallback(() => Object.keys(refs.current).map(k => refs.current[k]).filter(h => h && h.getRun).map(h => h.getRun()), []);
+  const ctx = useMemo(() => ({ api, store, maxDate, minDate, dataVer, dataChanged, saving, runsOnForm }), [api, store, maxDate, minDate, dataVer, dataChanged, saving, runsOnForm]);
 
   const [activeTab, setActiveTab] = useState('add');
   const [fixVisited, setFixVisited] = useState(false);
@@ -5531,7 +6536,6 @@ export default function GeneratedComponent(props) {
   const [errorMessage, setErrorMessage] = useState('');
   const [successMessage, setSuccessMessage] = useState('');
   const [warnMessage, setWarnMessage] = useState('');
-  const refs = useRef({});
   const rowSeq = useRef(0);
   const containerRef = useRef(null);
   const rootRef = useRef(null);
@@ -5574,6 +6578,7 @@ export default function GeneratedComponent(props) {
   useEffect(() => { loadRecent(); }, [loadRecent]);
 
   const addRows = (count, shared) => {
+    submitSeq.current += 1; // a run check still waiting names rows by their place
     const last = rows.length ? refs.current[rows[rows.length - 1].key] : null;
     const carry = shared || (last && last.getShared && last.getShared());
     setRows(prev => [...prev, ...Array.from({ length: count }, () => newRow(carry))]);
@@ -5595,11 +6600,32 @@ export default function GeneratedComponent(props) {
 
   const submitAll = async () => {
     if (saving) return;
+    const seq = ++submitSeq.current;
     setErrorMessage(''); setSuccessMessage(''); setWarnMessage('');
     for (let i = 0; i < rows.length; i++) {
       const h = refs.current[rows[i].key];
       const err = h ? h.validate() : 'Row is not ready.';
       if (err) { setErrorMessage(`Row ${i + 1}: ${err}`); return; }
+    }
+    // Two rows with the same order, date and equipment would log the same thing twice (the second is skipped): when they are two runs
+    // of the order that day, the second needs a number at the end of its order
+    const runs = rows.map((r) => { const h = refs.current[r.key]; return h && h.getRun ? h.getRun() : null; });
+    for (let j = 1; j < runs.length; j += 1) {
+      const b = runs[j];
+      if (!b || !b.code) continue;
+      for (let i = 0; i < j; i += 1) {
+        const a = runs[i];
+        if (!a || a.code !== b.code || a.date !== b.date || !a.ids.some(id => b.ids.indexOf(id) >= 0)) continue;
+        let next = '';
+        if (b.canNumber) { try { next = await nextRunNumber(store, api, { base: b.base, from: b.code, day: b.date, ids: b.ids, onForm: () => runs }); } catch (e) { next = ''; } }
+        if (seq !== submitSeq.current) return; // Submit pressed again, or a row added or removed meanwhile
+        const nb = refs.current[rows[j].key] && refs.current[rows[j].key].getRun ? refs.current[rows[j].key].getRun() : null;
+        if (!nb || nb.code !== b.code || nb.date !== b.date) return; // the row was changed meanwhile
+        const fix = !b.canNumber ? `${b.code} can only be logged once a day for the same equipment.`
+          : `If they are separate runs, change row ${j + 1} to ${next || `${b.base} with another number at its end`}${b.known ? '' : ' and add its equipment again'}.`;
+        setErrorMessage(`Rows ${i + 1} and ${j + 1} are both ${b.code} on ${sheetDateWords(b.date)} with the same equipment. ${fix} If row ${j + 1} is there by mistake, remove it.`);
+        return;
+      }
     }
     rows.forEach((r) => { const h = refs.current[r.key]; if (h && h.freeze) h.freeze(); });
     setSaving(true);
@@ -5625,6 +6651,8 @@ export default function GeneratedComponent(props) {
         (res.info || []).forEach(n => info.push(`Row ${i + 1}: ${n}`));
         // A row that failed (even partly) stays on the form so it can be submitted again
         if (res.error) { failure = `Row ${i + 1}: ${res.error}`; break; }
+        // ...and so does a row whose equipment an earlier row of this submit already logged for the same order and date (its run is not lost)
+        if (res.keep) { notes.push(`Row ${i + 1} stays on the form: ${res.keep}`); continue; }
         done.push(snapshot[i].key);
       }
     } catch (e) {
@@ -5688,7 +6716,7 @@ export default function GeneratedComponent(props) {
               {rows.map((r, i) => (
                 <EntryRow key={r.key} ref={(el) => { if (el) refs.current[r.key] = el; else delete refs.current[r.key]; }}
                   ctx={ctx} index={i} initialDate={r.date} initialInitials={r.initials} canRemove={rows.length > 1} saving={saving}
-                  onEnter={handleEnter} onRemove={() => setRows(prev => prev.filter(x => x.key !== r.key))} />
+                  onEnter={handleEnter} onRemove={() => { submitSeq.current += 1; setRows(prev => prev.filter(x => x.key !== r.key)); }} />
               ))}
             </div>
             <div className={styles.submitBar}>
