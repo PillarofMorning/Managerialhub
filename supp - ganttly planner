@@ -1424,7 +1424,7 @@ const NOT_LOGGED_MINS = 30;              // a stretch on shift before now this l
 // show it (see ROOM MARKS below).
 // ============================================================================
 const STAGES = [
-    { name: 'Dry pickup', short: 'Dry pickup', words: ['dry pickup', 'dry pick up', 'dry pick-up', 'pickup', 'pick up', 'picking up'] },
+    { name: 'Dry pickup', short: 'Pickup', words: ['dry pickup', 'dry pick up', 'dry pick-up', 'pickup', 'pick up', 'picking up'] },
     { name: 'Wrap / rinse', short: 'Wrap', words: ['wrap'] },
     { name: 'Foam / rinse', short: 'Foam', words: ['foam'] },
     { name: 'Detail self-inspect', short: 'Detail', words: ['detail', 'self inspect', 'self-inspect'] },
@@ -1476,16 +1476,19 @@ function stagePct(mark) { return !mark ? 0 : (mark.kind === 'done' || mark.stage
 // that when saved will affect all other apps, mark down a completion, or mark it as done", and "a 'mark as complete' to group complete
 // a room"). A mark: { room, kind: 'stage' | 'next' | 'done' | 'clear', stage (stages finished, 0 to 8), at (ms, when it was pressed),
 // by (which computer), until (ms: it stops counting then, the room's next startup, else a day later), nextFrom / nextCrew (Next shift:
-// the next crew's clock-in), bulk (the check-offs Mark room complete wrote: their block ids) and prev (the Start those blocks had, so
-// Undo puts it back) }.
+// the next crew's clock-in), bulk (the check-offs Mark room complete wrote: their block ids), prev (the Start those blocks had, so
+// Undo puts it back) and undoOf (a mark below Production ready that followed it: when Production ready was pressed, so the Shift Start
+// rows it closed open again) }.
 // Saved like a check-off in Clean Check-off, one row per press (Name room~<room>~<press>, Status 'room', Details { v, kind: 'room',
-// room, mark }); the newest press of a room wins on every computer. Written into Shift Start's table too (see shiftStartWrites):
+// room, mark }); the newest press of a room wins on every computer. Written into Shift Start's table too (see ssWriteJobs):
 // the room's open rows in the shift on now get "What is being done" = the stage text and "% complete" = the stage % (Production
 // ready: 100, complete = yes and an end time, which is how Shift Start, the Lead hub and Hub - manager mark a room finished).
 // ============================================================================
 const ROOM_MARK_PREFIX = 'room~';
 const NO_ROOMS = {};   // PBED: no room marks (one object, so the plan's inputs never change)
 const ROOM_MARK_DAY_MS = 24 * 3600000;   // a mark on a room with no known startup counts this long
+const SKEW_MS = 2 * 60000;   // Dataverse's clock and this computer's may differ this much: text a person typed this close to a mark counts as after it
+const REOPEN_SLACK_MS = 10 * 60000;   // a Shift Start row closed this long before Production ready was pressed was not closed by it
 function roomMarkKey(room, at) { return (ROOM_MARK_PREFIX + normS(room).slice(0, 70) + '~' + Math.round(at / 1000).toString(36)).slice(0, 100); }
 // A mark read back from Dataverse (another computer wrote it), every field checked. null when it is not usable.
 function roomMarkClean(m, room) {
@@ -1496,6 +1499,7 @@ function roomMarkClean(m, room) {
     if (!kind || !at || !room) return null;
     const out = { room: String(room), kind: kind, stage: Math.max(0, Math.min(STAGES.length, Math.round(num(m.stage)))), at: at, by: String(m.by || '').slice(0, 60), until: num(m.until) || at + ROOM_MARK_DAY_MS };
     if (kind === 'next') { out.nextFrom = num(m.nextFrom); out.nextCrew = String(m.nextCrew || '').slice(0, 4); }
+    if (kind !== 'done' && num(m.undoOf)) out.undoOf = num(m.undoOf);
     if (m.before && typeof m.before === 'object') out.before = { kind: m.before.kind === 'next' ? 'next' : 'stage', stage: Math.max(0, Math.min(STAGES.length - 1, Math.round(num(m.before.stage)))), nextFrom: num(m.before.nextFrom), nextCrew: String(m.before.nextCrew || '').slice(0, 4) };
     if (Array.isArray(m.bulk)) out.bulk = m.bulk.map(String).slice(0, 500);
     if (m.prev && typeof m.prev === 'object') {
@@ -1507,7 +1511,7 @@ function roomMarkClean(m, room) {
 // What is saved of a mark (no screen-only fields).
 function roomMarkBody(m) {
     const o = {};
-    ['room', 'kind', 'stage', 'at', 'by', 'until', 'nextFrom', 'nextCrew', 'bulk', 'prev', 'before'].forEach(function(k) { if (m[k] !== undefined) o[k] = m[k]; });
+    ['room', 'kind', 'stage', 'at', 'by', 'until', 'nextFrom', 'nextCrew', 'bulk', 'prev', 'before', 'undoOf'].forEach(function(k) { if (m[k] !== undefined) o[k] = m[k]; });
     return o;
 }
 // The status words other apps write that Ganttly never writes over: the Lead hub's ("Started", "In Progress", "Incomplete", "Pending
@@ -2373,6 +2377,7 @@ function boardsFromTaskRows(rows, windows, globalStartMs, who, lines) {
         const supCrew = supId ? (who.crewById[supId] || '') : '';
         const tc = rowTimeMs(getRowField(r, 'craa5_datetimeofassignment')) || rowTimeMs(getRowField(r, 'createdon'));
         const tm = rowTimeMs(getRowField(r, 'modifiedon')) || tc;
+        const tmRaw = rowTimeMs(rowRaw(r, 'modifiedon')) || tm;   // to the second (the formatted time drops the seconds)
         const inWin = function(w, t) { return t >= w.s && t < w.e; };
         // The supervisor's own crew decides the shift; saved again in a later shift (an unchanged row) counts for that shift too.
         // (A supervisor whose crew isn't on during the plan saved for another plan; only rows with no known supervisor go by time.)
@@ -2397,7 +2402,7 @@ function boardsFromTaskRows(rows, windows, globalStartMs, who, lines) {
             // Every row of the room in the shift, for the room's status and for Ganttly's room marks (see ROOM MARKS).
             const row = {
                 id: String(rowRaw(r, 'craa5_taskassignmentid') || '').replace(/[{}]/g, '').toLowerCase(),
-                tc: tc, at: tm, done: done, text: String(rowRaw(r, 'craa5_whatisbeingdone') || rowRaw(r, 'craa5__currentstatus') || '').trim(),
+                tc: tc, at: tmRaw, done: done, text: String(rowRaw(r, 'craa5_whatisbeingdone') || rowRaw(r, 'craa5__currentstatus') || '').trim(),
                 notes: String(rowRaw(r, 'craa5_whatislefttodo') || rowRaw(r, 'craa5__future_or_notes') || '').trim(),
                 pct: (function() { const v = rowRaw(r, 'craa5_percentagecomplete'); return v === null || v === undefined || v === '' || isNaN(Number(v)) ? null : Number(v); })(),
                 hub: !!equipText, ended: !!rowRaw(r, 'craa5_endtime'), person: !roomRow, area: area
@@ -2407,7 +2412,7 @@ function boardsFromTaskRows(rows, windows, globalStartMs, who, lines) {
                 const st = rw[ak] = rw[ak] || { area: area, text: '', notes: '', pct: null, at: 0, tc: 0, rows: [], people: 0 };
                 if (row.id && !st.rows.some(function(x) { return x.id === row.id; })) st.rows.push(row);
                 // Like Shift Start: the room's status is its newest open row (by when it was assigned), leaving out rows an employee hub works in.
-                if (!done && !row.hub && (tc > st.tc || (tc === st.tc && tm >= st.at))) { st.tc = tc; st.at = tm; st.text = row.text; st.notes = row.notes; st.pct = row.pct; }
+                if (!done && !row.hub && (tc > st.tc || (tc === st.tc && row.at >= st.at))) { st.tc = tc; st.at = row.at; st.text = row.text; st.notes = row.notes; st.pct = row.pct; }
             });
         }
         if (roomRow) return;
@@ -3553,6 +3558,7 @@ export default function App(props) {
     // only when no second click follows).
     const [roomMenu, setRoomMenu] = useState('');
     const rowClickRef = useRef(null);
+    const roomMenuAtRef = useRef(0);   // when the room menu opened (the second click of a double-click on ⋯ must not land in it)
     const [keyOpen, setKeyOpen] = useState(false);
     const [toolsOpen, setToolsOpen] = useState(false);
     const [popTop, setPopTop] = useState(0);   // below xl the Key / Supervisor tools pop-overs sit, full width, just under the button that opened them
@@ -3686,7 +3692,7 @@ export default function App(props) {
     // Ganttly (current): the newest room mark per room made on the Overview or read from another computer ({ room: mark }, see ROOM MARKS).
     const [roomMarks, setRoomMarks] = useState(function() {
         const m = initialCurrent.roomMarks, out = {};
-        if (IS_CURRENT && m && typeof m === 'object') Object.keys(m).forEach(function(r) { const c = roomMarkClean(m[r], r); if (c) { if (m[r].remote) c.remote = true; out[r] = c; } });
+        if (IS_CURRENT && m && typeof m === 'object') Object.keys(m).forEach(function(r) { const c = roomMarkClean(m[r], r); if (c && c.until > Date.now() - 2 * 86400000) { if (m[r].remote) c.remote = true; out[r] = c; } });   // (long over: dropped)
         return out;
     });
     // An area role's colour: the one picked on the Crew tab, else the colour of the room named for it (the chemical, admin and janitorial
@@ -4043,7 +4049,7 @@ export default function App(props) {
         let changed = false;
         Object.keys(roomMarks).forEach(function(room) {
             const m = roomMarks[room];
-            if (!m || m.remote) return;
+            if (!m || m.remote || now - m.at > CHECKOFF_KEEP_MS) return;
             const key = roomMarkKey(room, m.at);
             if (S.roomSent[key]) return;
             S.roomSent[key] = m.at;
@@ -4110,7 +4116,8 @@ export default function App(props) {
     const ckFlush = async function() {
         if (!IS_CURRENT || ckBusyRef.current || ckBlockedRef.current || Date.now() < ckPauseRef.current) return;
         const S = ckRef.current, now = Date.now();
-        const due = Object.keys(S.pending).filter(function(k) { return (S.pending[k].nextAt || 0) <= now; }).sort(function(a, b) { return (S.pending[a].at || 0) - (S.pending[b].at || 0); });
+        const undoneFirst = function(k) { const it = S.pending[k]; return it.kind !== 'room' && !it.rec ? 0 : 1; };   // on a tie an Undo goes before the press after it
+        const due = Object.keys(S.pending).filter(function(k) { return (S.pending[k].nextAt || 0) <= now; }).sort(function(a, b) { return ((S.pending[a].at || 0) - (S.pending[b].at || 0)) || (undoneFirst(a) - undoneFirst(b)); });
         if (!due.length) return;
         const w = swWriter(props.dataApi);
         if (!w) { ckPublish(); return; }
@@ -4160,12 +4167,14 @@ export default function App(props) {
             if (rec && ckAreaOf.id[normGuid(rec.parentId)]) rec.parentId = ckAreaOf.id[normGuid(rec.parentId)];
             incoming.push({ key: key, id: String(d.id), undone: undone, rec: rec });
         });
+        // Undone rows first: a block's undone row must not make it lose a newer Done read in the same batch (then be removed itself).
+        incoming.sort(function(a, b) { return (b.undone ? 1 : 0) - (a.undone ? 1 : 0); });
         ckDirtyRef.current = true;
         if (marksIn.length) setRoomMarks(function(prev) {
             let next = null;
             marksIn.forEach(function(m) {
                 const cur = next ? next[m.room] : prev[m.room];
-                if (cur && (cur.at > m.at || (cur.at === m.at && !cur.remote))) return;
+                if (cur && cur.at >= m.at) return;
                 if (!next) next = Object.assign({}, prev);
                 next[m.room] = Object.assign({}, m, { remote: true });
             });
@@ -5092,7 +5101,7 @@ export default function App(props) {
             const open = ss ? ss.rows.filter(function(x) { return !x.done; }) : [];
             const people = plan && lid && plan.lineWorkers[lid] ? plan.lineWorkers[lid] : [];
             out.people += people.length;
-            const staffed = people.length > 0 || open.length > 0 || !!worked[r];
+            const staffed = people.length > 0 || !!worked[r];   // (a row with nobody on it, or only people marked absent, is not anyone on it)
             const exempt = !!customOnlyAreas[r] || !lid || FIXED_AREA_KINDS.indexOf(normS(r)) > -1;   // custom tasks, rooms Shift Start has no line for, and the chemical, admin and janitorial rooms (their area roles clean them, wherever Shift Start puts people)
             const h = handoffInfo[r];
             const untilOf = function(at) { return h && h.restart && h.restart > at ? h.restart : at + ROOM_MARK_DAY_MS; };
@@ -5106,7 +5115,7 @@ export default function App(props) {
             if (ss && ss.text) {
                 const p = parseStageText(ss.text);
                 const human = !isMachineStatus(ss.text);
-                if (p && (human ? (!gm0 || ss.at > gm0.at) : (!gm0 && exact))) eff = { kind: p.done ? 'done' : p.next ? 'next' : 'stage', stage: p.stage, at: ss.at, src: 'shiftstart', text: ss.text, until: untilOf(ss.at) };
+                if (p && (human ? (!gm0 || ss.at > gm0.at - SKEW_MS) : (!gm0 && exact))) eff = { kind: p.done ? 'done' : p.next ? 'next' : 'stage', stage: p.stage, at: ss.at, src: 'shiftstart', text: ss.text, until: untilOf(ss.at) };
             }
             if (!eff && gm) eff = Object.assign({ src: 'ganttly' }, gm);
             if (!eff && !gm0 && ss && exact) {
@@ -5116,6 +5125,8 @@ export default function App(props) {
             }
             if (eff && !(nowMs < eff.until)) eff = null;
             if (eff && eff.kind === 'next' && !eff.nextFrom) { eff.nextFrom = nextFrom0; eff.nextCrew = nextWin0 ? nextWin0.crew : ''; }
+            // Once that crew has clocked in the room is theirs: its stage stands, it no longer waits (handed = for the notes).
+            if (eff && eff.kind === 'next' && eff.nextFrom && eff.nextFrom <= nowMs) eff = Object.assign({}, eff, { kind: 'stage', handed: true });
             let floorMs = 0, why = '';
             if (eff && eff.kind === 'next' && eff.nextFrom > nowMs) { floorMs = eff.nextFrom; why = 'next'; }
             else if (out.applies && !staffed && !exempt && !(eff && eff.kind === 'done')) { floorMs = slotMs; why = 'slot'; }
@@ -5161,26 +5172,33 @@ export default function App(props) {
         S.ssWrote = S.ssWrote || {};
         const strip = stripName;
         Object.keys(roomState.rooms).forEach(function(r) {
-            const x = roomState.rooms[r], g = x.gm;
+            const x = roomState.rooms[r];
+            let g = x.gm;
             if (!g || !(nowMs < (g.until || 0)) || !x.ss) return;
+            if (g.kind === 'next' && g.nextFrom && g.nextFrom <= nowMs) {   // the next crew is on: their rows get the stage, never "Next shift"
+                if (!g.stage) return;
+                g = Object.assign({}, g, { kind: 'stage' });
+            }
             if (x.eff && x.eff.src === 'shiftstart' && !isMachineStatus(x.eff.text)) return;   // a person's newer text in Shift Start stands
             if (strip(x.ss.area) !== strip(r) && !(x.line && strip(x.line.name) === strip(r) && strip(x.ss.area) === strip(x.line.name))) return;
-            const clear = g.kind === 'clear', done = g.kind === 'done';
+            const clear = g.kind === 'clear' || (g.kind === 'stage' && !g.stage), done = g.kind === 'done';
             const text = clear ? 'Working' : stageText(g), pct = clear ? 0 : stagePct(g);
             x.ss.rows.forEach(function(row) {
                 if (!row.id || row.hub) return;
                 const t = normS(row.text), ours = t === 'production ready';
                 let reopen = false;
                 if (row.done) {
-                    // Only a room Ganttly closed, after an Undo or a lower mark: closed before the mark, or closed from this computer before it
-                    // (Dataverse's clock may run ahead of this computer's).
-                    const mine = S.ssWrote[row.id];
-                    if (!ours || done || !(row.at < g.at || (mine && mine.done && mine.t < g.at))) return;
+                    // Only a row Production ready closed, after an Undo or a lower stage picked (undoOf: when Production ready was pressed;
+                    // a row closed well before that was closed by something else).
+                    if (!ours || done || !g.undoOf || row.at < g.undoOf - REOPEN_SLACK_MS) return;
                     reopen = true;
                 } else {
                     if (OTHER_APP_STATUS.test(t)) return;
-                    if (!isMachineStatus(row.text) && !(row.at < g.at)) return;   // a person typed it after the mark
-                    if (row.text === text && row.pct === pct) return;
+                    if (!isMachineStatus(row.text) && row.at > g.at - SKEW_MS) return;   // a person typed it after the mark (or about then)
+                    // Same as it would be written (a column this table does not have is not compared).
+                    const textSame = (d.craa5_whatisbeingdone && d.craa5__currentstatus) || row.text === text;
+                    const pctSame = d.craa5_percentagecomplete || row.pct === pct;
+                    if (textSame && pctSame) return;
                 }
                 const sig = text + '|' + pct + '|' + (done ? 1 : 0);
                 const w0 = S.ssWrote[row.id];
@@ -5192,7 +5210,7 @@ export default function App(props) {
                 if (done && !d.craa5_endtime) body.craa5_endtime = new Date().toISOString();
                 if (reopen && !d.craa5_complete) body.craa5_complete = false;
                 if (reopen && !d.craa5_endtime) body.craa5_endtime = null;
-                if (Object.keys(body).length) jobs.push({ room: r, id: row.id, at: row.at, body: body, sig: sig, done: done });
+                if (Object.keys(body).length) jobs.push({ room: r, id: row.id, at: row.at, body: body, sig: sig });
             });
         });
         return jobs;
@@ -5223,7 +5241,7 @@ export default function App(props) {
                 const j = jobs[i];
                 if (fresh[j.id] === undefined || fresh[j.id] !== j.at) continue;
                 await w.update('craa5_taskassignment', j.id, j.body);
-                S.ssWrote[j.id] = { sig: j.sig, t: Date.now(), done: j.done };
+                S.ssWrote[j.id] = { sig: j.sig, t: Date.now() };
                 wrote++;
             }
             R.tries = 0; R.err = ''; R.nextAt = 0;
@@ -8222,12 +8240,19 @@ export default function App(props) {
             const markDone = !!(eff && eff.kind === 'done');
             const markNext = !!(rsx && rsx.why === 'next');
             // Cleans Mark room complete checked off (no people on them, so not on the Gantt): still pieces of this room, done when it was pressed.
-            const bulkRecs = Object.keys(taskStatus).filter(function(id) { const rec = taskStatus[id]; return rec && rec.bulk && rec.status === 'done' && String((parentById[rec.parentId] || {}).area) === r && parentsHere.some(function(p) { return p.id === rec.parentId && p.keepIds && p.keepIds[id]; }); }).map(function(id) { return taskStatus[id]; });
+            // (Once this startup has passed, only ones pressed after it: the earlier ones belong to the changeover that ended.)
+            const bulkRecs = Object.keys(taskStatus).filter(function(id) { const rec = taskStatus[id]; return rec && rec.bulk && rec.status === 'done' && String((parentById[rec.parentId] || {}).area) === r && (!past || (rec.doneAt || rec.updatedAt || 0) > msOf(past.R)) && parentsHere.some(function(p) { return p.id === rec.parentId && p.keepIds && p.keepIds[id]; }); }).map(function(id) { return taskStatus[id]; });
             const bulkEnd = bulkRecs.length ? toMin(Math.max.apply(null, bulkRecs.map(function(rec) { return rec.doneAt || rec.updatedAt || 0; }))) : null;
             const allDone = markDone || (U.length === 0 && (T.length ? T.every(function(t) { return t.isComplete; }) : (!past && parentsHere.length > 0 && parentsHere.every(function(p) { return p.lastDoneMs > 0; }))));
             let F = null, est = false, stageF = false;
             const wontFit = !allDone && U.length > 0 && G !== null && G <= H;   // a room with no startup has nothing to miss
-            if (markDone) F = Math.max(T.some(function(t) { return t.isComplete; }) ? Math.max.apply(null, T.filter(function(t) { return t.isComplete; }).map(doneEnd)) : -Infinity, bulkEnd !== null ? bulkEnd : -Infinity, toMin(eff.at));
+            if (markDone) {
+                // Ready when its last clean was done; the moment it was marked only counts when cleans were still open then (Shift Start
+                // said production ready over them) or nothing was checked off at all. Mark room complete's own check-offs carry the press.
+                const doneTEnd = T.some(function(t) { return t.isComplete; }) ? Math.max.apply(null, T.filter(function(t) { return t.isComplete; }).map(doneEnd)) : -Infinity;
+                const openLeft = U.length > 0 || T.some(function(t) { return !t.isComplete; });
+                F = Math.max(doneTEnd, bulkEnd !== null ? bulkEnd : -Infinity, openLeft || (doneTEnd === -Infinity && bulkEnd === null) ? toMin(eff.at) : -Infinity);
+            }
             else if (allDone) F = Math.max(T.length ? Math.max.apply(null, T.map(doneEnd)) : toMin(Math.max.apply(null, parentsHere.map(function(p) { return p.lastDoneMs; }))), bulkEnd !== null ? bulkEnd : -Infinity);
             else if (wontFit) F = Infinity;
             else if (U.length) {
@@ -8239,18 +8264,21 @@ export default function App(props) {
             // Work: done, total, left (a clean under way counts the part of it still ahead).
             const workAll = sum(T, function(t) { return t.rawWorkloadMins; }) + uWork;
             const workDoneR = sum(T.filter(function(t) { return t.isComplete; }), function(t) { return t.rawWorkloadMins; });
-            const leftMins = markDone ? 0 : sum(T.filter(function(t) { return !t.isComplete; }), function(t) {
+            let leftMins = markDone ? 0 : sum(T.filter(function(t) { return !t.isComplete; }), function(t) {
                 return t.rawWorkloadMins * (t.isInProgress ? Math.max(0.1, Math.min(1, (endOf(t) - nowMin) / Math.max(1, t.finalDuration))) : 1);
             }) + uWork;
             // Ganttly: a stage marked takes its share off the room's cleaning time (Gerald: "the basic percentages that can be shaved off per
             // the run time"): the plan's own finish, from now (or the room's later start), scaled to the work the stages say is left. Start /
             // Done check-offs that show more progress win.
-            if (eff && !allDone && !wontFit && !est && F !== null && F !== Infinity && leftMins > 0) {
+            if (eff && eff.kind !== 'done' && eff.stage > 0 && !allDone && !wontFit && !est && F !== null && F !== Infinity && leftMins > 0) {
                 const stageLeft = workAll * (1 - stageCum(eff.stage) / 100);
                 if (stageLeft < leftMins) {
-                    const base = Math.max(nowMin, rsx && rsx.floorMs ? toMin(rsx.floorMs) : -Infinity);
+                    // From when the room's open cleans start (its line stop, a handover, the next update or the next crew, else now).
+                    const openStarts = T.filter(function(t) { return !t.isComplete; }).map(function(t) { return t.startMin; });
+                    const base = Math.max(nowMin, openStarts.length ? Math.min.apply(null, openStarts) : nowMin);
                     const Fs = base + Math.max(0, F - base) * stageLeft / leftMins;
                     if (Fs < F) { F = Fs; stageF = true; }
+                    leftMins = stageLeft;
                 }
             }
             const spare = G !== null && F !== null ? (F === Infinity ? -Infinity : G - F) : null;
@@ -8273,13 +8301,16 @@ export default function App(props) {
                 return p && String(p.area) === r ? Math.max(m, Number(rec.updatedAt) || 0) : m;
             }, 0);
             const plannedWhileRunning = running && T.some(function(t) { return !t.isComplete && !t.isInProgress && t.startMin < S; });
+            // Waiting for the next update because nobody in Shift Start is on it: only while cleaning is left, the line is stopped and the
+            // update is later than its own handoff.
+            const held = !!(rsx && rsx.why === 'slot') && !allDone && leftMins > 0 && !running && !(handoffMs[r] >= rsx.floorMs);
             const reasons = [];
             if (shortWindow && status !== 'READY') reasons.push('short window');
             if (uWork > 0) reasons.push(fmtMins(uWork) + " won't fit");
             if (overruns.length) reasons.push('overrun');
             if (w && S > w.shiftStart + 60 && S <= nowMin && (status === 'LATE' || status === 'AT_RISK')) reasons.push('handed over ' + clock(S));
             if (markNext) reasons.push('next shift');
-            else if (rsx && rsx.why === 'slot') reasons.push('not assigned in Shift Start');
+            else if (held) reasons.push('not assigned in Shift Start');
             else if (!assignedNow.length && leftMins > 0 && !running && R !== null && status !== 'READY') reasons.push('nobody on it now');
             if (absentN > 0 && (status === 'LATE' || status === 'AT_RISK')) reasons.push(absentN + ' marked absent on ' + w.crew);
             // Why no startup is known (never counted as on track or late).
@@ -8298,17 +8329,20 @@ export default function App(props) {
             const pieceIds = distinct(T.concat(U).map(pidOf).concat(bulkRecs.map(function(rec) { return String(rec.parentId); })));
             const pieceDone = markDone ? pieceIds.length : pieceIds.filter(function(id) { return !U.some(function(u) { return pidOf(u) === id; }) && T.every(function(t) { return pidOf(t) !== id || t.isComplete; }); }).length;
             const st = pieceIds.length ? { equipDone: pieceDone, equipCount: pieceIds.length } : allDone ? { equipDone: parentsHere.length, equipCount: parentsHere.length } : { equipDone: 0, equipCount: 0 };
-            // The completion metric (Gerald's stages): the stage marked (in Ganttly or Shift Start), else the one the Start / Done check-offs
-            // reach ("est."), and the share done: the larger of the stages' share and the check-offs' work.
+            // The completion metric (Gerald's stages): the stage marked (in Ganttly or Shift Start) decides, with its share, the same as
+            // Shift Start shows; with no stage marked, every clean checked off is production ready, else the stage the Start / Done
+            // check-offs reach is shown as an estimate ("est.", light blue).
             const workPct = markDone ? 100 : workAll > 0 ? Math.round(workDoneR / workAll * 100) : (allDone ? 100 : 0);
-            let compStage = 0;
-            if (allDone) compStage = STAGES.length;
-            else if (eff) compStage = Math.min(eff.stage, STAGES.length - 1);
-            else for (let k = STAGES.length - 1; k > 0; k--) { if (stageCum(k) <= workPct + 0.001) { compStage = k; break; } }
+            const marked = !markDone && !!eff && eff.stage > 0;
+            let compStage = 0, compEst = false;
+            if (markDone) compStage = STAGES.length;
+            else if (marked) compStage = Math.min(eff.stage, STAGES.length - 1);
+            else if (allDone) compStage = STAGES.length;
+            else { compEst = true; for (let k = STAGES.length - 1; k > 0; k--) { if (stageCum(k) <= workPct + 0.001) { compStage = k; break; } } }
             const comp = {
-                stage: compStage, est: !allDone && !eff, pct: allDone ? 100 : Math.max(eff ? stagePct(eff) : 0, workPct),
-                label: allDone ? READY_WORD : compStage > 0 ? STAGES[compStage - 1].name + ' finished' : 'Not started',
-                src: eff ? eff.src : '', at: eff ? eff.at : 0, by: eff && eff.by ? eff.by : ''
+                stage: compStage, est: compEst, pct: markDone ? 100 : marked ? stagePct(eff) : allDone ? 100 : workPct,
+                label: compStage >= STAGES.length ? READY_WORD : compStage > 0 ? STAGES[compStage - 1].name + ' finished' : 'Not started',
+                src: markDone || marked ? eff.src : '', at: markDone || marked ? eff.at : 0, by: (markDone || marked) && eff.by ? eff.by : ''
             };
             return {
                 room: r, status: status, S: S, R: R, G: G, F: F, spare: spare, est: est, wontFit: wontFit, uWork: uWork, gateLabel: gateLabel,
@@ -8318,7 +8352,7 @@ export default function App(props) {
                 piecesDone: st.equipDone, pieces: st.equipCount,
                 assignedNow: assignedNow, leadKey: leadKey, lead: leadKey ? laneName(leadKey) : '', lastLog: lastLog, plannedWhileRunning: plannedWhileRunning,
                 reasons: reasons, noStartupWhy: noStartupWhy, setStartupLine: setStartupLine,
-                comp: comp, eff: eff, markDone: markDone, markNext: markNext, rs: rsx, stageF: stageF, bulkN: bulkRecs.length
+                comp: comp, eff: eff, markDone: markDone, markNext: markNext, held: held, rs: rsx, stageF: stageF, bulkN: bulkRecs.length
             };
         }).sort(function(a, b) {
             return STATUS_ORDER[a.status] - STATUS_ORDER[b.status]
@@ -8329,17 +8363,24 @@ export default function App(props) {
 
         // ---- Support rooms: one folded line (they have no startup) ----
         const supRooms = shownRooms.filter(function(r) { return isSupportRoom(r); });
-        const supWork = function(done) {
-            return sum(supRooms, function(r) {
-                const g = groupByName[r];
-                const t = g ? g.tasks.filter(function(x) { return !done || x.isComplete; }) : [];
-                return sum(t, function(x) { return x.rawWorkloadMins; }) + (done ? 0 : sum(scheduleData.unscheduled.filter(function(x) { return x.originalArea === r; }), function(x) { return x.rawWorkloadMins; }));
-            });
+        const supWorkOf = function(r, done) {
+            const g = groupByName[r];
+            const t = g ? g.tasks.filter(function(x) { return !done || x.isComplete; }) : [];
+            return sum(t, function(x) { return x.rawWorkloadMins; }) + (done ? 0 : sum(scheduleData.unscheduled.filter(function(x) { return x.originalArea === r; }), function(x) { return x.rawWorkloadMins; }));
         };
-        const supAll = supWork(false), supDone = supWork(true);
+        // A support area's share done: its stage when one is marked (like a line), else its cleans checked off.
+        const supRows = supRooms.map(function(r) {
+            const s = statOf[r] || { pct: 0, equipDone: 0, equipCount: 0 };
+            const rs0 = roomState.rooms[r] || null;
+            const e = rs0 ? rs0.eff : null;
+            const pct = e && e.kind === 'done' ? 100 : e && e.stage > 0 ? stagePct(e) : s.pct;
+            const held = !!(rs0 && rs0.why === 'slot') && pct < 100 && !(handoffMs[r] >= rs0.floorMs);
+            return { room: r, pct: pct, piecesDone: e && e.kind === 'done' ? s.equipCount : s.equipDone, pieces: s.equipCount, eff: e, rs: rs0, held: held, work: supWorkOf(r, false) };
+        });
+        const supAll = sum(supRows, function(x) { return x.work; });
         const support = {
-            n: supRooms.length, pct: supAll > 0 ? Math.round(supDone / supAll * 100) : 0,
-            rooms: supRooms.map(function(r) { const s = statOf[r] || { pct: 0, equipDone: 0, equipCount: 0 }; const rs0 = roomState.rooms[r] || null; const e = rs0 ? rs0.eff : null; return { room: r, pct: e ? Math.max(s.pct, stagePct(e)) : s.pct, piecesDone: e && e.kind === 'done' ? s.equipCount : s.equipDone, pieces: s.equipCount, eff: e, rs: rs0 }; }),
+            n: supRooms.length, pct: supAll > 0 ? Math.round(sum(supRows, function(x) { return x.work * x.pct / 100; }) / supAll * 100) : 0,
+            rooms: supRows,
             onDuty: w ? laneRoster.filter(function(l) { return l.crew === w.crew && !l.isLead && isAreaRoleKind(l.kind); }).length : 0
         };
 
@@ -8377,7 +8418,7 @@ export default function App(props) {
         // Cleaning done over the lines being judged (all production rooms when none is).
         const base = scope.length ? scope : rows;
         const cleaning = {
-            pct: sum(base, function(x) { return x.workAll; }) > 0 ? Math.round(sum(base, function(x) { return x.workDone; }) / sum(base, function(x) { return x.workAll; }) * 100) : 0,
+            pct: sum(base, function(x) { return x.workAll; }) > 0 ? Math.round(sum(base, function(x) { return x.workAll * x.comp.pct / 100; }) / sum(base, function(x) { return x.workAll; }) * 100) : 0,   // (a room's stage counts, like its row)
             piecesDone: sum(base, function(x) { return x.piecesDone; }), pieces: sum(base, function(x) { return x.pieces; }),
             leftHrs: sum(base, function(x) { return x.leftMins; }) / 60, wontFitHrs: sum(base, function(x) { return x.wontFit ? x.uWork : 0; }) / 60
         };
@@ -8478,13 +8519,6 @@ export default function App(props) {
                 if (x.status === 'READY' && inW(x.F)) { const ld = leadOfRoomDone(x); thisShift.push({ icon: 'star', text: x.room + ' ready ' + clock(x.F) + ' · ' + fmtMins(x.G - x.F) + ' before ' + x.gateLabel + (ld ? ' · lead ' + ld : ''), room: x.room }); }
                 else if (x.status === 'NO_STARTUP' && x.allDone && inW(x.F)) thisShift.push({ icon: 'star', text: x.room + ' finished ' + clock(x.F), room: x.room });
             });
-            // Rooms marked in Ganttly this shift (Production ready, Next shift).
-            rows.concat(supRooms.map(function(r) { const rs0 = roomState.rooms[r]; return { room: r, eff: rs0 ? rs0.eff : null, bulkN: 0 }; })).forEach(function(x) {
-                const e = x.eff;
-                if (!e || e.src !== 'ganttly' || !(e.at >= clockInMs)) return;
-                if (e.kind === 'done') thisShift.push({ icon: 'check', text: x.room + ' marked production ready ' + clockMs(e.at) + (e.bulk && e.bulk.length ? ' (' + e.bulk.length + ' clean' + (e.bulk.length === 1 ? '' : 's') + ' checked off at once)' : ''), room: x.room });
-                else if (e.kind === 'next') thisShift.push({ icon: 'arrow', text: x.room + ' handed to ' + (e.nextCrew ? e.nextCrew + ' crew' : 'the next shift') + (e.stage ? ' · ' + STAGES[e.stage - 1].name + ' finished' : ''), room: x.room });
-            });
             if (effort.pace !== null && effort.pace >= 100) thisShift.push({ icon: 'star', text: w.crew + ' crew: ' + effort.atOrUnder + ' of ' + effort.timed + ' timed cleans at or under standard' });
             if (!planOnly) thisShift.push({ icon: 'check', text: (Math.round(effort.stdHrs * 10) / 10) + ' std hrs of cleaning done · ' + effort.cleans + ' clean' + (effort.cleans === 1 ? '' : 's') });
             const lateRooms = rows.filter(function(x) { return x.status === 'LATE'; }).map(function(x) { return x.room; });
@@ -8494,6 +8528,15 @@ export default function App(props) {
             const alerts = [overN ? overN + ' overrun' + (overN === 1 ? '' : 's') + ' (' + overRooms.join(', ') + ')' : '', wontRooms.length ? sum(wontRooms, function(x) { return x.U.length; }) + " cleans won't fit before startup (" + wontRooms.map(function(x) { return x.room; }).join(', ') + ')' : '', lateRooms.length ? lateRooms.length + ' line' + (lateRooms.length === 1 ? '' : 's') + ' late (' + lateRooms.join(', ') + ')' : ''].filter(Boolean);
             if (alerts.length) thisShift.push({ icon: 'alert', text: alerts.join(' · ') });
             if (nextWin && handedMins >= 30) thisShift.push({ icon: 'arrow', text: (Math.round(handedMins / 6) / 10) + ' std hrs planned for ' + nextWin.crew + ' crew and later' });
+            // Rooms marked in Ganttly this shift (Production ready, Next shift); a room already named ready above is not named twice.
+            const named = {};
+            thisShift.forEach(function(s) { if (s.room && s.icon === 'star') named[s.room] = true; });
+            rows.concat(supRows).forEach(function(x) {
+                const e = x.eff;
+                if (!e || e.src !== 'ganttly' || !(e.at >= clockInMs)) return;
+                if (e.kind === 'done' && !named[x.room]) thisShift.push({ icon: 'check', text: x.room + ' marked production ready ' + clockMs(e.at) + (e.bulk && e.bulk.length ? ' (' + e.bulk.length + ' clean' + (e.bulk.length === 1 ? '' : 's') + ' checked off at once)' : ''), room: x.room });
+                else if (e.kind === 'next' || e.handed) thisShift.push({ icon: 'arrow', text: x.room + ' handed to ' + (e.nextCrew ? e.nextCrew + ' crew' : 'the next shift') + (e.stage ? ' · ' + STAGES[e.stage - 1].name + ' finished' : ''), room: x.room });
+            });
         }
 
         // ---- Where the numbers come from ----
@@ -8531,7 +8574,7 @@ export default function App(props) {
             if (x.comp && !x.comp.est && x.comp.stage > 0 && !x.markDone) bits.push(x.comp.label.toLowerCase() + ' (' + x.comp.stage + ' of ' + STAGES.length + ')');
             if (x.markDone) bits.push('production ready');
             if (x.markNext) bits.push('next shift from ' + clockMs(x.rs.floorMs));
-            else if (x.rs && x.rs.why === 'slot') bits.push('not assigned in Shift Start, starts ' + clockMs(x.rs.floorMs));
+            else if (x.held) bits.push('not assigned in Shift Start, starts ' + clockMs(x.rs.floorMs));
             if (x.status === 'RUNNING') bits.push('line running until ' + clock(x.S));
             if (x.status === 'NO_STARTUP' && x.noStartupWhy) bits.push(x.noStartupWhy.toLowerCase());
             copyLines.push('- ' + x.room + ': ' + bits.join(' · '));
@@ -8556,15 +8599,21 @@ export default function App(props) {
         const R = x && x.R !== null && x.R !== undefined ? globalStartMs + x.R * 60000 : null;
         return R && R > nowMs ? R : nowMs + ROOM_MARK_DAY_MS;
     };
+    const effOf = function(room) { const rs0 = roomState.rooms[room]; return rs0 ? rs0.eff : null; };
     // The newest press of a room: one second after the last one at least, so every press is its own row in Clean Check-off.
     const putRoomMark = function(room, fields, x) {
         const cur = roomMarks[room];
         const at = Math.max(Date.now(), cur ? cur.at + 1000 : 0);
         const m = Object.assign({ room: room, kind: 'stage', stage: 0, at: at, by: hostUserName(), until: roomMarkUntil(x) }, fields, { at: at });
+        // Below Production ready after it (Undo, or a lower stage picked): the Shift Start rows it closed open again (see ssWriteJobs).
+        const e = effOf(room);
+        if (m.kind !== 'done') {
+            const was = e && e.kind === 'done' ? e.at : cur && cur.kind !== 'done' && cur.undoOf && Date.now() < (cur.until || 0) ? cur.undoOf : 0;
+            if (was) m.undoOf = was; else delete m.undoOf;
+        } else delete m.undoOf;
         setRoomMarks(function(prev) { const n = Object.assign({}, prev); n[room] = m; return n; });
         return m;
     };
-    const effOf = function(room) { const rs0 = roomState.rooms[room]; return rs0 ? rs0.eff : null; };
     const nextShiftFields = function() {
         return { nextFrom: nextWin0 ? globalStartMs + nextWin0.start * 60000 : Date.now() + 12 * 3600000, nextCrew: nextWin0 ? nextWin0.crew : '' };
     };
@@ -8581,7 +8630,7 @@ export default function App(props) {
     const setRoomNext = function(x, on) {
         const e = effOf(x.room);
         const stage = e && e.kind !== 'done' ? e.stage : 0;
-        putRoomMark(x.room, on ? Object.assign({ kind: 'next', stage: stage }, nextShiftFields()) : { kind: 'stage', stage: stage }, x);
+        putRoomMark(x.room, on ? Object.assign({ kind: 'next', stage: stage }, nextShiftFields()) : stage ? { kind: 'stage', stage: stage } : { kind: 'clear', stage: 0 }, x);
     };
     // "Mark room complete": every clean of the room still open in this changeover is checked off Done now (a Start already pressed keeps its
     // people and start time), and the room is Production ready. The check-offs carry the press time (bulk), so Undo finds exactly them.
@@ -8627,7 +8676,7 @@ export default function App(props) {
             return next;
         });
         const b = to || g.before || { kind: 'stage', stage: 0 };
-        putRoomMark(x.room, b.kind === 'next' && b.nextFrom > now ? { kind: 'next', stage: b.stage, nextFrom: b.nextFrom, nextCrew: b.nextCrew } : { kind: 'stage', stage: b.stage }, x);
+        putRoomMark(x.room, b.kind === 'next' && b.nextFrom > now ? { kind: 'next', stage: b.stage, nextFrom: b.nextFrom, nextCrew: b.nextCrew } : b.stage ? { kind: 'stage', stage: b.stage } : { kind: 'clear', stage: 0 }, x);
     };
     const clearRoomMark = function(x) { putRoomMark(x.room, { kind: 'clear', stage: 0 }, x); };
     // The board row of a room (a support area has none: its cleans are worked out here the same way).
@@ -9724,7 +9773,7 @@ export default function App(props) {
         const bits = [x.stateText];
         const rs0 = x.rs;
         if (x.markNext && rs0) bits.unshift('Next shift' + (x.eff && x.eff.nextCrew ? ' · ' + x.eff.nextCrew + ' crew' : '') + ' from ' + board.clockMs(rs0.floorMs));
-        else if (rs0 && rs0.why === 'slot') bits.unshift('Not assigned in Shift Start · starts at the ' + board.clockMs(rs0.floorMs) + ' update');
+        else if (x.held && rs0) bits.unshift('Not assigned in Shift Start · starts at the ' + board.clockMs(rs0.floorMs) + ' update');
         if (x.lines.length) bits.push(x.lines.slice(0, 2).map(function(l) { return l.replace(' · ', ' '); }).join(', ') + (x.lines.length > 2 ? ' +' + (x.lines.length - 2) : ''));
         if (x.status === 'NO_STARTUP' && x.noStartupWhy) bits.push(x.noStartupWhy);
         if (x.plannedWhileRunning) bits.push('planned while the line runs');
@@ -9741,10 +9790,10 @@ export default function App(props) {
             </div>
         );
     };
-    const compShort = function(comp) {
+    const compShort = function(comp, withEst) {
         if (comp.stage >= STAGES.length) return 'Ready';
         if (!comp.stage) return 'Not started';
-        return (comp.est ? 'est. ' : '') + STAGES[comp.stage - 1].short;
+        return (comp.est && withEst ? 'est. ' : '') + STAGES[comp.stage - 1].short;
     };
     const compTitle = function(x) {
         const c = x.comp;
@@ -9753,17 +9802,22 @@ export default function App(props) {
     };
     // A click opens the room on the Gantt (Focus) a moment later; a double-click opens the room menu instead (Gerald: "double click any
     // line"). The ⋯ button opens the menu with one tap (phones, tablets, keyboards). TV mode has no menu.
-    const roomRowClick = function(room) {
+    const perfNow = function() { return typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now(); };
+    const roomRowClick = function(room, e) {
         if (tvMode) return;
-        if (rowClickRef.current) clearTimeout(rowClickRef.current);
-        rowClickRef.current = setTimeout(function() { rowClickRef.current = null; openBoardRoom(room); }, 260);
+        if (rowClickRef.current) { clearTimeout(rowClickRef.current); rowClickRef.current = null; }
+        if (e && e.detail >= 2) return;   // the second click of a double-click
+        rowClickRef.current = setTimeout(function() { rowClickRef.current = null; openBoardRoom(room); }, 400);
     };
     const roomRowDouble = function(room, e) {
         if (tvMode) return;
         if (e && e.preventDefault) e.preventDefault();
         if (rowClickRef.current) { clearTimeout(rowClickRef.current); rowClickRef.current = null; }
+        roomMenuAtRef.current = perfNow();
         setRoomMenu(room);
     };
+    // A press in the menu right after it opened is the rest of the click that opened it, not a choice.
+    const menuSafe = function(fn) { return function(e) { if (perfNow() - roomMenuAtRef.current < 400) return; fn(e); }; };
     const roomMenuBtn = function(room) {
         if (tvMode) return null;
         return (
@@ -9797,13 +9851,13 @@ export default function App(props) {
                 : isDone ? READY_WORD : eff.stage ? STAGES[eff.stage - 1].name + ' finished (' + eff.stage + ' of ' + STAGES.length + ')' : 'No stage finished yet')
                 + (eff.src === 'shiftstart' ? ' · from Shift Start' + (eff.text && !isMachineStatus(eff.text) ? ' ("' + eff.text + '")' : '') : ' · marked in Ganttly' + (eff.by ? ' by ' + eff.by : '')) + (eff.at ? ', ' + clk(eff.at) : '');
         return (
-            <div data-room-menu={room} className="fixed inset-0 z-[90] flex items-end sm:items-center justify-center bg-slate-900/30 p-3" onPointerDown={function(e) { if (e.target === e.currentTarget) close(); }}>
+            <div data-room-menu={room} className="fixed inset-0 z-[90] flex items-end sm:items-center justify-center bg-slate-900/30 p-3" onPointerDown={menuSafe(function(e) { if (e.target === e.currentTarget) close(); })}>
                 <div className="w-full max-w-[460px] max-h-[calc(100vh-24px)] overflow-y-auto custom-scrollbar bg-white rounded-xl shadow-2xl border border-slate-200 p-4 text-slate-700">
                     <div className="flex items-center gap-2 min-w-0">
                         <span className="w-3 h-3 rounded-full flex-shrink-0" style={{ background: roomHexShown(room) }} />
                         <span className="text-[16px] font-black text-slate-800 truncate flex-1 min-w-0">{room}</span>
                         {!x.support && boardChip(x.status)}
-                        <button onClick={close} className="no-pan ml-1 w-7 h-7 rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-100 font-black" aria-label="Close">✕</button>
+                        <button onClick={menuSafe(close)} className="no-pan ml-1 w-7 h-7 rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-100 font-black" aria-label="Close">✕</button>
                     </div>
                     <div data-room-now className="mt-1 text-[12px] font-semibold text-slate-600 leading-snug">{nowLine}</div>
 
@@ -9812,7 +9866,7 @@ export default function App(props) {
                         {STAGES.map(function(st, i) {
                             const k = i + 1, fin = k <= cur, last = k === STAGES.length;
                             return (
-                                <button key={'st' + k} data-stage-btn={k} onClick={function() { setRoomStage(x, k); }}
+                                <button key={'st' + k} data-stage-btn={k} onClick={menuSafe(function() { setRoomStage(x, k); })}
                                     className={'no-pan flex items-center gap-1.5 px-2 py-1.5 rounded-lg border text-[11.5px] font-bold text-left leading-tight ' + (fin ? 'bg-[#E6F1FB] border-[#B3D4F2] text-[#00468B]' : k === cur + 1 ? 'bg-white border-[#0072CE] text-slate-800 hover:bg-[#F3F8FD]' : 'bg-white border-slate-200 text-slate-600 hover:bg-[#F3F8FD]')}
                                     title={(last ? 'Reassembly / sanitize finished: the room is production ready (same as Mark room complete)' : st.name + ' finished: ' + stageCum(k) + '% of the room\'s cleaning') + (k <= cur && !last ? '. Press to go back to this stage.' : '')}>
                                     <span className={'w-4 h-4 rounded flex items-center justify-center text-[10px] font-black flex-shrink-0 ' + (fin ? 'bg-[#0072CE] text-white' : 'bg-slate-100 text-slate-500')}>{fin ? <Check className="w-3 h-3" strokeWidth={3} /> : k}</span>
@@ -9823,20 +9877,20 @@ export default function App(props) {
                     </div>
 
                     <div className="mt-3 grid grid-cols-1 gap-1.5">
-                        {!isDone && <button data-room-next onClick={function() { setRoomNext(x, !isNext); }} className={act + (isNext ? ' bg-[#FFF4D6] border-[#FFB81C] text-[#8A5A00]' : ' bg-white border-slate-300 text-slate-700 hover:bg-[#F3F8FD]')}>
+                        {!isDone && <button data-room-next onClick={menuSafe(function() { setRoomNext(x, !isNext); })} className={act + (isNext ? ' bg-[#FFF4D6] border-[#FFB81C] text-[#8A5A00]' : ' bg-white border-slate-300 text-slate-700 hover:bg-[#F3F8FD]')}>
                             {isNext ? 'Back to this shift' : 'Next shift' + (nf.nextCrew ? ': ' + nf.nextCrew + ' crew from ' + clk(nf.nextFrom) : '')}
                             <span className="block text-[10.5px] font-semibold text-slate-500">{isNext ? 'The room is planned with this crew again.' : 'Its open cleans wait for the next crew. Shift Start and the other apps show "Next shift".'}</span>
                         </button>}
-                        {!isDone && <button data-room-complete onClick={function() { markRoomComplete(x); }} className={act + ' bg-[#0072CE] border-[#0072CE] text-white hover:bg-[#00468B]'}>
+                        {!isDone && <button data-room-complete onClick={menuSafe(function() { markRoomComplete(x); })} className={act + ' bg-[#0072CE] border-[#0072CE] text-white hover:bg-[#00468B]'}>
                             Mark room complete
                             <span className="block text-[10.5px] font-semibold text-white/85">{openN ? 'Checks off the ' + openN + ' clean' + (openN === 1 ? '' : 's') + ' still open (no one is credited for them) and marks it ' + READY_WORD.toLowerCase() + '.' : 'Marks it ' + READY_WORD.toLowerCase() + '.'}</span>
                         </button>}
-                        {canUndo && <button data-room-undo onClick={function() { undoRoomComplete(x); }} className={act + ' bg-white border-slate-300 text-slate-700 hover:bg-[#F3F8FD]'}>
+                        {canUndo && <button data-room-undo onClick={menuSafe(function() { undoRoomComplete(x); })} className={act + ' bg-white border-slate-300 text-slate-700 hover:bg-[#F3F8FD]'}>
                             Undo room complete
                             <span className="block text-[10.5px] font-semibold text-slate-500">{(gm.bulk || []).length ? 'The ' + gm.bulk.length + ' clean' + (gm.bulk.length === 1 ? '' : 's') + ' it checked off open again; ' : ''}the room goes back to {gm.before && gm.before.stage ? STAGES[gm.before.stage - 1].name + ' finished' : 'no stage marked'}.</span>
                         </button>}
                         {isDone && !canUndo && <div className="px-3 py-2 rounded-lg bg-slate-50 border border-slate-200 text-[11.5px] font-semibold text-slate-600">{fromGanttly ? 'Marked production ready on another computer. Pick a stage above to reopen it.' : 'Shift Start says production ready. Pick a stage above to reopen it.'}</div>}
-                        {gm && gm.kind !== 'clear' && gm.kind !== 'done' && fromGanttly && <button data-room-clear onClick={function() { clearRoomMark(x); }} className="no-pan self-start text-[11px] font-black text-[#0072CE] hover:underline">Clear the mark (back to Start / Done only)</button>}
+                        {gm && gm.kind !== 'clear' && gm.kind !== 'done' && fromGanttly && <button data-room-clear onClick={menuSafe(function() { clearRoomMark(x); })} className="no-pan self-start text-[11px] font-black text-[#0072CE] hover:underline">Clear the mark (back to Start / Done only)</button>}
                     </div>
 
                     <div className={sec + ' mt-3'}>Shift Start · {nowWin ? nowWin.crew + ' crew' : 'no crew on now'}</div>
@@ -9850,7 +9904,7 @@ export default function App(props) {
 
                     <div className="mt-3 pt-2 border-t border-slate-100 flex items-center justify-between gap-3">
                         <span className="text-[10px] font-semibold text-slate-400 leading-snug">Saved for every Ganttly and written into this room's Shift Start rows.</span>
-                        <button onClick={function() { close(); openBoardRoom(room); }} className="no-pan text-[11px] font-black text-[#0072CE] hover:underline whitespace-nowrap">Open on Gantt →</button>
+                        <button onClick={menuSafe(function() { close(); openBoardRoom(room); })} className="no-pan text-[11px] font-black text-[#0072CE] hover:underline whitespace-nowrap">Open on Gantt →</button>
                     </div>
                 </div>
             </div>
@@ -9900,7 +9954,7 @@ export default function App(props) {
             alert: <AlertCircle className="w-4 h-4 flex-shrink-0 text-[#E4002B]" />,
             arrow: <ArrowRight className="w-4 h-4 flex-shrink-0 text-slate-400" />
         };
-        const gridCols = 'lg:grid-cols-[104px_minmax(130px,180px)_minmax(160px,1fr)_96px_104px_minmax(96px,132px)]';
+        const gridCols = 'lg:grid-cols-[104px_minmax(130px,180px)_minmax(160px,1fr)_96px_112px_minmax(96px,132px)]';
         return (
             <div data-startup-board className="flex-1 min-h-0 flex flex-col bg-[#F7F9FC] p-3 lg:p-4 gap-3 overflow-y-auto xl:overflow-hidden custom-scrollbar">
                 {/* Verdict band: the answer first, then the next startup, cleaning done and the effort this shift. */}
@@ -9975,7 +10029,7 @@ export default function App(props) {
                         <div ref={tvRowsRef} className="xl:flex-1 xl:min-h-0 xl:overflow-y-auto custom-scrollbar border-t border-slate-100">
                             {rows.length === 0 && <div className="px-4 py-6 text-[13px] font-semibold text-slate-500">No production rooms have work in this view.</div>}
                             {rows.map(function(x) {
-                                const click = function() { roomRowClick(x.room); };
+                                const click = function(e) { roomRowClick(x.room, e); };
                                 const dbl = function(e) { roomRowDouble(x.room, e); };
                                 const lead = x.lead ? x.lead : '';
                                 return (
@@ -10009,7 +10063,7 @@ export default function App(props) {
                                                 {roomMenuBtn(x.room)}
                                             </div>
                                             <div className="mt-2">{renderRunway(x)}</div>
-                                            <div className="mt-1.5 flex items-center gap-2"><div className="w-24 flex-shrink-0">{stageBar(x.comp)}</div><span className="text-[11px] font-semibold text-slate-500 truncate">{x.comp.pct}% · {compShort(x.comp)} · {x.piecesDone}/{x.pieces} pcs{x.G !== null && x.status !== 'RUNNING' ? ' · ready by ' + board.clock(x.G) : ''}{x.lead ? ' · lead ' + x.lead : ''}</span></div>
+                                            <div className="mt-1.5 flex items-center gap-2"><div className="w-24 flex-shrink-0">{stageBar(x.comp)}</div><span className="text-[11px] font-semibold text-slate-500 truncate">{x.comp.pct}% · {compShort(x.comp, true)} · {x.piecesDone}/{x.pieces} pcs{x.G !== null && x.status !== 'RUNNING' ? ' · ready by ' + board.clock(x.G) : ''}{x.lead ? ' · lead ' + x.lead : ''}</span></div>
                                             <div className="text-[11px] font-semibold text-slate-400 truncate">{roomSubLine(x)}</div>
                                         </div>
                                     </div>
@@ -10216,7 +10270,7 @@ export default function App(props) {
                         <div className="min-w-0 pt-2">{renderRunway(fx, { labels: true })}</div>
                         <div className="flex items-center gap-3 text-[12px] font-bold text-slate-600 whitespace-nowrap">
                             {board.spareText(fx) && <span className="font-black" style={{ color: fx.status === 'LATE' || (fx.spare !== null && fx.spare < 0) ? '#B00020' : fx.status === 'AT_RISK' ? '#8A5A00' : '#0072CE' }}>{board.spareText(fx)}</span>}
-                            <span>{fx.pct}% · {fx.piecesDone}/{fx.pieces} pcs</span>
+                            <span>{fx.comp.pct}% · {fx.piecesDone}/{fx.pieces} pcs</span>
                             <span className="text-slate-400 font-semibold">{fx.lastLog ? 'last check-off ' + board.clockMs(fx.lastLog) : 'no check-off yet'}</span>
                         </div>
                     </div>
