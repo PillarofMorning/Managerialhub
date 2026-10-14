@@ -1610,8 +1610,10 @@ function cleanPlanWindowFor(plan, keys, w0, toMs, gapMs) {
     });
     if (!picks.length) return null;
     let best = picks[0], restart = Infinity;
-    picks.forEach(function(p) { if (p.window.start > best.window.start) best = p; if (p.end < restart) restart = p.end; });
-    return { window: best.window, key: best.key, keys: picks.map(function(p) { return p.key; }), restart: restart === Infinity ? null : restart };
+    picks.forEach(function(p) { if (p.window.start > best.window.start) best = p; });
+    // the restart: the first of the room's lines to run again after the chosen stop (a line back before that stop does not count)
+    picks.forEach(function(p) { if (p.end > best.window.start && p.end < restart) restart = p.end; });
+    return { window: best.window, key: best.key, keys: picks.map(function(p) { return p.key; }), windows: picks.map(function(p) { return p.window; }), restart: restart === Infinity ? null : restart };
 }
 // The value a datetime-local box shows for a moment in time (local clock).
 function msToLocalInput(ms) {
@@ -2688,8 +2690,8 @@ const MOCK_ASSETS = [
 // one (three tries, with waits) and marks it FOUND / MISSING, and a table or column that was created under another name can be typed
 // in and is used from then on (kept in the browser under the shared key stillwell.columnPicks, with the other apps' picks). A save
 // waits out a busy server, drops an optional column it cannot write and sends the row again, stops with the name of a required one
-// that is missing, and shows every payload it sent. Saving the same plan window again updates the rows it wrote (ids kept in the
-// browser) and removes the blocks no longer planned. Ganttly has none of this.
+// that is missing, and shows the payloads it sent. Saving the same plan window again updates the rows it wrote (found by the plan key
+// in Dataverse, and remembered in the browser) and removes the blocks no longer planned. Ganttly has none of this.
 // ============================================================================
 const PBED_PLAN_TABLE = 'craa5_pbedplan';
 const PBED_STEP_TABLE = 'craa5_pbedplanstep';
@@ -2726,15 +2728,16 @@ const PBED_COLS = [
 const PBED_PICKS_KEY = 'stillwell.columnPicks';     // shared by every app: { 'pbedplan.table': 'craa5_x', 'pbedplan.<column key>': 'craa5_y', ... }
 const PBED_SAVE_KEY = 'itp_pbed_save_v1';            // the last save: { planKey, planTable, stepTable, planId, stepIds: { stepKey: id }, savedAt }
 const PBED_MISSING_RE = /could not find a property named '([^']+)'|property '([^']+)' does not exist|'([^']+)' .{0,30}(not found|does not exist|is not a valid property)|invalid property '([^']+)'|undeclared property/i;
-const PBED_TABLE_GONE_RE = /resource not found for the segment|could not find.{0,40}entity|entity.{0,40}(does not exist|not found)|0x80060888|\b404\b/i;
+const PBED_TABLE_GONE_RE = /resource not found for the segment|not found in the metadatacache|with namemapping =|could not find.{0,80}entity|entity.{0,80}(does not exist|not found)|0x80060888|\b404\b/i;
 const PBED_BUSY_RE = /\b429\b|too many requests|0x80072322|service unavailable|\b503\b|\b502\b|timed? ?out|timeout|network|failed to fetch|0x8004431a|\bbusy\b/i;
 const PBED_PRIV_RE = /privilege|not have permission|access denied|unauthori[sz]ed|\b403\b|0x80040220|0x8004d24b/i;
 const PBED_GONE_ROW_RE = /with id.{0,45}does not exist|0x80040217/i;
 const PBED_CHECK_WAITS = [0, 1500, 4000];           // "Check": three tries per column, waiting this long before each
 const PBED_SAVE_BUSY_WAITS = [5000, 15000, 30000];  // a busy server during a save: wait, then send the same row again
 const PBED_POOL = 3;                                 // rows (or probes) in flight at once
-const PBED_TIMEOUT_MS = 20000;
-const PBED_PAYLOAD_KEEP = 40;                        // payloads kept for the Columns card
+const PBED_TIMEOUT_MS = 20000;                       // a probe (Check) or a lookup
+const PBED_WRITE_TIMEOUT_MS = 90000;                 // a row written: Dataverse can be slow, and a create sent twice makes two rows
+const PBED_PAYLOAD_KEEP = 300;                       // payloads kept for the Columns card (the newest)
 function pbedSleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
 function pbedErrText(e) {
     if (!e) return '';
@@ -2844,16 +2847,20 @@ async function pbedPut(w, table, cols, body, id, state) {
     const drop = function(n) { if (n in b) { delete b[n]; dropped.push(n); } if (!state.missing[table]) state.missing[table] = []; if (state.missing[table].indexOf(n) === -1) state.missing[table].push(n); };
     (state.missing[table] || []).slice().forEach(drop);
     for (let attempt = 0; attempt < 12; attempt++) {
+        let creating = false;
         try {
             if (curId) {
                 if (!w.update) throw new Error('This page cannot update rows (no updateRow), so the plan saved before cannot be changed.');
-                await pbedTimeout(w.update(table, curId, b), PBED_TIMEOUT_MS);
+                await pbedTimeout(w.update(table, curId, b), PBED_WRITE_TIMEOUT_MS);
                 return { id: curId, op: 'updated', body: b, dropped: dropped };
             }
-            const res = await pbedTimeout(w.create(table, b), PBED_TIMEOUT_MS);
+            creating = true;
+            const res = await pbedTimeout(w.create(table, b), PBED_WRITE_TIMEOUT_MS);
             return { id: pbedIdOf(res, table), op: 'created', body: b, dropped: dropped };
         } catch (e) {
             const msg = pbedErrText(e);
+            // a create that got no answer may still have made the row: never send it again blind (the next save finds the row by its key)
+            if (creating && /\(timeout\)$/.test(msg)) throw new Error(msg + '. Press Save again: rows already written are found again by their keys.');
             if (curId && PBED_GONE_ROW_RE.test(msg)) { curId = ''; continue; }   // the row saved before was deleted: make a new one
             if (PBED_PRIV_RE.test(msg)) { state.noWrite = msg; throw new Error('Dataverse refused the write to ' + table + ' (no permission): ' + msg); }
             const blamed = pbedBlamed(msg, cols.map(function(c) { return c.sentName; }));
@@ -2873,13 +2880,44 @@ async function pbedPut(w, table, cols, body, id, state) {
     }
     throw new Error('Gave up on ' + table + ' after too many tries.');
 }
-// Removes a row written before (delete, else deactivate). 'removed' | 'deactivated' | 'gone' (already deleted) | 'kept' (this page cannot).
+// Removes a row written before (delete, else deactivate), waiting out a busy server. 'removed' | 'deactivated' | 'gone' (already deleted) |
+// 'kept' (this page cannot remove rows).
 async function pbedRemove(w, table, id) {
+    let busy = 0;
+    for (;;) {
+        try {
+            if (w.remove) { await pbedTimeout(w.remove(table, id), PBED_WRITE_TIMEOUT_MS); return 'removed'; }
+            if (w.update) { await pbedTimeout(w.update(table, id, { statecode: 1, statuscode: 2 }), PBED_WRITE_TIMEOUT_MS); return 'deactivated'; }
+            return 'kept';
+        } catch (e) {
+            const msg = pbedErrText(e);
+            if (PBED_GONE_ROW_RE.test(msg)) return 'gone';
+            if (PBED_BUSY_RE.test(msg) && busy < PBED_SAVE_BUSY_WAITS.length) { await pbedSleep(PBED_SAVE_BUSY_WAITS[busy++]); continue; }
+            throw e;
+        }
+    }
+}
+// The active rows of a table matching an OData filter (one page of up to 500), or null when they cannot be read (no table, no column, no
+// connection): used before a save to find the rows already written for this plan key, on any computer.
+async function pbedFindRows(dataApi, table, select, filter) {
+    const web = pbedXrmWeb();
     try {
-        if (w.remove) { await pbedTimeout(w.remove(table, id), PBED_TIMEOUT_MS); return 'removed'; }
-        if (w.update) { await pbedTimeout(w.update(table, id, { statecode: 1, statuscode: 2 }), PBED_TIMEOUT_MS); return 'deactivated'; }
-    } catch (e) { if (PBED_GONE_ROW_RE.test(pbedErrText(e))) return 'gone'; throw e; }
-    return 'kept';
+        if (web && typeof web.retrieveMultipleRecords === 'function') {
+            const res = await pbedTimeout(web.retrieveMultipleRecords(table, '?$select=' + select.join(',') + '&$filter=statecode eq 0 and ' + filter + '&$top=500'), PBED_TIMEOUT_MS);
+            return res && res.entities ? res.entities : [];
+        }
+        if (dataApi && typeof dataApi === 'object' && typeof dataApi.queryTable === 'function') {
+            let page = await pbedTimeout(dataApi.queryTable(table, { select: select, filter: 'statecode eq 0 and ' + filter, pageSize: 250, top: 500 }), PBED_TIMEOUT_MS);
+            if (!page || !Array.isArray(page.rows)) return null;
+            const rows = page.rows.slice();
+            while (page && page.hasMoreRows && typeof page.loadMoreRows === 'function' && rows.length < 500) {
+                page = await pbedTimeout(page.loadMoreRows(), PBED_TIMEOUT_MS);
+                if (page && Array.isArray(page.rows)) rows.push.apply(rows, page.rows);
+            }
+            return rows;
+        }
+    } catch (e) {}
+    return null;
 }
 // The Columns card on Setup (PBED): both tables and every column the save writes, Check (FOUND / MISSING per column), a box per table and
 // column for the name it has in Dataverse when it was created under another one, the last save's result and the payloads sent.
@@ -2933,7 +2971,7 @@ function PbedColumnsCard(props) {
                 <span data-pbed-check className="inline-flex"><Button variant="primary" size="sm" disabled={check.status === 'checking'} onClick={props.onCheck} className="px-2 py-1 text-[10px]">{check.status === 'checking' ? 'Checking…' : 'Check'}</Button></span>
                 {check.at ? <span data-pbed-check-at className="text-[10px] font-bold text-slate-400">checked {clockOf(check.at)}</span> : null}
             </div>
-            <p className="text-[11px] font-bold text-slate-500 mt-1">Save to Dataverse (on the Gantt tab) writes the plan on screen to these two tables. The names are assumed: create them as listed or, when a table or column was created under another name, type that name in its box and it is used from then on. Check asks Dataverse for each one (three tries). A save waits out a busy server, drops an optional column it cannot write and sends the row again, stops on a required one that is missing and names it, and shows every payload it sent below.</p>
+            <p className="text-[11px] font-bold text-slate-500 mt-1">Save to Dataverse (on the Gantt tab) writes the plan on screen to these two tables. The names are assumed: create them as listed or, when a table or column was created under another name, type that name in its box and it is used from then on. Check asks Dataverse for each one (three tries). A save waits out a busy server, drops an optional column it cannot write and sends the row again, stops on a required one that is missing and names it, and shows the payloads it sent below (the newest 300).</p>
             {open && PBED_TABLES.map(function(t) {
                 const ts = check.tables[t.key] || '';
                 return (
@@ -2967,7 +3005,7 @@ function PbedColumnsCard(props) {
             {last && (
                 <div data-pbed-save-result={last.ok ? 'ok' : 'failed'} className={`mt-3 text-[11px] font-bold ${last.ok ? 'text-emerald-700' : 'text-[#E4002B]'}`}>
                     {last.ok
-                        ? 'Saved ' + clockOf(last.at) + ': ' + last.created + ' row' + (last.created === 1 ? '' : 's') + ' created, ' + last.updated + ' updated' + (last.removed ? ', ' + last.removed + ' removed' : '') + ' (' + last.blocks + ' block' + (last.blocks === 1 ? '' : 's') + ').' + (last.dropped && last.dropped.length ? ' Not written, column missing: ' + last.dropped.join(', ') + '.' : '')
+                        ? 'Saved ' + clockOf(last.at) + ': ' + last.created + ' row' + (last.created === 1 ? '' : 's') + ' created, ' + last.updated + ' updated' + (last.removed ? ', ' + last.removed + ' removed' : '') + ' (' + last.blocks + ' block' + (last.blocks === 1 ? '' : 's') + ').' + (last.dropped && last.dropped.length ? ' Not written, column missing: ' + last.dropped.join(', ') + '.' : '') + (last.removeFailed ? ' ' + last.removeFailed + ' old row' + (last.removeFailed === 1 ? '' : 's') + ' could not be removed; tried again on the next save.' : '')
                         : 'Save failed ' + clockOf(last.at) + ': ' + last.error}
                 </div>
             )}
@@ -3325,7 +3363,8 @@ export default function App(props) {
     // PBED: the Clean Plan the production schedule published (see STOP AND RESTART TIMES), read with the runs; null until read or when
     // the table could not be read. cpState = how that read went ({ status: 'idle' | 'loading' | 'ready' | 'failed', readAt, why, windows }).
     const [cleanPlan, setCleanPlan] = useState(null);
-    const [cpState, setCpState] = useState({ status: 'idle', readAt: 0, why: '', windows: 0 });
+    const [cpState, setCpState] = useState({ status: 'idle', readAt: 0, why: '', windows: 0, kept: false });
+    const cpWindowRef = useRef('');   // the read window of the Clean Plan held now ('' = none)
     const prodSigRef = useRef('');
     const prodReqRef = useRef(0);
     const loadProdRunsRef = useRef(null);   // set once the plan window is known (below)
@@ -3834,14 +3873,21 @@ export default function App(props) {
         const win = from + '|' + to;
         setProdState(function(prev) { return { status: 'loading', readAt: prev.readAt, truncated: prev.truncated }; });
         if (!IS_CURRENT) {   // PBED: the Clean Plan too (readCleanPlan never throws; found false = no table or no permission)
-            setCpState(function(prev) { return { status: 'loading', readAt: prev.readAt, why: prev.why, windows: prev.windows }; });
-            const cpFail = function(why) { if (req !== prodReqRef.current) return; setCleanPlan(null); setCpState({ status: 'failed', readAt: Date.now(), why: why, windows: 0 }); };
+            setCpState(function(prev) { return { status: 'loading', readAt: prev.readAt, why: prev.why, windows: prev.windows, kept: prev.kept }; });
+            // A failed read keeps the plan read earlier while the window is the same (as the runs do); a new window drops it.
+            const cpFail = function(why) {
+                if (req !== prodReqRef.current) return;
+                const kept = cpWindowRef.current === win;
+                if (!kept) { cpWindowRef.current = ''; setCleanPlan(null); }
+                setCpState(function(prev) { return { status: 'failed', readAt: kept ? prev.readAt : Date.now(), why: why, windows: kept ? prev.windows : 0, kept: kept }; });
+            };
             Promise.resolve().then(function() { return readCleanPlan(props.dataApi, globalStartMs, to); }).then(function(plan) {
                 if (req !== prodReqRef.current) return;
                 if (!plan || !plan.found) { cpFail(plan && plan.why ? String(plan.why) : 'The Clean Plan table could not be read.'); return; }
                 const n = (plan.windows || []).filter(function(w) { return w.stop !== 'overlap' && plan.weekDone(w.day); }).length;
+                cpWindowRef.current = win;
                 setCleanPlan(plan);
-                setCpState({ status: 'ready', readAt: Date.now(), why: '', windows: n });
+                setCpState({ status: 'ready', readAt: Date.now(), why: '', windows: n, kept: false });
             }, function(e) { cpFail(String(e && e.message || e)); });
         }
         return fetchProductionRuns(props.dataApi, from, to).then(function(rows) {
@@ -3909,22 +3955,39 @@ export default function App(props) {
             }
             if (handoffSource !== 'schedule') { out[area] = withRestart(area, isNaN(hv) ? { ms: null, src: 'hand-none' } : { ms: hv, src: 'hand' }, []); return; }   // PBED set to hand: only what was typed
             const ln = lineForArea(lineIndex, area);
+            const pick = roomProdLines[area] || '';
             const m = linesForRoom([area, ln ? ln.name : ''], prodLines, roomProdLines[area]);
             const lines = m.lines.map(function(L) { return prodLineLabel(L); });
-            // The Clean Plan first (see STOP AND RESTART TIMES): the stop the production schedule published for the room's line(s).
-            if (cleanPlan && roomProdLines[area] !== 'none') {
-                const keys = cleanPlanKeysFor(cleanPlan, m.lines.length ? wideOf(m.lines) : [], area, ln ? ln.name : '');
+            const h = roomHandoff(m.lines, w0, gapMs);   // the runs' own answer (null when the room has no line in this window)
+            let planLate = null;   // the Clean Plan's stop when the live runs show production running past it
+            // The Clean Plan first (see STOP AND RESTART TIMES): the stop the production schedule published for the room's line(s). The live
+            // runs still win when they show production running past that stop (the Clean Plan is republished by the production schedule page,
+            // so it can lag a change), and a line picked by hand on Setup is looked up by that pick, never by the room's name.
+            if (cleanPlan && pick !== 'none') {
+                let keys;
+                if (m.lines.length) keys = cleanPlanKeysFor(cleanPlan, wideOf(m.lines), area, ln ? ln.name : '');
+                else if (pick) { const cut = pick.lastIndexOf('|'); keys = [cleanPlanLineKey(cut > -1 ? pick.slice(0, cut) : pick, cut > -1 ? Number(pick.slice(cut + 1)) || 1 : 1)]; }
+                else keys = cleanPlanKeysFor(cleanPlan, [], area, ln ? ln.name : '');
                 const cw = cleanPlanWindowFor(cleanPlan, keys, w0, w1 + PROD_RESTART_AHEAD_MS, gapMs);
-                if (cw) {
-                    const w = cw.window;
-                    out[area] = { ms: Math.max(w0, w.start), src: 'plan', lines: lines.length ? lines : cw.keys, how: 'Clean Plan ' + cw.keys.join(', ') + (m.lines.length ? ' (' + m.how + ')' : ' (by name)'), next: cw.restart, restart: cw.restart, restartSrc: cw.restart !== null ? 'plan' : 'none', deadline: cw.restart !== null ? cw.restart - CLEAN_DONE_BEFORE_MINS * 60000 : null, plan: w, stopped: w.start <= w0 };
+                const runsLater = !!(cw && h && h.state === 'handed' && h.ms > cw.window.start + 60000);
+                if (cw && !runsLater) {
+                    const w = cw.window, stop = Math.max(w0, w.start);
+                    // the restart: the Clean Plan's, unless the runs show one of the room's lines back sooner; never at or before the stop
+                    const rsRuns = m.lines.length ? roomRestart(wideOf(m.lines), stop) : null;
+                    let restart = cw.restart, restartSrc = cw.restart !== null ? 'plan' : 'none';
+                    if (rsRuns !== null && (restart === null || rsRuns < restart)) { restart = rsRuns; restartSrc = 'schedule'; }
+                    if (restart !== null && restart <= stop) { restart = null; restartSrc = 'none'; }
+                    const labels = lines.length ? lines : cw.windows.map(function(x) { return x.area ? prodLineLabel({ area: x.area, line: x.line || 1 }) : x.lineKey; });
+                    out[area] = { ms: stop, src: 'plan', lines: labels, how: 'Clean Plan ' + cw.keys.join(', ') + (m.lines.length ? ' (' + m.how + ')' : pick ? ' (picked line)' : ' (by name)'), next: restart, restart: restart, restartSrc: restartSrc, deadline: restart !== null ? restart - CLEAN_DONE_BEFORE_MINS * 60000 : null, plan: w, stopped: w.start <= w0 };
                     return;
                 }
+                if (runsLater) planLate = cw.window.start;
             }
             // Then the runs themselves: the room is handed over when the run on at the plan start ends (a room on several lines waits for the last).
-            const h = roomHandoff(m.lines, w0, gapMs);
-            if (!h) { out[area] = withRestart(area, { ms: null, src: roomProdLines[area] === 'none' ? 'nolines' : 'nomatch', lines: lines, how: m.how }, wideOf(m.lines)); return; }
-            out[area] = withRestart(area, { ms: h.ms, src: h.state === 'handed' ? 'schedule' : h.state, lines: lines, how: m.how, next: h.next }, wideOf(m.lines));
+            if (!h) { out[area] = withRestart(area, { ms: null, src: pick === 'none' ? 'nolines' : 'nomatch', lines: lines, how: m.how }, wideOf(m.lines)); return; }
+            const e = withRestart(area, { ms: h.ms, src: h.state === 'handed' ? 'schedule' : h.state, lines: lines, how: m.how, next: h.next }, wideOf(m.lines));
+            if (planLate !== null) e.planLate = planLate;
+            out[area] = e;
         });
         // A line that is down frees its rooms from the time it went down; that wins over a Handover typed on the room.
         // Its startup is the down line's restart when one is typed in, else what the production schedule says (Ganttly).
@@ -7857,19 +7920,20 @@ export default function App(props) {
         // one line per room: stop, restart, done-by, spare or late (from the production schedule, see STOP AND RESTART TIMES)
         const rooms = [];
         Object.keys(handoffInfo).sort().forEach(function(area) {
-            if (!scheduleData.groups.some(function(g) { return g.name === area; })) return;
+            if (roomHidden(area)) return;   // every room in the plan, with or without a block (a room whose cleaning did not fit says so)
             const hi = handoffInfo[area];
             const roomBlocks = blocks.filter(function(b) { return b.area === area; });
             const cleanEnd = roomBlocks.reduce(function(m, b) { return Math.max(m, b.end); }, 0);
             const restart = hi.restart !== null && hi.restart !== undefined ? hi.restart : null;
             const doneBy = restart !== null ? restart - CLEAN_DONE_BEFORE_MINS * 60000 : null;
-            rooms.push({ area: area, stop: hi.ms !== null && hi.ms !== undefined ? iso(hi.ms) : null, stopSrc: hi.src, lines: hi.lines || [], restart: restart !== null ? iso(restart) : null, restartSrc: hi.restartSrc || 'none', doneBy: doneBy !== null ? iso(doneBy) : null, cleanEnd: cleanEnd ? iso(cleanEnd) : null, spareMins: doneBy !== null && cleanEnd ? Math.round((doneBy - cleanEnd) / 60000) : null, blocks: roomBlocks.length, cleanKind: hi.plan ? hi.plan.kind : '', planStatus: hi.plan ? hi.plan.status : '' });
+            const stopMs = hi.src === 'plan' && hi.stopped && hi.plan ? hi.plan.start : hi.ms;   // a line already down: when it really stopped
+            rooms.push({ area: area, stop: stopMs !== null && stopMs !== undefined ? iso(stopMs) : null, stopped: !!hi.stopped, stopSrc: hi.src, lines: hi.lines || [], restart: restart !== null ? iso(restart) : null, restartSrc: hi.restartSrc || 'none', doneBy: doneBy !== null ? iso(doneBy) : null, cleanEnd: cleanEnd ? iso(cleanEnd) : null, spareMins: doneBy !== null && cleanEnd ? Math.round((doneBy - cleanEnd) / 60000) : null, blocks: roomBlocks.length, cleanKind: hi.plan ? hi.plan.kind : '', planStatus: hi.plan ? hi.plan.status : '' });
         });
         const unplanned = scheduleData.unscheduled.map(function(t) { return { area: t.originalArea, equipment: t.name, minutes: Math.round(t.rawWorkloadMins) }; });
         const now = Date.now();
         const planJson = { v: 1, app: 'PBED', planKey: planKey, planStart: iso(planStart), planEnd: iso(planEnd), hours: Math.round(planHorizonMins / 60 * 100) / 100, savedAt: iso(now), rules: { doneBeforeMins: CLEAN_DONE_BEFORE_MINS, handoffGapMins: handoffGapMins, stopSource: 'production schedule: Clean Plan, then the runs' }, rooms: rooms, blocks: blocks, unplanned: unplanned };
         const summary = rooms.map(function(r) {
-            return r.area + ': stops ' + (r.stop ? formatDayClock(Date.parse(r.stop)) : 'not known') + ', restarts ' + (r.restart ? formatDayClock(Date.parse(r.restart)) : 'not known') + ', done by ' + (r.doneBy ? formatDayClock(Date.parse(r.doneBy)) : 'not known') + (r.spareMins === null ? '' : r.spareMins >= 0 ? ', ' + fmtMins(r.spareMins) + ' spare' : ', ' + fmtMins(-r.spareMins) + ' late') + (r.blocks ? '' : ', nothing planned');
+            return r.area + ': ' + (r.stopped ? 'already stopped ' : 'stops ') + (r.stop ? formatDayClock(Date.parse(r.stop)) : 'not known') + ', restarts ' + (r.restart ? formatDayClock(Date.parse(r.restart)) : 'not known') + ', done by ' + (r.doneBy ? formatDayClock(Date.parse(r.doneBy)) : 'not known') + (r.spareMins === null ? '' : r.spareMins >= 0 ? ', ' + fmtMins(r.spareMins) + ' spare' : ', ' + fmtMins(-r.spareMins) + ' late') + (r.blocks ? '' : ', nothing planned');
         }).join('\n');
         const planBody = {};
         planBody[pc.name] = ('PBED plan ' + formatDayClock(planStart) + ' to ' + formatDayClock(planEnd)).slice(0, 200);
@@ -7877,18 +7941,46 @@ export default function App(props) {
         planBody[pc.stepcount] = blocks.length; planBody[pc.planjson] = JSON.stringify(planJson); planBody[pc.summary] = summary.slice(0, 4000);
         const who = (function() { try { const x = safeGetXrm(); const u = x && x.Utility && typeof x.Utility.getGlobalContext === 'function' ? x.Utility.getGlobalContext().userSettings : null; return u && u.userName ? String(u.userName).slice(0, 200) : ''; } catch (e) { return ''; } })();
         if (who) planBody[pc.savedby] = who;
-        // the rows written last time for this plan window
-        let saved = null; try { saved = JSON.parse(localStorage.getItem(PBED_SAVE_KEY) || 'null'); } catch (e) { saved = null; }
-        const same = !!(saved && saved.planKey === planKey && saved.planTable === planTable && saved.stepTable === stepTable);
-        const oldStepIds = same && saved.stepIds && typeof saved.stepIds === 'object' ? saved.stepIds : {};
-        const state = { missing: {}, reqMissing: [], noWrite: '', stop: false };
-        const total = 1 + blocks.length, dropped = [], stepIds = {};
-        let done = 0, created = 0, updated = 0, removed = 0, planId = same ? String(saved.planId || '') : '';
+        // The rows written before for this plan window: remembered in the browser (one entry per plan window and table pair, the newest
+        // twelve), and found in Dataverse by the plan key (so a save from another computer, or after a lost answer, updates instead of adding).
+        const memKey = planKey + '|' + planTable + '|' + stepTable;
+        const readMem = function() { try { const o = JSON.parse(localStorage.getItem(PBED_SAVE_KEY) || 'null'); return o && o.v === 2 && o.plans && typeof o.plans === 'object' ? o.plans : {}; } catch (e) { return {}; } };
+        const mem = readMem()[memKey] || null;
+        const oldStepIds = mem && mem.stepIds && typeof mem.stepIds === 'object' ? Object.assign({}, mem.stepIds) : {};
+        const state = { missing: {}, reqMissing: [], noWrite: '', stop: false, err: null };
+        const total = 1 + blocks.length, dropped = [], stepIds = {}, extraIds = [];
+        let done = 0, created = 0, updated = 0, removed = 0, removeFailed = 0, planId = mem ? String(mem.planId || '') : '';
         pbedPayloadsRef.current = [];
         setPbedSave({ status: 'saving', done: 0, total: total, last: prevLast });
         const noteDropped = function(list) { (list || []).forEach(function(n) { if (dropped.indexOf(n) === -1) dropped.push(n); }); };
         const tick = function() { if (!state.stop) setPbedSave({ status: 'saving', done: done, total: total, last: prevLast }); };
-        const remember = function() { try { localStorage.setItem(PBED_SAVE_KEY, JSON.stringify({ planKey: planKey, planTable: planTable, stepTable: stepTable, planId: planId, stepIds: Object.assign({}, oldStepIds, stepIds), savedAt: Date.now() })); } catch (e) {} };
+        const remember = function() {
+            try {
+                const plans = readMem();
+                plans[memKey] = { planId: planId, stepIds: Object.assign({}, oldStepIds, stepIds), savedAt: Date.now() };
+                const keys = Object.keys(plans).sort(function(a, b) { return (plans[b].savedAt || 0) - (plans[a].savedAt || 0); }).slice(0, 12);
+                const out = {}; keys.forEach(function(k) { out[k] = plans[k]; });
+                localStorage.setItem(PBED_SAVE_KEY, JSON.stringify({ v: 2, plans: out }));
+            } catch (e) {}
+        };
+        const q = function(s) { return String(s).replace(/'/g, "''"); };
+        const idOfRow = function(r, table) { return String(r[table + 'id'] || r.id || '').replace(/[{}]/g, ''); };
+        const foundPlan = await pbedFindRows(props.dataApi, planTable, [planTable + 'id', pc.plankey], pc.plankey + " eq '" + q(planKey) + "'");
+        if (foundPlan && foundPlan.length) {
+            const ids = foundPlan.map(function(r) { return idOfRow(r, planTable); }).filter(Boolean);
+            if (ids.length) { planId = ids.indexOf(planId) > -1 ? planId : ids[0]; ids.forEach(function(x) { if (x !== planId) extraIds.push({ table: planTable, id: x }); }); }
+        }
+        const foundSteps = await pbedFindRows(props.dataApi, stepTable, [stepTable + 'id', sc.stepkey], sc.plankey + " eq '" + q(planKey) + "'");
+        if (foundSteps) {
+            foundSteps.forEach(function(r) {
+                const sid = idOfRow(r, stepTable), sk = String(r[sc.stepkey] || '');
+                if (!sid) return;
+                if (!sk) { extraIds.push({ table: stepTable, id: sid }); return; }
+                if (oldStepIds[sk] && oldStepIds[sk] !== sid && foundSteps.some(function(x) { return idOfRow(x, stepTable) === oldStepIds[sk]; })) { extraIds.push({ table: stepTable, id: sid }); return; }   // two rows for one block: keep the remembered one
+                if (oldStepIds[sk] && oldStepIds[sk] !== sid) extraIds.push({ table: stepTable, id: oldStepIds[sk] });   // the remembered row is gone from Dataverse's answer: drop it
+                oldStepIds[sk] = sid;
+            });
+        }
         try {
             const pr = await pbedPut(w, planTable, sentCols('pbedplan'), planBody, planId, state).catch(function(e) { pbedLogPayload('plan', planTable, planId, planBody, pbedErrText(e)); throw e; });
             pbedLogPayload(pr.op, planTable, pr.id, pr.body, '');
@@ -7896,6 +7988,7 @@ export default function App(props) {
             planId = pr.id; done++; tick();
             const jobs = blocks.slice();
             const stepWorker = async function() {
+              try {
                 while (jobs.length && !state.stop) {
                     const b = jobs.shift(), oldId = oldStepIds[b.stepKey] || '';
                     const body = {};
@@ -7909,25 +8002,28 @@ export default function App(props) {
                     noteDropped(r.dropped); if (r.op === 'created') created++; else updated++;
                     stepIds[b.stepKey] = r.id; done++; tick();
                 }
+              } catch (e) { state.stop = true; if (!state.err) state.err = e; }   // the other workers stop after the row they are on
             };
             const pool = [];
             for (let i = 0; i < PBED_POOL; i++) pool.push(stepWorker());
-            await Promise.all(pool);
-            // blocks saved last time that are no longer in the plan
-            const gone = Object.keys(oldStepIds).filter(function(k) { return !stepIds[k] && oldStepIds[k]; });
+            await Promise.all(pool);   // every row in flight has answered (and its id is known) before anything is decided
+            if (state.err) throw state.err;
+            // blocks saved before that are no longer in the plan, and any extra row found for this plan key
+            const gone = Object.keys(oldStepIds).filter(function(k) { return !stepIds[k] && oldStepIds[k]; }).map(function(k) { return { table: stepTable, id: oldStepIds[k], key: k }; }).concat(extraIds);
             for (let gi = 0; gi < gone.length; gi++) {
-                const gid = oldStepIds[gone[gi]];
+                const g = gone[gi];
                 try {
-                    const how = await pbedRemove(w, stepTable, gid);
+                    const how = await pbedRemove(w, g.table, g.id);
                     if (how === 'removed' || how === 'deactivated') removed++;
-                    pbedLogPayload(how, stepTable, gid, {}, '');
-                    if (how !== 'kept') delete oldStepIds[gone[gi]];
-                } catch (e) { pbedLogPayload('remove', stepTable, gid, {}, pbedErrText(e)); }
+                    pbedLogPayload(how, g.table, g.id, {}, '');
+                    if (how !== 'kept' && g.key) delete oldStepIds[g.key];
+                    if (how === 'kept') removeFailed++;
+                } catch (e) { removeFailed++; pbedLogPayload('remove', g.table, g.id, {}, pbedErrText(e)); }
             }
             remember();
-            setPbedSave({ status: 'idle', done: done, total: total, last: { at: Date.now(), ok: true, planId: planId, created: created, updated: updated, removed: removed, dropped: dropped, error: '', blocks: blocks.length } });
+            setPbedSave({ status: 'idle', done: done, total: total, last: { at: Date.now(), ok: true, planId: planId, created: created, updated: updated, removed: removed, removeFailed: removeFailed, dropped: dropped, error: '', blocks: blocks.length } });
         } catch (e) {
-            state.stop = true;   // the other rows in flight stop after the one they are on
+            state.stop = true;
             remember();          // what was written is remembered, so saving again updates those rows
             fail(pbedErrText(e) + (done ? ' (' + done + ' of ' + total + ' rows were written before it stopped; press Save again to finish.)' : ''), done, total);
         }
@@ -9255,6 +9351,8 @@ export default function App(props) {
                                         </div>
                                         <div data-cleanplan-status={cpState.status} className={`mt-1 text-[11px] font-bold ${cpState.status === 'failed' ? 'text-amber-700' : 'text-slate-500'}`}>
                                             {cpState.status === 'ready' ? `Clean Plan read ${clockOf(cpState.readAt)}: ${cpState.windows} published stop${cpState.windows === 1 ? '' : 's'} · ${fromPlan} of ${inPlanRooms.length} rooms take their stop and restart from it; the rest follow the runs.`
+                                                : cpState.status === 'failed' && cpState.kept ? 'Couldn\'t read the Clean Plan again, so the stops read earlier are still used.'
+                                                : cpState.status === 'failed' && PBED_TABLE_GONE_RE.test(String(cpState.why || '')) ? 'Clean Plan not published yet (no Clean Plan table), so the runs decide every stop and restart.'
                                                 : cpState.status === 'failed' ? 'Clean Plan not read (' + String(cpState.why || '').slice(0, 160) + '), so the runs decide every stop and restart.'
                                                 : 'Reading the Clean Plan…'}
                                         </div>
@@ -9342,7 +9440,7 @@ export default function App(props) {
                                                             const ls = (hi.lines || []).slice(0, 2).join(', ') + ((hi.lines || []).length > 2 ? ' +' + ((hi.lines || []).length - 2) : '');
                                                             const pw = hi.plan || null;
                                                             const chipP = hi.src === 'plan' ? 'Clean Plan: production ' + (hi.stopped ? 'already stopped' : 'stops') + ' · ' + ls + (pw && pw.kind && pw.kind !== 'none' ? ' · ' + pw.kind + ' clean' : '') + (pw && pw.status && pw.status !== 'ok' && pw.status !== 'none' ? ' · ' + pw.status : '')
-                                                                : hi.src === 'schedule' ? 'production hands it over · ' + ls
+                                                                : hi.src === 'schedule' ? 'production hands it over · ' + ls + (hi.planLate ? ' · later than the Clean Plan said (' + formatDayClock(hi.planLate) + '), so the runs are used' : '')
                                                                 : hi.src === 'free' ? 'production stopped · ' + ls
                                                                 : hi.src === 'norun' ? 'no run scheduled · ' + ls
                                                                 : hi.src === 'nolines' ? 'doesn\'t wait for production'
@@ -10603,7 +10701,7 @@ export default function App(props) {
                                                 <Button variant="primary" size="sm" disabled={pbedSave.status === 'saving'} onClick={savePlanToDataverse} className="shadow-sm px-2 py-1 text-[10px]" title="Write this plan to Dataverse: one PBED Plan row and one PBED Plan Step row per block (the columns are listed on Setup)">
                                                     {pbedSave.status === 'saving' ? 'Saving ' + pbedSave.done + ' of ' + pbedSave.total + '…' : 'Save to Dataverse'}
                                                 </Button>
-                                                {pbedSave.last && <span data-pbed-save-state={pbedSave.last.ok ? 'ok' : 'failed'} className={`text-[10px] font-bold ${pbedSave.last.ok ? 'text-emerald-700' : 'text-[#E4002B]'}`} title={pbedSave.last.ok ? pbedSave.last.blocks + ' blocks saved' : pbedSave.last.error}>{pbedSave.last.ok ? 'saved ' + new Date(pbedSave.last.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : 'save failed: ' + String(pbedSave.last.error).slice(0, 90) + (String(pbedSave.last.error).length > 90 ? '…' : '')}</span>}
+                                                {pbedSave.last && <span data-pbed-save-state={pbedSave.last.ok ? 'ok' : 'failed'} className={`text-[10px] font-bold ${pbedSave.last.ok ? 'text-emerald-700' : 'text-[#E4002B]'}`} title={pbedSave.last.ok ? pbedSave.last.blocks + ' blocks saved' + (pbedSave.last.removeFailed ? '; ' + pbedSave.last.removeFailed + ' old rows could not be removed (tried again on the next save)' : '') : pbedSave.last.error}>{pbedSave.last.ok ? 'saved ' + new Date(pbedSave.last.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) + (pbedSave.last.removeFailed ? ' (' + pbedSave.last.removeFailed + ' old row' + (pbedSave.last.removeFailed === 1 ? '' : 's') + ' left)' : '') : 'save failed: ' + String(pbedSave.last.error).slice(0, 90) + (String(pbedSave.last.error).length > 90 ? '…' : '')}</span>}
                                             </span>
                                         )}
                                         {Object.keys(overrides).length > 0 && (
@@ -11064,7 +11162,7 @@ export default function App(props) {
                                     <span>Production stops: {dp && dp.stop !== null ? formatClockTime(ganttStartDate, ganttStartHour, dp.stop) : <span className="text-slate-400">{hi && (hi.src === 'free' || (hi.src === 'plan' && hi.stopped)) ? 'already stopped at the start of the plan' : hi && hi.src === 'norun' ? 'nothing scheduled' : 'not known'}</span>}</span>
                                     <span className="flex items-center gap-2">Production restarts:
                                         <span data-restart-input className="font-bold text-xs text-slate-800">{hi && hi.restart !== null && hi.restart !== undefined ? clk(hi.restart) : <span className="text-slate-400">not known</span>}</span>
-                                        <span className={`text-[10px] ${hi && hi.restartSrc && hi.restartSrc !== 'none' ? 'text-slate-400' : 'text-amber-700'}`}>{hi && hi.restartSrc === 'plan' ? 'from the production schedule (Clean Plan)' : hi && hi.restartSrc === 'schedule' ? 'from the production schedule (next run)' : 'no run after the stop in the production schedule: add it there, then Read the schedule again on Setup'}</span>
+                                        <span className={`text-[10px] ${hi && hi.restartSrc && hi.restartSrc !== 'none' ? 'text-slate-400' : 'text-amber-700'}`}>{hi && hi.restartSrc === 'plan' ? 'from the production schedule (Clean Plan)' : hi && hi.restartSrc === 'schedule' ? 'from the production schedule (next run)' : hi && hi.src === 'nomatch' ? 'no production line found for this room: pick its line on the room row on Setup' : hi && hi.src === 'nolines' ? 'this room is set not to wait for production' : 'no run after the stop in the production schedule (within 4 days of the end of the plan): add it there, then Read the schedule again on Setup'}</span>
                                         {dp && dp.deadline !== null && dp.deadline !== undefined && <span data-restart-deadline className="text-[10px] text-slate-500">· cleaning done by {formatClockTime(ganttStartDate, ganttStartHour, dp.deadline)} ({fmtMins(CLEAN_DONE_BEFORE_MINS)} before)</span>}
                                     </span>
                                 </div>
