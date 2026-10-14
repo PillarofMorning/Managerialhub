@@ -1188,7 +1188,7 @@ const CHECKOFF_RETRY_MS = [15000, 30000, 60000, 120000, 300000];   // waits afte
 const CHECKOFF_BUSY_MS = 30000;              // Dataverse said "too many requests": wait this long
 const CHECKOFF_KEEP_MS = 14 * 86400000;      // a save still queued, or a key dropped as old, is forgotten after this
 const CHECKOFF_MISSING_RETRY_MS = 3600000;   // an optional column Dataverse refused is tried again after this (it may have been added)
-const CHECKOFF_DETAIL_FIELDS = ['status', 'parentId', 'name', 'startMs', 'durationMins', 'laneKeys', 'workMins', 'heads', 'updatedAt', 'startedAt', 'doneAt', 'noStart', 'syncAt', 'bulk'];   // bulk: written by Mark room complete (that press's time)
+const CHECKOFF_DETAIL_FIELDS = ['status', 'parentId', 'name', 'startMs', 'durationMins', 'laneKeys', 'workMins', 'heads', 'updatedAt', 'startedAt', 'doneAt', 'noStart', 'syncAt', 'bulk', 'was'];   // bulk: written by Mark room complete (that press's time); was: the Start another computer had pressed on it (Undo puts it back)
 // A check-off's key: its block id plus when it was first pressed (kept in the record; worked out the same way for older records).
 function checkoffKeyOf(blockId, rec) {
     if (rec && rec.syncKey) return String(rec.syncKey);
@@ -1216,7 +1216,15 @@ function checkoffClean(r, key) {
     if (num(r.doneAt)) out.doneAt = num(r.doneAt);
     if (r.noStart !== undefined) out.noStart = !!r.noStart;
     if (num(r.bulk)) out.bulk = num(r.bulk);
+    if (r.was && typeof r.was === 'object' && num(r.was.startMs) !== null) out.was = { startMs: num(r.was.startMs), startedAt: num(r.was.startedAt) || num(r.was.startMs), durationMins: Math.max(5, num(r.was.durationMins) || 5), laneKeys: Array.isArray(r.was.laneKeys) ? r.was.laneKeys.map(String) : [] };
     return out;
+}
+// The Start a bulk Done replaced (see was), as a Start again under a new key (Undo room complete).
+function startedFromWas(blockId, rec, now) {
+    const o = Object.assign({}, rec, { status: 'started', startMs: rec.was.startMs, startedAt: rec.was.startedAt, durationMins: rec.was.durationMins, laneKeys: rec.was.laneKeys.slice(), noStart: false,
+        syncKey: blockId + '~' + now.toString(36) + Math.random().toString(36).slice(2, 5), syncAt: now, updatedAt: now });
+    delete o.doneAt; delete o.bulk; delete o.was; delete o.remote;
+    return o;
 }
 // Two computers pressed the same block: Done beats Started, then the later press, then the key (so every computer picks the same one).
 function checkoffBeats(a, b) {
@@ -1226,7 +1234,7 @@ function checkoffBeats(a, b) {
     return String(a.syncKey) > String(b.syncKey);
 }
 function checkoffStoreLoad() {
-    const empty = { v: 1, sent: {}, pending: {}, gone: {}, known: {}, missing: {}, rowId: {}, readFrom: '', roomSent: {}, ssWrote: {} };
+    const empty = { v: 1, sent: {}, pending: {}, gone: {}, known: {}, missing: {}, rowId: {}, readFrom: '', roomSent: {}, ssWrote: {}, ssReplaced: {} };
     try {
         const o = JSON.parse(localStorage.getItem(CHECKOFF_STORE_KEY) || 'null');
         if (!o || o.v !== 1) return empty;
@@ -1238,7 +1246,8 @@ function checkoffStoreSave(S) {
     const now = Date.now();
     Object.keys(S.gone).forEach(function(k) { if (now - S.gone[k] > CHECKOFF_KEEP_MS) delete S.gone[k]; });
     Object.keys(S.pending).forEach(function(k) { if (now - (S.pending[k].at || 0) > CHECKOFF_KEEP_MS) delete S.pending[k]; });
-    S.roomSent = S.roomSent || {}; S.ssWrote = S.ssWrote || {};
+    S.roomSent = S.roomSent || {}; S.ssWrote = S.ssWrote || {}; S.ssReplaced = S.ssReplaced || {};
+    Object.keys(S.ssReplaced).forEach(function(k) { if (now - (Number(S.ssReplaced[k] && S.ssReplaced[k].t) || 0) > 2 * 86400000) delete S.ssReplaced[k]; });   // a person's text Ganttly wrote over, per room
     Object.keys(S.roomSent).forEach(function(k) { if (now - (Number(S.roomSent[k]) || 0) > CHECKOFF_KEEP_MS) delete S.roomSent[k]; });   // room marks (at of the press)
     Object.keys(S.ssWrote).forEach(function(k) { if (now - (Number(S.ssWrote[k] && S.ssWrote[k].t) || 0) > 2 * 86400000) delete S.ssWrote[k]; });   // Shift Start rows written
     Object.keys(S.known).forEach(function(k) { if (!S.sent[k] && !S.pending[k] && !S.gone[k] && !S.roomSent[k]) delete S.known[k]; });
@@ -1445,7 +1454,7 @@ function stageCum(k) {
 // Ganttly's own text ("Foam / rinse finished (3 of 8)", "Next shift · ...", "Production ready") reads back exactly. Other words: a
 // stage named with done / finished / complete is finished; a stage named alone is the one under way (the ones before it finished).
 function parseStageText(text) {
-    const t = normS(text).replace(/\s+/g, ' ');
+    const t = normS(text).replace(/\s+/g, ' ').replace(STAMP_RE, '');
     if (!t) return null;
     const next = /next shift/.test(t);
     if (/production ready|prod ready/.test(t)) return { stage: STAGES.length, done: true, next: false };
@@ -1465,10 +1474,11 @@ function parseStageText(text) {
 // finished is carried by 100 % alone.
 function stageText(mark) {
     if (!mark) return '';
-    if (mark.kind === 'done' || mark.stage >= STAGES.length) return READY_WORD;
+    const at = mark.at ? ' · ' + stampText(mark.at) : '';
+    if (mark.kind === 'done' || mark.stage >= STAGES.length) return READY_WORD + at;
     const base = mark.stage > 0 ? STAGES[mark.stage - 1].name + ' finished (' + mark.stage + ' of ' + STAGES.length + ')' : '';
-    if (mark.kind === 'next') return 'Next shift' + (base ? ' · ' + base : '');
-    return base;
+    if (mark.kind === 'next') return 'Next shift' + (base ? ' · ' + base : '') + at;
+    return base ? base + at : '';
 }
 function stagePct(mark) { return !mark ? 0 : (mark.kind === 'done' || mark.stage >= STAGES.length) ? 100 : Math.round(stageCum(mark.stage)); }
 // ============================================================================
@@ -1477,8 +1487,9 @@ function stagePct(mark) { return !mark ? 0 : (mark.kind === 'done' || mark.stage
 // a room"). A mark: { room, kind: 'stage' | 'next' | 'done' | 'clear', stage (stages finished, 0 to 8), at (ms, when it was pressed),
 // by (which computer), until (ms: it stops counting then, the room's next startup, else a day later), nextFrom / nextCrew (Next shift:
 // the next crew's clock-in), bulk (the check-offs Mark room complete wrote: their block ids), prev (the Start those blocks had, so
-// Undo puts it back) and undoOf (a mark below Production ready that followed it: when Production ready was pressed, so the Shift Start
-// rows it closed open again) }.
+// Undo puts it back), undoOf (a mark below Production ready that followed it: when Production ready was pressed, so the Shift Start
+// rows it closed open again), seen (the room's Shift Start text a person typed before the mark: a Shift Start Save that sends it again
+// is not newer than the mark) and n (random, so two presses in one second are two rows and every computer picks the same one) }.
 // Saved like a check-off in Clean Check-off, one row per press (Name room~<room>~<press>, Status 'room', Details { v, kind: 'room',
 // room, mark }); the newest press of a room wins on every computer. Written into Shift Start's table too (see ssWriteJobs):
 // the room's open rows in the shift on now get "What is being done" = the stage text and "% complete" = the stage % (Production
@@ -1489,7 +1500,9 @@ const NO_ROOMS = {};   // PBED: no room marks (one object, so the plan's inputs 
 const ROOM_MARK_DAY_MS = 24 * 3600000;   // a mark on a room with no known startup counts this long
 const SKEW_MS = 2 * 60000;   // Dataverse's clock and this computer's may differ this much: text a person typed this close to a mark counts as after it
 const REOPEN_SLACK_MS = 10 * 60000;   // a Shift Start row closed this long before Production ready was pressed was not closed by it
-function roomMarkKey(room, at) { return (ROOM_MARK_PREFIX + normS(room).slice(0, 70) + '~' + Math.round(at / 1000).toString(36)).slice(0, 100); }
+function roomMarkKey(room, at, n) { return (ROOM_MARK_PREFIX + normS(room).slice(0, 70) + '~' + Math.round(at / 1000).toString(36) + (n ? '~' + n : '')).slice(0, 100); }
+// The newer of two marks of a room (the same on every computer: the later press, then n).
+function roomMarkBeats(m, cur) { return m.at > cur.at || (m.at === cur.at && String(m.n || '') > String(cur.n || '')); }
 // A mark read back from Dataverse (another computer wrote it), every field checked. null when it is not usable.
 function roomMarkClean(m, room) {
     if (!m || typeof m !== 'object') return null;
@@ -1500,6 +1513,8 @@ function roomMarkClean(m, room) {
     const out = { room: String(room), kind: kind, stage: Math.max(0, Math.min(STAGES.length, Math.round(num(m.stage)))), at: at, by: String(m.by || '').slice(0, 60), until: num(m.until) || at + ROOM_MARK_DAY_MS };
     if (kind === 'next') { out.nextFrom = num(m.nextFrom); out.nextCrew = String(m.nextCrew || '').slice(0, 4); }
     if (kind !== 'done' && num(m.undoOf)) out.undoOf = num(m.undoOf);
+    if (m.n) out.n = String(m.n).replace(/[^a-z0-9]/gi, '').slice(0, 8);
+    if (Array.isArray(m.seen)) out.seen = m.seen.map(function(v) { return normS(v).slice(0, 120); }).filter(Boolean).slice(0, 4);
     if (m.before && typeof m.before === 'object') out.before = { kind: m.before.kind === 'next' ? 'next' : 'stage', stage: Math.max(0, Math.min(STAGES.length - 1, Math.round(num(m.before.stage)))), nextFrom: num(m.before.nextFrom), nextCrew: String(m.before.nextCrew || '').slice(0, 4) };
     if (Array.isArray(m.bulk)) out.bulk = m.bulk.map(String).slice(0, 500);
     if (m.prev && typeof m.prev === 'object') {
@@ -1511,18 +1526,47 @@ function roomMarkClean(m, room) {
 // What is saved of a mark (no screen-only fields).
 function roomMarkBody(m) {
     const o = {};
-    ['room', 'kind', 'stage', 'at', 'by', 'until', 'nextFrom', 'nextCrew', 'bulk', 'prev', 'before', 'undoOf'].forEach(function(k) { if (m[k] !== undefined) o[k] = m[k]; });
+    ['room', 'kind', 'stage', 'at', 'by', 'until', 'nextFrom', 'nextCrew', 'bulk', 'prev', 'before', 'undoOf', 'n', 'seen'].forEach(function(k) { if (m[k] !== undefined) o[k] = m[k]; });
     return o;
 }
 // The status words other apps write that Ganttly never writes over: the Lead hub's ("Started", "In Progress", "Incomplete", "Pending
 // Inspection", "Reclean", "Complete", "Not Applicable") and Shift Start's "Completed".
 const OTHER_APP_STATUS = /^(started|in progress|incomplete|ended incomplete|pending inspection|pending|reclean|complete|completed|not applicable|n\/a|done)$/;
-// Text a person did not type: empty, Shift Start's "Working", or Ganttly's own stage text. Ganttly may write over it at any time.
+// Ganttly's text in Shift Start ends with when the mark was pressed ("Foam / rinse finished (3 of 8) · Tue 10:05 AM"). Shift Start keeps
+// the status it loaded and saves it again with every row, so the press time tells an old mark sent back from a later one made on
+// another computer, and a person typing "Production ready" from Ganttly's own words.
+const STAMP_DAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+const STAMP_RE = / · (sun|mon|tue|wed|thu|fri|sat) (\d{1,2}):(\d{2}) ?([ap]m)$/;
+function stampText(ms) {
+    const d = new Date(ms), h = d.getHours(), m = d.getMinutes(), day = STAMP_DAYS[d.getDay()];
+    return day.charAt(0).toUpperCase() + day.slice(1) + ' ' + ((h % 12) || 12) + ':' + (m < 10 ? '0' : '') + m + ' ' + (h < 12 ? 'AM' : 'PM');
+}
+// Ganttly's own text: { ms } = the minute it was pressed (the last such day and time up to refMs, when the row was saved; 0 for text
+// written before the stamp), null for anything else (a person's text, another app's word, plain "Production ready").
+function ganttlyText(text, refMs) {
+    const t = normS(text).replace(/\s+/g, ' ');
+    if (!t) return null;
+    const m = STAMP_RE.exec(t);
+    const base = m ? t.slice(0, m.index) : t;
+    if (!/^(next shift( · .*)?|production ready|.+ finished \(\d+ of \d+\))$/.test(base)) return null;
+    if (!m) return /finished \(\d+ of \d+\)$/.test(base) ? { ms: 0 } : null;
+    const dow = STAMP_DAYS.indexOf(m[1]), mi = Number(m[3]);
+    const h = (Number(m[2]) % 12) + (m[4] === 'pm' ? 12 : 0);
+    const lim = (refMs || Date.now()) + SKEW_MS + 60000, r = new Date(lim);
+    for (let k = 0; k < 8; k++) {
+        const c = new Date(r.getFullYear(), r.getMonth(), r.getDate() - k, h, mi, 0, 0);
+        if (c.getDay() === dow && c.getTime() <= lim) return { ms: c.getTime() };
+    }
+    return { ms: 0 };
+}
+// Text a person did not type: empty, Shift Start's "Working", or Ganttly's own stage text.
 function isMachineStatus(text) {
     const t = normS(text);
     if (!t || t === 'working') return true;
-    return /^(next shift( · .*)?|production ready|.+ finished \(\d+ of \d+\))$/.test(t);
+    return !!ganttlyText(t);
 }
+// "Production ready", with or without the press time.
+function isReadyText(text) { return normS(text).replace(/\s+/g, ' ').replace(STAMP_RE, '') === 'production ready'; }
 // A room or area name with only its letters and digits ("IBL-4 " and "ibl4" are the same room), for exact matches.
 function stripName(v) { return normS(v).replace(/[^a-z0-9]/g, ''); }
 // Shift Start's update times (Gerald, Oct 10: "the 'shift start' is the primary source of truth for what we are doing ... if it is not
@@ -2200,7 +2244,8 @@ async function fetchTaskAssignmentRows(dataApi, sinceMs, untilMs) {
     return null;
 }
 function taskRowsSignature(rows) {
-    return (rows || []).map(function(r) { return String(getRowField(r, 'craa5_taskassignmentid') || '') + '|' + String(getRowField(r, 'modifiedon') || ''); }).join(';');
+    // (Ganttly: the change time to the second, so a row changed twice in a minute, by Ganttly's write and then a person, is read again.)
+    return (rows || []).map(function(r) { return String(getRowField(r, 'craa5_taskassignmentid') || '') + '|' + String((IS_CURRENT ? rowRaw(r, 'modifiedon') : null) || getRowField(r, 'modifiedon') || ''); }).join(';');
 }
 
 // ============================================================================
@@ -2355,8 +2400,8 @@ function taskRowDone(r) {
 // A row with no person is a room Shift Start set up with nobody in it.
 function boardsFromTaskRows(rows, windows, globalStartMs, who, lines) {
     const stats = { read: (rows || []).length, used: 0, equipment: 0, unknownPerson: 0, noShift: 0, done: 0, roomRows: 0 };
-    const out = {}, rooms = {};
-    if (!rows || !rows.length || !windows.length) return { boards: out, rooms: rooms, stats: stats };
+    const out = {}, rooms = {}, latest = {};   // latest: windowKey -> employeeId -> when their newest Shift Start row was saved (not a hub's)
+    if (!rows || !rows.length || !windows.length) return { boards: out, rooms: rooms, stats: stats, latest: latest };
     const nameKey = function(v) { return normS(formatFullName(String(v || '').trim())); };
     const idOfName = function(v) { return v ? (who.idByName[normS(v)] || who.idByName[nameKey(v)] || '') : ''; };
     const wins = windows.map(function(w) {
@@ -2405,7 +2450,7 @@ function boardsFromTaskRows(rows, windows, globalStartMs, who, lines) {
                 tc: tc, at: tmRaw, done: done, text: String(rowRaw(r, 'craa5_whatisbeingdone') || rowRaw(r, 'craa5__currentstatus') || '').trim(),
                 notes: String(rowRaw(r, 'craa5_whatislefttodo') || rowRaw(r, 'craa5__future_or_notes') || '').trim(),
                 pct: (function() { const v = rowRaw(r, 'craa5_percentagecomplete'); return v === null || v === undefined || v === '' || isNaN(Number(v)) ? null : Number(v); })(),
-                hub: !!equipText, ended: !!rowRaw(r, 'craa5_endtime'), person: !roomRow, area: area
+                hub: !!equipText, ended: !!rowRaw(r, 'craa5_endtime'), person: !roomRow, emp: empId, area: area
             };
             hit.forEach(function(w) {
                 const rw = rooms[w.key] = rooms[w.key] || {};
@@ -2416,6 +2461,7 @@ function boardsFromTaskRows(rows, windows, globalStartMs, who, lines) {
             });
         }
         if (roomRow) return;
+        if (IS_CURRENT && !equipText) hit.forEach(function(w) { const l = latest[w.key] = latest[w.key] || {}; if (!(l[empId] >= tc)) l[empId] = tc; });
         const item = { empId: empId, area: area, lead: String(getRowField(r, 'craa5_lead') || '').trim(), supName: supName, supId: supId, tc: tc, tm: tm, touched: !!equipText, done: done };
         hit.forEach(function(w) {
             // Newest row per person (when two were saved at the same moment, the open one, then the one touched last, like Shift
@@ -2478,7 +2524,7 @@ function boardsFromTaskRows(rows, windows, globalStartMs, who, lines) {
             return { supervisor: formatFullName(sg.name) || 'Shift Start', crew: w.crew, startMs: globalStartMs + w.shiftStart * 60000, board: board, fromTasks: true };
         });
     });
-    return { boards: out, rooms: rooms, stats: stats };
+    return { boards: out, rooms: rooms, stats: stats, latest: latest };
 }
 
 // ============================================================================
@@ -3558,7 +3604,9 @@ export default function App(props) {
     // only when no second click follows).
     const [roomMenu, setRoomMenu] = useState('');
     const rowClickRef = useRef(null);
-    const roomMenuAtRef = useRef(0);   // when the room menu opened (the second click of a double-click on ⋯ must not land in it)
+    const roomMenuAtRef = useRef(0);
+    const backdropDownRef = useRef(false);   // the press that closes the room menu began on its dimmed backdrop (closed on the click, so a tap never reaches the row behind)
+    const overviewLiveRef = useRef(false);   // the Overview is on screen and not in TV mode (a single click's timer checks it when it fires)   // when the room menu opened (the second click of a double-click on ⋯ must not land in it)
     const [keyOpen, setKeyOpen] = useState(false);
     const [toolsOpen, setToolsOpen] = useState(false);
     const [popTop, setPopTop] = useState(0);   // below xl the Key / Supervisor tools pop-overs sit, full width, just under the button that opened them
@@ -3966,7 +4014,7 @@ export default function App(props) {
     // says about it. A check-off is queued when its record changes here (Start, Done, a move), saved in the background and retried
     // with growing waits; the other computers' check-offs are read every CHECKOFF_READ_MS and merged into taskStatus.
     const ckRef = useRef(null);
-    if (ckRef.current === null) ckRef.current = IS_CURRENT ? checkoffStoreLoad() : { v: 1, sent: {}, pending: {}, gone: {}, known: {}, missing: {}, rowId: {}, readFrom: '', roomSent: {}, ssWrote: {} };
+    if (ckRef.current === null) ckRef.current = IS_CURRENT ? checkoffStoreLoad() : { v: 1, sent: {}, pending: {}, gone: {}, known: {}, missing: {}, rowId: {}, readFrom: '', roomSent: {}, ssWrote: {}, ssReplaced: {} };
     const ckUndoneRef = useRef({});        // keys undone on this computer, to be saved as 'undone'
     const ckBlockedRef = useRef(null);     // { kind: 'table' | 'columns' | 'denied', err, cols }: saving waits for Check again (or a good read)
     const ckPauseRef = useRef(0);          // Dataverse busy or out of reach: no save before this time
@@ -4050,7 +4098,7 @@ export default function App(props) {
         Object.keys(roomMarks).forEach(function(room) {
             const m = roomMarks[room];
             if (!m || m.remote || now - m.at > CHECKOFF_KEEP_MS) return;
-            const key = roomMarkKey(room, m.at);
+            const key = roomMarkKey(room, m.at, m.n);
             if (S.roomSent[key]) return;
             S.roomSent[key] = m.at;
             S.pending[key] = { id: 'room', kind: 'room', room: room, mark: roomMarkBody(m), area: room, keep: Math.max(m.until || 0, m.at) + 2 * 86400000, tries: 0, nextAt: 0, at: now };
@@ -4174,9 +4222,14 @@ export default function App(props) {
             let next = null;
             marksIn.forEach(function(m) {
                 const cur = next ? next[m.room] : prev[m.room];
-                if (cur && cur.at >= m.at) return;
+                if (cur && !roomMarkBeats(m, cur)) return;
                 if (!next) next = Object.assign({}, prev);
-                next[m.room] = Object.assign({}, m, { remote: true });
+                const add = { remote: true };
+                // Pressed below Production ready on a computer that had not read it yet: the Shift Start rows it closed open again here.
+                if (cur && m.kind !== 'done' && !m.undoOf && now < (cur.until || 0)) {
+                    if (cur.kind === 'done') add.undoOf = cur.at; else if (cur.undoOf) add.undoOf = cur.undoOf;
+                }
+                next[m.room] = Object.assign({}, m, add);
             });
             return next || prev;
         });
@@ -4195,7 +4248,8 @@ export default function App(props) {
                 const cur = next ? next[x.id] : prev[x.id];
                 const curKey = cur ? checkoffKeyOf(x.id, cur) : '';
                 if (x.undone) {
-                    if (cur && curKey === x.key) { put(x.id, null); S.gone[x.key] = now; delete S.sent[x.key]; }
+                    // (Undo room complete on another computer that had not read the Start this one folded into it: the Start comes back.)
+                    if (cur && curKey === x.key) { put(x.id, cur.was && !cur.remote ? startedFromWas(x.id, cur, now) : null); S.gone[x.key] = now; delete S.sent[x.key]; }
                     return;
                 }
                 if (!x.rec) return;
@@ -4218,6 +4272,7 @@ export default function App(props) {
                 S.sent[x.key] = { sig: checkoffSig(x.rec), id: x.id };
                 // Done on the other computer without Start, started on this one: keep this computer's Start (saved back with the row).
                 if (!cur.remote && won.status === 'done' && !won.startedAt && cur.startedAt) {
+                    if (won.bulk && cur.status === 'started') won.was = { startMs: cur.startMs, startedAt: cur.startedAt, durationMins: cur.durationMins, laneKeys: (cur.laneKeys || []).slice() };   // (Undo room complete puts it back)
                     won.startedAt = cur.startedAt; won.noStart = false; won.syncAt = now; delete won.remote;
                     won.startMs = cur.startMs; won.durationMins = Math.max(5, Math.round(((won.doneAt || now) - cur.startMs) / 60000));
                 }
@@ -5076,6 +5131,14 @@ export default function App(props) {
     const nextWinKey = nextWin0 ? nextWin0.key : '';
     const slotMs = IS_CURRENT ? nextUpdateSlotMs(liveTime.getTime()) : 0;
     const liveMinute = Math.floor(liveTime.getTime() / 60000);
+    // A room's Shift Start text that is older than its mark although saved after it: what a person had typed before the mark (kept in the
+    // mark, seen) and what this computer wrote over. Shift Start keeps the status it loaded and saves it again with every row.
+    const staleOf = function(room, g) {
+        const out = g && g.seen ? g.seen.slice() : [];
+        const rp = ((ckRef.current || {}).ssReplaced || {})[room];
+        if (rp && g && (rp.markAt || 0) <= g.at + SKEW_MS && Array.isArray(rp.texts)) rp.texts.forEach(function(t) { if (out.indexOf(t) === -1) out.push(t); });
+        return out;
+    };
     const roomState = useMemo(function() {
         const out = { rooms: {}, applies: false, ssRooms: {}, people: 0, slotMs: slotMs, unmatched: [] };
         if (!IS_CURRENT) return out;
@@ -5086,7 +5149,13 @@ export default function App(props) {
         out.ssRooms = ssRooms;
         out.applies = roomSource === 'shiftstart' && !autoCrews && !!nowWin && (anyOpen || !!(plan && Object.keys(plan.lineWorkers).length));
         const clockInMs = nowWin ? globalStartMs + nowWin.shiftStart * 60000 : nowMs;
+        out.clockInMs = clockInMs;
         const nextFrom0 = nextWin0 ? globalStartMs + nextWin0.start * 60000 : 0;
+        // The first crew to clock in after ms (Next shift read from Shift Start: the crew after the one it was saved in).
+        const nextClockIn = function(ms) {
+            const w = shiftWindows.filter(function(x) { return globalStartMs + x.shiftStart * 60000 > ms + 60000; }).sort(function(a, b) { return a.shiftStart - b.shiftStart; })[0];
+            return w ? { ms: globalStartMs + w.shiftStart * 60000, crew: w.crew } : null;
+        };
         // Rooms with a Start or Done pressed this shift are being worked, whatever Shift Start says.
         const worked = {}, matched = {};
         Object.keys(taskStatus).forEach(function(id) { const rec = taskStatus[id]; if (rec && (rec.updatedAt || 0) >= clockInMs && !rec.bulk) worked[ckAreaOf.area[String(rec.parentId)] || ''] = true; });
@@ -5105,26 +5174,31 @@ export default function App(props) {
             const exempt = !!customOnlyAreas[r] || !lid || FIXED_AREA_KINDS.indexOf(normS(r)) > -1;   // custom tasks, rooms Shift Start has no line for, and the chemical, admin and janitorial rooms (their area roles clean them, wherever Shift Start puts people)
             const h = handoffInfo[r];
             const untilOf = function(at) { return h && h.restart && h.restart > at ? h.restart : at + ROOM_MARK_DAY_MS; };
-            // The newest mark: Ganttly's (this computer or another), or text a person typed in Shift Start after it. Ganttly's own text read
-            // back from Shift Start only counts when this computer has no mark for the room at all.
+            // The newest mark: Ganttly's (this computer or another), or the room's Shift Start text saved after it: a person's (not one a
+            // Shift Start Save sent again, see staleOf), or a later press another Ganttly wrote (its text carries the press time). Ganttly's
+            // own text is only read back from the room's own row, never from a line's row that a sibling room shares.
             const gm0 = roomMarks[r] || null;
-            const gm = gm0 && gm0.kind !== 'clear' && nowMs < (gm0.until || 0) ? gm0 : null;
-            // (Ganttly's own text is only read back from the room's own row, never from a line's row that a sibling room shares.)
+            const gmA = gm0 && nowMs < (gm0.until || 0) ? gm0 : null;   // (a mark that has run out is as good as none)
+            const gm = gmA && gmA.kind !== 'clear' ? gmA : null;
             const exact = !!ss && stripName(ss.area) === stripName(r);
             let eff = null;
             if (ss && ss.text) {
                 const p = parseStageText(ss.text);
-                const human = !isMachineStatus(ss.text);
-                if (p && (human ? (!gm0 || ss.at > gm0.at - SKEW_MS) : (!gm0 && exact))) eff = { kind: p.done ? 'done' : p.next ? 'next' : 'stage', stage: p.stage, at: ss.at, src: 'shiftstart', text: ss.text, until: untilOf(ss.at) };
+                const gt = ganttlyText(ss.text, ss.at);
+                const mk = function(at, machine) { return { kind: p.done ? 'done' : p.next ? 'next' : 'stage', stage: p.stage, at: at, src: 'shiftstart', text: ss.text, until: untilOf(at), machine: machine }; };
+                if (p && !gt && (!gmA || (ss.at > gmA.at - SKEW_MS && staleOf(r, gmA).indexOf(normS(ss.text)) === -1))) eff = mk(ss.at, false);
+                else if (p && gt && exact && (!gmA || gt.ms > gmA.at)) eff = mk(gt.ms || ss.at, true);
             }
             if (!eff && gm) eff = Object.assign({ src: 'ganttly' }, gm);
-            if (!eff && !gm0 && ss && exact) {
+            if (!eff && !gmA && ss && exact) {
                 // Production ready closes the rows (100 %): the newest closed row saying so, with no open row saved after it, still reads as done.
-                const ready = ss.rows.filter(function(x) { return x.done && normS(x.text) === 'production ready'; }).sort(function(a, b) { return b.at - a.at; })[0];
-                if (ready && !open.some(function(x) { return x.tc > ready.at; })) eff = { kind: 'done', stage: STAGES.length, at: ready.at, src: 'shiftstart', text: READY_WORD, until: untilOf(ready.at) };
+                const ready = ss.rows.filter(function(x) { return x.done && isReadyText(x.text); }).sort(function(a, b) { return b.at - a.at; })[0];
+                if (ready && !open.some(function(x) { return x.tc > ready.at; })) eff = { kind: 'done', stage: STAGES.length, at: ready.at, src: 'shiftstart', text: READY_WORD, until: untilOf(ready.at), machine: true };
             }
             if (eff && !(nowMs < eff.until)) eff = null;
-            if (eff && eff.kind === 'next' && !eff.nextFrom) { eff.nextFrom = nextFrom0; eff.nextCrew = nextWin0 ? nextWin0.crew : ''; }
+            // Production ready pressed in an earlier shift, and this shift's Shift Start has put people on the room since: it is worked again.
+            if (eff && eff.kind === 'done' && eff.src === 'ganttly' && eff.at < clockInMs - SKEW_MS && open.some(function(o) { return o.person && !o.hub && o.tc > eff.at + SKEW_MS; })) eff = null;
+            if (eff && eff.kind === 'next' && !eff.nextFrom) { const nc = nextClockIn(eff.at); eff.nextFrom = nc ? nc.ms : nextFrom0; eff.nextCrew = nc ? nc.crew : nextWin0 ? nextWin0.crew : ''; }
             // Once that crew has clocked in the room is theirs: its stage stands, it no longer waits (handed = for the notes).
             if (eff && eff.kind === 'next' && eff.nextFrom && eff.nextFrom <= nowMs) eff = Object.assign({}, eff, { kind: 'stage', handed: true });
             let floorMs = 0, why = '';
@@ -5137,7 +5211,7 @@ export default function App(props) {
         // the rooms those people clean count as not assigned.
         out.unmatched = Object.keys(ssRooms).filter(function(k) { return !matched[k] && ssRooms[k].rows.some(function(x) { return !x.done; }); }).map(function(k) { return ssRooms[k].area; });
         return out;
-    }, [areaSig, taskBoards, nowWinKey, nextWinKey, windowPlans, areaLine, lineById, customOnlyAreas, roomMarks, slotMs, liveMinute, handoffInfo, roomSource, autoCrews, taskStatus, ckAreaOf, globalStartMs]);
+    }, [areaSig, taskBoards, nowWinKey, nextWinKey, windowPlans, areaLine, lineById, customOnlyAreas, roomMarks, slotMs, liveMinute, handoffInfo, roomSource, autoCrews, taskStatus, ckAreaOf, globalStartMs, shiftWindows]);
     // What the plan takes from it, kept as the same objects until something changes (a re-read that finds nothing new never re-plans):
     // the earliest start of each room (its handoff, the next update, or the next crew), the rooms marked Production ready and Next shift.
     const roomPlanNow = (function() {
@@ -5171,6 +5245,7 @@ export default function App(props) {
         const d = TASK_READ.dropped, S = ckRef.current, nowMs = Date.now();
         S.ssWrote = S.ssWrote || {};
         const strip = stripName;
+        const latest = (taskBoards.latest || {})[nowWinKey] || {};
         Object.keys(roomState.rooms).forEach(function(r) {
             const x = roomState.rooms[r];
             let g = x.gm;
@@ -5179,22 +5254,33 @@ export default function App(props) {
                 if (!g.stage) return;
                 g = Object.assign({}, g, { kind: 'stage' });
             }
-            if (x.eff && x.eff.src === 'shiftstart' && !isMachineStatus(x.eff.text)) return;   // a person's newer text in Shift Start stands
+            if (x.eff && x.eff.src === 'shiftstart') return;   // Shift Start has something newer: a person's text, or a later press on another computer
             if (strip(x.ss.area) !== strip(r) && !(x.line && strip(x.line.name) === strip(r) && strip(x.ss.area) === strip(x.line.name))) return;
             const clear = g.kind === 'clear' || (g.kind === 'stage' && !g.stage), done = g.kind === 'done';
             const text = clear ? 'Working' : stageText(g), pct = clear ? 0 : stagePct(g);
+            const stale = staleOf(r, g);
+            const before = g.at < roomState.clockInMs - SKEW_MS;   // pressed in an earlier shift
             x.ss.rows.forEach(function(row) {
                 if (!row.id || row.hub) return;
-                const t = normS(row.text), ours = t === 'production ready';
-                let reopen = false;
+                const t = normS(row.text), gt = ganttlyText(row.text, row.at);
+                let reopen = false, replaced = '';
                 if (row.done) {
                     // Only a row Production ready closed, after an Undo or a lower stage picked (undoOf: when Production ready was pressed;
-                    // a row closed well before that was closed by something else).
-                    if (!ours || done || !g.undoOf || row.at < g.undoOf - REOPEN_SLACK_MS) return;
+                    // a row closed well before that was closed by something else), and only the newest row of its person (a Shift Start Save
+                    // saves everyone again: a row it replaced stays closed).
+                    if (!isReadyText(row.text) || done || !g.undoOf || row.at < g.undoOf - REOPEN_SLACK_MS) return;
+                    if (row.emp ? (latest[row.emp] || 0) > row.tc : x.ss.rows.some(function(o) { return o.id !== row.id && o.tc > row.tc; })) return;
                     reopen = true;
                 } else {
                     if (OTHER_APP_STATUS.test(t)) return;
-                    if (!isMachineStatus(row.text) && row.at > g.at - SKEW_MS) return;   // a person typed it after the mark (or about then)
+                    if (gt) { if (gt.ms > g.at) return; }   // a later press on another computer
+                    else if (t && t !== 'working') {
+                        // A person's text: only written over when it was there before the mark (or a Shift Start Save sent it again), never by Clear.
+                        if (clear) return;
+                        if (stale.indexOf(t) === -1) { if (row.at > g.at - SKEW_MS) return; replaced = t; }
+                    } else if (clear) return;   // (Clear only takes back Ganttly's own text)
+                    // Production ready from an earlier shift does not close the rows this shift's Shift Start has put people on since.
+                    if (done && before && row.person && row.tc > g.at + SKEW_MS) return;
                     // Same as it would be written (a column this table does not have is not compared).
                     const textSame = (d.craa5_whatisbeingdone && d.craa5__currentstatus) || row.text === text;
                     const pctSame = d.craa5_percentagecomplete || row.pct === pct;
@@ -5210,7 +5296,7 @@ export default function App(props) {
                 if (done && !d.craa5_endtime) body.craa5_endtime = new Date().toISOString();
                 if (reopen && !d.craa5_complete) body.craa5_complete = false;
                 if (reopen && !d.craa5_endtime) body.craa5_endtime = null;
-                if (Object.keys(body).length) jobs.push({ room: r, id: row.id, at: row.at, body: body, sig: sig });
+                if (Object.keys(body).length) jobs.push({ room: r, id: row.id, at: row.at, body: body, sig: sig, replaced: replaced, markAt: g.at });
             });
         });
         return jobs;
@@ -5242,6 +5328,12 @@ export default function App(props) {
                 if (fresh[j.id] === undefined || fresh[j.id] !== j.at) continue;
                 await w.update('craa5_taskassignment', j.id, j.body);
                 S.ssWrote[j.id] = { sig: j.sig, t: Date.now() };
+                if (j.replaced) {   // a person's text written over: a Shift Start Save that sends it again is older than the mark
+                    S.ssReplaced = S.ssReplaced || {};
+                    const rp = S.ssReplaced[j.room];
+                    const keep = rp && Array.isArray(rp.texts) && (rp.markAt || 0) <= j.markAt + SKEW_MS ? rp.texts.filter(function(t) { return t !== j.replaced; }) : [];
+                    S.ssReplaced[j.room] = { texts: [j.replaced].concat(keep).slice(0, 4), markAt: j.markAt, t: Date.now() };
+                }
                 wrote++;
             }
             R.tries = 0; R.err = ''; R.nextAt = 0;
@@ -8344,8 +8436,10 @@ export default function App(props) {
                 label: compStage >= STAGES.length ? READY_WORD : compStage > 0 ? STAGES[compStage - 1].name + ' finished' : 'Not started',
                 src: markDone || marked ? eff.src : '', at: markDone || marked ? eff.at : 0, by: (markDone || marked) && eff.by ? eff.by : ''
             };
+            // Its weight in the plant's cleaning %: its work, or (Production ready with nothing checked off here) the work its pieces take.
+            const wt = workAll > 0 ? workAll : (markDone || allDone) ? sum(parentsHere, function(p) { return p.totalWork || 0; }) : 0;
             return {
-                room: r, status: status, S: S, R: R, G: G, F: F, spare: spare, est: est, wontFit: wontFit, uWork: uWork, gateLabel: gateLabel,
+                room: r, status: status, S: S, R: R, G: G, F: F, spare: spare, est: est, wontFit: wontFit, uWork: uWork, gateLabel: gateLabel, wt: wt,
                 shortWindow: shortWindow, restartSrc: restartSrc, down: down, running: running, stateText: stateText, lines: (h.lines || []).concat(h.schedLines || []).filter(function(x, i, a) { return x && a.indexOf(x) === i; }),
                 T: T, U: U, past: past, allDone: allDone, overruns: overruns, workAll: workAll, workDone: workDoneR, leftMins: leftMins,
                 pct: markDone ? 100 : workAll > 0 ? Math.round(workDoneR / workAll * 100) : (allDone ? 100 : 0),
@@ -8375,7 +8469,9 @@ export default function App(props) {
             const e = rs0 ? rs0.eff : null;
             const pct = e && e.kind === 'done' ? 100 : e && e.stage > 0 ? stagePct(e) : s.pct;
             const held = !!(rs0 && rs0.why === 'slot') && pct < 100 && !(handoffMs[r] >= rs0.floorMs);
-            return { room: r, pct: pct, piecesDone: e && e.kind === 'done' ? s.equipCount : s.equipDone, pieces: s.equipCount, eff: e, rs: rs0, held: held, work: supWorkOf(r, false) };
+            const wk = supWorkOf(r, false);
+            return { room: r, pct: pct, piecesDone: e && e.kind === 'done' ? s.equipCount : s.equipDone, pieces: s.equipCount, eff: e, rs: rs0, held: held,
+                work: wk > 0 ? wk : pct >= 100 ? sum(scheduleData.parents.filter(function(p) { return String(p.area) === r && !p.removed; }), function(p) { return p.totalWork || 0; }) : 0 };
         });
         const supAll = sum(supRows, function(x) { return x.work; });
         const support = {
@@ -8418,7 +8514,7 @@ export default function App(props) {
         // Cleaning done over the lines being judged (all production rooms when none is).
         const base = scope.length ? scope : rows;
         const cleaning = {
-            pct: sum(base, function(x) { return x.workAll; }) > 0 ? Math.round(sum(base, function(x) { return x.workAll * x.comp.pct / 100; }) / sum(base, function(x) { return x.workAll; }) * 100) : 0,   // (a room's stage counts, like its row)
+            pct: sum(base, function(x) { return x.wt; }) > 0 ? Math.round(sum(base, function(x) { return x.wt * x.comp.pct / 100; }) / sum(base, function(x) { return x.wt; }) * 100) : 0,   // (a room's stage counts, like its row)
             piecesDone: sum(base, function(x) { return x.piecesDone; }), pieces: sum(base, function(x) { return x.pieces; }),
             leftHrs: sum(base, function(x) { return x.leftMins; }) / 60, wontFitHrs: sum(base, function(x) { return x.wontFit ? x.uWork : 0; }) / 60
         };
@@ -8533,7 +8629,7 @@ export default function App(props) {
             thisShift.forEach(function(s) { if (s.room && s.icon === 'star') named[s.room] = true; });
             rows.concat(supRows).forEach(function(x) {
                 const e = x.eff;
-                if (!e || e.src !== 'ganttly' || !(e.at >= clockInMs)) return;
+                if (!e || e.src !== 'ganttly' || !((e.handed ? e.nextFrom : e.at) >= clockInMs)) return;   // (handed: for the crew it was handed to)
                 if (e.kind === 'done' && !named[x.room]) thisShift.push({ icon: 'check', text: x.room + ' marked production ready ' + clockMs(e.at) + (e.bulk && e.bulk.length ? ' (' + e.bulk.length + ' clean' + (e.bulk.length === 1 ? '' : 's') + ' checked off at once)' : ''), room: x.room });
                 else if (e.kind === 'next' || e.handed) thisShift.push({ icon: 'arrow', text: x.room + ' handed to ' + (e.nextCrew ? e.nextCrew + ' crew' : 'the next shift') + (e.stage ? ' · ' + STAGES[e.stage - 1].name + ' finished' : ''), room: x.room });
             });
@@ -8593,18 +8689,28 @@ export default function App(props) {
     };
     const board = IS_CURRENT ? startupBoard() : null;
     // ---- Room marks from the Overview's room menu (see ROOM MARKS) ----
-    // A mark lasts until the room's next startup (or a day, when none is known), so it never carries into the next changeover.
-    const roomMarkUntil = function(x) {
+    // A mark lasts until the room's next startup, so it never carries into the next changeover. With no startup known (a support room, a
+    // line with no next run) it lasts to the end of this shift (Next shift: the end of the next one), so it never reaches a later crew's rows.
+    const roomMarkUntil = function(x, kind) {
         const nowMs = Date.now();
         const R = x && x.R !== null && x.R !== undefined ? globalStartMs + x.R * 60000 : null;
-        return R && R > nowMs ? R : nowMs + ROOM_MARK_DAY_MS;
+        if (R && R > nowMs) return R;
+        const w = kind === 'next' ? nextWin0 : nowWin;
+        const end = w ? globalStartMs + w.shiftEnd * 60000 : 0;
+        return end > nowMs ? end : nowMs + ROOM_MARK_DAY_MS;
     };
     const effOf = function(room) { const rs0 = roomState.rooms[room]; return rs0 ? rs0.eff : null; };
     // The newest press of a room: one second after the last one at least, so every press is its own row in Clean Check-off.
     const putRoomMark = function(room, fields, x) {
         const cur = roomMarks[room];
         const at = Math.max(Date.now(), cur ? cur.at + 1000 : 0);
-        const m = Object.assign({ room: room, kind: 'stage', stage: 0, at: at, by: hostUserName(), until: roomMarkUntil(x) }, fields, { at: at });
+        const m = Object.assign({ room: room, kind: 'stage', stage: 0, at: at, by: hostUserName(), until: roomMarkUntil(x, fields.kind) }, fields, { at: at, n: Math.random().toString(36).slice(2, 6) });
+        // The room's Shift Start text a person typed before this press (and texts Ganttly wrote over): a Shift Start Save that sends it
+        // again is not newer than this mark.
+        const rs0 = roomState.rooms[room];
+        const typed = rs0 && rs0.ss && rs0.ss.text && !isMachineStatus(rs0.ss.text) ? normS(rs0.ss.text).slice(0, 120) : '';
+        const seen = [typed].concat(staleOf(room, cur && Date.now() < (cur.until || 0) ? cur : null)).filter(function(t, i, a) { return t && a.indexOf(t) === i; }).slice(0, 4);
+        if (seen.length) m.seen = seen; else delete m.seen;
         // Below Production ready after it (Undo, or a lower stage picked): the Shift Start rows it closed open again (see ssWriteJobs).
         const e = effOf(room);
         if (m.kind !== 'done') {
@@ -8636,6 +8742,7 @@ export default function App(props) {
     // people and start time), and the room is Production ready. The check-offs carry the press time (bulk), so Undo finds exactly them.
     const markRoomComplete = function(x) {
         const now = Date.now(), e = effOf(x.room);
+        if (e && e.kind === 'done') return;   // already production ready (a second press would lose what Undo puts back)
         const m = putRoomMark(x.room, { kind: 'done', stage: STAGES.length }, x);
         const at = m.at, recs = {}, prevRecs = {};
         x.T.filter(function(t) { return !t.isComplete; }).concat(x.U).forEach(function(t) {
@@ -8671,6 +8778,7 @@ export default function App(props) {
                 ckUndoneRef.current[checkoffKeyOf(id, cur)] = true;   // saved as 'undone' in Dataverse
                 const pr = g.prev && g.prev[id];
                 if (pr) next[id] = Object.assign({}, pr, { syncKey: id + '~' + now.toString(36) + Math.random().toString(36).slice(2, 5), syncAt: now, updatedAt: now });
+                else if (cur.was) next[id] = startedFromWas(id, cur, now);   // a Start another computer had pressed on it
                 else delete next[id];
             });
             return next;
@@ -8679,6 +8787,12 @@ export default function App(props) {
         putRoomMark(x.room, b.kind === 'next' && b.nextFrom > now ? { kind: 'next', stage: b.stage, nextFrom: b.nextFrom, nextCrew: b.nextCrew } : b.stage ? { kind: 'stage', stage: b.stage } : { kind: 'clear', stage: 0 }, x);
     };
     const clearRoomMark = function(x) { putRoomMark(x.room, { kind: 'clear', stage: 0 }, x); };
+    // Whether the room waits for the next update time on the Overview (its row, or its support line).
+    const heldOf = function(room) {
+        if (!board) return false;
+        const x = board.rows.filter(function(r) { return r.room === room; })[0] || board.support.rooms.filter(function(r) { return r.room === room; })[0];
+        return !!(x && x.held);
+    };
     // The board row of a room (a support area has none: its cleans are worked out here the same way).
     const roomRowOf = function(room) {
         const x = board ? board.rows.filter(function(r) { return r.room === room; })[0] : null;
@@ -9803,11 +9917,13 @@ export default function App(props) {
     // A click opens the room on the Gantt (Focus) a moment later; a double-click opens the room menu instead (Gerald: "double click any
     // line"). The ⋯ button opens the menu with one tap (phones, tablets, keyboards). TV mode has no menu.
     const perfNow = function() { return typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now(); };
+    overviewLiveRef.current = activeTab === 'startup' && !tvMode;
     const roomRowClick = function(room, e) {
         if (tvMode) return;
         if (rowClickRef.current) { clearTimeout(rowClickRef.current); rowClickRef.current = null; }
         if (e && e.detail >= 2) return;   // the second click of a double-click
-        rowClickRef.current = setTimeout(function() { rowClickRef.current = null; openBoardRoom(room); }, 400);
+        // (Windows counts two clicks up to 500 ms apart as a double-click.)
+        rowClickRef.current = setTimeout(function() { rowClickRef.current = null; if (overviewLiveRef.current) openBoardRoom(room); }, 500);
     };
     const roomRowDouble = function(room, e) {
         if (tvMode) return;
@@ -9849,9 +9965,11 @@ export default function App(props) {
         const nowLine = !eff ? 'No stage marked' + (x.comp && x.comp.stage > 0 && x.comp.stage < STAGES.length ? ' · Start / Done suggest ' + x.comp.label.toLowerCase() : '')
             : (isNext ? 'Next shift' + (eff.nextCrew ? ' · ' + eff.nextCrew + ' crew' : '') + (eff.nextFrom ? ' from ' + clk(eff.nextFrom) : '') + (eff.stage ? ' · ' + STAGES[eff.stage - 1].name + ' finished' : '')
                 : isDone ? READY_WORD : eff.stage ? STAGES[eff.stage - 1].name + ' finished (' + eff.stage + ' of ' + STAGES.length + ')' : 'No stage finished yet')
-                + (eff.src === 'shiftstart' ? ' · from Shift Start' + (eff.text && !isMachineStatus(eff.text) ? ' ("' + eff.text + '")' : '') : ' · marked in Ganttly' + (eff.by ? ' by ' + eff.by : '')) + (eff.at ? ', ' + clk(eff.at) : '');
+                + (eff.src === 'shiftstart' ? (eff.machine ? ' · marked in Ganttly on another computer' : ' · from Shift Start' + (eff.text ? ' ("' + eff.text + '")' : '')) : ' · marked in Ganttly' + (eff.by ? ' by ' + eff.by : '')) + (eff.at ? ', ' + clk(eff.at) : '');
         return (
-            <div data-room-menu={room} className="fixed inset-0 z-[90] flex items-end sm:items-center justify-center bg-slate-900/30 p-3" onPointerDown={menuSafe(function(e) { if (e.target === e.currentTarget) close(); })}>
+            <div data-room-menu={room} className="fixed inset-0 z-[90] flex items-end sm:items-center justify-center bg-slate-900/30 p-3"
+                onPointerDown={function(e) { backdropDownRef.current = e.target === e.currentTarget; }}
+                onClick={menuSafe(function(e) { const ok = backdropDownRef.current && e.target === e.currentTarget; backdropDownRef.current = false; if (ok) close(); })}>
                 <div className="w-full max-w-[460px] max-h-[calc(100vh-24px)] overflow-y-auto custom-scrollbar bg-white rounded-xl shadow-2xl border border-slate-200 p-4 text-slate-700">
                     <div className="flex items-center gap-2 min-w-0">
                         <span className="w-3 h-3 rounded-full flex-shrink-0" style={{ background: roomHexShown(room) }} />
@@ -9866,9 +9984,9 @@ export default function App(props) {
                         {STAGES.map(function(st, i) {
                             const k = i + 1, fin = k <= cur, last = k === STAGES.length;
                             return (
-                                <button key={'st' + k} data-stage-btn={k} onClick={menuSafe(function() { setRoomStage(x, k); })}
+                                <button key={'st' + k} data-stage-btn={k} disabled={last && isDone} onClick={menuSafe(function() { setRoomStage(x, k); })}
                                     className={'no-pan flex items-center gap-1.5 px-2 py-1.5 rounded-lg border text-[11.5px] font-bold text-left leading-tight ' + (fin ? 'bg-[#E6F1FB] border-[#B3D4F2] text-[#00468B]' : k === cur + 1 ? 'bg-white border-[#0072CE] text-slate-800 hover:bg-[#F3F8FD]' : 'bg-white border-slate-200 text-slate-600 hover:bg-[#F3F8FD]')}
-                                    title={(last ? 'Reassembly / sanitize finished: the room is production ready (same as Mark room complete)' : st.name + ' finished: ' + stageCum(k) + '% of the room\'s cleaning') + (k <= cur && !last ? '. Press to go back to this stage.' : '')}>
+                                    title={(last && isDone ? 'Already production ready' : last ? 'Reassembly / sanitize finished: the room is production ready (same as Mark room complete)' : st.name + ' finished: ' + stageCum(k) + '% of the room\'s cleaning') + (k <= cur && !last ? '. Press to go back to this stage.' : '')}>
                                     <span className={'w-4 h-4 rounded flex items-center justify-center text-[10px] font-black flex-shrink-0 ' + (fin ? 'bg-[#0072CE] text-white' : 'bg-slate-100 text-slate-500')}>{fin ? <Check className="w-3 h-3" strokeWidth={3} /> : k}</span>
                                     <span className="min-w-0">{st.name}{last && <span className="block text-[10px] font-black text-[#00468B]">→ {READY_WORD}</span>}</span>
                                 </button>
@@ -9889,7 +10007,7 @@ export default function App(props) {
                             Undo room complete
                             <span className="block text-[10.5px] font-semibold text-slate-500">{(gm.bulk || []).length ? 'The ' + gm.bulk.length + ' clean' + (gm.bulk.length === 1 ? '' : 's') + ' it checked off open again; ' : ''}the room goes back to {gm.before && gm.before.stage ? STAGES[gm.before.stage - 1].name + ' finished' : 'no stage marked'}.</span>
                         </button>}
-                        {isDone && !canUndo && <div className="px-3 py-2 rounded-lg bg-slate-50 border border-slate-200 text-[11.5px] font-semibold text-slate-600">{fromGanttly ? 'Marked production ready on another computer. Pick a stage above to reopen it.' : 'Shift Start says production ready. Pick a stage above to reopen it.'}</div>}
+                        {isDone && !canUndo && <div className="px-3 py-2 rounded-lg bg-slate-50 border border-slate-200 text-[11.5px] font-semibold text-slate-600">{fromGanttly || eff.machine ? 'Marked production ready on another computer. Pick a stage above to reopen it.' : 'Shift Start says production ready. Pick a stage above to reopen it.'}</div>}
                         {gm && gm.kind !== 'clear' && gm.kind !== 'done' && fromGanttly && <button data-room-clear onClick={menuSafe(function() { clearRoomMark(x); })} className="no-pan self-start text-[11px] font-black text-[#0072CE] hover:underline">Clear the mark (back to Start / Done only)</button>}
                     </div>
 
@@ -9898,7 +10016,7 @@ export default function App(props) {
                         <div>{people.length ? people.join(', ') : rs0 && rs0.open.length ? 'Set up with no one named' : 'Nobody set up on this room'}</div>
                         {ss && ss.text && <div className="text-slate-500">Status: "{ss.text}"{ss.at ? ' · ' + clk(ss.at) : ''}</div>}
                         {ss && ss.notes && <div className="text-slate-500 truncate" title={ss.notes}>Notes: {ss.notes}</div>}
-                        {rs0 && rs0.why === 'slot' && <div className="mt-1 text-[#8A5A00]">Not assigned, so its cleaning starts at the {clk(rs0.floorMs)} update.</div>}
+                        {rs0 && heldOf(room) && <div className="mt-1 text-[#8A5A00]">Not assigned, so its cleaning starts at the {clk(rs0.floorMs)} update.</div>}
                         {rs0 && rs0.why === 'next' && <div className="mt-1 text-[#8A5A00]">Waits for {eff && eff.nextCrew ? eff.nextCrew + ' crew' : 'the next crew'} from {clk(rs0.floorMs)}.</div>}
                     </div>
 
@@ -9915,7 +10033,7 @@ export default function App(props) {
     const ssFooter = function() {
         const rs = roomState, ws = ssWriteState;
         const list = Object.keys(rs.rooms).map(function(r) { return rs.rooms[r]; });
-        const held = list.filter(function(r) { return r.why === 'slot'; });
+        const held = list.filter(function(r) { return heldOf(r.room); });   // (as the rows say: not a room with nothing left, or one still running)
         const ids = {};
         list.forEach(function(r) { r.people.forEach(function(id) { ids[id] = true; }); });
         const nPeople = Object.keys(ids).length, nRooms = list.filter(function(r) { return r.people.length > 0; }).length;
