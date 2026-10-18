@@ -4,16 +4,20 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
  * ============================================================================
  * HUB - CHEMICALS: sanitation chemical and supply ordering
  * ============================================================================
+ * Version 0.2 (phase A): the Ordering tab. Suggested carts per distributor under the cart limit (from stock, open carts,
+ * weekly use worked out from the Sunday counts, and requests), paste-ready text for SAP, the cart tracker (draft, submitted,
+ * approved, ordered, received), clerk requests, and alerts (quotes, prices, vendors, carts left open).
  * Version 0.1 (phase 0): the Tables tab. Every Dataverse table this hub will use, with its display and logical names, the
  * data type of every column, whether the hub needs it, and a Dataverse check that reads the TABLE DEFINITIONS (never rows,
  * apart from one tiny count per table) and says what is found, missing, typed differently or not readable.
- * Later phases add Ordering, the Sunday count, the chemical log, the clerk checklist and the insight views (plan:
+ * Later phases add the Sunday count, the chemical log, the clerk checklist and the insight views (plan:
  * chemical-ordering-plan.md in the project folder).
  *
  * Same look as Manager Hub v6.6 (company blue / yellow / red, Tailwind from https://cdn.tailwindcss.com loaded by the page).
  * Host rule: the host compiles to ES5 with no iterable support. Only arrays, plain objects, index loops, forEach / map and
  * Promises are used: no for-of, no Set or Map, no spreading anything but arrays.
- * Nothing on this page writes to Dataverse.
+ * Writes happen only on a button press in the Ordering tab (save a draft cart, move a cart on, receive, add a request).
+ * The Tables tab only reads.
  *
  * DATAVERSE MAPPING CHEAT SHEET (owned by this hub; read-only tables from other apps are listed in CH_SPEC too)
  * | craa5__c_distributor       | Distributors (Ecolab, Grainger, Vincit, Star Steel ...)                       |
@@ -979,13 +983,702 @@ function TablesTab(props) {
 }
 
 // ============================================================================
+// ORDERING (phase A): suggested carts under the cart limit, cart tracker, requests, alerts
+// ============================================================================
+// Reads the six ordering tables by their spec names. The primary name column of each table is read from its definition
+// (Dataverse picks it and it cannot be renamed), and columns that do not exist are left out of every request.
+// Writes only on a button press: a draft cart with its lines, a cart step, a receipt (cart lines, cart, stock), a request.
+const ORD_T = { dist: 'craa5__c_distributor', item: 'craa5__c_chemical', stock: 'craa5__c_chemicalinventory', cart: 'craa5__c_cart', line: 'craa5__c_cartline', count: 'craa5__c_chemicalcount' };
+const ORD_LEAD_DAYS = 9;
+const ORD_CART_LIMIT = 25000;
+const ORD_USE_WEEKS = 12;
+const ORD_QUOTE_WARN_DAYS = 30;
+const ORD_STALE_DAYS = 14;
+const ORD_OPEN = ['Draft (not in SAP yet)', 'Submitted', 'Approved', 'Ordered', 'Partially received'];
+const ORD_NEXT = { 'Draft (not in SAP yet)': 'Submitted', 'Submitted': 'Approved', 'Approved': 'Ordered' };
+const ORD_MAX_ROWS = 20000;
+
+function chSpecTable(logical) { return CH_SPEC.filter(function (t) { return t.logical === logical; })[0] || null; }
+function chSpecCol(logical, col) { const t = chSpecTable(logical); return t ? t.columns.filter(function (c) { return c.logical === col; })[0] || null : null; }
+function ordChoiceLabel(logical, col, value) {
+    const c = chSpecCol(logical, col);
+    if (!c || !c.options || value === null || value === undefined) return value === undefined ? null : value;
+    const o = c.options.filter(function (x) { return x[1] === value; })[0];
+    return o ? o[0] : null;
+}
+function ordChoiceValue(logical, col, label) {
+    const c = chSpecCol(logical, col);
+    const o = c && c.options ? c.options.filter(function (x) { return x[0] === label; })[0] : null;
+    return o ? o[1] : null;
+}
+function ordKey(s) { return String(s === null || s === undefined ? '' : s).replace(/[^\x21-\x7E]/g, '').toUpperCase(); }
+function ordNum(v) { const n = typeof v === 'number' ? v : parseFloat(v); return isFinite(n) ? n : 0; }
+function ordRound(n, d) { const f = Math.pow(10, d || 2); return Math.round(n * f) / f; }
+function ordMoney(n) { const v = ordRound(ordNum(n), 2); const s = v.toFixed(2).split('.'); return '$' + chNumber(s[0]) + '.' + s[1]; }
+function ordQty(n) { const v = ordRound(ordNum(n), 2); return String(v); }
+// Date-only values come back as "2026-10-11": read them as a local day, not UTC midnight.
+function ordDate(s) {
+    if (!s) return null;
+    if (s instanceof Date) return s;
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s));
+    if (m) return new Date(+m[1], +m[2] - 1, +m[3]);
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? null : d;
+}
+function ordDay(d) { return d ? (d.getMonth() + 1) + '/' + d.getDate() + '/' + d.getFullYear() : ''; }
+function ordIsoDay(d) { return d.getFullYear() + '-' + (d.getMonth() < 9 ? '0' : '') + (d.getMonth() + 1) + '-' + (d.getDate() < 10 ? '0' : '') + d.getDate(); }
+function ordDaysBetween(a, b) { return Math.round((b.getTime() - a.getTime()) / 86400000); }
+function chUserName() {
+    try {
+        const x = chGetXrm();
+        const ctx = x && x.Utility && x.Utility.getGlobalContext ? x.Utility.getGlobalContext() : null;
+        const u = ctx && ctx.userSettings ? ctx.userSettings : null;
+        if (u && u.userName) return String(u.userName);
+    } catch (e) { /* no context */ }
+    return '';
+}
+
+// One write. Resolves { status, body, message }; never rejects.
+function chSend(fetcher, method, url, data) {
+    return new Promise(function (resolve) {
+        let done = false;
+        const finish = function (r) { if (done) return; done = true; clearTimeout(timer); resolve(r); };
+        const timer = setTimeout(function () { finish({ status: 0, body: null, message: 'Dataverse did not answer within ' + (CH_TIMEOUT_MS / 1000) + ' seconds.' }); }, CH_TIMEOUT_MS);
+        const headers = Object.assign({}, CH_HEADERS, { 'Content-Type': 'application/json; charset=utf-8' });
+        if (method === 'POST') headers['Prefer'] = 'return=representation,odata.include-annotations="*"';
+        let p;
+        try { p = fetcher(url, { method: method, headers: headers, credentials: 'same-origin', body: JSON.stringify(data) }); } catch (e) { finish({ status: 0, body: null, message: chErrText(e) }); return; }
+        Promise.resolve(p).then(function (res) {
+            const status = res && typeof res.status === 'number' ? res.status : 0;
+            const read = res && typeof res.text === 'function' ? Promise.resolve(res.text()) : Promise.resolve('');
+            return read.then(function (t) {
+                let body = t;
+                if (typeof t === 'string' && t) { try { body = JSON.parse(t); } catch (e) { body = t; } }
+                let message = 'HTTP ' + status;
+                if (body && body.error && body.error.message) message = String(body.error.message).replace(/\s+/g, ' ').slice(0, 300) + ' (HTTP ' + status + ')';
+                finish({ status: status, body: body, message: message });
+            }, function () { finish({ status: status, body: null, message: 'HTTP ' + status }); });
+        }, function (e) { finish({ status: 0, body: null, message: chErrText(e) }); });
+    });
+}
+// Every page of a query (Dataverse returns up to 5,000 rows a page).
+function chGetAll(fetcher, url) {
+    let rows = [];
+    const step = function (u) {
+        return chRequest(fetcher, u).then(function (r) {
+            if (!chOk(r) || !r.body || !Array.isArray(r.body.value)) return { rows: rows, error: r.status === 401 || r.status === 403 ? 'No permission to read the rows: ' + r.message : r.message };
+            rows = rows.concat(r.body.value);
+            const next = r.body['@odata.nextLink'];
+            if (next && rows.length < ORD_MAX_ROWS) return step(next);
+            return { rows: rows, error: '' };
+        });
+    };
+    return step(url);
+}
+// Definition (set name, id and primary column, which columns exist), then every row with the spec columns that exist.
+function ordLoadTable(fetcher, base, logical) {
+    const t = chSpecTable(logical);
+    const out = { logical: logical, label: t ? t.label : logical, meta: null, have: {}, rows: [], error: '' };
+    return chRequest(fetcher, chDefUrl(base, logical) + '?$select=EntitySetName,PrimaryIdAttribute,PrimaryNameAttribute&$expand=Attributes($select=LogicalName)').then(function (r) {
+        if (!chOk(r)) { out.error = r.status === 404 ? 'Dataverse has no table named ' + logical + '.' : r.message; return out; }
+        const b = r.body || {};
+        out.meta = { set: b.EntitySetName || '', idCol: b.PrimaryIdAttribute || (logical + 'id'), primary: b.PrimaryNameAttribute || '' };
+        (Array.isArray(b.Attributes) ? b.Attributes : []).forEach(function (a) { if (a && a.LogicalName) out.have[a.LogicalName] = true; });
+        // spec column -> actual column (the primary one is whatever Dataverse named it)
+        out.cols = {};
+        t.columns.forEach(function (c) { const real = c.primary ? out.meta.primary : c.logical; if (real && out.have[real]) out.cols[c.logical] = real; });
+        const sel = [out.meta.idCol];
+        Object.keys(out.cols).forEach(function (k) { if (sel.indexOf(out.cols[k]) < 0) sel.push(out.cols[k]); });
+        return chGetAll(fetcher, base + CH_API + out.meta.set + '?$select=' + sel.join(',')).then(function (g) {
+            out.error = g.error;
+            out.rows = g.rows.map(function (row) {
+                const o = { _id: row[out.meta.idCol] };
+                t.columns.forEach(function (c) {
+                    const real = out.cols[c.logical];
+                    if (!real) return;
+                    let v = row[real];
+                    if (v === undefined) v = null;
+                    if (c.options && v !== null) {
+                        const lab = ordChoiceLabel(logical, c.logical, v);
+                        v = lab !== null ? lab : (row[real + '@OData.Community.Display.V1.FormattedValue'] || String(v));
+                    }
+                    o[c.logical] = v;
+                });
+                return o;
+            });
+            return out;
+        });
+    });
+}
+// A payload with spec names turned into the real column names; columns the table lacks are dropped.
+function ordPayload(tbl, fields) {
+    const out = {};
+    Object.keys(fields).forEach(function (k) { const real = tbl.cols[k]; if (real && fields[k] !== undefined) out[real] = fields[k]; });
+    return out;
+}
+function ordLoadAll(fetcher, base) {
+    const keys = Object.keys(ORD_T);
+    return chPool(keys, CH_PARALLEL, function (k) { return ordLoadTable(fetcher, base, ORD_T[k]); }).then(function (list) {
+        const d = { tables: {}, loadedAt: new Date() };
+        keys.forEach(function (k, i) { d.tables[k] = list[i] && list[i].logical ? list[i] : { logical: ORD_T[k], label: ORD_T[k], rows: [], have: {}, cols: {}, error: (list[i] && list[i].error) || 'Not read.' }; });
+        return d;
+    });
+}
+
+// ---------------------------------------------------------------- the numbers (no React below this line until the UI)
+function ordIndex(d, today) {
+    const T = d.tables;
+    const ix = { items: {}, itemList: [], vendors: {}, stock: {}, carts: {}, cartList: [], linesByCart: {}, requests: [], open: {}, counts: {}, today: today };
+    (T.dist.rows || []).forEach(function (r) { const k = ordKey(r.craa5_vendornumber); if (k) ix.vendors[k] = r; });
+    (T.item.rows || []).forEach(function (r) { const k = ordKey(r.craa5_itemnumber); if (!k || ix.items[k]) return; ix.items[k] = r; ix.itemList.push(r); });
+    ix.itemList.sort(function (a, b) { return (ordNum(a.craa5_sortorder) || 9999) - (ordNum(b.craa5_sortorder) || 9999) || String(a.craa5__c_chemicalname || '').localeCompare(String(b.craa5__c_chemicalname || '')); });
+    (T.stock.rows || []).forEach(function (r) {
+        const k = ordKey(r.craa5_itemnumber); if (!k) return;
+        const s = ix.stock[k] || (ix.stock[k] = { onHand: 0, min: 0, par: null, rows: [] });
+        s.onHand += ordNum(r.craa5_quantityonhand); s.min += ordNum(r.craa5_minimumthreshold);
+        if (r.craa5_parlevel !== null && r.craa5_parlevel !== undefined) s.par = (s.par || 0) + ordNum(r.craa5_parlevel);
+        s.rows.push(r);
+    });
+    Object.keys(ix.stock).forEach(function (k) { ix.stock[k].rows.sort(function (a, b) { return ordNum(a.craa5_displayorder) - ordNum(b.craa5_displayorder); }); });
+    (T.cart.rows || []).forEach(function (r) { const k = ordKey(r.craa5__c_cartname); if (!k) return; ix.carts[k] = r; ix.cartList.push(r); });
+    (T.line.rows || []).forEach(function (r) {
+        const ck = ordKey(r.craa5__c_cartname);
+        if (!ck) { if (ordNum(r.craa5_quantity) > 0) ix.requests.push(r); return; }
+        (ix.linesByCart[ck] || (ix.linesByCart[ck] = [])).push(r);
+        const cart = ix.carts[ck];
+        if (cart && ORD_OPEN.indexOf(cart.craa5_cartstatus) > -1) {
+            const ik = ordKey(r.craa5_itemnumber);
+            const left = Math.max(0, ordNum(r.craa5_quantity) - ordNum(r.craa5_quantityreceived));
+            ix.open[ik] = (ix.open[ik] || 0) + left;
+        }
+    });
+    (T.count.rows || []).forEach(function (r) {
+        const k = ordKey(r.craa5_itemnumber), dd = ordDate(r.craa5_countdate);
+        if (!k || !dd) return;
+        const m = ix.counts[k] || (ix.counts[k] = {});
+        const day = ordIsoDay(dd);
+        m[day] = (m[day] || 0) + ordNum(r.craa5_quantity);
+    });
+    return ix;
+}
+function ordLead(ix, vendorNo) { const v = ix.vendors[ordKey(vendorNo)]; const n = v ? ordNum(v.craa5_leadtimedays) : 0; return n > 0 ? n : ORD_LEAD_DAYS; }
+function ordLimit(ix, vendorNo) { const v = ix.vendors[ordKey(vendorNo)]; const n = v ? ordNum(v.craa5_cartlimit) : 0; return n > 0 ? n : ORD_CART_LIMIT; }
+// When received goods arrived: the line's received date, else the cart's, else the cart's submitted date plus the lead time.
+function ordArrivals(ix) {
+    const out = {};
+    ix.cartList.forEach(function (c) {
+        const lines = ix.linesByCart[ordKey(c.craa5__c_cartname)] || [];
+        const sub = ordDate(c.craa5_submittedon) || ordDate(c.craa5_draftedon);
+        lines.forEach(function (l) {
+            const q = ordNum(l.craa5_quantityreceived);
+            if (q <= 0) return;
+            let when = ordDate(l.craa5_receivedon) || ordDate(c.craa5_receivedon);
+            if (!when && sub) when = new Date(sub.getTime() + ordLead(ix, c.craa5_vendornumber) * 86400000);
+            if (!when) return;
+            const k = ordKey(l.craa5_itemnumber);
+            (out[k] || (out[k] = [])).push({ when: when, qty: q });
+        });
+    });
+    return out;
+}
+// Weekly use per item from the counts: between two counts, use = earlier count + arrivals in between - later count.
+function ordWeeklyUse(ix) {
+    const arr = ordArrivals(ix), out = {};
+    Object.keys(ix.counts).forEach(function (k) {
+        const days = Object.keys(ix.counts[k]).sort();
+        if (days.length < 2) return;
+        const last = ordDate(days[days.length - 1]);
+        const from = new Date(last.getTime() - ORD_USE_WEEKS * 7 * 86400000);
+        let used = 0, span = 0, gaps = 0;
+        for (let i = 1; i < days.length; i++) {
+            const a = ordDate(days[i - 1]), b = ordDate(days[i]);
+            if (b < from || a < from) continue;
+            let inbound = 0;
+            (arr[k] || []).forEach(function (x) { if (x.when > a && x.when <= b) inbound += x.qty; });
+            used += Math.max(0, ix.counts[k][days[i - 1]] + inbound - ix.counts[k][days[i]]);
+            span += ordDaysBetween(a, b); gaps++;
+        }
+        if (span > 0) out[k] = { perWeek: used / span * 7, weeks: gaps, last: last };
+    });
+    return out;
+}
+// One suggestion per item that needs ordering. The old sheet rule (order when on hand + on order is at or under the
+// minimum, up to minimum + 1) is the same formula with no use: here the use expected before delivery is taken off first.
+function ordSuggest(ix, use) {
+    const out = [];
+    const reqBy = {};
+    ix.requests.forEach(function (r) { const k = ordKey(r.craa5_itemnumber); (reqBy[k] || (reqBy[k] = [])).push(r); });
+    const keys = Object.keys(ix.stock);
+    Object.keys(reqBy).forEach(function (k) { if (keys.indexOf(k) < 0) keys.push(k); });
+    keys.forEach(function (k) {
+        const item = ix.items[k] || null;
+        if (item && item.craa5_active === false) return;
+        const s = ix.stock[k] || { onHand: 0, min: 0, par: null, rows: [] };
+        const open = ix.open[k] || 0;
+        const vendorNo = item ? item.craa5_vendornumber : '';
+        const lead = ordLead(ix, vendorNo);
+        const u = use[k] ? use[k].perWeek : 0;
+        const useLead = u * lead / 7;
+        let stockQty = 0;
+        if (ix.stock[k] && s.onHand + open - useLead <= s.min) {
+            const target = (s.par !== null ? s.par : s.min + 1) + useLead;
+            stockQty = Math.max(0, Math.ceil(target - (s.onHand + open) - 1e-9));
+        }
+        const reqs = reqBy[k] || [];
+        const reqQty = reqs.reduce(function (n, r) { return n + ordNum(r.craa5_quantity); }, 0);
+        if (stockQty + reqQty <= 0) return;
+        const price = item ? ordNum(item.craa5_priceperunit) : 0;
+        out.push({ key: k, itemNo: item ? item.craa5_itemnumber : (reqs[0] && reqs[0].craa5_itemnumber), item: item, name: item ? (item.craa5_commonname || item.craa5__c_chemicalname || k) : (reqs[0] && reqs[0].craa5__c_cartlinename) || k,
+            vendorNo: vendorNo || '', qty: stockQty + reqQty, stockQty: stockQty, requests: reqs, reqQty: reqQty, price: price, onHand: s.onHand, open: open, min: s.min, par: s.par,
+            perWeek: use[k] ? use[k].perWeek : null, lead: lead, useLead: useLead });
+    });
+    return out;
+}
+function ordVendorName(ix, vendorNo) { const v = ix.vendors[ordKey(vendorNo)]; return v ? String(v.craa5__c_distributorname || vendorNo) : (vendorNo ? 'Vendor ' + vendorNo : 'No distributor'); }
+// Carts per vendor, each under the vendor's cart limit (first fit, biggest lines first). A line bigger than the limit is split.
+function ordBuildCarts(ix, sugs, now, taken) {
+    const byVendor = {}, order = [];
+    sugs.forEach(function (s) { const k = ordKey(s.vendorNo) || '?'; if (!byVendor[k]) { byVendor[k] = []; order.push(k); } byVendor[k].push(s); });
+    const carts = [];
+    const used = {};
+    (taken || []).forEach(function (n) { used[ordKey(n)] = true; });
+    // same form as the cart names already in SAP: "ECOLAB 10/15/2026 11:23"
+    const p2 = function (x) { return (x < 10 ? '0' : '') + x; };
+    const stamp = p2(now.getMonth() + 1) + '/' + p2(now.getDate()) + '/' + now.getFullYear() + ' ' + chTime(now);
+    order.forEach(function (vk) {
+        const list = byVendor[vk];
+        const vendorNo = list[0].vendorNo;
+        const limit = ordLimit(ix, vendorNo);
+        const pieces = [];
+        list.forEach(function (s) {
+            if (s.price > 0 && s.qty * s.price > limit) {
+                const per = Math.max(1, Math.floor(limit / s.price));
+                let left = s.qty;
+                while (left > 0) { const q = Math.min(per, left); pieces.push({ sug: s, qty: q }); left -= q; }
+            } else pieces.push({ sug: s, qty: s.qty });
+        });
+        pieces.sort(function (a, b) { return b.qty * b.sug.price - a.qty * a.sug.price; });
+        const bins = [];
+        pieces.forEach(function (p) {
+            const t = p.qty * p.sug.price;
+            let bin = bins.filter(function (b) { return b.total + t <= limit + 0.005; })[0];
+            if (!bin) { bin = { total: 0, pieces: [] }; bins.push(bin); }
+            bin.pieces.push(p); bin.total += t;
+        });
+        const vname = ordVendorName(ix, vendorNo).toUpperCase();
+        bins.forEach(function (b, i) {
+            let title = vname + ' ' + stamp + (bins.length > 1 ? ' (' + (i + 1) + ' of ' + bins.length + ')' : '');
+            let n = 2; const baseTitle = title;
+            while (used[ordKey(title)]) { title = baseTitle + ' ' + n; n++; }
+            used[ordKey(title)] = true;
+            carts.push({ key: title, title: title, vendorNo: vendorNo, vendorName: ordVendorName(ix, vendorNo), limit: limit, noVendor: !ordKey(vendorNo), lines: b.pieces.map(function (p) { return { sug: p.sug, qty: p.qty }; }) });
+        });
+    });
+    return carts;
+}
+function ordCartTotal(cart, qtyOf) { return cart.lines.reduce(function (n, l) { return n + qtyOf(cart, l) * l.sug.price; }, 0); }
+// Paste-ready text for SAP: a title line, then one tab-separated row per line, then the total.
+function ordSapText(cart, qtyOf) {
+    const rows = [cart.title, ['Item', 'Qty', 'Description', 'Unit price', 'Line total', 'Cost center', 'GL account', 'Purchasing group', 'Plant'].join('\t')];
+    cart.lines.forEach(function (l) {
+        const q = qtyOf(cart, l); if (q <= 0) return;
+        const it = l.sug.item || {};
+        rows.push([l.sug.itemNo, ordQty(q), it.craa5__c_chemicalname || l.sug.name, ordRound(l.sug.price, 2).toFixed(2), ordRound(q * l.sug.price, 2).toFixed(2),
+            it.craa5_costcenter || '', it.craa5_glaccount || '', it.craa5_purchasinggroup || '', it.craa5_plant || ''].join('\t'));
+    });
+    rows.push('Total\t\t\t\t' + ordRound(ordCartTotal(cart, qtyOf), 2).toFixed(2));
+    return rows.join('\n');
+}
+function ordAlerts(ix) {
+    const out = [];
+    const today = ix.today;
+    const stocked = function (k) { return !!ix.stock[k]; };
+    ix.itemList.forEach(function (it) {
+        if (it.craa5_active === false) return;
+        const k = ordKey(it.craa5_itemnumber), name = it.craa5_commonname || it.craa5__c_chemicalname || it.craa5_itemnumber;
+        const q = ordDate(it.craa5_quoteexpires);
+        if (q) {
+            const days = ordDaysBetween(today, q);
+            if (days < 0) out.push({ kind: 'quote', level: 'red', text: name + ': quote ' + (it.craa5_quotenumber ? it.craa5_quotenumber + ' ' : '') + 'expired ' + ordDay(q) + '.' });
+            else if (days <= ORD_QUOTE_WARN_DAYS) out.push({ kind: 'quote', level: 'amber', text: name + ': quote expires ' + ordDay(q) + ' (in ' + days + ' days).' });
+        }
+        if (stocked(k) && !(ordNum(it.craa5_priceperunit) > 0)) out.push({ kind: 'price', level: 'amber', text: name + ' (' + it.craa5_itemnumber + ') has no price, so its cart total is short.' });
+        if (stocked(k) && !ordKey(it.craa5_vendornumber)) out.push({ kind: 'vendor', level: 'amber', text: name + ' (' + it.craa5_itemnumber + ') has no vendor number, so it cannot go on a cart.' });
+        else if (ordKey(it.craa5_vendornumber) && !ix.vendors[ordKey(it.craa5_vendornumber)]) out.push({ kind: 'vendor', level: 'amber', text: name + ': vendor ' + it.craa5_vendornumber + ' is not in Distributors (cart limit and lead time fall back to $25,000 and 9 days).' });
+    });
+    // last price paid per item, from the newest cart that has it
+    const last = {};
+    ix.cartList.slice().sort(function (a, b) { return (ordDate(b.craa5_submittedon) || ordDate(b.craa5_draftedon) || 0) - (ordDate(a.craa5_submittedon) || ordDate(a.craa5_draftedon) || 0); }).forEach(function (c) {
+        (ix.linesByCart[ordKey(c.craa5__c_cartname)] || []).forEach(function (l) { const k = ordKey(l.craa5_itemnumber); if (!(k in last) && ordNum(l.craa5_unitprice) > 0) last[k] = { price: ordNum(l.craa5_unitprice), cart: c.craa5__c_cartname }; });
+    });
+    Object.keys(last).forEach(function (k) {
+        const it = ix.items[k]; if (!it) return;
+        const now = ordNum(it.craa5_priceperunit);
+        if (now > 0 && Math.abs(now - last[k].price) >= 0.01) {
+            const pct = (now - last[k].price) / last[k].price * 100;
+            out.push({ kind: 'change', level: pct > 0 ? 'amber' : 'blue', text: (it.craa5_commonname || it.craa5__c_chemicalname) + ': price is ' + ordMoney(now) + ', ' + (pct > 0 ? 'up ' : 'down ') + Math.abs(pct).toFixed(1) + '% from ' + ordMoney(last[k].price) + ' on ' + last[k].cart + '.' });
+        }
+    });
+    Object.keys(ix.stock).forEach(function (k) { if (!ix.items[k]) out.push({ kind: 'item', level: 'amber', text: 'Stock row ' + (ix.stock[k].rows[0].craa5__c_chemicalinventoryname || k) + ' points at item ' + k + ', which is not in Chemicals.' }); });
+    // a cart still open well past its lead time keeps its lines "on order" and holds back new suggestions
+    ix.cartList.forEach(function (c) {
+        if (ORD_OPEN.indexOf(c.craa5_cartstatus) < 0 || c.craa5_cartstatus === 'Draft (not in SAP yet)') return;
+        const sub = ordDate(c.craa5_submittedon); if (!sub) return;
+        const days = ordDaysBetween(new Date(sub.getFullYear(), sub.getMonth(), sub.getDate()), today);
+        if (days > ordLead(ix, c.craa5_vendornumber) + ORD_STALE_DAYS) out.push({ kind: 'stale', level: 'amber', text: c.craa5__c_cartname + ' has been ' + c.craa5_cartstatus.toLowerCase() + ' for ' + days + ' days, so its lines still count as on order. Under Open carts: Receive if it just arrived, Close as received if it came before the last count, or Cancel cart if it is not coming.' });
+    });
+    const rank = { red: 0, amber: 1, blue: 2 };
+    return out.map(function (a, i) { return { a: a, i: i }; }).sort(function (x, y) { return rank[x.a.level] - rank[y.a.level] || x.i - y.i; }).map(function (x) { return x.a; });
+}
+
+// ---------------------------------------------------------------- UI
+const ORD_STATUS_CLS = {
+    'Draft (not in SAP yet)': 'bg-slate-100 text-slate-700 border-slate-300', 'Submitted': 'bg-[#E6F1FB] text-[#00468B] border-[#B3D4F2]', 'Approved': 'bg-[#E6F1FB] text-[#00468B] border-[#0072CE]',
+    'Ordered': 'bg-[#FFF6E0] text-[#7A4B00] border-[#FFB81C]', 'Partially received': 'bg-[#FFF6E0] text-[#7A4B00] border-[#FFB81C]', 'Received': 'bg-[#E6F1FB] text-[#00468B] border-[#B3D4F2]', 'Cancelled': 'bg-slate-100 text-slate-500 border-slate-300'
+};
+function StatusTag(props) { return <span className={'inline-flex items-center whitespace-nowrap rounded-full border px-2 py-0.5 text-xs font-bold ' + (ORD_STATUS_CLS[props.status] || ORD_STATUS_CLS['Draft (not in SAP yet)'])}>{props.status || 'No status'}</span>; }
+function Tile(props) {
+    return <div className="rounded-lg border border-slate-200 p-3"><p className="text-[11px] font-black uppercase tracking-widest text-slate-500">{props.label}</p><p className="text-2xl font-black text-slate-900">{props.value} <span className="text-base font-bold text-slate-500">{props.note}</span></p></div>;
+}
+const inputCls = 'min-h-[44px] rounded-lg border border-slate-300 px-3 text-sm focus:outline-none focus:ring-2 focus:ring-[#0072CE]/40';
+
+function SuggestedCart(props) {
+    const c = props.cart, qtyOf = props.qtyOf;
+    const total = ordCartTotal(c, qtyOf);
+    const over = total > c.limit + 0.005;
+    const pct = Math.min(100, c.limit > 0 ? total / c.limit * 100 : 0);
+    return (
+        <div className="rounded-xl border border-slate-200 bg-white shadow-sm" data-ord-suggested={c.key}>
+            <div className="px-4 py-3 border-b border-slate-100 flex flex-wrap items-center gap-x-3 gap-y-1">
+                <span className="font-black text-slate-900 break-all">{c.title}</span>
+                <span className="text-xs text-slate-500">{c.lines.length} line{c.lines.length === 1 ? '' : 's'}</span>
+                <span className={'ml-auto text-sm font-black ' + (over ? 'text-[#B80022]' : 'text-slate-900')}>{ordMoney(total)}</span>
+                <span className="text-xs text-slate-500">of {ordMoney(c.limit)} limit</span>
+                <div className="w-full h-1.5 rounded-full bg-slate-100" aria-hidden="true"><div className="h-1.5 rounded-full" style={{ width: pct + '%', background: over ? BRAND.red : BRAND.blue }} /></div>
+            </div>
+            {c.noVendor && <p className="mx-4 mt-3 rounded-lg border border-[#FFB81C] bg-[#FFF6E0] px-3 py-2 text-sm text-[#7A4B00]">These items have no vendor number. Add it on the Chemical row, then press Refresh; until then they cannot be saved as a cart.</p>}
+            {over && <p className="mx-4 mt-3 rounded-lg border border-[#E4002B]/40 bg-[#FDE8EC] px-3 py-2 text-sm text-[#B80022]">Over the cart limit after your changes. Lower a quantity, or save and move a line to another cart.</p>}
+            <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                    <thead><tr className="text-left text-[11px] uppercase tracking-widest text-slate-500"><th className="px-4 py-2">Item</th><th className="px-2 py-2 text-right">On hand</th><th className="hidden sm:table-cell px-2 py-2 text-right">On order</th><th className="hidden sm:table-cell px-2 py-2 text-right">Min</th><th className="hidden sm:table-cell px-2 py-2 text-right">Use a week</th><th className="px-2 py-2">Order</th><th className="hidden sm:table-cell px-2 py-2 text-right">Price</th><th className="px-4 py-2 text-right">Total</th></tr></thead>
+                    <tbody>
+                        {c.lines.map(function (l, i) {
+                            const s = l.sug, q = qtyOf(c, l);
+                            return (
+                                <tr key={s.key + i} className="border-t border-slate-100 align-top">
+                                    <td className="px-4 py-2"><span className="font-semibold text-slate-900">{s.name}</span><span className="block text-xs text-slate-500 font-mono">{s.itemNo}</span>
+                                        {s.reqQty > 0 && <span className="block text-xs text-[#00468B]">Includes {ordQty(s.reqQty)} requested{s.requests[0] && s.requests[0].craa5_requestedby ? ' by ' + s.requests.map(function (r) { return r.craa5_requestedby; }).filter(function (x) { return x; }).join(', ') : ''}</span>}
+                                        {!(s.price > 0) && <span className="block text-xs font-bold text-[#7A4B00]">No price</span>}
+                                        <span className="block sm:hidden text-xs text-slate-500">On order {ordQty(s.open)}, min {ordQty(s.min)}{s.perWeek === null ? '' : ', use ' + ordQty(s.perWeek) + ' a week'}, {ordMoney(s.price)} each</span></td>
+                                    <td className="px-2 py-2 text-right">{ordQty(s.onHand)}</td>
+                                    <td className="hidden sm:table-cell px-2 py-2 text-right">{ordQty(s.open)}</td>
+                                    <td className="hidden sm:table-cell px-2 py-2 text-right">{ordQty(s.min)}</td>
+                                    <td className="hidden sm:table-cell px-2 py-2 text-right">{s.perWeek === null ? <span className="text-slate-400">-</span> : ordQty(s.perWeek)}</td>
+                                    <td className="px-2 py-2"><input type="number" min="0" step="1" inputMode="numeric" aria-label={'Quantity of ' + s.name} value={q} data-ord-qty
+                                        onChange={function (e) { props.setQty(c, l, e.target.value); }} className={inputCls + ' w-20 text-right'} /></td>
+                                    <td className="hidden sm:table-cell px-2 py-2 text-right whitespace-nowrap">{ordMoney(s.price)}</td>
+                                    <td className="px-4 py-2 text-right whitespace-nowrap font-semibold">{ordMoney(q * s.price)}</td>
+                                </tr>
+                            );
+                        })}
+                    </tbody>
+                </table>
+            </div>
+            <div className="px-4 py-3 flex flex-wrap gap-2">
+                <button type="button" className={btnWhite} onClick={function () { props.onCopy(c); }}><CopyIcon className="w-4 h-4" />{props.copied === c.key ? 'Copied' : 'Copy for SAP'}</button>
+                <button type="button" data-ord-save className={btnBlue + (props.busy || c.noVendor || over ? ' opacity-50 cursor-not-allowed' : '')} aria-disabled={props.busy || c.noVendor || over}
+                    onClick={function () { if (!props.busy && !c.noVendor && !over) props.onSave(c); }}>Save as draft cart</button>
+            </div>
+        </div>
+    );
+}
+
+function OpenCart(props) {
+    const c = props.cart, ix = props.ix;
+    const lines = ix.linesByCart[ordKey(c.craa5__c_cartname)] || [];
+    const [sap, setSap] = useState(c.craa5_sapcartnumber || '');
+    const [eta, setEta] = useState(c.craa5_eta ? String(c.craa5_eta).slice(0, 10) : '');
+    const [receiving, setReceiving] = useState(false);
+    const [got, setGot] = useState({});
+    const next = ORD_NEXT[c.craa5_cartstatus];
+    const canReceive = c.craa5_cartstatus === 'Ordered' || c.craa5_cartstatus === 'Partially received' || c.craa5_cartstatus === 'Approved';
+    const left = function (l) { return Math.max(0, ordNum(l.craa5_quantity) - ordNum(l.craa5_quantityreceived)); };
+    const gotOf = function (l) { return got[l._id] !== undefined ? got[l._id] : left(l); };
+    return (
+        <div className="rounded-xl border border-slate-200 bg-white shadow-sm" data-ord-open={c.craa5__c_cartname}>
+            <div className="px-4 py-3 flex flex-wrap items-center gap-x-3 gap-y-1">
+                <span className="font-black text-slate-900 break-all">{c.craa5__c_cartname}</span>
+                <StatusTag status={c.craa5_cartstatus} />
+                <span className="ml-auto text-sm font-black text-slate-900">{ordMoney(c.craa5_carttotal)}</span>
+                <span className="w-full text-xs text-slate-500">{ordVendorName(ix, c.craa5_vendornumber)}{c.craa5_sapcartnumber ? ' - SAP cart ' + c.craa5_sapcartnumber : ' - no SAP cart number yet'}
+                    {c.craa5_submittedon ? ' - submitted ' + ordDay(ordDate(c.craa5_submittedon)) : ''}{c.craa5_approvedby ? ' - approved by ' + c.craa5_approvedby : ''}{c.craa5_eta ? ' - ETA ' + ordDay(ordDate(c.craa5_eta)) : ''}</span>
+            </div>
+            <div className="px-4 pb-3 flex flex-wrap items-end gap-2">
+                <label className="text-xs font-bold text-slate-600">SAP cart number<input value={sap} onChange={function (e) { setSap(e.target.value.replace(/[^0-9A-Za-z-]/g, '')); }} className={inputCls + ' block w-40 mt-1'} /></label>
+                {sap !== (c.craa5_sapcartnumber || '') && <button type="button" className={btnWhite} onClick={function () { props.onPatch(c, { craa5_sapcartnumber: sap }, 'SAP cart number saved.'); }}>Save number</button>}
+                {c.craa5_cartstatus === 'Approved' && <label className="text-xs font-bold text-slate-600">ETA<input type="date" value={eta} onChange={function (e) { setEta(e.target.value); }} className={inputCls + ' block mt-1'} /></label>}
+                {next && <button type="button" data-ord-next className={btnBlue + (props.busy ? ' opacity-50 cursor-not-allowed' : '')} aria-disabled={props.busy} onClick={function () {
+                    if (props.busy) return;
+                    const f = { craa5_cartstatus: ordChoiceValue(ORD_T.cart, 'craa5_cartstatus', next) };
+                    const now = new Date().toISOString();
+                    if (next === 'Submitted') f.craa5_submittedon = now;
+                    if (next === 'Approved') { f.craa5_approvedon = now; f.craa5_approvedby = chUserName() || 'Hub user'; }
+                    if (next === 'Ordered' && eta) f.craa5_eta = eta;
+                    if (sap && sap !== (c.craa5_sapcartnumber || '')) f.craa5_sapcartnumber = sap;
+                    props.onPatch(c, f, 'Cart moved to ' + next + '.');
+                }}>{next === 'Submitted' ? 'Mark submitted' : next === 'Approved' ? 'Approve' : 'Mark ordered'}</button>}
+                {canReceive && !receiving && <button type="button" data-ord-receive className={btnWhite} onClick={function () { setReceiving(true); }}>Receive</button>}
+                {c.craa5_cartstatus !== 'Draft (not in SAP yet)' && !receiving && <button type="button" data-ord-close className={btnWhite + (props.busy ? ' opacity-50 cursor-not-allowed' : '')} aria-disabled={props.busy} onClick={function () {
+                    if (!props.busy && window.confirm('Mark every line of ' + c.craa5__c_cartname + ' received without adding to stock? Use this for a cart that arrived before the last count, so its items are already counted.')) props.onClose(c, lines);
+                }}>Close as received</button>}
+                <button type="button" className={btnWhite} onClick={function () { if (window.confirm('Cancel cart ' + c.craa5__c_cartname + '? Its lines stop counting as on order.')) props.onPatch(c, { craa5_cartstatus: ordChoiceValue(ORD_T.cart, 'craa5_cartstatus', 'Cancelled') }, 'Cart cancelled.'); }}>Cancel cart</button>
+            </div>
+            <details className="border-t border-slate-100" open={receiving}>
+                <summary className="min-h-[44px] flex items-center px-4 cursor-pointer text-sm font-extrabold text-[#0072CE]">{receiving ? 'Receive: enter what arrived' : lines.length + ' line' + (lines.length === 1 ? '' : 's')}</summary>
+                <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                        <thead><tr className="text-left text-[11px] uppercase tracking-widest text-slate-500"><th className="px-4 py-2">Item</th><th className="px-2 py-2 text-right">Ordered</th><th className="px-2 py-2 text-right">Received</th><th className="hidden sm:table-cell px-2 py-2 text-right">Price</th>{receiving && <th className="px-4 py-2">Arrived now</th>}</tr></thead>
+                        <tbody>
+                            {lines.map(function (l) {
+                                return (
+                                    <tr key={l._id} className="border-t border-slate-100">
+                                        <td className="px-4 py-2"><span className="font-semibold">{l.craa5__c_cartlinename}</span><span className="block text-xs font-mono text-slate-500">{l.craa5_itemnumber}</span></td>
+                                        <td className="px-2 py-2 text-right">{ordQty(l.craa5_quantity)}</td>
+                                        <td className="px-2 py-2 text-right">{ordQty(l.craa5_quantityreceived)}</td>
+                                        <td className="hidden sm:table-cell px-2 py-2 text-right">{ordMoney(l.craa5_unitprice)}</td>
+                                        {receiving && <td className="px-4 py-2"><input type="number" min="0" step="1" inputMode="numeric" aria-label={'Arrived of ' + l.craa5__c_cartlinename} value={gotOf(l)} data-ord-got
+                                            onChange={function (e) { const v = e.target.value; setGot(function (p) { const n = Object.assign({}, p); n[l._id] = v; return n; }); }} className={inputCls + ' w-20 text-right'} /></td>}
+                                    </tr>
+                                );
+                            })}
+                        </tbody>
+                    </table>
+                </div>
+                {receiving && <div className="px-4 py-3 flex flex-wrap gap-2">
+                    <button type="button" data-ord-receive-save className={btnBlue + (props.busy ? ' opacity-50 cursor-not-allowed' : '')} aria-disabled={props.busy} onClick={function () {
+                        if (props.busy) return;
+                        const recs = lines.map(function (l) { return { line: l, qty: Math.max(0, ordNum(gotOf(l))) }; }).filter(function (r) { return r.qty > 0; });
+                        if (!recs.length) return;
+                        props.onReceive(c, lines, recs).then(function (ok) { if (ok) setReceiving(false); });
+                    }}>Save receipt</button>
+                    <button type="button" className={btnWhite} onClick={function () { setReceiving(false); setGot({}); }}>Close</button>
+                </div>}
+            </details>
+        </div>
+    );
+}
+
+function OrderingTab(props) {
+    const fetcher = props.fetcher;
+    const base = useMemo(function () { return props.baseUrl !== undefined ? props.baseUrl : chClientUrl(); }, [props.baseUrl]);
+    const [data, setData] = useState(null);
+    const [loading, setLoading] = useState(false);
+    const [problem, setProblem] = useState('');
+    const [msg, setMsg] = useState('');
+    const [busy, setBusy] = useState(false);
+    const [view, setView] = useState('suggested');
+    const [qty, setQty] = useState({});
+    const [copied, setCopied] = useState('');
+    const [req, setReq] = useState({ item: '', qty: '1', reason: '' });
+    const loadId = useRef(0);
+
+    const load = useCallback(function () {
+        if (!base) { setProblem('Cannot read Dataverse from here: open the Chemical hub inside the Power Apps app.'); return; }
+        const id = ++loadId.current;
+        setLoading(true); setProblem('');
+        ordLoadAll(fetcher, base).then(function (d) {
+            if (loadId.current !== id) return;
+            setData(d); setLoading(false); setQty({});
+            const bad = Object.keys(d.tables).filter(function (k) { return d.tables[k].error; }).map(function (k) { return d.tables[k].label + ': ' + d.tables[k].error; });
+            if (bad.length) setProblem('Some tables could not be read, so numbers may be short. ' + bad.join(' '));
+        });
+    }, [base, fetcher]);
+    useEffect(function () { load(); }, [load]);
+
+    const today = useMemo(function () { const n = data ? data.loadedAt : new Date(); return new Date(n.getFullYear(), n.getMonth(), n.getDate()); }, [data]);
+    const ix = useMemo(function () { return data ? ordIndex(data, today) : null; }, [data, today]);
+    const use = useMemo(function () { return ix ? ordWeeklyUse(ix) : {}; }, [ix]);
+    const sugs = useMemo(function () { return ix ? ordSuggest(ix, use) : []; }, [ix, use]);
+    const carts = useMemo(function () { return ix ? ordBuildCarts(ix, sugs, data.loadedAt, Object.keys(ix.carts)) : []; }, [ix, sugs, data]);
+    const alerts = useMemo(function () { return ix ? ordAlerts(ix) : []; }, [ix]);
+    const openCarts = ix ? ix.cartList.filter(function (c) { return ORD_OPEN.indexOf(c.craa5_cartstatus) > -1; }).sort(function (a, b) { return (ordDate(b.craa5_submittedon) || ordDate(b.craa5_draftedon) || 0) - (ordDate(a.craa5_submittedon) || ordDate(a.craa5_draftedon) || 0); }) : [];
+
+    const qtyOf = function (cart, l) { const k = cart.key + '|' + l.sug.key; return qty[k] !== undefined ? Math.max(0, ordNum(qty[k])) : l.qty; };
+    const setLineQty = function (cart, l, v) { const k = cart.key + '|' + l.sug.key; setQty(function (p) { const n = Object.assign({}, p); n[k] = v; return n; }); };
+    const say = function (text) { setMsg(text); setTimeout(function () { setMsg(function (m) { return m === text ? '' : m; }); }, 6000); };
+    const copyText = function (key, text) {
+        const done = function () { setCopied(key); setTimeout(function () { setCopied(''); }, 2500); };
+        try { if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(text).then(done, function () { window.prompt('Copy this text', text); }); return; } } catch (e) { /* fall through */ }
+        window.prompt('Copy this text', text);
+    };
+    const T = data ? data.tables : null;
+    const url = function (tbl, id) { return base + CH_API + tbl.meta.set + (id ? '(' + String(id).replace(/[^0-9a-fA-F-]/g, '') + ')' : ''); };
+    // Writes run one after another and stop at the first refusal, which is shown as it came from Dataverse.
+    const run = function (steps, doneText) {
+        setBusy(true); setProblem('');
+        let i = 0;
+        const step = function () {
+            if (i >= steps.length) return Promise.resolve(true);
+            const s = steps[i++];
+            return chSend(fetcher, s.method, s.url, s.data).then(function (r) {
+                if (!chOk(r)) { setProblem((s.what || 'A change') + ' was not saved. Dataverse said: ' + r.message + (i > 1 ? ' The ' + (i - 1) + ' change' + (i - 1 === 1 ? '' : 's') + ' before it were saved.' : '')); return false; }
+                return step();
+            });
+        };
+        return step().then(function (ok) { setBusy(false); if (ok) { say(doneText); load(); } return ok; });
+    };
+    const saveCart = function (c) {
+        const now = new Date().toISOString();
+        const total = ordRound(ordCartTotal(c, qtyOf), 2);
+        const steps = [{ method: 'POST', url: url(T.cart), what: 'The cart', data: ordPayload(T.cart, { craa5__c_cartname: c.title, craa5_vendornumber: c.vendorNo, craa5_cartstatus: ordChoiceValue(ORD_T.cart, 'craa5_cartstatus', 'Draft (not in SAP yet)'), craa5_carttotal: total, craa5_draftedon: now }) }];
+        c.lines.forEach(function (l) {
+            const q = qtyOf(c, l); if (q <= 0) return;
+            let fromStock = q;
+            // requests join the cart as they are; only the rest becomes a new line
+            l.sug.requests.forEach(function (r) {
+                if (fromStock <= 0) return;
+                const rq = Math.min(ordNum(r.craa5_quantity), fromStock); fromStock -= rq;
+                steps.push({ method: 'PATCH', url: url(T.line, r._id), what: 'Request ' + (r.craa5__c_cartlinename || ''), data: ordPayload(T.line, { craa5__c_cartname: c.title, craa5_quantity: rq, craa5_unitprice: l.sug.price, craa5_linetotal: ordRound(rq * l.sug.price, 2) }) });
+            });
+            if (fromStock > 0) steps.push({ method: 'POST', url: url(T.line), what: 'Line ' + l.sug.name, data: ordPayload(T.line, { craa5__c_cartlinename: (l.sug.name + ' x' + ordQty(fromStock)).slice(0, 200), craa5__c_cartname: c.title, craa5_itemnumber: l.sug.itemNo,
+                craa5_quantity: fromStock, craa5_unitprice: l.sug.price, craa5_linetotal: ordRound(fromStock * l.sug.price, 2), craa5_source: ordChoiceValue(ORD_T.line, 'craa5_source', 'Suggested') }) });
+        });
+        run(steps, 'Saved ' + c.title + ' as a draft cart. Paste it into SAP, then add the SAP cart number under Open carts.');
+    };
+    const patchCart = function (c, fields, doneText) { return run([{ method: 'PATCH', url: url(T.cart, c._id), what: 'The cart', data: ordPayload(T.cart, fields) }], doneText); };
+    const receive = function (c, lines, recs) {
+        const now = new Date();
+        const steps = [];
+        recs.forEach(function (r) {
+            steps.push({ method: 'PATCH', url: url(T.line, r.line._id), what: 'Line ' + (r.line.craa5__c_cartlinename || ''), data: ordPayload(T.line, { craa5_quantityreceived: ordNum(r.line.craa5_quantityreceived) + r.qty, craa5_receivedon: ordIsoDay(now) }) });
+            const k = ordKey(r.line.craa5_itemnumber), s = ix.stock[k];
+            if (s && s.rows.length) {
+                const row = s.rows[0];
+                steps.push({ method: 'PATCH', url: url(T.stock, row._id), what: 'Stock of ' + (row.craa5__c_chemicalinventoryname || k), data: ordPayload(T.stock, { craa5_quantityonhand: ordNum(row.craa5_quantityonhand) + r.qty, craa5_lastupdated: now.toISOString() }) });
+                row.craa5_quantityonhand = ordNum(row.craa5_quantityonhand) + r.qty;
+            } else {
+                const it = ix.items[k];
+                steps.push({ method: 'POST', url: url(T.stock), what: 'New stock row for ' + k, data: ordPayload(T.stock, { craa5__c_chemicalinventoryname: ((it && (it.craa5_commonname || it.craa5__c_chemicalname)) || k) + ' - Chemical room', craa5_itemnumber: r.line.craa5_itemnumber,
+                    craa5_location: ordChoiceValue(ORD_T.stock, 'craa5_location', 'Chemical room'), craa5_quantityonhand: r.qty, craa5_minimumthreshold: 0, craa5_lastupdated: now.toISOString() }) });
+            }
+        });
+        const all = lines.every(function (l) {
+            const r = recs.filter(function (x) { return x.line._id === l._id; })[0];
+            return ordNum(l.craa5_quantityreceived) + (r ? r.qty : 0) >= ordNum(l.craa5_quantity);
+        });
+        steps.push({ method: 'PATCH', url: url(T.cart, c._id), what: 'The cart', data: ordPayload(T.cart, { craa5_cartstatus: ordChoiceValue(ORD_T.cart, 'craa5_cartstatus', all ? 'Received' : 'Partially received'), craa5_receivedon: now.toISOString() }) });
+        return run(steps, 'Receipt saved for ' + c.craa5__c_cartname + '. Stock is updated.');
+    };
+    // A cart that arrived before the last count: its lines are marked received, stock is left alone (the count already has them).
+    const closeCart = function (c, lines) {
+        const steps = [];
+        lines.forEach(function (l) {
+            if (ordNum(l.craa5_quantityreceived) < ordNum(l.craa5_quantity)) steps.push({ method: 'PATCH', url: url(T.line, l._id), what: 'Line ' + (l.craa5__c_cartlinename || ''), data: ordPayload(T.line, { craa5_quantityreceived: ordNum(l.craa5_quantity) }) });
+        });
+        steps.push({ method: 'PATCH', url: url(T.cart, c._id), what: 'The cart', data: ordPayload(T.cart, { craa5_cartstatus: ordChoiceValue(ORD_T.cart, 'craa5_cartstatus', 'Received') }) });
+        return run(steps, c.craa5__c_cartname + ' closed as received. Stock was not changed.');
+    };
+    const addRequest = function () {
+        const it = ix.items[ordKey(req.item)];
+        const q = ordNum(req.qty);
+        if (!it || q <= 0) { setProblem('Pick an item from the list and a quantity above 0.'); return; }
+        const name = it.craa5_commonname || it.craa5__c_chemicalname || it.craa5_itemnumber;
+        run([{ method: 'POST', url: url(T.line), what: 'The request', data: ordPayload(T.line, { craa5__c_cartlinename: ('Request: ' + name + ' x' + ordQty(q)).slice(0, 200), craa5_itemnumber: it.craa5_itemnumber, craa5_quantity: q,
+            craa5_unitprice: ordNum(it.craa5_priceperunit), craa5_linetotal: ordRound(q * ordNum(it.craa5_priceperunit), 2), craa5_source: ordChoiceValue(ORD_T.line, 'craa5_source', 'Clerk request'), craa5_requestedby: chUserName() || null, craa5_reason: req.reason || null }) }],
+            'Request added. It joins the next suggested cart for ' + ordVendorName(ix, it.craa5_vendornumber) + '.').then(function (ok) { if (ok) setReq({ item: '', qty: '1', reason: '' }); });
+    };
+
+    const spend = carts.reduce(function (n, c) { return n + ordCartTotal(c, qtyOf); }, 0);
+    const openValue = openCarts.reduce(function (n, c) { return n + ordNum(c.craa5_carttotal); }, 0);
+    const viewBtn = function (key, label, n) {
+        const on = view === key;
+        return <button type="button" key={key} onClick={function () { setView(key); }} aria-pressed={on} data-ord-view={key}
+            className={'min-h-[44px] px-3 rounded-lg text-sm font-bold border focus:outline-none focus:ring-2 focus:ring-[#0072CE]/40 ' + (on ? 'bg-[#0072CE] text-white border-[#0072CE]' : 'bg-white text-[#00468B] border-slate-300 hover:bg-slate-50')}>{label}{n !== undefined ? ' (' + n + ')' : ''}</button>;
+    };
+    const ready = !!ix;
+    const noData = ready && !ix.itemList.length;
+    return (
+        <div>
+            <div className="rounded-xl border border-slate-200 bg-white shadow-sm">
+                <div className="bg-[#E6F1FB] border-b border-[#CFE3F7] px-5 py-3 flex flex-wrap items-center gap-2 rounded-t-xl">
+                    <h1 className="text-sm font-black text-[#00468B] uppercase tracking-widest">Ordering</h1>
+                    <span className="ml-auto text-xs text-slate-600" aria-live="polite">{loading ? 'Reading the ordering tables...' : data ? 'Read at ' + chTime(data.loadedAt) : 'Not read yet'}</span>
+                </div>
+                <div className="px-5 py-4">
+                    <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
+                        <Tile label="To order" value={ready ? sugs.length : '-'} note={ready ? 'items' : ''} />
+                        <Tile label="Suggested spend" value={ready ? ordMoney(spend) : '-'} note={ready ? carts.length + ' cart' + (carts.length === 1 ? '' : 's') : ''} />
+                        <Tile label="Open carts" value={ready ? openCarts.length : '-'} note={ready ? ordMoney(openValue) : ''} />
+                        <Tile label="Alerts" value={ready ? alerts.length : '-'} note="" />
+                    </div>
+                    {problem && <p role="alert" className="mt-3 flex items-start gap-2 rounded-lg border border-[#FFB81C] bg-[#FFF6E0] px-3 py-2 text-sm text-[#7A4B00]"><WarnIcon className="w-4 h-4 mt-0.5 flex-shrink-0" />{problem}</p>}
+                    {msg && <p role="status" className="mt-3 rounded-lg border border-[#B3D4F2] bg-[#E6F1FB] px-3 py-2 text-sm text-[#00468B]">{msg}</p>}
+                    {noData && <p className="mt-3 rounded-lg border border-[#FFB81C] bg-[#FFF6E0] px-3 py-2 text-sm text-[#7A4B00]">The Chemical table has no rows yet. Import the files in the chemical-ordering import folder (Distributors, Chemicals, stock, carts, cart lines, counts), then press Refresh.</p>}
+                    <div className="mt-4 flex flex-wrap items-center gap-2">
+                        <button type="button" onClick={function () { if (!loading) load(); }} aria-disabled={loading} className={btnBlue + (loading ? ' opacity-50 cursor-not-allowed' : '')}><RefreshIcon className="w-4 h-4" />{loading ? 'Reading...' : 'Refresh'}</button>
+                        <span className="ml-auto flex flex-wrap gap-2" role="group" aria-label="Show">
+                            {viewBtn('suggested', 'Suggested carts', ready ? carts.length : undefined)}{viewBtn('open', 'Open carts', ready ? openCarts.length : undefined)}{viewBtn('requests', 'Requests', ready ? ix.requests.length : undefined)}{viewBtn('alerts', 'Alerts', ready ? alerts.length : undefined)}
+                        </span>
+                    </div>
+                    <details className="mt-3">
+                        <summary className="min-h-[44px] flex items-center cursor-pointer text-sm font-extrabold text-[#0072CE]">How this is read</summary>
+                        <ul className="mt-1 list-disc pl-5 text-sm text-slate-700 space-y-1">
+                            <li>On hand and minimum add up every stock row of the item. On order is what open carts (draft to partially received) still have to deliver.</li>
+                            <li>Use a week comes from the Sunday counts over the last {ORD_USE_WEEKS} weeks: between two counts, use = the earlier count + what arrived in between - the later count. A delivery with no received date is dated its cart's submitted date plus the lead time.</li>
+                            <li>An item is suggested when on hand + on order - the use expected during the lead time is at or under its minimum. It is ordered up to its par level (or minimum + 1 when there is no par level, the old sheet rule) plus that lead-time use. With no count history the use is 0, which is exactly the old sheet rule.</li>
+                            <li>Lead time and cart limit come from the distributor row ({ORD_LEAD_DAYS} days and {ordMoney(ORD_CART_LIMIT)} when blank). Lines are packed biggest first into as few carts as fit under the limit; a single line over the limit is split.</li>
+                            <li>Requests (cart lines with no cart yet) are added on top and join the cart when it is saved.</li>
+                            <li>Nothing is written until you press a button. Save as draft cart writes the cart and its lines; Receive adds what arrived to the first stock row of each item; Close as received marks a cart that came before the last count as received and leaves stock alone, because the count already has it.</li>
+                        </ul>
+                    </details>
+                </div>
+            </div>
+            {ready && view === 'suggested' && <div className="mt-6 space-y-3">
+                <h2 className="text-sm font-black uppercase tracking-widest text-[#00468B]">Suggested carts</h2>
+                {carts.map(function (c) { return <SuggestedCart key={c.key} cart={c} qtyOf={qtyOf} setQty={setLineQty} busy={busy} copied={copied} onCopy={function (cc) { copyText(cc.key, ordSapText(cc, qtyOf)); }} onSave={saveCart} />; })}
+                {!carts.length && <p className="text-sm text-slate-600">Nothing needs ordering right now.</p>}
+            </div>}
+            {ready && view === 'open' && <div className="mt-6 space-y-3">
+                <h2 className="text-sm font-black uppercase tracking-widest text-[#00468B]">Open carts</h2>
+                {openCarts.map(function (c) { return <OpenCart key={c._id} cart={c} ix={ix} busy={busy} onPatch={patchCart} onReceive={receive} onClose={closeCart} />; })}
+                {!openCarts.length && <p className="text-sm text-slate-600">No open carts.</p>}
+            </div>}
+            {ready && view === 'requests' && <div className="mt-6 space-y-3">
+                <h2 className="text-sm font-black uppercase tracking-widest text-[#00468B]">Requests</h2>
+                <div className="rounded-xl border border-slate-200 bg-white shadow-sm px-4 py-3 flex flex-wrap items-end gap-2">
+                    <label className="text-xs font-bold text-slate-600 grow min-w-[220px]">Item<input list="ord-items" value={req.item} onChange={function (e) { const v = e.target.value; setReq(function (p) { return Object.assign({}, p, { item: v.split(' - ')[0] }); }); }} placeholder="Item number or name" data-ord-req-item className={inputCls + ' block w-full mt-1'} /></label>
+                    <datalist id="ord-items">{ix.itemList.map(function (it) { return <option key={it._id} value={it.craa5_itemnumber + ' - ' + (it.craa5_commonname || it.craa5__c_chemicalname || '')} />; })}</datalist>
+                    <label className="text-xs font-bold text-slate-600">Quantity<input type="number" min="1" step="1" value={req.qty} onChange={function (e) { const v = e.target.value; setReq(function (p) { return Object.assign({}, p, { qty: v }); }); }} data-ord-req-qty className={inputCls + ' block w-24 mt-1'} /></label>
+                    <label className="text-xs font-bold text-slate-600 grow min-w-[180px]">Reason<input value={req.reason} maxLength={200} onChange={function (e) { const v = e.target.value; setReq(function (p) { return Object.assign({}, p, { reason: v }); }); }} className={inputCls + ' block w-full mt-1'} /></label>
+                    <button type="button" data-ord-req-add className={btnBlue + (busy ? ' opacity-50 cursor-not-allowed' : '')} aria-disabled={busy} onClick={function () { if (!busy) addRequest(); }}>Add request</button>
+                </div>
+                {ix.requests.map(function (r) {
+                    const it = ix.items[ordKey(r.craa5_itemnumber)];
+                    return <div key={r._id} className="rounded-lg border border-slate-200 bg-white px-4 py-3 text-sm"><span className="font-semibold">{it ? (it.craa5_commonname || it.craa5__c_chemicalname) : r.craa5__c_cartlinename}</span> <span className="font-mono text-xs text-slate-500">{r.craa5_itemnumber}</span>
+                        <span className="block text-slate-600">{ordQty(r.craa5_quantity)} requested{r.craa5_requestedby ? ' by ' + r.craa5_requestedby : ''}{r.craa5_reason ? ': ' + r.craa5_reason : ''}</span></div>;
+                })}
+                {!ix.requests.length && <p className="text-sm text-slate-600">No requests waiting.</p>}
+            </div>}
+            {ready && view === 'alerts' && <div className="mt-6 space-y-2">
+                <h2 className="text-sm font-black uppercase tracking-widest text-[#00468B]">Alerts</h2>
+                {alerts.map(function (a, i) {
+                    const cls = a.level === 'red' ? 'border-[#E4002B]/40 bg-[#FDE8EC] text-[#B80022]' : a.level === 'blue' ? 'border-[#B3D4F2] bg-[#E6F1FB] text-[#00468B]' : 'border-[#FFB81C] bg-[#FFF6E0] text-[#7A4B00]';
+                    return <p key={i} className={'rounded-lg border px-3 py-2 text-sm ' + cls}>{a.text}</p>;
+                })}
+                {!alerts.length && <p className="text-sm text-slate-600">No alerts.</p>}
+            </div>}
+        </div>
+    );
+}
+
+// ============================================================================
 // PAGE
 // ============================================================================
-const CH_TABS = [{ key: 'tables', label: 'Tables' }];
+const CH_TABS = [{ key: 'ordering', label: 'Ordering' }, { key: 'tables', label: 'Tables' }];
 
 export default function ChemicalHub(props) {
     const p = props || {};
-    const [tab, setTab] = useState('tables');
+    const [tab, setTab] = useState('ordering');
     const fetcher = useMemo(function () { return p.fetcher || function (u, i) { return window.fetch(u, i); }; }, [p.fetcher]);
     useEffect(function () {
         try {
@@ -1016,6 +1709,7 @@ export default function ChemicalHub(props) {
                 <div style={{ height: 4, background: 'linear-gradient(90deg, ' + BRAND.blue + ' 0 60%, ' + BRAND.yellow + ' 60% 80%, ' + BRAND.red + ' 80% 100%)' }} />
             </header>
             <main className="mx-auto max-w-6xl px-4 py-5">
+                {tab === 'ordering' && <OrderingTab fetcher={fetcher} baseUrl={p.baseUrl} />}
                 {tab === 'tables' && <TablesTab fetcher={fetcher} baseUrl={p.baseUrl} />}
             </main>
         </div>
