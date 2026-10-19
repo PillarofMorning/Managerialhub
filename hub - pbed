@@ -1,0 +1,2328 @@
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+
+/*
+ * ============================================================================
+ * hub - pbed: PBED weekend clean planner (Plan - Brief - Execute - Debrief)
+ * ============================================================================
+ * Version 1.0 (rebuilt from scratch, replaces pbed.txt v4.0).
+ *
+ * What it does
+ * - Plan: one lane per line. Production stop and restart come from the production schedule (craa5__aa_prd_schd).
+ *   Sanitation milestones are the equipment subcategories of the assets table (craa5_aa_assets.craa5_subcategory):
+ *   the number in the name is the clean order (1 - pic first); subcategories with the same number run side by side.
+ *   A milestone takes the sum of its equipment minutes (craa5_hoursrequired holds minutes) divided by its people.
+ *   People are limited by the crew on shift (craa5_workshift rotation; headcount from the Shift Start board for
+ *   that shift, else the Employees roster; any shift can be set by hand). Maintenance is one block per line,
+ *   after the foam milestone by default, sized from its SAP work orders. OPS / FSQ steps (handoff, inspect, swab,
+ *   preflight, 1st pie) wrap around the milestones and are edited on Setup.
+ * - Brief: goalposts per line and people by shift, copied as text.
+ * - Execute: started / done per milestone (craa5__p_milestone), with Ganttly check-offs (craa5_cleancheckoff).
+ * - Debrief: plan against actual, time loss (the manager hub's craa5__m_timelosslog, kind "Weekend clean"),
+ *   the biggest costs of the weekend and hours paid but not used.
+ * - Work orders: paste the SAP export; each order is matched to a piece of equipment (the match is remembered
+ *   per functional location and asset in craa5__p_flocmap).
+ * - Crew: who is on each weekend shift. Experience (hours per area, last 56 days of Shift Start history) is
+ *   worked out in the background and shown only when a name is double clicked.
+ *
+ * Rules this page keeps
+ * - Only real Dataverse rows. A read that fails is shown on the page and on the Data tab; nothing is filled in
+ *   with sample data. Own tables that do not exist yet fall back to this computer (localStorage), and say so.
+ * - No lookup columns: tables point at each other with plain text keys (area key, asset guid, order number).
+ * - ASCII only (GEMINI.md).
+ *
+ * Tables: reads craa5_aa_assets, craa5__aa_prd_schd, craa5_workshift, craa5__aa_employee, craa5_shiftplan,
+ * craa5_shiftboard, craa5_shiftarchive, craa5_taskassignment, craa5_cleancheckoff. Writes craa5__p_plan,
+ * craa5__p_milestone, craa5__p_workorder, craa5__p_flocmap, craa5__m_timelosslog (prompts: pbed-table-prompts.md).
+ * ============================================================================
+ */
+// ==== PBED UTIL ====
+// Small helpers shared by the data layer, the planning engine and the screens. Plain functions, no React.
+
+var PB_MIN = 60000;
+var PB_HOUR = 3600000;
+var PB_DAY = 86400000;
+var PB_BUCKET_MIN = 15;          // the planner books headcount in 15 minute pieces
+var PB_DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+function pbCanon(s) { return String(s == null ? '' : s).toLowerCase().replace(/[^a-z0-9]/g, ''); }
+function pbTrim(s) { return String(s == null ? '' : s).replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim(); }
+function pbNum(v) { if (v === null || v === undefined || v === '') return null; var n = typeof v === 'number' ? v : parseFloat(String(v).replace(/,/g, '')); return isFinite(n) ? n : null; }
+function pbInt(v, dflt) { var n = pbNum(v); return n === null ? dflt : Math.round(n); }
+function pbPad(n) { return n < 10 ? '0' + n : String(n); }
+function pbClamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+function pbUniq(arr) { var seen = {}, out = []; for (var i = 0; i < arr.length; i++) { var k = String(arr[i]); if (!seen[k]) { seen[k] = 1; out.push(arr[i]); } } return out; }
+function pbSum(arr, fn) { var t = 0; for (var i = 0; i < arr.length; i++) t += (fn ? fn(arr[i]) : arr[i]) || 0; return t; }
+function pbKeys(o) { return o ? Object.keys(o) : []; }
+function pbPlural(n, one, many) { return n + ' ' + (n === 1 ? one : (many || one + 's')); }
+function pbGuidLike(s) { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(s || '').replace(/[{}]/g, '')); }
+function pbCleanId(s) { return String(s || '').replace(/[{}]/g, '').toLowerCase(); }
+
+// Local calendar dates (adding 24h in ms drifts an hour across daylight saving changes).
+function pbYmd(d) { d = d instanceof Date ? d : new Date(d); return d.getFullYear() + '-' + pbPad(d.getMonth() + 1) + '-' + pbPad(d.getDate()); }
+function pbFromYmd(ymd) { var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(ymd || '')); return m ? new Date(+m[1], +m[2] - 1, +m[3]) : null; }
+function pbAddDays(d, n) { return new Date(d.getFullYear(), d.getMonth(), d.getDate() + n, d.getHours(), d.getMinutes(), d.getSeconds()); }
+function pbAt(day, hour, min) { return new Date(day.getFullYear(), day.getMonth(), day.getDate(), hour, min || 0, 0).getTime(); }
+function pbIsoZ(ms) { return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z'); }
+function pbMs(v) { if (v === null || v === undefined || v === '') return null; if (typeof v === 'number') return v; var t = new Date(v).getTime(); return isFinite(t) ? t : null; }
+
+// The weekend is named by its Saturday. On Monday and Tuesday the page opens on the weekend just gone (debrief days),
+// on the other days on the coming one.
+function pbDefaultWeekend(now) {
+    var d = new Date(now); d = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    var dow = d.getDay();
+    var back = { 0: 1, 1: 2, 2: 3 };
+    if (back[dow] !== undefined) return pbYmd(pbAddDays(d, -back[dow]));
+    return pbYmd(pbAddDays(d, 6 - dow));
+}
+// Fri 18:00 to Mon 06:00 is the weekend focus the production scheduler uses for end-of-week cleans.
+function pbWeekendFrame(sat) {
+    var s = pbFromYmd(sat);
+    return {
+        sat: s,
+        focusStart: pbAt(pbAddDays(s, -1), 18), focusEnd: pbAt(pbAddDays(s, 2), 6),
+        readStart: pbAt(pbAddDays(s, -3), 0), readEnd: pbAt(pbAddDays(s, 4), 0)
+    };
+}
+
+function pbFmtTime(ms) {
+    if (ms === null || ms === undefined || !isFinite(ms)) return '--';
+    var d = new Date(ms); var h = d.getHours(); var ap = h < 12 ? 'AM' : 'PM'; var h12 = h % 12 === 0 ? 12 : h % 12;
+    return h12 + ':' + pbPad(d.getMinutes()) + ' ' + ap;
+}
+function pbFmtDayTime(ms) { if (ms === null || ms === undefined || !isFinite(ms)) return '--'; return PB_DAY_NAMES[new Date(ms).getDay()] + ' ' + pbFmtTime(ms); }
+function pbFmtDate(ms) { if (ms === null || ms === undefined) return '--'; var d = new Date(ms); return PB_DAY_NAMES[d.getDay()] + ' ' + (d.getMonth() + 1) + '/' + d.getDate(); }
+function pbFmtHours(min) {
+    if (min === null || min === undefined || !isFinite(min)) return '--';
+    var neg = min < 0; var m = Math.round(Math.abs(min)); var h = Math.floor(m / 60); var r = m % 60;
+    return (neg ? '-' : '') + (h ? h + 'h' : '') + (h && r ? ' ' : '') + (r || !h ? r + 'm' : '');
+}
+function pbFmtNum(n, dp) { if (n === null || n === undefined || !isFinite(n)) return '--'; var p = Math.pow(10, dp || 0); return String(Math.round(n * p) / p); }
+function pbFmtMoney(n) {
+    if (n === null || n === undefined || !isFinite(n)) return '--';
+    var s = Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    return '$' + s;
+}
+// datetime-local input value <-> ms
+function pbToLocalInput(ms) { if (ms === null || ms === undefined) return ''; var d = new Date(ms); return pbYmd(d) + 'T' + pbPad(d.getHours()) + ':' + pbPad(d.getMinutes()); }
+function pbFromLocalInput(s) { var m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(String(s || '')); return m ? new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]).getTime() : null; }
+
+function pbReadLocal(key, dflt) { try { var raw = window.localStorage.getItem(key); return raw ? JSON.parse(raw) : dflt; } catch (e) { return dflt; } }
+function pbWriteLocal(key, val) { try { window.localStorage.setItem(key, JSON.stringify(val)); return true; } catch (e) { return false; } }
+function pbDropLocal(key) { try { window.localStorage.removeItem(key); } catch (e) { /* storage blocked */ } }
+
+function pbClone(o) { return o === undefined ? undefined : JSON.parse(JSON.stringify(o)); }
+function pbErrText(e) {
+    if (!e) return 'Unknown error';
+    var m = e.message || e.errorMessage || (e.error && e.error.message) || (typeof e === 'string' ? e : '');
+    if (!m) { try { m = JSON.stringify(e).slice(0, 200); } catch (x) { m = String(e); } }
+    return String(m).replace(/[^\x20-\x7E]/g, ' ').slice(0, 300);
+}
+// Reads a column from a Xrm or dataApi row: formatted value first only when asked, then the raw value, then a key in any case.
+function pbField(row, name, formatted) {
+    if (!row) return undefined;
+    if (formatted) { var f = row[name + '@OData.Community.Display.V1.FormattedValue']; if (f !== undefined && f !== null && f !== '') return f; }
+    if (row[name] !== undefined) return row[name];
+    var low = name.toLowerCase();
+    for (var k in row) { if (Object.prototype.hasOwnProperty.call(row, k) && k.toLowerCase() === low) return row[k]; }
+    return undefined;
+}
+// ==== END PBED UTIL ====
+// ==== PBED DATA ====
+// Every read goes to Dataverse (Xrm.WebApi in the model-driven app, else the page's dataApi). Nothing is invented:
+// a read that fails says so and the screens show what is missing instead of filling in sample rows.
+
+var PB_TIMEOUT = 25000;
+var PB_PAGE_CAP = 20;    // at most 20 pages (5000 rows each) per read
+
+// Tables this page reads (made by other apps) and the four it owns (prefix _p_, plus the manager hub time loss log).
+var PB_TABLES = {
+    assets: { names: ['craa5_aa_assets'], label: 'Assets (Ganttly, MSS)', owner: 'Ganttly' },
+    runs: { names: ['craa5__aa_prd_schd'], label: 'Production schedule runs', owner: 'Production Scheduler' },
+    workshift: { names: ['craa5_workshift'], label: 'Work shifts (crew rotation)', owner: 'Shift Start' },
+    employees: { names: ['craa5__aa_employee', 'craa5_aa_employee'], label: 'Employees', owner: 'Shift Start' },
+    shiftplan: { names: ['craa5_shiftplan'], label: 'Planned shift boards', owner: 'Shift Start' },
+    shiftboard: { names: ['craa5_shiftboard'], label: 'Live shift boards', owner: 'Shift Start' },
+    shiftarchive: { names: ['craa5_shiftarchive'], label: 'Shift board archive (experience)', owner: 'Shift Start' },
+    taskassignment: { names: ['craa5_taskassignment'], label: 'Task assignments (experience)', owner: 'Shift Start' },
+    checkoff: { names: ['craa5_cleancheckoff', 'craa5__cleancheckoff', 'craa5_ganttlycheckoff'], label: 'Ganttly check-offs', owner: 'Ganttly' },
+    plan: { names: ['craa5__p_plan', 'craa5_p_plan', 'craa5_pbedplan'], label: '_p_ Plan', owner: 'PBED', mine: true },
+    milestone: { names: ['craa5__p_milestone', 'craa5_p_milestone', 'craa5_pbedmilestone'], label: '_p_ Milestone', owner: 'PBED', mine: true },
+    workorder: { names: ['craa5__p_workorder', 'craa5_p_workorder', 'craa5_pbedworkorder'], label: '_p_ Work order', owner: 'PBED', mine: true },
+    flocmap: { names: ['craa5__p_flocmap', 'craa5_p_flocmap', 'craa5_pbedflocmap'], label: '_p_ FLOC map', owner: 'PBED', mine: true },
+    timeloss: { names: ['craa5__m_timelosslog', 'craa5_timelosslog'], label: 'Time loss log (shared with hub - manager)', owner: 'hub - manager', mine: true }
+};
+
+// Columns the page writes into its own tables. The check on the Data tab looks for each one.
+var PB_COLS = {
+    plan: ['craa5_name', 'craa5_weekendkey', 'craa5_planjson', 'craa5_status', 'craa5_version', 'craa5_savedby', 'craa5_savedon'],
+    milestone: ['craa5_name', 'craa5_weekendkey', 'craa5_areakey', 'craa5_stepkey', 'craa5_stepname', 'craa5_department', 'craa5_plannedstart', 'craa5_plannedend', 'craa5_actualstart', 'craa5_actualend', 'craa5_headcount', 'craa5_notes', 'craa5_updatedby'],
+    workorder: ['craa5_name', 'craa5_priority', 'craa5_description', 'craa5_assetdescription', 'craa5_ordertype', 'craa5_functionallocation', 'craa5_basicstart', 'craa5_workcenter', 'craa5_sortfield', 'craa5_assetguid', 'craa5_equipment', 'craa5_areakey', 'craa5_plannedhours', 'craa5_weekendkey', 'craa5_status', 'craa5_importedby', 'craa5_importedon'],
+    flocmap: ['craa5_name', 'craa5_functionallocation', 'craa5_assetdescription', 'craa5_assetguid', 'craa5_equipment', 'craa5_areakey', 'craa5_mappedby'],
+    timeloss: ['craa5_name', 'craa5_kind', 'craa5_occurredon', 'craa5_minuteslost', 'craa5_reason', 'craa5_description', 'craa5_equipment', 'craa5_area', 'craa5_department', 'craa5_status', 'craa5_crew', 'craa5_loggedby', 'craa5_data']
+};
+
+function pbXrm() {
+    if (typeof window === 'undefined') return null;
+    if (window.Xrm) return window.Xrm;
+    try { if (window.parent && window.parent !== window && window.parent.Xrm) return window.parent.Xrm; } catch (e) { /* cross origin */ }
+    try { if (window.top && window.top !== window && window.top.Xrm) return window.top.Xrm; } catch (e2) { /* cross origin */ }
+    return null;
+}
+function pbWeb() { var x = pbXrm(); return x && x.WebApi && x.WebApi.retrieveMultipleRecords ? x.WebApi : null; }
+function pbTimeout(fn, label) {
+    return new Promise(function (resolve, reject) {
+        var t = setTimeout(function () { reject(new Error(label + ' timed out')); }, PB_TIMEOUT);
+        Promise.resolve().then(fn).then(function (v) { clearTimeout(t); resolve(v); }, function (e) { clearTimeout(t); reject(e); });
+    });
+}
+function pbEnc(s) { return String(s).replace(/%/g, '%25').replace(/&/g, '%26').replace(/#/g, '%23').replace(/\+/g, '%2B'); }
+function pbIdCol(table) { return table + 'id'; }
+
+// What an error means for "does this table / column exist".
+function pbErrKind(msg) {
+    var m = String(msg || '').toLowerCase();
+    if (/resource not found for the segment|entity.*does not exist|could not find (a|an) (entity|table)|metadatacache|no entity|not exist.*entity|entityname/.test(m)) return 'missing';
+    if (/could not find a property|property .* does not exist|invalid column|is not a valid attribute|doesn't have an attribute|does not have a column/.test(m)) return 'column';
+    if (/privilege|prvread|not have permission|access is denied|principal user/.test(m)) return 'denied';
+    return 'unknown';
+}
+
+// One read, paged. Never throws: resolves { rows, err, kind, via, droppedSelect }.
+function pbQuery(dataApi, table, opts) {
+    opts = opts || {};
+    var top = opts.top || 5000;
+    var sel = opts.select && opts.select.length ? opts.select : null;
+    var web = pbWeb();
+    var firstErr = null;
+    function viaXrm(useSel) {
+        var parts = [];
+        if (opts.filter) parts.push('$filter=' + pbEnc(opts.filter));
+        if (useSel) parts.push('$select=' + useSel.join(','));
+        if (opts.orderBy) parts.push('$orderby=' + opts.orderBy);
+        var q = '?' + parts.join('&');
+        var rows = [];
+        var pages = 0;
+        function page(query) {
+            return pbTimeout(function () { return web.retrieveMultipleRecords(table, query, Math.min(top, 5000)); }, 'Read of ' + table).then(function (res) {
+                var ents = res && res.entities ? res.entities : [];
+                rows = rows.concat(ents); pages++;
+                var next = res && res.nextLink;
+                if (next && rows.length < top && pages < PB_PAGE_CAP) { var i = next.indexOf('?'); return page(i >= 0 ? next.slice(i) : next); }
+                return rows.slice(0, top);
+            });
+        }
+        return page(q);
+    }
+    function viaApi(useSel) {
+        var q = { pageSize: Math.min(top, 500) };
+        if (opts.filter) q.filter = opts.filter;
+        if (opts.orderBy) q.orderBy = opts.orderBy;
+        if (useSel) q.select = useSel;
+        return pbTimeout(function () { return dataApi.queryTable(table, q); }, 'Read of ' + table).then(function (pg) {
+            var rows = pg && pg.rows ? Array.prototype.slice.call(pg.rows) : null;
+            if (!rows) throw new Error('No rows came back from ' + table);
+            var n = 0;
+            function more(p) {
+                if (p && p.hasMoreRows && typeof p.loadMoreRows === 'function' && rows.length < top && n < 200) {
+                    n++;
+                    return pbTimeout(function () { return p.loadMoreRows(); }, 'Read of ' + table).then(function (nx) { rows = rows.concat(nx && nx.rows ? Array.prototype.slice.call(nx.rows) : []); return more(nx); });
+                }
+                return rows.slice(0, top);
+            }
+            return more(pg);
+        });
+    }
+    function attempt(useSel) {
+        if (web) {
+            return viaXrm(useSel).then(function (rows) { return { rows: rows, via: 'Xrm.WebApi' }; }, function (e) {
+                firstErr = pbErrText(e);
+                if (dataApi && dataApi.queryTable) return viaApi(useSel).then(function (rows) { return { rows: rows, via: 'dataApi' }; }, function (e2) { return { rows: null, err: firstErr || pbErrText(e2) }; });
+                return { rows: null, err: firstErr };
+            });
+        }
+        if (dataApi && dataApi.queryTable) return viaApi(useSel).then(function (rows) { return { rows: rows, via: 'dataApi' }; }, function (e) { return { rows: null, err: pbErrText(e) }; });
+        return Promise.resolve({ rows: null, err: 'This page has no Dataverse connection (no Xrm.WebApi and no dataApi).', kind: 'nohost' });
+    }
+    return attempt(sel).then(function (r) {
+        if (r.rows || !sel || pbErrKind(r.err) !== 'column' || opts.strictSelect) { if (!r.rows && !r.kind) r.kind = pbErrKind(r.err); return r; }
+        // A listed column the table lacks fails the whole read: read again with every column.
+        return attempt(null).then(function (r2) { r2.droppedSelect = true; if (!r2.rows && !r2.kind) r2.kind = pbErrKind(r2.err); return r2; });
+    });
+}
+
+// Reads the first table name in the list that exists. Resolves { table, rows, err, kind, via }.
+function pbQueryFirst(dataApi, names, opts) {
+    var i = 0; var last = null;
+    function next() {
+        if (i >= names.length) return Promise.resolve(last || { rows: null, err: 'No table name to try', kind: 'missing' });
+        var t = names[i++];
+        return pbQuery(dataApi, t, opts).then(function (r) {
+            r.table = t;
+            if (r.rows) return r;
+            if (!last || last.kind === 'missing') last = r;
+            if (r.kind === 'missing') return next();
+            return r;   // denied or unknown: do not hide it behind a later name
+        });
+    }
+    return next();
+}
+
+// Which of the names is the real table: one tiny read each.
+function pbProbe(dataApi, names) {
+    var i = 0; var res = { table: null, state: 'missing', why: '' };
+    function next() {
+        if (i >= names.length) return Promise.resolve(res);
+        var t = names[i++];
+        return pbQuery(dataApi, t, { select: [pbIdCol(t)], top: 1, strictSelect: true }).then(function (r) {
+            if (r.rows) return { table: t, state: 'found', why: '' };
+            var k = r.kind || pbErrKind(r.err);
+            if (k === 'column') return { table: t, state: 'found', why: 'The id column ' + pbIdCol(t) + ' was not found, so its name differs: ' + r.err };
+            if (k === 'denied') return { table: t, state: 'denied', why: r.err };
+            if (k === 'nohost') return { table: null, state: 'nohost', why: r.err };
+            if (k === 'unknown') { res = { table: null, state: 'unknown', why: r.err }; return next(); }
+            if (res.state === 'missing') res.why = r.err;
+            return next();
+        });
+    }
+    return next();
+}
+// Columns of a found table: one tiny read per column.
+function pbProbeCols(dataApi, table, cols) {
+    var out = {};
+    var chain = Promise.resolve();
+    cols.forEach(function (c) {
+        chain = chain.then(function () {
+            return pbQuery(dataApi, table, { select: [c], top: 1, strictSelect: true }).then(function (r) {
+                out[c] = r.rows ? 'found' : (pbErrKind(r.err) === 'column' ? 'missing' : 'unknown');
+            });
+        });
+    });
+    return chain.then(function () { return out; });
+}
+
+function pbIdOf(res) { var id = typeof res === 'string' ? res : res && (res.id || res.entityId || res.recordId); return id ? pbCleanId(id) : null; }
+// Writes: Xrm.WebApi first, else dataApi. Null when there is no way to write.
+function pbWriter(dataApi) {
+    var x = pbXrm(); var web = x && x.WebApi;
+    if (web && web.createRecord && web.updateRecord) {
+        return {
+            create: function (t, body) { return pbTimeout(function () { return web.createRecord(t, body); }, 'Save to ' + t).then(pbIdOf); },
+            update: function (t, id, body) { return pbTimeout(function () { return web.updateRecord(t, id, body); }, 'Save to ' + t); },
+            remove: function (t, id) { return pbTimeout(function () { return web.deleteRecord(t, id); }, 'Delete from ' + t); }
+        };
+    }
+    if (dataApi && dataApi.createRow && dataApi.updateRow) {
+        return {
+            create: function (t, body) { return pbTimeout(function () { return dataApi.createRow(t, body); }, 'Save to ' + t).then(pbIdOf); },
+            update: function (t, id, body) { return pbTimeout(function () { return dataApi.updateRow(t, id, body); }, 'Save to ' + t); },
+            remove: function (t, id) { return dataApi.deleteRow ? pbTimeout(function () { return dataApi.deleteRow(t, id); }, 'Delete from ' + t) : Promise.reject(new Error('Delete is not available here')); }
+        };
+    }
+    return null;
+}
+// Create, or update when an id is known; a write that names a missing column says which one.
+function pbSave(dataApi, table, id, body) {
+    var w = pbWriter(dataApi);
+    if (!w) return Promise.reject(new Error('This page cannot write to Dataverse here.'));
+    var p = id ? w.update(table, id, body).then(function () { return id; }) : w.create(table, body);
+    return p.catch(function (e) {
+        var m = pbErrText(e);
+        if (pbErrKind(m) === 'column') throw new Error('A column is missing in ' + table + ': ' + m);
+        throw new Error(m);
+    });
+}
+
+function pbUserName() {
+    var x = pbXrm();
+    try { var gc = x && x.Utility && x.Utility.getGlobalContext && x.Utility.getGlobalContext(); var u = gc && gc.userSettings; if (u && u.userName) return String(u.userName); } catch (e) { /* not in host */ }
+    return '';
+}
+// ==== END PBED DATA ====
+// ==== PBED ENGINE ====
+// Pure planning functions: no React, no Dataverse. Each takes rows that were really read and returns what the screens draw.
+
+var PB_STATUS_AREA = /\b(pto|sick|late|left early|ncns|no call|unassigned|vacation|fmla)\b/i;
+var PB_ROLE = { 256000000: 'regular', 256000001: 'lead', 256000002: 'supervisor', 256000003: 'manager' };
+var PB_DEPTS = ['SAN', 'MNT', 'FSQ', 'OPS'];
+var PB_DEPT_NAME = { SAN: 'Sanitation', MNT: 'Maintenance', FSQ: 'Quality (FSQ)', OPS: 'Operations' };
+
+// Steps around the sanitation milestones, taken from the PBED example sheet (handoff, FSQ inspect, swab, preflight, 1st pie).
+// anchor 'stop' = minutes after production stops, 'chain' = after the step before it, 'restart' = minutes from the restart.
+function pbDefaultConfig() {
+    return {
+        v: 1,
+        rate: null,
+        excludeOnDemand: true,
+        monthlyRule: true,
+        mntPattern: 'foam',
+        lineOrder: [],
+        pre: [{ id: 'handoff', dept: 'OPS', name: 'Debris pick up, rinse down, handoff to sanitation', anchor: 'stop', offset: 0, minutes: 60, hc: 0 }],
+        tail: [
+            { id: 'fsqinspect', dept: 'FSQ', name: 'FSQ inspect', anchor: 'chain', offset: 0, minutes: 60, hc: 0 },
+            { id: 'swab', dept: 'FSQ', name: 'Swab', anchor: 'chain', offset: 0, minutes: 90, hc: 0 },
+            { id: 'preflight', dept: 'OPS', name: 'Preflight', anchor: 'restart', offset: -60, minutes: 120, hc: 0 },
+            { id: 'firstpie', dept: 'OPS', name: '1st pie', anchor: 'restart', offset: 60, minutes: 0, hc: 0 }
+        ]
+    };
+}
+function pbMergeConfig(saved) {
+    var d = pbDefaultConfig();
+    if (!saved || typeof saved !== 'object') return d;
+    var out = pbClone(d);
+    ['rate', 'excludeOnDemand', 'monthlyRule', 'mntPattern', 'lineOrder', 'pre', 'tail'].forEach(function (k) { if (saved[k] !== undefined) out[k] = saved[k]; });
+    if (!Array.isArray(out.pre)) out.pre = d.pre;
+    if (!Array.isArray(out.tail)) out.tail = d.tail;
+    if (!Array.isArray(out.lineOrder)) out.lineOrder = [];
+    return out;
+}
+function pbEmptyPlan(weekend) { return { v: 1, weekend: weekend, lines: {}, shiftHc: {}, notes: '' }; }
+
+// ---------- subcategories ----------
+// "1 - pic" -> 1, "5 Staging" -> 5. No number -> null (shown last, flagged).
+function pbSubcatOrder(s) { var m = /(\d+(\.\d+)?)/.exec(String(s || '')); return m ? parseFloat(m[1]) : null; }
+function pbIsOnDemand(s) { return /on\s*-?\s*deman/i.test(String(s || '')); }
+function pbIsSecondWeekItem(name) { return /2nd\s*w(ee)?k|2nd\s*wom|2nd\s*week/i.test(String(name || '')); }
+// The 2nd weekend of the month: its Saturday falls on day 8 to 14.
+function pbIsSecondWeekend(satYmd) { var d = pbFromYmd(satYmd); return !!d && d.getDate() >= 8 && d.getDate() <= 14; }
+
+function pbNormAsset(r) {
+    var area = pbTrim(pbField(r, 'craa5_areaname', true));
+    var sub = pbTrim(pbField(r, 'craa5_subcategory', true));
+    var min = pbNum(pbField(r, 'craa5_hoursrequired'));
+    return {
+        id: pbCleanId(pbField(r, 'craa5_aa_assetsid')),
+        name: pbTrim(pbField(r, 'craa5_equipmentidentifier')) || '(no name)',
+        area: area, areaKey: pbCanon(area),
+        room: pbTrim(pbField(r, 'craa5_roomname', true)),
+        subcat: sub,
+        order: pbSubcatOrder(sub),
+        minutes: min !== null && min > 0 ? min : null,          // craa5_hoursrequired holds minutes (Ganttly, Production Scheduler)
+        allergenMin: pbNum(pbField(r, 'craa5_minalrg')),
+        heads: Math.max(1, pbInt(pbField(r, 'craa5_heads'), 1) || 1),
+        headsKnown: pbNum(pbField(r, 'craa5_heads')) !== null,
+        weekly: pbField(r, 'craa5_weeklyclean') === true,
+        monthly: pbField(r, 'craa5_monthlyclean') === true || pbField(r, 'craa5_month') === true,
+        secondWeek: pbIsSecondWeekItem(pbField(r, 'craa5_equipmentidentifier')),
+        onDemand: pbIsOnDemand(sub),
+        active: pbField(r, 'statecode') === undefined || pbField(r, 'statecode') === 0
+    };
+}
+function pbGroupAreas(assets) {
+    var areas = {};
+    assets.forEach(function (a) {
+        if (!a.active || !a.areaKey) return;
+        var g = areas[a.areaKey] || (areas[a.areaKey] = { key: a.areaKey, name: a.area, rooms: [], assets: [] });
+        g.assets.push(a);
+        if (a.room && g.rooms.indexOf(a.room) < 0) g.rooms.push(a.room);
+    });
+    return areas;
+}
+
+// Milestones of one area for one weekend: one per subcategory, in its number order. Pieces left out are listed with why.
+function pbMilestones(area, opts) {
+    opts = opts || {};
+    var exclude = {}; (opts.exclude || []).forEach(function (id) { exclude[id] = 1; });
+    var groups = {}; var left = [];
+    (area ? area.assets : []).forEach(function (a) {
+        var why = '';
+        if (exclude[a.id]) why = 'Left out by hand';
+        else if (opts.excludeOnDemand && a.onDemand) why = 'On demand';
+        else if (opts.monthlyRule && a.secondWeek && !opts.secondWeekend) why = '2nd week of the month only';
+        if (why) { left.push({ asset: a, why: why }); return; }
+        var label = a.subcat || '(no subcategory)';
+        var key = pbCanon(label) || 'none';
+        var g = groups[key] || (groups[key] = { key: key, name: label, order: a.order, pieces: [], totalMin: 0, maxWall: 0, headsSum: 0, missingMin: 0 });
+        var min = a.minutes;
+        if (opts.allergen && a.allergenMin && a.allergenMin > 0) min = a.allergenMin;
+        g.pieces.push({ asset: a, minutes: min });
+        if (min === null) g.missingMin++;
+        else { g.totalMin += min; g.maxWall = Math.max(g.maxWall, min / a.heads); }
+        g.headsSum += a.heads;
+    });
+    var list = pbKeys(groups).map(function (k) { return groups[k]; });
+    list.sort(function (a, b) {
+        var oa = a.order === null ? 1e9 : a.order; var ob = b.order === null ? 1e9 : b.order;
+        return oa - ob || a.name.localeCompare(b.name);
+    });
+    list.forEach(function (g) { g.pieces.sort(function (x, y) { return (y.minutes || 0) - (x.minutes || 0); }); });
+    return { groups: list, left: left };
+}
+
+// ---------- production windows ----------
+function pbNormRun(r) {
+    return {
+        id: pbCleanId(pbField(r, 'craa5__aa_prd_schdid')),
+        area: pbTrim(pbField(r, 'craa5_area')),
+        line: pbInt(pbField(r, 'craa5_line'), 1) || 1,
+        start: pbMs(pbField(r, 'craa5_datestarttime')),
+        end: pbMs(pbField(r, 'craa5_dateendtime')),
+        product: pbTrim(pbField(r, 'craa5_product')),
+        allergen: pbField(r, 'craa5_allergen') === true,
+        allergenType: pbTrim(pbField(r, 'craa5_typeofallergen'))
+    };
+}
+// "IBL" line 4 and "IBL4" line 1 are both the IBL4 area of the assets table.
+function pbRunAreaKey(run, known) {
+    var a = pbCanon(run.area);
+    var cands = [a + String(run.line), a];
+    for (var i = 0; i < cands.length; i++) if (known[cands[i]]) return cands[i];
+    return a + (run.line > 1 ? String(run.line) : '');
+}
+function pbRunsByArea(runs, known) {
+    var out = {};
+    runs.forEach(function (r) {
+        if (r.start === null || r.end === null || r.end <= r.start) return;
+        if (/maint/i.test(r.product)) return;   // a "maintenance" run is downtime, the way the scheduler and Ganttly read it
+        var k = pbRunAreaKey(r, known);
+        (out[k] || (out[k] = [])).push(r);
+    });
+    pbKeys(out).forEach(function (k) { out[k].sort(function (a, b) { return a.start - b.start; }); });
+    return out;
+}
+// The stop going into the weekend and the restart after it: the gap between runs that overlaps Fri 18:00 - Mon 06:00 the most.
+function pbFindWindow(runs, frame) {
+    if (!runs || !runs.length) return { status: 'noruns', stop: null, restart: null, note: 'No runs in the production schedule this week' };
+    var merged = [];
+    runs.forEach(function (r) {
+        var last = merged[merged.length - 1];
+        if (last && r.start <= last.end + 30 * PB_MIN) { if (r.end > last.end) { last.end = r.end; last.lastRun = r; } }
+        else merged.push({ start: r.start, end: r.end, firstRun: r, lastRun: r });
+    });
+    var gaps = [];
+    if (merged[0].start > frame.focusStart) gaps.push({ start: null, end: merged[0].start, next: merged[0].firstRun });
+    for (var i = 0; i < merged.length - 1; i++) gaps.push({ start: merged[i].end, end: merged[i + 1].start, prev: merged[i].lastRun, next: merged[i + 1].firstRun });
+    var tail = merged[merged.length - 1];
+    gaps.push({ start: tail.end, end: null, prev: tail.lastRun });
+    var best = null; var bestOv = 0;
+    gaps.forEach(function (g) {
+        var s = g.start === null ? frame.readStart : g.start; var e = g.end === null ? frame.readEnd : g.end;
+        if (e - s < 60 * PB_MIN) return;
+        var ov = Math.min(e, frame.focusEnd) - Math.max(s, frame.focusStart);
+        if (ov > bestOv) { bestOv = ov; best = g; }
+    });
+    if (!best) return { status: 'runsthrough', stop: null, restart: null, note: 'Runs through the weekend in the production schedule (no stop of an hour or more)' };
+    var out = { stop: best.start, restart: best.end, prev: best.prev || null, next: best.next || null, status: 'ok', note: '' };
+    if (best.start === null) { out.status = 'nostop'; out.note = 'Already down before Friday in the schedule: set the stop time'; }
+    else if (best.end === null) { out.status = 'norestart'; out.note = 'No run after the weekend in the production schedule yet: set the restart time'; }
+    return out;
+}
+
+// ---------- shifts and headcount ----------
+function pbNormShift(v) {
+    if (v === null || v === undefined || v === '') return '';
+    var n = pbNum(v);
+    if (n !== null) { if (n >= 256000000 && n <= 256000003) return 'ABCD'.charAt(n - 256000000); if (n >= 1 && n <= 4) return 'ABCD'.charAt(n - 1); }
+    var s = String(v).trim().toUpperCase();
+    var m = /^(?:CREW|SHIFT|TEAM)?\s*([A-D])\b/.exec(s);
+    return m ? m[1] : '';
+}
+function pbNormEmployee(r) {
+    var role = pbNum(pbField(r, 'craa5_role'));
+    return {
+        id: pbCleanId(pbField(r, 'craa5__aa_employeeid') || pbField(r, 'craa5_aa_employeeid')),
+        name: pbTrim(pbField(r, 'craa5_name')),
+        crew: pbNormShift(pbField(r, 'craa5_shift')),
+        role: role === null ? 'regular' : (PB_ROLE[role] || 'regular'),
+        active: pbField(r, 'statecode') === undefined || pbField(r, 'statecode') === 0
+    };
+}
+function pbFixHour(h) { var n = pbInt(h, null); if (n === null) return null; return n === 1 ? 0 : n; }   // midnight is stored as 1
+// Crew slots between two times, built hour by hour from craa5_workshift (day number 1 = Sunday).
+function pbShiftSlots(rows, fromMs, toMs) {
+    var segs = [];
+    rows.forEach(function (r) {
+        var code = pbNormShift(pbField(r, 'craa5_shiftcode'));
+        var day = pbInt(pbField(r, 'craa5_daynumber'), null);
+        var s = pbFixHour(pbField(r, 'craa5_shiftstarthour')); var e = pbInt(pbField(r, 'craa5_shiftendhour'), null);
+        if (!code || day === null || s === null || e === null) return;
+        segs.push({ code: code, dow: (day - 1 + 7) % 7, s: s, e: e });
+    });
+    if (!segs.length) return [];
+    function crewsAt(t) {
+        var d = new Date(t); var dow = d.getDay(); var h = d.getHours(); var prev = (dow + 6) % 7; var out = [];
+        segs.forEach(function (g) {
+            var on = false;
+            if (g.e > g.s) on = g.dow === dow && h >= g.s && h < g.e;
+            else on = (g.dow === dow && h >= g.s) || (g.dow === prev && h < g.e);
+            if (on && out.indexOf(g.code) < 0) out.push(g.code);
+        });
+        out.sort();
+        return out;
+    }
+    var slots = [];
+    var t0 = new Date(fromMs); t0.setMinutes(0, 0, 0);
+    for (var t = t0.getTime(); t < toMs; t += PB_HOUR) {
+        var c = crewsAt(t); var key = c.join('');
+        var last = slots[slots.length - 1];
+        if (last && last.key === key) last.end = t + PB_HOUR;
+        else slots.push({ key: key, crews: c, start: t, end: t + PB_HOUR });
+    }
+    return slots;
+}
+// Shift Start boards and plans: who is on the board for a crew slot.
+function pbNormBoard(r, src) {
+    var raw = pbField(r, 'craa5_boardjson'); var j = null;
+    try { j = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch (e) { j = null; }
+    var crew = pbNormShift(pbField(r, 'craa5_crew') || (j && j.crew));
+    var ss = pbMs(pbField(r, 'craa5_slotstart')); if (ss === null && j && j.slotStart) ss = pbMs(j.slotStart);
+    var se = pbMs(pbField(r, 'craa5_slotend')); if (se === null && j && j.slotEnd) se = pbMs(j.slotEnd);
+    var ids = []; var names = {};
+    var absent = {};
+    if (j && Array.isArray(j.attendance)) j.attendance.forEach(function (g) { (g && g.people || []).forEach(function (p) { if (p && p.guid) absent[pbCleanId(p.guid)] = 1; }); });
+    var rows = j && Array.isArray(j.rows) ? j.rows : [];
+    rows.forEach(function (x) {
+        var area = x.craa5_area || x.area || '';
+        if (PB_STATUS_AREA.test(String(area))) { var g = pbCleanId(x.craa5__aaemp_guid || x.empId); if (g) absent[g] = 1; return; }
+        var id = pbCleanId(x.craa5__aaemp_guid || x.empId);
+        var nm = pbTrim(x.craa5_id || x.emp);
+        var k = id || (nm ? 'n:' + pbCanon(nm) : '');
+        if (!k) return;
+        if (ids.indexOf(k) < 0) { ids.push(k); names[k] = nm; }
+    });
+    ids = ids.filter(function (k) { return !absent[k]; });
+    return { src: src, crew: crew, start: ss, end: se, ids: ids, names: names, absent: pbKeys(absent).length, status: pbTrim(pbField(r, 'craa5_status')), savedAt: pbMs(pbField(r, 'modifiedon')) };
+}
+function pbSlotHeadcount(slot, employees, boards, override) {
+    var roster = employees.filter(function (e) { return e.active && e.crew && slot.crews.indexOf(e.crew) >= 0 && e.role === 'regular'; });
+    var rank = { board: 3, archive: 2, plan: 1 };
+    var match = null;
+    boards.forEach(function (b) {
+        if (!b.crew || slot.crews.indexOf(b.crew) < 0 || b.start === null) return;
+        if (Math.abs(b.start - slot.start) > 2 * PB_HOUR) return;
+        if (!match || rank[b.src] > rank[match.src] || (rank[b.src] === rank[match.src] && (b.savedAt || 0) > (match.savedAt || 0))) match = b;
+    });
+    var out = { roster: roster.length, rosterIds: roster.map(function (e) { return e.id; }), board: match ? match.ids.length : null, boardSrc: match ? match.src : '', boardIds: match ? match.ids : [] };
+    if (override !== null && override !== undefined && override !== '' && isFinite(override)) { out.value = Number(override); out.src = 'override'; }
+    else if (match) { out.value = match.ids.length; out.src = match.src; }
+    else { out.value = roster.length; out.src = 'roster'; }
+    return out;
+}
+
+// ---------- scheduling ----------
+function pbRoundUp(min) { return Math.ceil(min / PB_BUCKET_MIN) * PB_BUCKET_MIN; }
+function pbGroupDuration(g, hc) {
+    if (!hc || hc < 1) hc = 1;
+    var d = Math.max(g.totalMin / hc, g.maxWall);
+    return pbRoundUp(Math.max(d, PB_BUCKET_MIN));
+}
+function pbDefaultHc(g, lineCrew) { var h = Math.max(1, g.headsSum); if (lineCrew && lineCrew > 0) h = Math.min(h, lineCrew); return Math.max(1, Math.round(h)); }
+
+// A share of the people on shift when each line stops, split by how much clean time each line has.
+function pbCrewShare(lines, capAt) {
+    var out = {};
+    lines.forEach(function (l) {
+        if (l.stop === null || capAt(l.stop) === Infinity) { out[l.key] = null; return; }
+        var rivals = lines.filter(function (o) { return o.stop !== null && o.stop <= l.stop + 4 * PB_HOUR && (o.restart === null || o.restart > l.stop); });
+        var tot = pbSum(rivals, function (o) { return o.workMin; });
+        var cap = capAt(l.stop);
+        out[l.key] = tot > 0 ? Math.max(1, Math.round(cap * l.workMin / tot)) : Math.max(1, cap);
+    });
+    return out;
+}
+
+// lines: [{ key, name, stop, restart, groups, hc:{groupKey:n}, crew, mntAfter, mntMinutes, sanWaits, pre, tail, ignoreCap }]
+// slots: [{ start, end, cap }] or null when headcount is unknown (no limit is applied, and the result says so).
+function pbSchedule(lines, slots, config) {
+    var active = lines.filter(function (l) { return l.stop !== null && l.stop !== undefined; });
+    if (!active.length) return { lines: {}, profile: [], start: null, end: null, capped: !!slots };
+    var h0 = Math.min.apply(null, active.map(function (l) { return l.stop; }));
+    var h1 = Math.max.apply(null, active.map(function (l) { return (l.restart || l.stop) + 48 * PB_HOUR; }));
+    h0 = Math.floor(h0 / (PB_BUCKET_MIN * PB_MIN)) * PB_BUCKET_MIN * PB_MIN;
+    var nb = Math.ceil((h1 - h0) / (PB_BUCKET_MIN * PB_MIN));
+    var used = []; var cap = [];
+    for (var b = 0; b < nb; b++) {
+        used.push(0);
+        var t = h0 + b * PB_BUCKET_MIN * PB_MIN; var c = slots ? 0 : Infinity;
+        if (slots) for (var si = 0; si < slots.length; si++) if (t >= slots[si].start && t < slots[si].end) { c = slots[si].cap; break; }
+        cap.push(c);
+    }
+    function bk(ms) { return Math.max(0, Math.round((ms - h0) / (PB_BUCKET_MIN * PB_MIN))); }
+    function fits(sb, n, hc) { for (var i = sb; i < sb + n; i++) { if (i >= nb) return false; if (used[i] + hc > cap[i]) return false; } return true; }
+    function book(sb, n, hc) { for (var i = sb; i < sb + n && i < nb; i++) used[i] += hc; }
+    function place(ready, minutes, hc, ignoreCap) {
+        var n = Math.max(0, Math.round(minutes / PB_BUCKET_MIN)); var sb = bk(ready);
+        if (hc <= 0 || n === 0) return { start: h0 + sb * PB_BUCKET_MIN * PB_MIN, over: false, waited: 0 };
+        if (ignoreCap) { book(sb, n, hc); return { start: h0 + sb * PB_BUCKET_MIN * PB_MIN, over: false, waited: 0 }; }
+        for (var s = sb; s + n <= nb; s++) { if (fits(s, n, hc)) { book(s, n, hc); return { start: h0 + s * PB_BUCKET_MIN * PB_MIN, over: false, waited: (s - sb) * PB_BUCKET_MIN }; } }
+        book(sb, n, hc);
+        return { start: h0 + sb * PB_BUCKET_MIN * PB_MIN, over: true, waited: 0 };
+    }
+    var res = {};
+    active.forEach(function (l) {
+        var blocks = []; var issues = [];
+        var chain = l.stop;
+        function step(st, dept) {
+            var start;
+            if (st.anchor === 'stop') start = l.stop + (st.offset || 0) * PB_MIN;
+            else if (st.anchor === 'restart' && l.restart !== null) start = l.restart + (st.offset || 0) * PB_MIN;
+            else start = chain + (st.offset || 0) * PB_MIN;
+            var minutes = Math.max(0, pbNum(st.minutes) || 0);
+            var hc = Math.max(0, pbInt(st.hc, 0) || 0);
+            var over = false;
+            if (st.dept === 'SAN' && hc > 0) { var p = place(start, pbRoundUp(minutes), hc, l.ignoreCap); start = p.start; over = p.over; }
+            var blk = { id: 'step:' + st.id, kind: 'step', dept: st.dept, name: st.name, start: start, end: start + minutes * PB_MIN, minutes: minutes, hc: hc, anchor: st.anchor, over: over, milestone: minutes === 0 };
+            blocks.push(blk);
+            if (st.anchor !== 'restart') chain = Math.max(chain, blk.end);
+            return blk;
+        }
+        (l.pre || []).forEach(function (st) { step(st); });
+        // MNT goes after the group the plan names; 'auto' = the first group whose name has the pattern (foam), else the last group.
+        var orders = [];
+        l.groups.forEach(function (g) { var o = g.order === null ? 1e9 : g.order; if (orders.indexOf(o) < 0) orders.push(o); });
+        orders.sort(function (a, b) { return a - b; });
+        var mntIdx = -1;
+        if (l.mntAfter === 'none') mntIdx = -2;
+        else if (l.mntAfter && l.mntAfter !== 'auto') { l.groups.forEach(function (g) { if (g.key === l.mntAfter) mntIdx = orders.indexOf(g.order === null ? 1e9 : g.order); }); if (l.mntAfter === 'start') mntIdx = -3; }
+        if (mntIdx === -1) {
+            var re = null; try { re = new RegExp(config && config.mntPattern ? config.mntPattern : 'foam', 'i'); } catch (e) { re = /foam/i; }
+            l.groups.forEach(function (g) { if (mntIdx === -1 && re.test(g.name)) mntIdx = orders.indexOf(g.order === null ? 1e9 : g.order); });
+            if (mntIdx === -1) mntIdx = orders.length - 1;
+        }
+        var mntBlk = null;
+        function doMnt() {
+            var m = Math.max(0, pbNum(l.mntMinutes) || 0);
+            mntBlk = { id: 'mnt', kind: 'mnt', dept: 'MNT', name: 'Maintenance PM/CM' + (l.woCount ? ' (' + pbPlural(l.woCount, 'work order') + ')' : ''), start: chain, end: chain + m * PB_MIN, minutes: m, hc: 0, over: false, milestone: m === 0 };
+            if (m === 0) issues.push(l.woCount ? 'Maintenance has ' + pbPlural(l.woCount, 'work order') + ' but no hours: add hours on the Work orders tab or on the block' : 'No maintenance hours set');
+            blocks.push(mntBlk);
+            if (l.sanWaits !== false) chain = mntBlk.end;
+        }
+        if (mntIdx === -3 && orders.length) doMnt();
+        orders.forEach(function (o, oi) {
+            var ready = chain; var groupEnd = chain;
+            l.groups.forEach(function (g) {
+                if ((g.order === null ? 1e9 : g.order) !== o) return;
+                var hc = l.hc && l.hc[g.key] ? Math.max(1, pbInt(l.hc[g.key], 1)) : pbDefaultHc(g, l.crew);
+                var dur = pbGroupDuration(g, hc);
+                var p = place(ready, dur, hc, l.ignoreCap);
+                var blk = { id: 'sub:' + g.key, kind: 'sub', dept: 'SAN', name: g.name, order: g.order, group: g, start: p.start, end: p.start + dur * PB_MIN, minutes: dur, hc: hc, laborMin: hc * dur, over: p.over, waited: p.waited, hcSet: !!(l.hc && l.hc[g.key]) };
+                if (g.missingMin) issues.push(g.name + ': ' + pbPlural(g.missingMin, 'piece has', 'pieces have') + ' no clean time in the assets table');
+                if (p.over) issues.push(g.name + ': needs ' + hc + ' people but the shift does not have them free');
+                blocks.push(blk);
+                groupEnd = Math.max(groupEnd, blk.end);
+            });
+            chain = groupEnd;
+            if (oi === mntIdx) doMnt();
+        });
+        if (!orders.length) issues.push('No equipment with a subcategory for this area in the assets table');
+        if (!mntBlk && mntIdx !== -2 && ((pbNum(l.mntMinutes) || 0) > 0 || l.woCount)) doMnt();
+        (l.tail || []).forEach(function (st) { step(st); });
+        var finish = chain; if (mntBlk) finish = Math.max(finish, mntBlk.end);
+        var slack = l.restart !== null && l.restart !== undefined ? (l.restart - finish) / PB_MIN : null;
+        var status = slack === null ? 'norestart' : slack < 0 ? 'late' : slack < 120 ? 'tight' : 'ok';
+        var labor = pbSum(blocks, function (x) { return x.dept === 'SAN' ? x.hc * x.minutes : 0; });
+        blocks.sort(function (a, b) { return a.start - b.start || (a.kind === 'step' ? -1 : 1); });
+        res[l.key] = { key: l.key, blocks: blocks, finish: finish, slack: slack, status: status, laborMin: labor, issues: issues, mntBlk: mntBlk };
+    });
+    var profile = [];
+    for (var i = 0; i < nb; i++) { if (used[i] || (cap[i] !== Infinity && i % 4 === 0)) profile.push({ t: h0 + i * PB_BUCKET_MIN * PB_MIN, used: used[i], cap: cap[i] }); }
+    var end = Math.max.apply(null, pbKeys(res).map(function (k) { return res[k].finish; }));
+    return { lines: res, profile: profile, used: used, cap: cap, h0: h0, nb: nb, start: h0, end: end, capped: !!slots };
+}
+// Peak and idle headcount per crew slot (for the headcount justification).
+function pbSlotUse(sched, slots) {
+    return slots.map(function (s) {
+        var peak = 0; var sum = 0; var n = 0;
+        if (sched && sched.used) for (var i = 0; i < sched.nb; i++) { var t = sched.h0 + i * PB_BUCKET_MIN * PB_MIN; if (t >= s.start && t < s.end) { peak = Math.max(peak, sched.used[i]); sum += sched.used[i]; n++; } }
+        var hours = (s.end - s.start) / PB_HOUR;
+        var usedHrs = sum * PB_BUCKET_MIN / 60;
+        return { slot: s, peak: peak, usedHours: usedHrs, paidHours: s.cap === Infinity ? null : s.cap * hours, idleHours: s.cap === Infinity ? null : Math.max(0, s.cap * hours - usedHrs) };
+    });
+}
+
+// ---------- experience (background; shown only on double click) ----------
+function pbExperience(taskRows, archiveRows, sinceMs) {
+    var byEmp = {}; var seen = {};
+    function add(empId, name, area, start, end) {
+        if (!area || PB_STATUS_AREA.test(area)) return;
+        var id = pbCleanId(empId) || (name ? 'n:' + pbCanon(name) : ''); if (!id) return;
+        if (start === null || start < sinceMs) return;
+        var ak = pbCanon(area);
+        var sk = id + '|' + ak + '|' + Math.round(start / (5 * PB_MIN));
+        if (seen[sk]) return; seen[sk] = 1;
+        var hrs = end !== null && end > start ? Math.min(16, (end - start) / PB_HOUR) : 0;
+        var e = byEmp[id] || (byEmp[id] = { id: id, name: name || '', areas: {}, hours: 0, days: {}, last: 0 });
+        if (!e.name && name) e.name = name;
+        var a = e.areas[ak] || (e.areas[ak] = { name: area, hours: 0, days: {} });
+        var day = pbYmd(start);
+        a.hours += hrs; a.days[day] = 1; e.hours += hrs; e.days[day] = 1; e.last = Math.max(e.last, start);
+    }
+    (taskRows || []).forEach(function (r) {
+        add(pbField(r, 'craa5__aaemp_guid'), pbTrim(pbField(r, 'craa5_id')), pbTrim(pbField(r, 'craa5_area')),
+            pbMs(pbField(r, 'craa5_starttime')) || pbMs(pbField(r, 'craa5_datetimeofassignment')) || pbMs(pbField(r, 'createdon')),
+            pbMs(pbField(r, 'craa5_endtime')));
+    });
+    (archiveRows || []).forEach(function (r) {
+        var b = null; try { var raw = pbField(r, 'craa5_boardjson'); b = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch (e) { b = null; }
+        if (!b || !Array.isArray(b.rows)) return;
+        var ss = pbMs(pbField(r, 'craa5_slotstart')) || pbMs(b.slotStart); var se = pbMs(pbField(r, 'craa5_slotend')) || pbMs(b.slotEnd);
+        b.rows.forEach(function (x) {
+            var st = pbMs(x.craa5_starttime) || ss; var en = pbMs(x.craa5_endtime) || se || (st !== null ? st + 12 * PB_HOUR : null);
+            add(x.craa5__aaemp_guid || x.empId, pbTrim(x.craa5_id || x.emp), pbTrim(x.craa5_area || x.area), st, en);
+        });
+    });
+    pbKeys(byEmp).forEach(function (k) {
+        var e = byEmp[k]; e.dayCount = pbKeys(e.days).length;
+        pbKeys(e.areas).forEach(function (ak) { e.areas[ak].dayCount = pbKeys(e.areas[ak].days).length; });
+    });
+    return byEmp;
+}
+// People on the given crews, most hours in this area first.
+function pbSuggestPeople(exp, employees, crews, areaKey, limit) {
+    var list = employees.filter(function (e) { return e.active && e.role === 'regular' && crews.indexOf(e.crew) >= 0; }).map(function (e) {
+        var x = exp ? (exp[e.id] || exp['n:' + pbCanon(e.name)]) : null; var a = x && x.areas[areaKey];
+        return { emp: e, hours: a ? a.hours : 0, days: a ? a.dayCount : 0 };
+    });
+    list.sort(function (a, b) { return b.hours - a.hours || b.days - a.days || a.emp.name.localeCompare(b.emp.name); });
+    return list.slice(0, limit || 50);
+}
+
+// ---------- maintenance work orders ----------
+function pbSplitRows(text) {
+    var t = String(text || '').replace(/\r\n?/g, '\n');
+    var firstLine = t.split('\n')[0] || '';
+    var delim = firstLine.indexOf('\t') >= 0 ? '\t' : (firstLine.indexOf(';') >= 0 && firstLine.indexOf(',') < 0 ? ';' : ',');
+    var rows = []; var row = []; var cell = ''; var q = false;
+    for (var i = 0; i < t.length; i++) {
+        var ch = t.charAt(i);
+        if (q) { if (ch === '"') { if (t.charAt(i + 1) === '"') { cell += '"'; i++; } else q = false; } else cell += ch; continue; }
+        if (ch === '"' && cell === '') { q = true; continue; }
+        if (ch === delim) { row.push(cell); cell = ''; continue; }
+        if (ch === '\n') { row.push(cell); rows.push(row); row = []; cell = ''; continue; }
+        cell += ch;
+    }
+    if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+    return rows.filter(function (r) { return r.some(function (c) { return pbTrim(c) !== ''; }); });
+}
+var PB_WO_HEAD = {
+    priority: /^priority$|^prio/, order: /^order$|^ordernumber$|^order(no|num|#)/, description: /^description$|^desc$/, description2: /^description2$|^desc2$|^asset|^equipment/,
+    ordertype: /^ordertype$|^type$/, floc: /^functionalloc|^floc|^functionallocation/, basstart: /^basstart|^basicstart|^startdate/, workctr: /^mainworkctr|^workctr|^workcenter|^maint?workcenter/, sortfield: /^sortfield|^sort/
+};
+function pbParseDate(v) {
+    var s = pbTrim(v); if (!s) return null;
+    var m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s); if (m) return new Date(+m[1], +m[2] - 1, +m[3]).getTime();
+    m = /^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})/.exec(s); if (m) { var y = +m[3]; if (y < 100) y += 2000; return new Date(y, +m[1] - 1, +m[2]).getTime(); }
+    var n = pbNum(s); if (n !== null && n > 30000 && n < 80000) { var base = new Date(1899, 11, 30); return pbAddDays(base, Math.floor(n)).getTime(); }
+    return null;
+}
+function pbParseWorkOrders(text) {
+    var rows = pbSplitRows(text); var issues = [];
+    if (!rows.length) return { rows: [], issues: ['Nothing was pasted'] };
+    var head = rows[0].map(function (h) { return pbCanon(h); });
+    var idx = {};
+    pbKeys(PB_WO_HEAD).forEach(function (k) {
+        for (var i = 0; i < head.length; i++) { if (PB_WO_HEAD[k].test(head[i]) && !(k === 'description' && head[i] === 'description2') && !(k === 'order' && /type/.test(head[i]))) { if (idx[k] === undefined) idx[k] = i; } }
+    });
+    if (idx.order === undefined) return { rows: [], issues: ['No "Order" column was found in the first row. Copy the header row from the SAP export too.'] };
+    ['floc', 'description2'].forEach(function (k) { if (idx[k] === undefined) issues.push('No "' + (k === 'floc' ? 'Functional loc.' : 'Description2') + '" column: asset matching will be by hand'); });
+    var out = []; var seen = {};
+    rows.slice(1).forEach(function (r, i) {
+        function g(k) { return idx[k] === undefined ? '' : pbTrim(r[idx[k]]); }
+        var order = g('order').replace(/\.0+$/, '');
+        if (!order) { issues.push('Row ' + (i + 2) + ' has no order number and was skipped'); return; }
+        if (seen[order]) { issues.push('Order ' + order + ' is pasted twice; the first one was kept'); return; }
+        seen[order] = 1;
+        var bs = g('basstart');
+        out.push({ order: order, priority: g('priority'), description: g('description'), assetDesc: g('description2'), orderType: g('ordertype'), floc: g('floc').toUpperCase(), basicStart: pbParseDate(bs), basicStartText: bs, workCenter: g('workctr'), sortField: g('sortfield') });
+    });
+    return { rows: out, issues: issues };
+}
+// OK-0320-IBL4-CASOUT -> { state: OK, site: 0320, area: IBL4, sub: CASOUT }
+function pbParseFloc(f) { var p = String(f || '').toUpperCase().split('-'); return { state: p[0] || '', site: p[1] || '', area: p[2] || '', sub: p.slice(3).join('-') }; }
+function pbFlocKey(floc, desc) { return (String(floc || '').toUpperCase().trim() + '|' + pbCanon(desc)).slice(0, 300); }
+function pbTokens(s) { return pbUniq(String(s || '').toLowerCase().replace(/\(.*?\)/g, ' ').split(/[^a-z0-9]+/).filter(function (w) { return w.length > 1 && !/^(the|and|of|on|to|for|with|line|left|right)$/.test(w); })); }
+// A saved mapping first; otherwise a guess the person must confirm (never saved on its own).
+function pbSuggestAsset(wo, assets, maps) {
+    var key = pbFlocKey(wo.floc, wo.assetDesc);
+    if (maps[key]) return { how: 'saved', map: maps[key], assetId: maps[key].assetId, areaKey: maps[key].areaKey, score: 1 };
+    var fl = pbParseFloc(wo.floc); var areaKey = '';
+    var ac = pbCanon(fl.area);
+    var areaKeys = pbUniq(assets.map(function (a) { return a.areaKey; }));
+    if (ac && areaKeys.indexOf(ac) >= 0) areaKey = ac;
+    if (!areaKey) { pbKeys(maps).forEach(function (k) { var m = maps[k]; if (!areaKey && m.areaKey && pbCanon(pbParseFloc(m.floc).area) === ac) areaKey = m.areaKey; }); }
+    var toks = pbTokens(wo.assetDesc);
+    var best = null; var bestScore = 0;
+    if (toks.length) assets.forEach(function (a) {
+        if (areaKey && a.areaKey !== areaKey) return;
+        var at = pbTokens(a.name); var hit = 0;
+        toks.forEach(function (t) { if (at.indexOf(t) >= 0) hit++; });
+        var sc = hit / toks.length;
+        if (sc > bestScore) { bestScore = sc; best = a; }
+    });
+    if (best && bestScore >= 0.5) return { how: 'guess', assetId: best.id, areaKey: best.areaKey, score: bestScore };
+    return { how: areaKey ? 'area' : 'none', assetId: '', areaKey: areaKey, score: 0 };
+}
+// ==== END PBED ENGINE ====
+// ==== PBED UI PARTS ====
+var PB_BLUE = '#0072CE';
+var PB_NAVY = '#00468B';
+var PB_DEPT_COLOR = { SAN: '#0072CE', MNT: '#FF8200', FSQ: '#7C3AED', OPS: '#64748B' };
+var PB_STATUS_CHIP = {
+    ok: { label: 'On track', cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+    tight: { label: 'Tight', cls: 'bg-amber-50 text-amber-700 border-amber-200' },
+    late: { label: 'Late', cls: 'bg-red-50 text-red-700 border-red-200' },
+    norestart: { label: 'No restart set', cls: 'bg-slate-100 text-slate-600 border-slate-200' }
+};
+
+function PbChip(props: any) {
+    return <span className={'inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[11px] font-bold whitespace-nowrap ' + (props.cls || 'bg-slate-100 text-slate-600 border-slate-200')} title={props.title || ''}>{props.children}</span>;
+}
+function PbStatusChip(props: any) {
+    var s = PB_STATUS_CHIP[props.status] || PB_STATUS_CHIP.norestart;
+    return <PbChip cls={s.cls} title={props.title}>{s.label}{props.slack !== null && props.slack !== undefined ? ' (' + (props.slack >= 0 ? pbFmtHours(props.slack) + ' spare' : pbFmtHours(-props.slack) + ' over') + ')' : ''}</PbChip>;
+}
+function PbBtn(props: any) {
+    var kind = props.kind || 'plain';
+    var cls = kind === 'primary' ? 'bg-[#0072CE] hover:bg-[#00468B] text-white border-transparent'
+        : kind === 'danger' ? 'bg-white hover:bg-red-50 text-red-700 border-red-200'
+            : kind === 'ghost' ? 'bg-transparent hover:bg-slate-100 text-slate-600 border-transparent'
+                : 'bg-white hover:bg-[#E6F1FB] text-[#00468B] border-[#B3D4F2]';
+    return (
+        <button type="button" disabled={props.disabled} onClick={props.onClick} title={props.title || ''}
+            className={'min-h-[36px] px-3 py-1.5 rounded-lg border text-sm font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed ' + cls + ' ' + (props.className || '')}>
+            {props.children}
+        </button>
+    );
+}
+function PbCard(props: any) {
+    return (
+        <section className={'bg-white rounded-xl border border-slate-200 shadow-sm ' + (props.className || '')}>
+            {props.title && (
+                <div className="flex flex-wrap items-center gap-2 px-4 py-3 border-b border-slate-100">
+                    <h2 className="text-sm font-black text-[#00468B] uppercase tracking-widest flex-1 min-w-[160px]">{props.title}</h2>
+                    {props.right}
+                </div>
+            )}
+            <div className={props.pad === false ? '' : 'p-4'}>{props.children}</div>
+        </section>
+    );
+}
+function PbModal(props: any) {
+    useEffect(function () {
+        function onKey(e: any) { if (e.key === 'Escape') props.onClose(); }
+        window.addEventListener('keydown', onKey);
+        return function () { window.removeEventListener('keydown', onKey); };
+    }, []);
+    return (
+        <div className="fixed inset-0 z-50 flex items-start justify-center bg-slate-900/40 p-2 sm:p-6 overflow-y-auto" onClick={props.onClose}>
+            <div className={'bg-white rounded-xl shadow-2xl w-full ' + (props.wide ? 'max-w-4xl' : 'max-w-2xl') + ' my-4'} onClick={function (e: any) { e.stopPropagation(); }} role="dialog" aria-label={props.title}>
+                <div className="flex items-start gap-3 px-5 py-4 border-b border-slate-100">
+                    <div className="flex-1 min-w-0">
+                        <h3 className="text-lg font-black text-[#00468B] break-words">{props.title}</h3>
+                        {props.sub && <p className="text-xs text-slate-500 mt-0.5">{props.sub}</p>}
+                    </div>
+                    <PbBtn kind="ghost" onClick={props.onClose} title="Close">Close</PbBtn>
+                </div>
+                <div className="p-5 space-y-4">{props.children}</div>
+            </div>
+        </div>
+    );
+}
+function PbNote(props: any) {
+    var tone = props.tone || 'info';
+    var cls = tone === 'warn' ? 'bg-amber-50 border-amber-200 text-amber-800' : tone === 'bad' ? 'bg-red-50 border-red-200 text-red-800' : tone === 'good' ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-[#E6F1FB] border-[#B3D4F2] text-[#00468B]';
+    return <div className={'rounded-lg border px-3 py-2 text-sm ' + cls + ' ' + (props.className || '')}>{props.children}</div>;
+}
+function PbNumInput(props: any) {
+    return (
+        <input type="number" inputMode="decimal" value={props.value === null || props.value === undefined ? '' : props.value} min={props.min} step={props.step || 1} placeholder={props.placeholder || ''}
+            onChange={function (e: any) { var v = e.target.value; props.onChange(v === '' ? null : Number(v)); }}
+            className={'border border-slate-300 rounded-lg px-2 py-1 text-sm w-24 ' + (props.className || '')} aria-label={props.label || ''} />
+    );
+}
+function PbStepper(props: any) {
+    var v = props.value || 0;
+    return (
+        <div className="inline-flex items-center gap-1">
+            <PbBtn onClick={function () { props.onChange(Math.max(props.min || 1, v - 1)); }} title="One less">-</PbBtn>
+            <span className="min-w-[40px] text-center text-lg font-black text-slate-800">{v}</span>
+            <PbBtn onClick={function () { props.onChange(v + 1); }} title="One more">+</PbBtn>
+        </div>
+    );
+}
+function PbDot(props: any) { return <span className="inline-block w-2.5 h-2.5 rounded-sm shrink-0" style={{ backgroundColor: PB_DEPT_COLOR[props.dept] || '#94A3B8' }} />; }
+function PbSourceLine(props: any) {
+    // One line per data source: what it is, how many rows, or why not.
+    var s = props.src || {};
+    var state = s.loading ? 'Reading...' : s.rows ? pbPlural(s.rows.length, 'row') : s.err ? 'Not read' : 'Not read yet';
+    return (
+        <tr className="border-t border-slate-100 align-top">
+            <td className="py-2 pr-3 font-semibold text-slate-700">{props.label}<div className="text-[11px] font-normal text-slate-400">{props.owner}</div></td>
+            <td className="py-2 pr-3 font-mono text-xs text-slate-500 break-all">{s.table || props.names}</td>
+            <td className={'py-2 pr-3 text-sm ' + (s.rows ? 'text-emerald-700' : s.err ? 'text-red-700' : 'text-slate-500')}>{state}{s.droppedSelect ? ' (read with all columns)' : ''}</td>
+            <td className="py-2 text-xs text-slate-500 break-words">{s.err || props.note || ''}</td>
+        </tr>
+    );
+}
+// ==== END PBED UI PARTS ====
+// ==== PBED MODEL ====
+// Turns what was read plus the saved plan into the one picture every tab draws (lines, shifts, schedule, costs).
+
+function pbNormWo(r) {
+    return {
+        id: pbCleanId(pbField(r, '__id')), order: pbTrim(pbField(r, 'craa5_name')), priority: pbTrim(pbField(r, 'craa5_priority')),
+        description: pbTrim(pbField(r, 'craa5_description')), assetDesc: pbTrim(pbField(r, 'craa5_assetdescription')), orderType: pbTrim(pbField(r, 'craa5_ordertype')),
+        floc: pbTrim(pbField(r, 'craa5_functionallocation')).toUpperCase(), basicStart: pbMs(pbField(r, 'craa5_basicstart')), workCenter: pbTrim(pbField(r, 'craa5_workcenter')),
+        sortField: pbTrim(pbField(r, 'craa5_sortfield')), assetId: pbCleanId(pbField(r, 'craa5_assetguid')), equipment: pbTrim(pbField(r, 'craa5_equipment')),
+        areaKey: pbTrim(pbField(r, 'craa5_areakey')), plannedHours: pbNum(pbField(r, 'craa5_plannedhours')), weekendKey: pbTrim(pbField(r, 'craa5_weekendkey')),
+        status: pbTrim(pbField(r, 'craa5_status')) || 'Open', raw: r
+    };
+}
+function pbNormMap(r) {
+    return { id: pbCleanId(pbField(r, '__id')), key: pbTrim(pbField(r, 'craa5_name')), floc: pbTrim(pbField(r, 'craa5_functionallocation')).toUpperCase(), assetDesc: pbTrim(pbField(r, 'craa5_assetdescription')), assetId: pbCleanId(pbField(r, 'craa5_assetguid')), equipment: pbTrim(pbField(r, 'craa5_equipment')), areaKey: pbTrim(pbField(r, 'craa5_areakey')) };
+}
+function pbNormActual(r) {
+    return { id: pbCleanId(pbField(r, '__id')), areaKey: pbTrim(pbField(r, 'craa5_areakey')), stepKey: pbTrim(pbField(r, 'craa5_stepkey')), stepName: pbTrim(pbField(r, 'craa5_stepname')), actualStart: pbMs(pbField(r, 'craa5_actualstart')), actualEnd: pbMs(pbField(r, 'craa5_actualend')), plannedStart: pbMs(pbField(r, 'craa5_plannedstart')), plannedEnd: pbMs(pbField(r, 'craa5_plannedend')), headcount: pbNum(pbField(r, 'craa5_headcount')), notes: pbTrim(pbField(r, 'craa5_notes')), by: pbTrim(pbField(r, 'craa5_updatedby')) };
+}
+function pbNormLoss(r) {
+    var d = {}; try { var raw = pbField(r, 'craa5_data'); d = raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : {}; } catch (e) { d = {}; }
+    return { id: pbCleanId(pbField(r, '__id')), name: pbTrim(pbField(r, 'craa5_name')), at: pbMs(pbField(r, 'craa5_occurredon')), minutes: pbNum(pbField(r, 'craa5_minuteslost')) || 0, reason: pbTrim(pbField(r, 'craa5_reason')), description: pbTrim(pbField(r, 'craa5_description')), step: pbTrim(pbField(r, 'craa5_equipment')), area: pbTrim(pbField(r, 'craa5_area')), dept: pbTrim(pbField(r, 'craa5_department')), crew: pbTrim(pbField(r, 'craa5_crew')), by: pbTrim(pbField(r, 'craa5_loggedby')), weekend: d.weekend || '', areaKey: d.areaKey || pbCanon(pbField(r, 'craa5_area')), stepKey: d.stepKey || '', heads: pbNum(d.heads) || 1, app: d.app || '' };
+}
+function pbNormCheckoff(r) {
+    var st = pbTrim(pbField(r, 'craa5_status')).toLowerCase();
+    var done = pbMs(pbField(r, 'craa5_doneat'));
+    return { guid: pbCleanId(pbField(r, 'craa5_equipmentguid')), started: pbMs(pbField(r, 'craa5_startedat')), done: done, isDone: !!done || /done|complete|finished/.test(st), at: pbMs(pbField(r, 'modifiedon')) };
+}
+
+var PB_LOSS_REASONS = ['Late production handoff', 'Maintenance overrun', 'Equipment breakdown', 'Short staffed', 'Waiting on FSQ', 'Failed inspection or swab (re-clean)', 'Chemical or supplies', 'Water, steam or utilities', 'Other'];
+var PB_LOSS_DEPTS = ['Operations', 'Maintenance', 'Quality (FSQ)', 'Warehouse', 'Sanitation', 'Other'];
+
+// d: { assets, runs, workshift, employees, boards(list), checkoffs, workorders, flocmap, milestone, timeloss } each { rows, err }
+function pbBuildModel(d, plan, config, weekend) {
+    var frame = pbWeekendFrame(weekend);
+    var assets = (d.assets.rows || []).map(pbNormAsset);
+    var areas = pbGroupAreas(assets);
+    var runs = (d.runs.rows || []).map(pbNormRun);
+    var runsBy = pbRunsByArea(runs, areas);
+    var employees = (d.employees.rows || []).map(pbNormEmployee).filter(function (e) { return e.id || e.name; });
+    var empById = {}; employees.forEach(function (e) { empById[e.id] = e; });
+    var boards = d.boards || [];
+    var wos = (d.workorder.rows || []).map(pbNormWo);
+    var checkoffs = (d.checkoff.rows || []).map(pbNormCheckoff).filter(function (c) { return c.guid && (c.at === null || (c.at >= frame.readStart && c.at <= frame.readEnd)); });
+    var doneByGuid = {}; checkoffs.forEach(function (c) { if (c.isDone) doneByGuid[c.guid] = c; });
+    var secondWeekend = pbIsSecondWeekend(weekend);
+    var pl = plan.lines || {};
+
+    // Lines: every area that has equipment. Areas with runs this week start included; the rest can be added by hand.
+    var keys = pbKeys(areas);
+    pbKeys(runsBy).forEach(function (k) { if (keys.indexOf(k) < 0 && runsBy[k].some(function (r) { return r.end > frame.readStart && r.start < frame.readEnd; })) keys.push(k); });
+    var order = config.lineOrder || [];
+    var lines = keys.map(function (k) {
+        var p = pl[k] || {};
+        var area = areas[k] || null;
+        var win = pbFindWindow(runsBy[k] || [], frame);
+        var hasRuns = !!(runsBy[k] && runsBy[k].length);
+        var include = p.include !== undefined ? !!p.include : (hasRuns && win.status !== 'runsthrough' && !!area);
+        var stop = p.stop !== undefined && p.stop !== null ? p.stop : win.stop;
+        var restart = p.restart !== undefined && p.restart !== null ? p.restart : win.restart;
+        var allergen = p.allergen !== undefined && p.allergen !== null ? !!p.allergen : !!(win.prev && win.prev.allergen);
+        var ms = pbMilestones(area, { exclude: p.exclude || [], excludeOnDemand: config.excludeOnDemand, monthlyRule: config.monthlyRule, secondWeekend: secondWeekend, allergen: allergen });
+        var lineWos = wos.filter(function (w) { return w.areaKey === k && w.weekendKey === weekend && !/^(closed|done|cancel)/i.test(w.status); });
+        var woMin = pbSum(lineWos, function (w) { return (w.plannedHours || 0) * 60; });
+        var mntMinutes = p.mntMinutes !== undefined && p.mntMinutes !== null ? p.mntMinutes : woMin;
+        var workMin = pbSum(ms.groups, function (g) { return g.totalMin; });
+        var pieces = pbSum(ms.groups, function (g) { return g.pieces.length; });
+        var done = 0; ms.groups.forEach(function (g) { g.done = 0; g.pieces.forEach(function (pc) { if (doneByGuid[pc.asset.id]) { g.done++; done++; } }); });
+        return {
+            key: k, name: area ? area.name : (runsBy[k] && runsBy[k][0] ? runsBy[k][0].area + (runsBy[k][0].line > 1 ? ' line ' + runsBy[k][0].line : '') : k), area: area, rooms: area ? area.rooms : [],
+            hasAssets: !!area, hasRuns: hasRuns, win: win, include: include,
+            stop: stop, restart: restart, stopSrc: p.stop !== undefined && p.stop !== null ? 'set by hand' : (win.stop !== null ? 'production schedule' : ''), restartSrc: p.restart !== undefined && p.restart !== null ? 'set by hand' : (win.restart !== null ? 'production schedule' : ''),
+            allergen: allergen, allergenSrc: p.allergen !== undefined && p.allergen !== null ? 'set by hand' : (win.prev && win.prev.allergen ? 'last run ' + (win.prev.allergenType || 'allergen') : ''),
+            ms: ms, workMin: workMin, pieces: pieces, done: done, wos: lineWos, woMin: woMin, mntMinutes: mntMinutes, mntAfter: p.mntAfter || 'auto', sanWaits: p.sanWaits !== false,
+            hc: p.hc || {}, people: p.people || {}, crewSet: p.crew, ignoreCap: !!p.ignoreCap, stepMin: p.stepMin || {},
+            rank: order.indexOf(k) >= 0 ? order.indexOf(k) : 1000
+        };
+    });
+    lines.sort(function (a, b) { return a.rank - b.rank || (a.restart || 9e15) - (b.restart || 9e15) || a.name.localeCompare(b.name); });
+
+    // Shifts on and around the weekend, with how many people each has and where the number came from.
+    var slotFrom = frame.focusStart - 12 * PB_HOUR; var slotTo = frame.readEnd;
+    var incl = lines.filter(function (l) { return l.include && l.stop !== null; });
+    if (incl.length) { slotFrom = Math.min(slotFrom, Math.min.apply(null, incl.map(function (l) { return l.stop; })) - PB_HOUR); }
+    var rawSlots = pbShiftSlots(d.workshift.rows || [], slotFrom, slotTo);
+    var shiftHc = plan.shiftHc || {};
+    var slots = rawSlots.map(function (s) {
+        var hc = pbSlotHeadcount(s, employees, boards, shiftHc[String(s.start)]);
+        return { start: s.start, end: s.end, crews: s.crews, key: s.key, hc: hc, cap: s.crews.length ? hc.value : 0 };
+    });
+    var slotsOk = slots.length > 0 && slots.some(function (s) { return s.crews.length; });
+    function capAt(t) { if (!slotsOk) return Infinity; for (var i = 0; i < slots.length; i++) if (t >= slots[i].start && t < slots[i].end) return slots[i].cap; return 0; }
+    function slotAt(t) { for (var i = 0; i < slots.length; i++) if (t >= slots[i].start && t < slots[i].end) return slots[i]; return null; }
+
+    var share = pbCrewShare(incl, capAt);
+    var inputs = incl.map(function (l) {
+        l.crew = l.crewSet !== undefined && l.crewSet !== null ? l.crewSet : share[l.key];
+        l.crewSrc = l.crewSet !== undefined && l.crewSet !== null ? 'set by hand' : (share[l.key] ? 'share of the people on shift when it stops' : 'no headcount known');
+        function withMin(list) { return (list || []).map(function (st) { var o = pbClone(st); if (l.stepMin[st.id] !== undefined && l.stepMin[st.id] !== null) o.minutes = l.stepMin[st.id]; return o; }); }
+        return { key: l.key, name: l.name, stop: l.stop, restart: l.restart, groups: l.ms.groups, hc: l.hc, crew: l.crew, mntAfter: l.mntAfter, mntMinutes: l.mntMinutes, sanWaits: l.sanWaits, woCount: l.wos.length, pre: withMin(config.pre), tail: withMin(config.tail), ignoreCap: l.ignoreCap };
+    });
+    var sched = pbSchedule(inputs, slotsOk ? slots : null, config);
+    lines.forEach(function (l) { l.sched = sched.lines[l.key] || null; });
+    // Shifts that overlap the weekend cleans (first stop to last restart): the ones the headcount question is about.
+    var winFrom = incl.length ? Math.min.apply(null, incl.map(function (l) { return l.stop; })) : frame.focusStart;
+    var winTo = incl.length ? Math.max.apply(null, incl.map(function (l) { return Math.max(l.restart || 0, l.sched ? l.sched.finish : 0); })) : frame.focusEnd;
+    var use = slotsOk ? pbSlotUse(sched, slots.filter(function (s) { return s.crews.length && s.end > winFrom && s.start < winTo; })) : [];
+    var laborMin = pbSum(incl, function (l) { return l.sched ? l.sched.laborMin : 0; });
+    var rate = pbNum(config.rate);
+
+    // Actuals and time loss for this weekend.
+    var actuals = {}; (d.milestone.rows || []).map(pbNormActual).forEach(function (a) { actuals[a.areaKey + '|' + a.stepKey] = a; });
+    var losses = (d.timeloss.rows || []).map(pbNormLoss).filter(function (x) { return !x.weekend || x.weekend === weekend; });
+    var maps = {}; (d.flocmap.rows || []).map(pbNormMap).forEach(function (m) { if (m.key) maps[m.key] = m; });
+
+    return {
+        frame: frame, weekend: weekend, secondWeekend: secondWeekend, assets: assets, areas: areas, runs: runs, runsBy: runsBy, employees: employees, empById: empById,
+        lines: lines, included: incl, slots: slots, slotsOk: slotsOk, capAt: capAt, slotAt: slotAt, sched: sched, use: use,
+        laborMin: laborMin, rate: rate, cost: rate !== null ? laborMin / 60 * rate : null,
+        late: incl.filter(function (l) { return l.sched && l.sched.status === 'late'; }).length,
+        tight: incl.filter(function (l) { return l.sched && l.sched.status === 'tight'; }).length,
+        wos: wos, maps: maps, actuals: actuals, losses: losses, checkoffs: checkoffs
+    };
+}
+
+// Plain text for the Monday debrief / Friday brief (pasted into Teams or an email).
+function pbBriefText(m) {
+    var out = ['PBED brief - weekend of ' + pbFmtDate(m.frame.sat.getTime())];
+    m.included.forEach(function (l) {
+        var s = l.sched;
+        out.push('');
+        out.push(l.name + ': stops ' + pbFmtDayTime(l.stop) + ', restarts ' + pbFmtDayTime(l.restart) + (s ? ', clean done ' + pbFmtDayTime(s.finish) + ' (' + (PB_STATUS_CHIP[s.status] || {}).label + ')' : ''));
+        if (s) s.blocks.forEach(function (b) { if (b.kind === 'sub' || b.kind === 'mnt' || b.milestone || b.anchor === 'restart') out.push('  - ' + pbFmtDayTime(b.end) + '  ' + b.name + (b.hc ? ' (' + b.hc + ' people)' : '')); });
+    });
+    if (m.slotsOk) {
+        out.push(''); out.push('Headcount by shift (needed at peak / on shift):');
+        m.use.forEach(function (u) { if (u.peak || u.slot.cap) out.push('  - ' + u.slot.key + ' ' + pbFmtDayTime(u.slot.start) + ': ' + u.peak + ' / ' + u.slot.cap); });
+    }
+    return out.join('\n');
+}
+// ==== END PBED MODEL ====
+// ==== PBED PLAN TAB ====
+var PB_CREW_BG = { A: '#E0F2FE', B: '#DCFCE7', C: '#FEF3C7', D: '#EDE9FE' };
+
+function pbBlockLabel(b: any) {
+    if (b.kind === 'sub') return (b.order !== null && b.order !== undefined ? b.order + '. ' : '') + b.name.replace(/^\s*\d+(\.\d+)?\s*[-.]?\s*/, '');
+    return b.name;
+}
+
+function PbGantt(props: any) {
+    var m = props.m; var pxh = props.pxh || 28;
+    var incl = m.included;
+    if (!incl.length) return <PbNote>No line is in the plan for this weekend. Lines join when the production schedule shows them stopping for the weekend, or add one on the Lines list below.</PbNote>;
+    var t0 = Math.min.apply(null, incl.map(function (l: any) { return l.stop; })) - 2 * PB_HOUR;
+    var t1 = Math.max.apply(null, incl.map(function (l: any) { return Math.max(l.restart || 0, l.sched ? l.sched.finish : 0, l.stop + 12 * PB_HOUR); })) + 3 * PB_HOUR;
+    t0 = Math.floor(t0 / PB_HOUR) * PB_HOUR; t1 = Math.min(t1, t0 + 6 * PB_DAY);
+    var hours = Math.ceil((t1 - t0) / PB_HOUR);
+    var width = hours * pxh;
+    function x(ms: number) { return (ms - t0) / PB_HOUR * pxh; }
+    var ticks = [];
+    for (var h = 0; h <= hours; h++) { var t = t0 + h * PB_HOUR; var d = new Date(t); ticks.push({ t: t, x: h * pxh, day: d.getHours() === 0, label: d.getHours() % 6 === 0 }); }
+    var LABEL_W = 210;
+    function row(content: any, label: any, key: string, tall?: boolean, onLabel?: any) {
+        return (
+            <div key={key} className="flex border-t border-slate-100" style={{ minWidth: LABEL_W + width }}>
+                <div className="sticky left-0 z-10 bg-white border-r border-slate-200 shrink-0 px-2 py-1 text-xs" style={{ width: LABEL_W }} onClick={onLabel}>{label}</div>
+                <div className="relative shrink-0" style={{ width: width, height: tall ? 46 : 30 }}>
+                    {ticks.map(function (tk: any) { return tk.day ? <div key={tk.t} className="absolute top-0 bottom-0 border-l border-slate-300" style={{ left: tk.x }} /> : null; })}
+                    {content}
+                </div>
+            </div>
+        );
+    }
+    function blockEl(l: any, b: any, single?: boolean) {
+        var left = x(b.start); var w = Math.max(b.milestone ? 0 : 3, x(b.end) - left);
+        var col = PB_DEPT_COLOR[b.dept] || '#94A3B8';
+        var title = b.name + ' - ' + pbFmtDayTime(b.start) + ' to ' + pbFmtDayTime(b.end) + (b.hc ? ' - ' + b.hc + ' people' : '') + (b.over ? ' - not enough people free' : '') + '. Double click for details.';
+        if (b.milestone) {
+            return <div key={b.id} title={title} onDoubleClick={function () { props.onOpen(l, b); }} className="absolute cursor-pointer" style={{ left: left - 7, top: single ? 8 : 15, width: 14, height: 14, transform: 'rotate(45deg)', backgroundColor: col, border: '2px solid white', boxShadow: '0 0 0 1px ' + col }} />;
+        }
+        return (
+            <div key={b.id} title={title} onDoubleClick={function () { props.onOpen(l, b); }}
+                className={'absolute rounded text-[10px] leading-tight font-bold text-white overflow-hidden whitespace-nowrap px-1 cursor-pointer select-none ' + (b.over ? 'ring-2 ring-red-500' : '')}
+                style={{ left: left, width: w, top: single ? 4 : 6, height: single ? 22 : 34, backgroundColor: col, opacity: b.kind === 'step' ? 0.75 : 1 }}>
+                {w > 26 ? (b.kind === 'sub' ? (b.order !== null && b.order !== undefined ? b.order : '') + (b.hc ? ' - ' + b.hc + 'p' : '') : (b.dept === 'MNT' ? 'MNT' : '')) : ''}
+                {!single && w > 70 && <div className="font-normal opacity-90 truncate">{pbBlockLabel(b)}</div>}
+            </div>
+        );
+    }
+    var expanded = props.expanded || {};
+    var rows = [];
+    // Shift band: crew letter and people on shift.
+    rows.push(row(m.slots.filter(function (s: any) { return s.end > t0 && s.start < t1; }).map(function (s: any) {
+        var l = Math.max(0, x(s.start)); var r = Math.min(width, x(s.end));
+        return (
+            <div key={s.start} onDoubleClick={function () { props.onSlot(s); }} title={'Crew ' + (s.key || 'none') + ' ' + pbFmtDayTime(s.start) + ' to ' + pbFmtDayTime(s.end) + ': ' + s.cap + ' people. Double click to change.'}
+                className="absolute top-1 bottom-1 rounded border border-white text-[10px] font-bold text-slate-700 px-1 overflow-hidden whitespace-nowrap cursor-pointer" style={{ left: l, width: Math.max(2, r - l), backgroundColor: PB_CREW_BG[s.crews[0]] || '#F1F5F9' }}>
+                {s.key ? s.key + ' - ' + s.cap : 'no crew'}
+            </div>
+        );
+    }), <span className="font-bold text-slate-500">Crew on shift - people</span>, 'shift'));
+    incl.forEach(function (l: any) {
+        var s = l.sched; if (!s) return;
+        var marks = [
+            <div key="stop" className="absolute top-0 bottom-0 border-l-2 border-slate-800" style={{ left: x(l.stop) }} title={'Production stops ' + pbFmtDayTime(l.stop)} />,
+            l.restart ? <div key="rs" className="absolute top-0 bottom-0 border-l-2 border-dashed border-red-600" style={{ left: x(l.restart) }} title={'Production restarts ' + pbFmtDayTime(l.restart)} /> : null
+        ];
+        rows.push(row(marks.concat(s.blocks.map(function (b: any) { return blockEl(l, b); })),
+            <div className="cursor-pointer">
+                <div className="flex items-center gap-1"><span className="text-slate-400 w-3">{expanded[l.key] ? '-' : '+'}</span><span className="font-black text-slate-800 truncate">{l.name}</span></div>
+                <div className="pl-4 mt-0.5"><PbStatusChip status={s.status} slack={s.slack} /></div>
+            </div>, 'l:' + l.key, true, function () { props.onToggle(l.key); }));
+        if (expanded[l.key]) s.blocks.forEach(function (b: any) {
+            rows.push(row(blockEl(l, b, true), <div className="flex items-center gap-1.5 pl-4 truncate" title={b.name}><PbDot dept={b.dept} /><span className="truncate text-slate-600">{pbBlockLabel(b)}</span></div>, 'b:' + l.key + b.id));
+        });
+    });
+    // Headcount used against people on shift, every 15 minutes.
+    var sch = m.sched; var bars = [];
+    if (sch && sch.used) {
+        var maxv = 1; for (var i = 0; i < sch.nb; i++) { maxv = Math.max(maxv, sch.used[i], sch.cap[i] === Infinity ? 0 : sch.cap[i]); }
+        for (var j = 0; j < sch.nb; j++) {
+            var tt = sch.h0 + j * PB_BUCKET_MIN * PB_MIN; if (tt < t0 || tt >= t1) continue;
+            var u = sch.used[j]; var c = sch.cap[j];
+            var bw = pxh / 4;
+            if (c !== Infinity && c > 0) bars.push(<div key={'c' + j} className="absolute bottom-0 bg-slate-200" style={{ left: x(tt), width: bw, height: Math.round(40 * c / maxv) }} />);
+            if (u) bars.push(<div key={'u' + j} className="absolute bottom-0" style={{ left: x(tt), width: bw, height: Math.round(40 * u / maxv), backgroundColor: c !== Infinity && u > c ? '#DC2626' : PB_BLUE }} title={pbFmtDayTime(tt) + ': ' + u + ' people working' + (c !== Infinity ? ' of ' + c + ' on shift' : '')} />);
+        }
+    }
+    rows.push(row(bars, <span className="font-bold text-slate-500">Sanitation people working (blue) and on shift (grey)</span>, 'hc', true));
+    return (
+        <div className="overflow-x-auto border border-slate-200 rounded-lg">
+            <div className="flex" style={{ minWidth: LABEL_W + width }}>
+                <div className="sticky left-0 z-10 bg-slate-50 border-r border-slate-200 shrink-0" style={{ width: LABEL_W }} />
+                <div className="relative bg-slate-50 shrink-0" style={{ width: width, height: 34 }}>
+                    {ticks.map(function (tk: any) {
+                        return tk.label ? (
+                            <div key={tk.t} className={'absolute top-0 text-[10px] whitespace-nowrap pl-1 border-l ' + (tk.day ? 'border-slate-400 font-black text-slate-700' : 'border-slate-200 text-slate-500')} style={{ left: tk.x }}>
+                                {tk.day ? pbFmtDate(tk.t) : ''}<div>{pbFmtTime(tk.t).replace(':00', '')}</div>
+                            </div>
+                        ) : null;
+                    })}
+                </div>
+            </div>
+            {rows}
+        </div>
+    );
+}
+
+function PbMilestoneTable(props: any) {
+    var l = props.line; var s = l.sched; if (!s) return null;
+    return (
+        <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+                <thead><tr className="text-left text-[11px] uppercase tracking-wider text-slate-400">
+                    <th className="py-1 pr-2">Dept</th><th className="py-1 pr-2">Milestone</th><th className="py-1 pr-2">Start</th><th className="py-1 pr-2">End</th><th className="py-1 pr-2 text-right">People</th><th className="py-1 pr-2 text-right">Time</th><th className="py-1 pr-2 text-right">Labor</th><th className="py-1"></th>
+                </tr></thead>
+                <tbody>
+                    {s.blocks.map(function (b: any) {
+                        return (
+                            <tr key={b.id} className="border-t border-slate-100 hover:bg-slate-50 cursor-pointer" onDoubleClick={function () { props.onOpen(l, b); }}>
+                                <td className="py-1.5 pr-2"><span className="inline-flex items-center gap-1 text-xs font-bold text-slate-600"><PbDot dept={b.dept} />{b.dept}</span></td>
+                                <td className="py-1.5 pr-2 font-semibold text-slate-800">{pbBlockLabel(b)}{b.over && <span className="ml-2 text-[11px] font-bold text-red-600">not enough people free</span>}{b.waited ? <span className="ml-2 text-[11px] text-amber-700">waits {pbFmtHours(b.waited)} for people</span> : null}</td>
+                                <td className="py-1.5 pr-2 whitespace-nowrap">{pbFmtDayTime(b.start)}</td>
+                                <td className="py-1.5 pr-2 whitespace-nowrap">{pbFmtDayTime(b.end)}</td>
+                                <td className="py-1.5 pr-2 text-right">{b.hc || ''}</td>
+                                <td className="py-1.5 pr-2 text-right whitespace-nowrap">{b.milestone ? '' : pbFmtHours(b.minutes)}</td>
+                                <td className="py-1.5 pr-2 text-right whitespace-nowrap">{b.dept === 'SAN' && b.hc ? pbFmtNum(b.hc * b.minutes / 60, 1) + ' h' : ''}</td>
+                                <td className="py-1.5 text-right"><button type="button" className="text-xs font-bold text-[#0072CE] hover:underline" onClick={function () { props.onOpen(l, b); }}>Details</button></td>
+                            </tr>
+                        );
+                    })}
+                </tbody>
+            </table>
+        </div>
+    );
+}
+
+function PbPlanTab(props: any) {
+    var m = props.m; var act = props.act;
+    var expandedState = useState({}); var expanded = expandedState[0]; var setExpanded = expandedState[1];
+    var zoomState = useState(24); var zoom = zoomState[0]; var setZoom = zoomState[1];
+    var showAllState = useState(false);
+    function toggle(k: string) { var n = pbClone(expanded); n[k] = !n[k]; setExpanded(n); }
+    var peak = 0; m.use.forEach(function (u: any) { peak = Math.max(peak, u.peak); });
+    var others = m.lines.filter(function (l: any) { return !l.include; });
+    return (
+        <div className="space-y-4">
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                <PbStat label="Lines in the plan" value={m.included.length} sub={m.late ? m.late + ' late' : m.tight ? m.tight + ' tight' : 'none late'} tone={m.late ? 'bad' : m.tight ? 'warn' : 'good'} />
+                <PbStat label="First stop" value={m.included.length ? pbFmtDayTime(Math.min.apply(null, m.included.map(function (l: any) { return l.stop; }))) : '--'} />
+                <PbStat label="Last clean done" value={m.included.length ? pbFmtDayTime(Math.max.apply(null, m.included.map(function (l: any) { return l.sched ? l.sched.finish : 0; }))) : '--'} />
+                <PbStat label="Sanitation labor" value={pbFmtNum(m.laborMin / 60, 1) + ' h'} sub={m.cost !== null ? pbFmtMoney(m.cost) + ' at ' + pbFmtMoney(m.rate) + '/h' : 'set a labor rate on Setup for cost'} />
+                <PbStat label="Peak people needed" value={m.slotsOk ? String(peak) : '--'} sub={m.slotsOk ? 'of the crew on shift' : 'shifts not read'} />
+            </div>
+            {!m.slotsOk && <PbNote tone="warn">The crew rotation (Work shifts table) could not be read, so the plan does not check how many people are on shift. Every milestone gets the people it asks for. See the Data tab.</PbNote>}
+            <PbCard title="Weekend timeline" right={
+                <div className="flex items-center gap-2 text-xs text-slate-500">
+                    <span>Zoom</span>
+                    {[14, 24, 40].map(function (z: number) { return <PbBtn key={z} kind={zoom === z ? 'primary' : 'plain'} onClick={function () { setZoom(z); }}>{z === 14 ? 'Weekend' : z === 24 ? 'Normal' : 'Close'}</PbBtn>; })}
+                </div>
+            }>
+                <p className="text-xs text-slate-500 mb-3">Each block is a subcategory milestone: its number is the clean order and "4p" is the people on it. Same numbers run side by side. Click a line name to open its steps; double click any block for its equipment, people and times. Black line = production stops, red dashed line = restart.</p>
+                <PbGantt m={m} pxh={zoom} expanded={expanded} onToggle={toggle} onOpen={act.openBlock} onSlot={act.openSlot} />
+                <div className="flex flex-wrap gap-3 mt-3 text-xs text-slate-600">
+                    {PB_DEPTS.map(function (dp: string) { return <span key={dp} className="inline-flex items-center gap-1"><PbDot dept={dp} />{PB_DEPT_NAME[dp]}</span>; })}
+                </div>
+            </PbCard>
+            {m.included.map(function (l: any) {
+                var s = l.sched; if (!s) return null;
+                return (
+                    <PbCard key={l.key} title={l.name} right={
+                        <div className="flex flex-wrap items-center gap-2">
+                            <PbStatusChip status={s.status} slack={s.slack} />
+                            {l.allergen && <PbChip cls="bg-pink-50 text-pink-700 border-pink-200" title={l.allergenSrc}>Allergen clean</PbChip>}
+                            <PbBtn onClick={function () { act.openLine(l); }}>Times and crew</PbBtn>
+                        </div>
+                    }>
+                        <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm text-slate-600 mb-3">
+                            <span>Stops <b className="text-slate-800">{pbFmtDayTime(l.stop)}</b> <span className="text-xs text-slate-400">{l.stopSrc}</span></span>
+                            <span>Restarts <b className="text-slate-800">{pbFmtDayTime(l.restart)}</b> <span className="text-xs text-slate-400">{l.restartSrc}</span></span>
+                            <span>Clean done <b className="text-slate-800">{pbFmtDayTime(s.finish)}</b></span>
+                            <span>{pbPlural(l.pieces, 'piece')} of equipment, {pbFmtHours(l.workMin)} of clean time</span>
+                            <span>Crew for this line <b className="text-slate-800">{l.crew === null || l.crew === undefined ? 'no limit' : l.crew}</b> <span className="text-xs text-slate-400">{l.crewSrc}</span></span>
+                        </div>
+                        {s.issues.length > 0 && <PbNote tone="warn" className="mb-3"><ul className="list-disc pl-5 space-y-0.5">{s.issues.map(function (t: string, i: number) { return <li key={i}>{t}</li>; })}</ul></PbNote>}
+                        <PbMilestoneTable line={l} onOpen={act.openBlock} />
+                    </PbCard>
+                );
+            })}
+            <PbCard title="Other areas" right={<PbBtn kind="ghost" onClick={function () { showAllState[1](!showAllState[0]); }}>{showAllState[0] ? 'Hide' : 'Show ' + others.length}</PbBtn>}>
+                <p className="text-sm text-slate-500">Areas with equipment that are not in this weekend's plan (no stop in the production schedule, or taken out).</p>
+                {showAllState[0] && (
+                    <div className="mt-3 divide-y divide-slate-100">
+                        {others.map(function (l: any) {
+                            return (
+                                <div key={l.key} className="flex flex-wrap items-center gap-3 py-2">
+                                    <span className="font-semibold text-slate-800 min-w-[140px]">{l.name}</span>
+                                    <span className="text-xs text-slate-500 flex-1">{!l.hasAssets ? 'No equipment in the assets table' : l.win.note || ('Stops ' + pbFmtDayTime(l.stop))}</span>
+                                    <PbBtn disabled={!l.hasAssets} onClick={function () { act.line(l.key, { include: true }); act.openLine(l); }}>Add to plan</PbBtn>
+                                </div>
+                            );
+                        })}
+                    </div>
+                )}
+            </PbCard>
+        </div>
+    );
+}
+function PbStat(props: any) {
+    var tone = props.tone === 'bad' ? 'text-red-700' : props.tone === 'warn' ? 'text-amber-700' : props.tone === 'good' ? 'text-emerald-700' : 'text-slate-500';
+    return (
+        <div className="bg-white rounded-xl border border-slate-200 shadow-sm px-4 py-3">
+            <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{props.label}</div>
+            <div className="text-xl font-black text-slate-800 mt-1 break-words">{props.value}</div>
+            {props.sub && <div className={'text-xs mt-0.5 ' + tone}>{props.sub}</div>}
+        </div>
+    );
+}
+// ==== END PBED PLAN TAB ====
+// ==== PBED DETAIL WINDOWS ====
+function PbSubModal(props: any) {
+    var m = props.m; var l = props.line; var b = props.block; var act = props.act; var g = b.group;
+    var p = l; var exclude = (props.plan.lines[l.key] || {}).exclude || [];
+    var slot = m.slotAt(b.start);
+    var crews = slot ? slot.crews : [];
+    var people = pbSuggestPeople(props.exp, m.employees, crews, l.key, 60);
+    var assigned = (p.people[g.key] || []);
+    var defHc = pbDefaultHc(g, l.crew);
+    var left = l.ms.left;
+    function setHc(v: number) { var hc = pbClone(p.hc); if (v === defHc) delete hc[g.key]; else hc[g.key] = v; act.line(l.key, { hc: hc }); }
+    function toggleAsset(id: string) { var ex = exclude.slice(); var i = ex.indexOf(id); if (i >= 0) ex.splice(i, 1); else ex.push(id); act.line(l.key, { exclude: ex }); }
+    function togglePerson(id: string) { var all = pbClone(p.people); var list = (all[g.key] || []).slice(); var i = list.indexOf(id); if (i >= 0) list.splice(i, 1); else list.push(id); all[g.key] = list; act.line(l.key, { people: all }); }
+    return (
+        <PbModal title={l.name + ': ' + g.name} sub={'Milestone ' + (g.order === null ? '(no order number)' : g.order) + ' - ' + pbFmtDayTime(b.start) + ' to ' + pbFmtDayTime(b.end)} onClose={props.onClose} wide>
+            <div className="grid sm:grid-cols-3 gap-3">
+                <div className="rounded-lg border border-slate-200 p-3">
+                    <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400">People on it</div>
+                    <div className="mt-1"><PbStepper value={b.hc} onChange={setHc} /></div>
+                    <div className="text-xs text-slate-500 mt-1">{b.hcSet ? 'Set by hand. ' : ''}Default {defHc}: the heads the pieces need ({g.headsSum}){l.crew ? ', no more than the line crew of ' + l.crew : ''}.</div>
+                    {b.hcSet && <button type="button" className="text-xs font-bold text-[#0072CE] hover:underline mt-1" onClick={function () { setHc(defHc); }}>Back to default</button>}
+                </div>
+                <div className="rounded-lg border border-slate-200 p-3">
+                    <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400">Time frame</div>
+                    <div className="text-xl font-black text-slate-800 mt-1">{pbFmtHours(b.minutes)}</div>
+                    <div className="text-xs text-slate-500 mt-1">{pbFmtHours(g.totalMin)} of clean time divided by {b.hc} people{g.maxWall > g.totalMin / b.hc ? ', but the longest piece alone takes ' + pbFmtHours(g.maxWall) : ''}. Rounded up to 15 minutes.</div>
+                </div>
+                <div className="rounded-lg border border-slate-200 p-3">
+                    <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400">Ganttly check-offs</div>
+                    <div className="text-xl font-black text-slate-800 mt-1">{g.done || 0} of {g.pieces.length}</div>
+                    <div className="text-xs text-slate-500 mt-1">pieces checked off this weekend</div>
+                </div>
+            </div>
+            {b.over && <PbNote tone="bad">This milestone needs {b.hc} people at once, but the crew on shift does not have that many free. Lower the people on it, raise the shift headcount, or tick "No headcount limit" on the line.</PbNote>}
+            {b.waited ? <PbNote tone="warn">It waits {pbFmtHours(b.waited)} after the step before it, because the people are busy on other lines.</PbNote> : null}
+            <div>
+                <h4 className="text-sm font-black text-slate-700 mb-2">Equipment ({g.pieces.length})</h4>
+                <div className="overflow-x-auto max-h-[320px] overflow-y-auto border border-slate-100 rounded-lg">
+                    <table className="w-full text-sm">
+                        <thead className="bg-slate-50 sticky top-0"><tr className="text-left text-[11px] uppercase tracking-wider text-slate-400"><th className="p-2">In</th><th className="p-2">Equipment</th><th className="p-2">Room</th><th className="p-2 text-right">Minutes</th><th className="p-2 text-right">Heads</th><th className="p-2">Done</th></tr></thead>
+                        <tbody>
+                            {g.pieces.map(function (pc: any) {
+                                return (
+                                    <tr key={pc.asset.id} className="border-t border-slate-100">
+                                        <td className="p-2"><input type="checkbox" checked={true} onChange={function () { toggleAsset(pc.asset.id); }} aria-label={'Leave out ' + pc.asset.name} /></td>
+                                        <td className="p-2 text-slate-800">{pc.asset.name}</td>
+                                        <td className="p-2 text-slate-500">{pc.asset.room}</td>
+                                        <td className={'p-2 text-right ' + (pc.minutes === null ? 'text-red-600 font-bold' : '')}>{pc.minutes === null ? 'none' : pbFmtNum(pc.minutes)}</td>
+                                        <td className="p-2 text-right">{pc.asset.heads}{pc.asset.headsKnown ? '' : ' (blank)'}</td>
+                                        <td className="p-2">{m.checkoffs.some(function (c: any) { return c.guid === pc.asset.id && c.isDone; }) ? 'Yes' : ''}</td>
+                                    </tr>
+                                );
+                            })}
+                        </tbody>
+                    </table>
+                </div>
+                <p className="text-xs text-slate-500 mt-1">Minutes come from the assets table (Hours required holds minutes){l.allergen ? '; this is an allergen clean, so a piece with allergen minutes uses those' : ''}. Untick a piece to leave it out of this weekend.</p>
+                {left.length > 0 && (
+                    <details className="mt-2">
+                        <summary className="text-xs font-bold text-slate-600 cursor-pointer">Left out of this area ({left.length})</summary>
+                        <ul className="mt-1 text-xs text-slate-600 space-y-1">
+                            {left.map(function (x: any) {
+                                return <li key={x.asset.id} className="flex items-center gap-2"><span className="flex-1">{x.asset.subcat} - {x.asset.name}: {x.why}</span>{x.why === 'Left out by hand' && <button type="button" className="font-bold text-[#0072CE] hover:underline" onClick={function () { toggleAsset(x.asset.id); }}>Put back</button>}</li>;
+                            })}
+                        </ul>
+                    </details>
+                )}
+            </div>
+            <div>
+                <h4 className="text-sm font-black text-slate-700 mb-1">Who ({assigned.length} picked)</h4>
+                <p className="text-xs text-slate-500 mb-2">{crews.length ? 'Crew ' + crews.join(' and ') + ' is on shift when it starts. ' : 'No crew is known for this time. '}{props.exp ? 'Listed with the most time in ' + l.name + ' first (last 56 days). Double click a name to see their experience.' : 'Experience is still being worked out in the background, so the list is not ranked yet.'}</p>
+                {people.length === 0 ? <PbNote tone="warn">No regular employee on {crews.length ? 'crew ' + crews.join(', ') : 'this shift'} was found in the Employees table.</PbNote> : (
+                    <div className="flex flex-wrap gap-1.5">
+                        {people.map(function (x: any) {
+                            var on = assigned.indexOf(x.emp.id) >= 0;
+                            return (
+                                <button key={x.emp.id} type="button" onClick={function () { togglePerson(x.emp.id); }} onDoubleClick={function () { act.openPerson(x.emp.id); }}
+                                    className={'px-2.5 py-1 rounded-full border text-xs font-semibold ' + (on ? 'bg-[#0072CE] text-white border-[#0072CE]' : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50')}>
+                                    {x.emp.name}
+                                </button>
+                            );
+                        })}
+                    </div>
+                )}
+            </div>
+        </PbModal>
+    );
+}
+
+function PbMntModal(props: any) {
+    var m = props.m; var l = props.line; var act = props.act; var b = props.block;
+    var opts = [{ v: 'auto', t: 'After the foam milestone (default)' }, { v: 'start', t: 'Before the first sanitation milestone' }];
+    var seenOrder: any = {};
+    l.ms.groups.forEach(function (g: any) { var o = g.order === null ? 'none' : String(g.order); if (seenOrder[o]) return; seenOrder[o] = 1; opts.push({ v: g.key, t: 'After milestone ' + (g.order === null ? '' : g.order + '. ') + g.name }); });
+    opts.push({ v: 'none', t: 'No maintenance block this weekend' });
+    return (
+        <PbModal title={l.name + ': maintenance'} sub={b ? pbFmtDayTime(b.start) + ' to ' + pbFmtDayTime(b.end) : ''} onClose={props.onClose} wide>
+            <div className="grid sm:grid-cols-2 gap-4">
+                <label className="block text-sm">
+                    <span className="font-bold text-slate-700">Where it goes</span>
+                    <select className="mt-1 block w-full border border-slate-300 rounded-lg px-2 py-1.5 text-sm" value={l.mntAfter} onChange={function (e: any) { act.line(l.key, { mntAfter: e.target.value }); }}>
+                        {opts.map(function (o: any) { return <option key={o.v} value={o.v}>{o.t}</option>; })}
+                    </select>
+                    <span className="text-xs text-slate-500">"Foam" is matched in the subcategory name (change the word on Setup).</span>
+                </label>
+                <label className="block text-sm">
+                    <span className="font-bold text-slate-700">Hours</span>
+                    <div className="mt-1 flex items-center gap-2">
+                        <PbNumInput value={(props.plan.lines[l.key] || {}).mntMinutes === undefined || (props.plan.lines[l.key] || {}).mntMinutes === null ? null : pbFmtNum(l.mntMinutes / 60, 2)} step={0.5} placeholder={pbFmtNum(l.woMin / 60, 2)} onChange={function (v: any) { act.line(l.key, { mntMinutes: v === null ? null : v * 60 }); }} label="Maintenance hours" />
+                        <span className="text-xs text-slate-500">{l.wos.length ? 'Blank = the work orders total, ' + pbFmtNum(l.woMin / 60, 1) + ' h' : 'No work orders for this line this weekend'}</span>
+                    </div>
+                </label>
+            </div>
+            <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={l.sanWaits} onChange={function (e: any) { act.line(l.key, { sanWaits: e.target.checked }); }} />Sanitation waits for maintenance to finish before the next milestone (like the PBED sheet)</label>
+            <div>
+                <h4 className="text-sm font-black text-slate-700 mb-2">Work orders on this line this weekend ({l.wos.length})</h4>
+                {l.wos.length === 0 ? <p className="text-sm text-slate-500">None yet. Paste the SAP list on the Work orders tab and tick "This weekend".</p> : (
+                    <table className="w-full text-sm">
+                        <thead><tr className="text-left text-[11px] uppercase tracking-wider text-slate-400"><th className="py-1 pr-2">Order</th><th className="py-1 pr-2">Pri</th><th className="py-1 pr-2">What</th><th className="py-1 pr-2">Equipment</th><th className="py-1 text-right">Hours</th></tr></thead>
+                        <tbody>{l.wos.map(function (w: any) { return <tr key={w.order} className="border-t border-slate-100"><td className="py-1.5 pr-2 font-mono text-xs">{w.order}</td><td className="py-1.5 pr-2">{w.priority}</td><td className="py-1.5 pr-2">{w.description}</td><td className="py-1.5 pr-2">{w.equipment || w.assetDesc}</td><td className="py-1.5 text-right">{w.plannedHours === null ? 'not set' : pbFmtNum(w.plannedHours, 1)}</td></tr>; })}</tbody>
+                    </table>
+                )}
+            </div>
+        </PbModal>
+    );
+}
+
+function PbStepModal(props: any) {
+    var l = props.line; var b = props.block; var act = props.act;
+    var id = b.id.replace(/^step:/, '');
+    var cur = (props.plan.lines[l.key] || {}).stepMin || {};
+    var anchorText = b.anchor === 'stop' ? 'starts when production stops' : b.anchor === 'restart' ? 'is set from the restart time' : 'follows the step before it';
+    return (
+        <PbModal title={l.name + ': ' + b.name} sub={PB_DEPT_NAME[b.dept] + ' - ' + pbFmtDayTime(b.start) + (b.milestone ? '' : ' to ' + pbFmtDayTime(b.end))} onClose={props.onClose}>
+            <p className="text-sm text-slate-600">This step {anchorText}. Its name, order and default time are on the Setup tab and apply to every line.</p>
+            <label className="flex flex-wrap items-center gap-2 text-sm">
+                <span className="font-bold text-slate-700">Minutes on this line</span>
+                <PbNumInput value={cur[id] === undefined ? null : cur[id]} placeholder={String(b.minutes)} step={15} onChange={function (v: any) { var n = pbClone(cur); if (v === null) delete n[id]; else n[id] = v; act.line(l.key, { stepMin: n }); }} label="Minutes" />
+                <span className="text-xs text-slate-500">Blank = the Setup default</span>
+            </label>
+        </PbModal>
+    );
+}
+
+function PbLineModal(props: any) {
+    var l = props.line; var act = props.act; var p = props.plan.lines[l.key] || {};
+    var w = l.win;
+    function setTime(field: string, v: any) { var o: any = {}; o[field] = v; act.line(l.key, o); }
+    return (
+        <PbModal title={l.name + ': times and crew'} sub={l.rooms.length ? 'Rooms: ' + l.rooms.join(', ') : ''} onClose={props.onClose} wide>
+            <label className="flex items-center gap-2 text-sm font-bold text-slate-700"><input type="checkbox" checked={l.include} onChange={function (e: any) { act.line(l.key, { include: e.target.checked }); }} />In this weekend's plan</label>
+            <PbNote>
+                From the production schedule: {w.status === 'noruns' ? 'no runs on this line this week.' : w.status === 'runsthrough' ? w.note + '.' : (
+                    <span>last run before the weekend {w.prev ? (w.prev.product || 'run') + ' ends ' + pbFmtDayTime(w.prev.end) + (w.prev.allergen ? ' (allergen ' + (w.prev.allergenType || '') + ')' : '') : 'not found'}; next run {w.next ? (w.next.product || 'run') + ' starts ' + pbFmtDayTime(w.next.start) : 'not scheduled yet'}.</span>
+                )}
+            </PbNote>
+            <div className="grid sm:grid-cols-2 gap-4">
+                {[['stop', 'Production stops', w.stop], ['restart', 'Production restarts', w.restart]].map(function (f: any) {
+                    var setByHand = p[f[0]] !== undefined && p[f[0]] !== null;
+                    return (
+                        <label key={f[0]} className="block text-sm">
+                            <span className="font-bold text-slate-700">{f[1]}</span>
+                            <input type="datetime-local" className="mt-1 block w-full border border-slate-300 rounded-lg px-2 py-1.5 text-sm" value={pbToLocalInput(setByHand ? p[f[0]] : f[2])} onChange={function (e: any) { setTime(f[0], pbFromLocalInput(e.target.value)); }} />
+                            <span className="text-xs text-slate-500">{setByHand ? 'Set by hand. ' : f[2] !== null ? 'From the production schedule. ' : 'Not in the production schedule: type it. '}</span>
+                            {setByHand && <button type="button" className="text-xs font-bold text-[#0072CE] hover:underline" onClick={function () { setTime(f[0], null); }}>Use the schedule</button>}
+                        </label>
+                    );
+                })}
+            </div>
+            <div className="grid sm:grid-cols-2 gap-4">
+                <label className="block text-sm">
+                    <span className="font-bold text-slate-700">Crew for this line</span>
+                    <div className="mt-1 flex items-center gap-2">
+                        <PbNumInput value={p.crew === undefined ? null : p.crew} min={1} placeholder={l.crew === null || l.crew === undefined ? 'none' : String(l.crew)} onChange={function (v: any) { act.line(l.key, { crew: v }); }} label="Crew" />
+                        <span className="text-xs text-slate-500">Most people one milestone gets. Blank = {l.crewSrc}.</span>
+                    </div>
+                </label>
+                <label className="block text-sm">
+                    <span className="font-bold text-slate-700">Allergen clean</span>
+                    <select className="mt-1 block w-full border border-slate-300 rounded-lg px-2 py-1.5 text-sm" value={p.allergen === undefined || p.allergen === null ? 'auto' : p.allergen ? 'yes' : 'no'} onChange={function (e: any) { act.line(l.key, { allergen: e.target.value === 'auto' ? null : e.target.value === 'yes' }); }}>
+                        <option value="auto">From the last run ({w.prev && w.prev.allergen ? 'yes' : 'no'})</option><option value="yes">Yes: use allergen minutes</option><option value="no">No</option>
+                    </select>
+                </label>
+            </div>
+            <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={!!p.ignoreCap} onChange={function (e: any) { act.line(l.key, { ignoreCap: e.target.checked }); }} />No headcount limit on this line (it still counts in the totals)</label>
+        </PbModal>
+    );
+}
+
+function PbSlotModal(props: any) {
+    var m = props.m; var s = props.slot; var act = props.act;
+    var cur = props.plan.shiftHc[String(s.start)];
+    var u = null; m.use.forEach(function (x: any) { if (x.slot.start === s.start) u = x; });
+    var roster = s.hc.rosterIds.map(function (id: string) { return m.empById[id]; }).filter(Boolean);
+    return (
+        <PbModal title={'Crew ' + (s.key || 'none') + ': ' + pbFmtDayTime(s.start) + ' to ' + pbFmtDayTime(s.end)} onClose={props.onClose}>
+            <div className="grid grid-cols-3 gap-3 text-center">
+                <div className="rounded-lg border border-slate-200 p-2"><div className="text-[11px] font-bold uppercase text-slate-400">Roster</div><div className="text-xl font-black">{s.hc.roster}</div><div className="text-[11px] text-slate-500">Employees table</div></div>
+                <div className="rounded-lg border border-slate-200 p-2"><div className="text-[11px] font-bold uppercase text-slate-400">Shift Start</div><div className="text-xl font-black">{s.hc.board === null ? '--' : s.hc.board}</div><div className="text-[11px] text-slate-500">{s.hc.boardSrc ? (s.hc.boardSrc === 'plan' ? 'planned board' : s.hc.boardSrc === 'board' ? 'live board' : 'archived board') : 'no board yet'}</div></div>
+                <div className="rounded-lg border border-slate-200 p-2"><div className="text-[11px] font-bold uppercase text-slate-400">Peak needed</div><div className="text-xl font-black">{u ? u.peak : '--'}</div><div className="text-[11px] text-slate-500">by this plan</div></div>
+            </div>
+            <label className="flex flex-wrap items-center gap-2 text-sm">
+                <span className="font-bold text-slate-700">People for sanitation on this shift</span>
+                <PbNumInput value={cur === undefined ? null : cur} min={0} placeholder={String(s.hc.board !== null ? s.hc.board : s.hc.roster)} onChange={function (v: any) { act.shiftHc(s.start, v); }} label="Headcount" />
+                <span className="text-xs text-slate-500">Blank = {s.hc.board !== null ? 'the Shift Start board' : 'the roster'}</span>
+            </label>
+            <p className="text-xs text-slate-500">Roster = active employees on crew {s.crews.join(', ')} who are not a lead, supervisor or manager. Shift Start = people on the board for this shift, less PTO, sick and late.</p>
+            {roster.length > 0 && (
+                <details>
+                    <summary className="text-sm font-bold text-slate-700 cursor-pointer">Roster names ({roster.length})</summary>
+                    <div className="flex flex-wrap gap-1.5 mt-2">{roster.map(function (e: any) { return <button key={e.id} type="button" onDoubleClick={function () { act.openPerson(e.id); }} className="px-2.5 py-1 rounded-full border border-slate-300 text-xs font-semibold text-slate-700 hover:bg-slate-50" title="Double click for experience">{e.name}</button>; })}</div>
+                </details>
+            )}
+        </PbModal>
+    );
+}
+
+function PbPersonModal(props: any) {
+    var m = props.m; var id = props.id; var e = m.empById[id] || { id: id, name: '(not in the Employees table)', crew: '', role: '' };
+    var x = props.exp ? (props.exp[id] || props.exp['n:' + pbCanon(e.name)]) : null;
+    var areas = x ? pbKeys(x.areas).map(function (k: string) { return x.areas[k]; }).sort(function (a: any, b: any) { return b.hours - a.hours; }) : [];
+    return (
+        <PbModal title={e.name} sub={(e.crew ? 'Crew ' + e.crew : 'No crew') + (e.role && e.role !== 'regular' ? ' - ' + e.role : '')} onClose={props.onClose}>
+            {!props.exp ? <PbNote>Experience is still being worked out from Shift Start history. Try again in a moment.</PbNote> : !x ? <PbNote tone="warn">No shift history for this person in the last 56 days (Shift Start boards and task assignments).</PbNote> : (
+                <div className="space-y-3">
+                    <div className="grid grid-cols-3 gap-3 text-center">
+                        <div className="rounded-lg border border-slate-200 p-2"><div className="text-[11px] font-bold uppercase text-slate-400">Hours</div><div className="text-xl font-black">{pbFmtNum(x.hours, 0)}</div></div>
+                        <div className="rounded-lg border border-slate-200 p-2"><div className="text-[11px] font-bold uppercase text-slate-400">Days</div><div className="text-xl font-black">{x.dayCount}</div></div>
+                        <div className="rounded-lg border border-slate-200 p-2"><div className="text-[11px] font-bold uppercase text-slate-400">Last seen</div><div className="text-sm font-black mt-1">{pbFmtDate(x.last)}</div></div>
+                    </div>
+                    <table className="w-full text-sm">
+                        <thead><tr className="text-left text-[11px] uppercase tracking-wider text-slate-400"><th className="py-1">Area</th><th className="py-1 text-right">Hours</th><th className="py-1 text-right">Days</th></tr></thead>
+                        <tbody>{areas.map(function (a: any) { return <tr key={a.name} className="border-t border-slate-100"><td className="py-1.5">{a.name}</td><td className="py-1.5 text-right">{pbFmtNum(a.hours, 1)}</td><td className="py-1.5 text-right">{a.dayCount}</td></tr>; })}</tbody>
+                    </table>
+                    <p className="text-xs text-slate-500">Last 56 days, from Shift Start boards (archive) and task assignments. A row with no end time counts as a day but no hours.</p>
+                </div>
+            )}
+        </PbModal>
+    );
+}
+// ==== END PBED DETAIL WINDOWS ====
+// ==== PBED OTHER TABS ====
+function pbCopy(text: string, done: any) {
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); }); return; }
+    } catch (e) { /* fall through */ }
+    try { var ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); var ok = document.execCommand('copy'); document.body.removeChild(ta); done(ok); } catch (e2) { done(false); }
+}
+
+function PbBriefTab(props: any) {
+    var m = props.m; var act = props.act;
+    var copiedState = useState(''); var copied = copiedState[0]; var setCopied = copiedState[1];
+    return (
+        <div className="space-y-4">
+            <PbCard title={'Brief - weekend of ' + pbFmtDate(m.frame.sat.getTime())} right={<PbBtn kind="primary" onClick={function () { pbCopy(pbBriefText(m), function (ok: boolean) { setCopied(ok ? 'Copied' : 'Copy failed: select the text in the box below'); }); }}>Copy brief as text</PbBtn>}>
+                {copied && <PbNote className="mb-3">{copied}</PbNote>}
+                <p className="text-sm text-slate-600">The goalposts each department is held to: when each line is handed over, when each milestone must be done, and when production restarts.</p>
+                <label className="block text-sm mt-3"><span className="font-bold text-slate-700">Notes for the brief</span>
+                    <textarea className="mt-1 block w-full border border-slate-300 rounded-lg px-2 py-1.5 text-sm" rows={3} value={props.plan.notes || ''} onChange={function (e: any) { act.notes(e.target.value); }} placeholder="Focus areas, call-outs, contractor work, anything the crews need to know" />
+                </label>
+            </PbCard>
+            <div className="grid lg:grid-cols-2 gap-4">
+                {m.included.map(function (l: any) {
+                    var s = l.sched; if (!s) return null;
+                    var goal = s.blocks.filter(function (b: any) { return b.kind !== 'step' || b.anchor !== 'chain' || b.milestone || b.dept !== 'SAN'; });
+                    return (
+                        <PbCard key={l.key} title={l.name} right={<PbStatusChip status={s.status} slack={s.slack} />}>
+                            <div className="text-sm text-slate-600 mb-2">Stops <b>{pbFmtDayTime(l.stop)}</b> - restarts <b>{pbFmtDayTime(l.restart)}</b> - {pbFmtHours(l.restart && l.stop ? (l.restart - l.stop) / PB_MIN : null)} down</div>
+                            <table className="w-full text-sm">
+                                <tbody>
+                                    {goal.map(function (b: any) {
+                                        return <tr key={b.id} className="border-t border-slate-100"><td className="py-1 pr-2 whitespace-nowrap font-bold text-slate-800">{pbFmtDayTime(b.end)}</td><td className="py-1 pr-2"><span className="inline-flex items-center gap-1.5"><PbDot dept={b.dept} />{pbBlockLabel(b)}</span></td><td className="py-1 text-right text-xs text-slate-500 whitespace-nowrap">{b.hc ? b.hc + ' people' : PB_DEPT_NAME[b.dept]}</td></tr>;
+                                    })}
+                                </tbody>
+                            </table>
+                            {l.wos.length > 0 && <p className="text-xs text-slate-500 mt-2">{pbPlural(l.wos.length, 'maintenance work order')} on this line.</p>}
+                        </PbCard>
+                    );
+                })}
+            </div>
+            {m.slotsOk && (
+                <PbCard title="People by shift">
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                            <thead><tr className="text-left text-[11px] uppercase tracking-wider text-slate-400"><th className="py-1 pr-2">Crew</th><th className="py-1 pr-2">Shift</th><th className="py-1 pr-2 text-right">On shift</th><th className="py-1 pr-2 text-right">Peak needed</th><th className="py-1 pr-2 text-right">Hours used</th><th className="py-1 text-right">Hours not used</th></tr></thead>
+                            <tbody>{m.use.map(function (u: any) {
+                                return <tr key={u.slot.start} className="border-t border-slate-100 cursor-pointer hover:bg-slate-50" onDoubleClick={function () { act.openSlot(u.slot); }}><td className="py-1.5 pr-2 font-bold">{u.slot.key}</td><td className="py-1.5 pr-2 whitespace-nowrap">{pbFmtDayTime(u.slot.start)} to {pbFmtTime(u.slot.end)}</td><td className="py-1.5 pr-2 text-right">{u.slot.cap}</td><td className={'py-1.5 pr-2 text-right ' + (u.peak > u.slot.cap ? 'text-red-700 font-bold' : '')}>{u.peak}</td><td className="py-1.5 pr-2 text-right">{pbFmtNum(u.usedHours, 1)}</td><td className="py-1.5 text-right">{u.idleHours === null ? '--' : pbFmtNum(u.idleHours, 1)}</td></tr>;
+                            })}</tbody>
+                        </table>
+                    </div>
+                    <p className="text-xs text-slate-500 mt-2">Shifts from the first stop to the last restart. Hours not used = people on shift times shift hours, less the hours the plan books on weekend cleans. Double click a row to change its headcount.</p>
+                </PbCard>
+            )}
+        </div>
+    );
+}
+
+function PbExecuteTab(props: any) {
+    var m = props.m; var act = props.act;
+    var nowState = useState(Date.now()); var now = nowState[0];
+    useEffect(function () { var t = setInterval(function () { nowState[1](Date.now()); }, 60000); return function () { clearInterval(t); }; }, []);
+    return (
+        <div className="space-y-4">
+            <PbNote>Tap Started and Done as each milestone happens. Times save {props.canSave.milestone ? 'to Dataverse (_p_ Milestone)' : 'on this computer only, because the _p_ Milestone table was not found'}. Ganttly check-offs show how many pieces are done.</PbNote>
+            {m.included.map(function (l: any) {
+                var s = l.sched; if (!s) return null;
+                return (
+                    <PbCard key={l.key} title={l.name} right={<span className="text-xs text-slate-500">{l.done} of {l.pieces} pieces checked off in Ganttly</span>}>
+                        <div className="divide-y divide-slate-100">
+                            {s.blocks.map(function (b: any) {
+                                var a = m.actuals[l.key + '|' + b.id] || null;
+                                var late = !a || !a.actualEnd ? (now > b.end && b.end > 0) : a.actualEnd > b.end;
+                                var g = b.group;
+                                return (
+                                    <div key={b.id} className="flex flex-wrap items-center gap-2 py-2">
+                                        <span className="inline-flex items-center gap-1.5 min-w-[200px] flex-1 font-semibold text-slate-800"><PbDot dept={b.dept} />{pbBlockLabel(b)}{g ? <span className="text-xs font-normal text-slate-500">{g.done || 0}/{g.pieces.length} done</span> : null}</span>
+                                        <span className="text-xs text-slate-500 whitespace-nowrap w-[150px]">plan {pbFmtTime(b.start)} - {pbFmtDayTime(b.end)}</span>
+                                        <span className="text-xs whitespace-nowrap w-[150px]">{a && a.actualStart ? 'started ' + pbFmtDayTime(a.actualStart) : ''}</span>
+                                        <span className={'text-xs whitespace-nowrap w-[150px] ' + (a && a.actualEnd ? (late ? 'text-red-700 font-bold' : 'text-emerald-700 font-bold') : late ? 'text-amber-700' : '')}>{a && a.actualEnd ? 'done ' + pbFmtDayTime(a.actualEnd) : late ? 'past its goalpost' : ''}</span>
+                                        <PbBtn disabled={props.busy} onClick={function () { act.actual(l, b, { actualStart: Date.now() }); }}>{a && a.actualStart ? 'Restart time' : 'Started'}</PbBtn>
+                                        <PbBtn kind={a && a.actualEnd ? 'plain' : 'primary'} disabled={props.busy} onClick={function () { act.actual(l, b, a && a.actualStart ? { actualEnd: Date.now() } : { actualStart: b.start, actualEnd: Date.now() }); }}>Done</PbBtn>
+                                        <PbBtn kind="ghost" onClick={function () { act.openActual(l, b); }}>Edit</PbBtn>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </PbCard>
+                );
+            })}
+        </div>
+    );
+}
+function PbActualModal(props: any) {
+    var l = props.line; var b = props.block; var a = props.actual || {};
+    var st = useState({ s: a.actualStart || null, e: a.actualEnd || null, n: a.notes || '', h: a.headcount === null || a.headcount === undefined ? null : a.headcount });
+    var v = st[0]; var set = st[1];
+    return (
+        <PbModal title={l.name + ': ' + pbBlockLabel(b)} sub={'Planned ' + pbFmtDayTime(b.start) + ' to ' + pbFmtDayTime(b.end)} onClose={props.onClose}>
+            <div className="grid sm:grid-cols-2 gap-3">
+                <label className="block text-sm"><span className="font-bold">Actual start</span><input type="datetime-local" className="mt-1 block w-full border border-slate-300 rounded-lg px-2 py-1.5" value={pbToLocalInput(v.s)} onChange={function (e: any) { set({ s: pbFromLocalInput(e.target.value), e: v.e, n: v.n, h: v.h }); }} /></label>
+                <label className="block text-sm"><span className="font-bold">Actual end</span><input type="datetime-local" className="mt-1 block w-full border border-slate-300 rounded-lg px-2 py-1.5" value={pbToLocalInput(v.e)} onChange={function (e: any) { set({ s: v.s, e: pbFromLocalInput(e.target.value), n: v.n, h: v.h }); }} /></label>
+            </div>
+            <label className="flex items-center gap-2 text-sm"><span className="font-bold">People who did it</span><PbNumInput value={v.h} min={0} placeholder={String(b.hc || 0)} onChange={function (x: any) { set({ s: v.s, e: v.e, n: v.n, h: x }); }} label="People" /></label>
+            <label className="block text-sm"><span className="font-bold">Notes</span><textarea rows={3} className="mt-1 block w-full border border-slate-300 rounded-lg px-2 py-1.5" value={v.n} onChange={function (e: any) { set({ s: v.s, e: v.e, n: e.target.value, h: v.h }); }} /></label>
+            <div className="flex gap-2 justify-end"><PbBtn onClick={props.onClose}>Cancel</PbBtn><PbBtn kind="primary" disabled={props.busy} onClick={function () { props.onSave({ actualStart: v.s, actualEnd: v.e, notes: v.n, headcount: v.h }); }}>Save</PbBtn></div>
+        </PbModal>
+    );
+}
+
+function PbDebriefTab(props: any) {
+    var m = props.m; var act = props.act;
+    var formState = useState({ area: '', step: '', dept: 'Sanitation', reason: PB_LOSS_REASONS[0], minutes: null, heads: null, text: '' });
+    var f: any = formState[0]; var setF = formState[1];
+    var copiedState = useState('');
+    function upd(k: string, v: any) { var n = pbClone(f); n[k] = v; setF(n); }
+    var rows: any[] = []; var overrunMin = 0;
+    m.included.forEach(function (l: any) {
+        if (!l.sched) return;
+        l.sched.blocks.forEach(function (b: any) {
+            var a = m.actuals[l.key + '|' + b.id];
+            var varMin = a && a.actualEnd ? (a.actualEnd - b.end) / PB_MIN : null;
+            var durVar = a && a.actualEnd && a.actualStart ? ((a.actualEnd - a.actualStart) - (b.end - b.start)) / PB_MIN : null;
+            rows.push({ l: l, b: b, a: a, varMin: varMin, durVar: durVar });
+            if (durVar && durVar > 0 && b.dept === 'SAN') overrunMin += durVar * (a.headcount || b.hc || 1);
+        });
+    });
+    var losses = m.losses;
+    var lossMin = pbSum(losses, function (x: any) { return x.minutes; });
+    var lossHeadMin = pbSum(losses, function (x: any) { return x.minutes * (x.heads || 1); });
+    var byReason: any = {}; losses.forEach(function (x: any) { byReason[x.reason || 'Other'] = (byReason[x.reason || 'Other'] || 0) + x.minutes * (x.heads || 1); });
+    var idle = pbSum(m.use, function (u: any) { return u.idleHours || 0; });
+    // The biggest costs of the weekend, largest first (people-hours; dollars when a labor rate is set).
+    var costs: any[] = [];
+    pbKeys(byReason).forEach(function (k: string) { costs.push({ what: 'Time loss: ' + k, hours: byReason[k] / 60 }); });
+    rows.forEach(function (r: any) { if (r.durVar && r.durVar > 15 && r.b.dept === 'SAN') costs.push({ what: 'Overran: ' + r.l.name + ' - ' + pbBlockLabel(r.b), hours: r.durVar * (r.a.headcount || r.b.hc || 1) / 60 }); });
+    if (idle > 0) costs.push({ what: 'People on shift but not booked on a weekend clean', hours: idle });
+    costs.sort(function (a: any, b: any) { return b.hours - a.hours; });
+    var lineFinish = m.included.map(function (l: any) {
+        var ends = rows.filter(function (r: any) { return r.l.key === l.key && r.a && r.a.actualEnd && r.b.anchor !== 'restart'; }).map(function (r: any) { return r.a.actualEnd; });
+        return { l: l, actual: ends.length ? Math.max.apply(null, ends) : null };
+    });
+    function debriefText() {
+        var out = ['PBED debrief - weekend of ' + pbFmtDate(m.frame.sat.getTime())];
+        lineFinish.forEach(function (x: any) { out.push(x.l.name + ': planned done ' + pbFmtDayTime(x.l.sched.finish) + ', actual ' + (x.actual ? pbFmtDayTime(x.actual) : 'not recorded') + ', restart ' + pbFmtDayTime(x.l.restart)); });
+        out.push(''); out.push('Time lost: ' + pbFmtHours(lossMin) + ' (' + pbFmtNum(lossHeadMin / 60, 1) + ' people-hours)');
+        losses.forEach(function (x: any) { out.push('  - ' + x.area + ' ' + (x.step || '') + ': ' + x.reason + ', ' + pbFmtHours(x.minutes) + (x.heads > 1 ? ' x ' + x.heads + ' people' : '') + (x.description ? ' - ' + x.description : '')); });
+        out.push(''); out.push('Biggest costs:');
+        costs.slice(0, 8).forEach(function (c: any) { out.push('  - ' + c.what + ': ' + pbFmtNum(c.hours, 1) + ' people-hours' + (m.rate !== null ? ' (' + pbFmtMoney(c.hours * m.rate) + ')' : '')); });
+        return out.join('\n');
+    }
+    return (
+        <div className="space-y-4">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <PbStat label="Time lost" value={pbFmtHours(lossMin)} sub={pbFmtNum(lossHeadMin / 60, 1) + ' people-hours'} tone={lossMin ? 'warn' : 'good'} />
+                <PbStat label="Overruns" value={pbFmtNum(overrunMin / 60, 1) + ' h'} sub="people-hours over plan" tone={overrunMin ? 'warn' : 'good'} />
+                <PbStat label="Planned labor" value={pbFmtNum(m.laborMin / 60, 1) + ' h'} sub={m.cost !== null ? pbFmtMoney(m.cost) : 'no labor rate set'} />
+                <PbStat label="Hours not used" value={m.slotsOk ? pbFmtNum(idle, 1) + ' h' : '--'} sub="on shift, not booked" />
+            </div>
+            <PbCard title="Lines: plan against actual" right={<PbBtn kind="primary" onClick={function () { pbCopy(debriefText(), function (ok: boolean) { copiedState[1](ok ? 'Copied' : 'Copy failed'); }); }}>Copy debrief as text</PbBtn>}>
+                {copiedState[0] && <PbNote className="mb-3">{copiedState[0]}</PbNote>}
+                <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                        <thead><tr className="text-left text-[11px] uppercase tracking-wider text-slate-400"><th className="py-1 pr-2">Line</th><th className="py-1 pr-2">Milestone</th><th className="py-1 pr-2">Planned end</th><th className="py-1 pr-2">Actual end</th><th className="py-1 text-right">Off by</th></tr></thead>
+                        <tbody>{rows.filter(function (r: any) { return r.b.kind !== 'step' || r.a; }).map(function (r: any) {
+                            return <tr key={r.l.key + r.b.id} className="border-t border-slate-100"><td className="py-1.5 pr-2 font-semibold">{r.l.name}</td><td className="py-1.5 pr-2">{pbBlockLabel(r.b)}</td><td className="py-1.5 pr-2 whitespace-nowrap">{pbFmtDayTime(r.b.end)}</td><td className="py-1.5 pr-2 whitespace-nowrap">{r.a && r.a.actualEnd ? pbFmtDayTime(r.a.actualEnd) : <span className="text-slate-400">not recorded</span>}</td><td className={'py-1.5 text-right whitespace-nowrap ' + (r.varMin > 0 ? 'text-red-700 font-bold' : r.varMin !== null ? 'text-emerald-700' : '')}>{r.varMin === null ? '' : (r.varMin > 0 ? '+' : '') + pbFmtHours(r.varMin)}</td></tr>;
+                        })}</tbody>
+                    </table>
+                </div>
+            </PbCard>
+            <PbCard title="Time loss">
+                <div className="grid md:grid-cols-3 gap-3">
+                    <label className="block text-sm"><span className="font-bold">Line</span><select className="mt-1 block w-full border border-slate-300 rounded-lg px-2 py-1.5" value={f.area} onChange={function (e: any) { upd('area', e.target.value); }}><option value="">Pick a line</option>{m.included.map(function (l: any) { return <option key={l.key} value={l.key}>{l.name}</option>; })}</select></label>
+                    <label className="block text-sm"><span className="font-bold">Milestone</span><select className="mt-1 block w-full border border-slate-300 rounded-lg px-2 py-1.5" value={f.step} onChange={function (e: any) { upd('step', e.target.value); }}><option value="">Whole line</option>{(m.included.filter(function (l: any) { return l.key === f.area; })[0] || { sched: { blocks: [] } }).sched.blocks.map(function (b: any) { return <option key={b.id} value={b.id}>{pbBlockLabel(b)}</option>; })}</select></label>
+                    <label className="block text-sm"><span className="font-bold">Department responsible</span><select className="mt-1 block w-full border border-slate-300 rounded-lg px-2 py-1.5" value={f.dept} onChange={function (e: any) { upd('dept', e.target.value); }}>{PB_LOSS_DEPTS.map(function (d: string) { return <option key={d}>{d}</option>; })}</select></label>
+                    <label className="block text-sm"><span className="font-bold">Reason</span><select className="mt-1 block w-full border border-slate-300 rounded-lg px-2 py-1.5" value={f.reason} onChange={function (e: any) { upd('reason', e.target.value); }}>{PB_LOSS_REASONS.map(function (d: string) { return <option key={d}>{d}</option>; })}</select></label>
+                    <label className="block text-sm"><span className="font-bold">Minutes lost</span><PbNumInput className="mt-1 block w-full" value={f.minutes} min={0} step={5} onChange={function (v: any) { upd('minutes', v); }} label="Minutes lost" /></label>
+                    <label className="block text-sm"><span className="font-bold">People waiting</span><PbNumInput className="mt-1 block w-full" value={f.heads} min={1} placeholder="1" onChange={function (v: any) { upd('heads', v); }} label="People" /></label>
+                </div>
+                <label className="block text-sm mt-3"><span className="font-bold">What happened</span><textarea rows={2} className="mt-1 block w-full border border-slate-300 rounded-lg px-2 py-1.5" value={f.text} onChange={function (e: any) { upd('text', e.target.value); }} /></label>
+                <div className="flex flex-wrap items-center gap-2 mt-3">
+                    <PbBtn kind="primary" disabled={!f.area || !f.minutes || props.busy} onClick={function () { act.addLoss(f, function () { setF({ area: f.area, step: '', dept: f.dept, reason: f.reason, minutes: null, heads: null, text: '' }); }); }}>Add time loss</PbBtn>
+                    <span className="text-xs text-slate-500">{props.canSave.timeloss ? 'Saved to the time loss log the manager hub reads (kind "Weekend clean").' : 'The time loss log table was not found: entries stay on this computer.'}</span>
+                </div>
+                {losses.length > 0 && (
+                    <table className="w-full text-sm mt-4">
+                        <thead><tr className="text-left text-[11px] uppercase tracking-wider text-slate-400"><th className="py-1 pr-2">Line</th><th className="py-1 pr-2">Milestone</th><th className="py-1 pr-2">Reason</th><th className="py-1 pr-2">Dept</th><th className="py-1 pr-2 text-right">Lost</th><th className="py-1"></th></tr></thead>
+                        <tbody>{losses.map(function (x: any) { return <tr key={x.id} className="border-t border-slate-100 align-top"><td className="py-1.5 pr-2 font-semibold">{x.area}</td><td className="py-1.5 pr-2">{x.step}</td><td className="py-1.5 pr-2">{x.reason}{x.description ? <div className="text-xs text-slate-500">{x.description}</div> : null}</td><td className="py-1.5 pr-2">{x.dept}</td><td className="py-1.5 pr-2 text-right whitespace-nowrap">{pbFmtHours(x.minutes)}{x.heads > 1 ? ' x ' + x.heads : ''}</td><td className="py-1.5 text-right"><button type="button" className="text-xs font-bold text-red-700 hover:underline" onClick={function () { act.removeLoss(x); }}>Remove</button></td></tr>; })}</tbody>
+                    </table>
+                )}
+            </PbCard>
+            <PbCard title="Biggest costs this weekend">
+                {costs.length === 0 ? <p className="text-sm text-slate-500">Nothing yet: record actual times on Execute and time loss above.</p> : (
+                    <table className="w-full text-sm"><tbody>{costs.slice(0, 10).map(function (c: any, i: number) { return <tr key={i} className="border-t border-slate-100"><td className="py-1.5 pr-2">{c.what}</td><td className="py-1.5 pr-2 text-right whitespace-nowrap">{pbFmtNum(c.hours, 1)} people-hours</td><td className="py-1.5 text-right whitespace-nowrap font-bold">{m.rate !== null ? pbFmtMoney(c.hours * m.rate) : ''}</td></tr>; })}</tbody></table>
+                )}
+                {m.rate === null && <p className="text-xs text-slate-500 mt-2">Set an hourly labor rate on Setup to see dollars.</p>}
+            </PbCard>
+        </div>
+    );
+}
+
+function PbWorkOrdersTab(props: any) {
+    var m = props.m; var act = props.act;
+    var textState = useState(''); var parsedState = useState(null); var filterState = useState('weekend');
+    var parsed: any = parsedState[0];
+    var areaKeys = pbKeys(m.areas).sort();
+    var list = m.wos.filter(function (w: any) { return filterState[0] === 'all' ? true : filterState[0] === 'weekend' ? w.weekendKey === m.weekend : !w.areaKey || !w.assetId; });
+    list.sort(function (a: any, b: any) { return String(a.priority).localeCompare(String(b.priority)) || a.order.localeCompare(b.order); });
+    function onFile(e: any) {
+        var file = e.target.files && e.target.files[0]; if (!file) return;
+        var r = new FileReader();
+        r.onload = function () { textState[1](String(r.result || '')); parsedState[1](pbParseWorkOrders(String(r.result || ''))); };
+        r.readAsText(file);
+    }
+    return (
+        <div className="space-y-4">
+            <PbCard title="Add work orders from SAP">
+                <p className="text-sm text-slate-600 mb-2">In the SAP export, select the rows with the header row (Priority, Order, Description, Description2, Order Type, Functional loc., Bas. start date, Main WorkCtr, Sort field), copy, and paste here. A .csv or .txt file works too.</p>
+                <textarea rows={5} className="block w-full border border-slate-300 rounded-lg px-2 py-1.5 font-mono text-xs" value={textState[0]} onChange={function (e: any) { textState[1](e.target.value); parsedState[1](null); }} placeholder="Paste the rows here" />
+                <div className="flex flex-wrap items-center gap-2 mt-2">
+                    <PbBtn onClick={function () { parsedState[1](pbParseWorkOrders(textState[0])); }} disabled={!textState[0]}>Read the paste</PbBtn>
+                    <input type="file" accept=".csv,.txt,.tsv" onChange={onFile} className="text-xs" />
+                </div>
+                {parsed && (
+                    <div className="mt-3 space-y-2">
+                        {parsed.issues.length > 0 && <PbNote tone="warn"><ul className="list-disc pl-5">{parsed.issues.map(function (t: string, i: number) { return <li key={i}>{t}</li>; })}</ul></PbNote>}
+                        <p className="text-sm text-slate-700">{pbPlural(parsed.rows.length, 'work order')} read. {parsed.rows.filter(function (r: any) { return m.wos.some(function (w: any) { return w.order === r.order; }); }).length} are already saved and will be updated (their equipment and hours stay).</p>
+                        <PbBtn kind="primary" disabled={!parsed.rows.length || props.busy} onClick={function () { act.importWos(parsed.rows, function () { textState[1](''); parsedState[1](null); }); }}>Save {pbPlural(parsed.rows.length, 'work order')}</PbBtn>
+                        <span className="text-xs text-slate-500 ml-2">Orders with a basic start date on or before Monday of this weekend are put on this weekend.</span>
+                    </div>
+                )}
+            </PbCard>
+            <PbCard title="Work orders" right={
+                <div className="flex gap-1">{[['weekend', 'This weekend'], ['unmapped', 'Needs equipment'], ['all', 'All']].map(function (o: any) { return <PbBtn key={o[0]} kind={filterState[0] === o[0] ? 'primary' : 'plain'} onClick={function () { filterState[1](o[0]); }}>{o[1]}</PbBtn>; })}</div>
+            }>
+                {!props.canSave.workorder && <PbNote tone="warn" className="mb-3">The _p_ Work order table was not found, so work orders are kept on this computer only. Make the table from the prompts (Data tab).</PbNote>}
+                {list.length === 0 ? <p className="text-sm text-slate-500">None here.</p> : (
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                            <thead><tr className="text-left text-[11px] uppercase tracking-wider text-slate-400"><th className="py-1 pr-2">Order</th><th className="py-1 pr-2">Pri</th><th className="py-1 pr-2">What</th><th className="py-1 pr-2">SAP asset and location</th><th className="py-1 pr-2">Equipment in the plan</th><th className="py-1 pr-2">Hours</th><th className="py-1">This weekend</th></tr></thead>
+                            <tbody>{list.map(function (w: any) { return <PbWoRow key={w.order} w={w} m={m} act={act} areaKeys={areaKeys} busy={props.busy} />; })}</tbody>
+                        </table>
+                    </div>
+                )}
+            </PbCard>
+        </div>
+    );
+}
+function PbWoRow(props: any) {
+    var w = props.w; var m = props.m; var act = props.act;
+    var sug = pbSuggestAsset(w, m.assets, m.maps);
+    var areaState = useState(w.areaKey || sug.areaKey || '');
+    var area = areaState[0];
+    var options = m.assets.filter(function (a: any) { return a.areaKey === area; }).sort(function (a: any, b: any) { return a.name.localeCompare(b.name); });
+    var guessed = !w.assetId && sug.how === 'guess' ? m.assets.filter(function (a: any) { return a.id === sug.assetId; })[0] : null;
+    var fl = pbParseFloc(w.floc);
+    var hrsState = useState(w.plannedHours === null ? '' : String(w.plannedHours));
+    return (
+        <tr className="border-t border-slate-100 align-top">
+            <td className="py-2 pr-2 font-mono text-xs">{w.order}<div className="text-[11px] text-slate-400">{w.orderType}</div></td>
+            <td className="py-2 pr-2">{w.priority}</td>
+            <td className="py-2 pr-2 max-w-[220px]">{w.description}<div className="text-[11px] text-slate-400">{w.basicStart ? 'start ' + pbFmtDate(w.basicStart) : w.basicStartText} {w.workCenter}</div></td>
+            <td className="py-2 pr-2 max-w-[200px]">{w.assetDesc}<div className="text-[11px] text-slate-400 font-mono" title={fl.area ? 'Area code ' + fl.area + (fl.sub ? ', sub area ' + fl.sub : '') : ''}>{w.floc}</div></td>
+            <td className="py-2 pr-2 min-w-[220px]">
+                <div className="flex flex-col gap-1">
+                    <select className="border border-slate-300 rounded px-1 py-1 text-xs" value={area} onChange={function (e: any) { areaState[1](e.target.value); }} aria-label="Area">
+                        <option value="">Area...</option>{props.areaKeys.map(function (k: string) { return <option key={k} value={k}>{m.areas[k].name}</option>; })}
+                    </select>
+                    <select className="border border-slate-300 rounded px-1 py-1 text-xs" value={w.assetId} disabled={!area || props.busy} onChange={function (e: any) { var a = m.assets.filter(function (x: any) { return x.id === e.target.value; })[0]; act.mapWo(w, a || null, area); }} aria-label="Equipment">
+                        <option value="">{area ? 'Pick the equipment...' : 'Pick an area first'}</option>{options.map(function (a: any) { return <option key={a.id} value={a.id}>{a.name}{a.subcat ? ' (' + a.subcat + ')' : ''}</option>; })}
+                    </select>
+                    {w.assetId && <span className="text-[11px] text-emerald-700">{sug.how === 'saved' ? 'Saved for this location and asset' : 'Picked'}</span>}
+                    {guessed && <button type="button" className="text-left text-[11px] font-bold text-[#0072CE] hover:underline" onClick={function () { act.mapWo(w, guessed, guessed.areaKey); }}>Looks like {guessed.name}: use it</button>}
+                </div>
+            </td>
+            <td className="py-2 pr-2"><input type="number" inputMode="decimal" min={0} step={0.5} placeholder="hours" aria-label="Planned hours" className="border border-slate-300 rounded-lg px-2 py-1 text-sm w-20"
+                value={hrsState[0]} onChange={function (e: any) { hrsState[1](e.target.value); }}
+                onBlur={function () { var v = hrsState[0] === '' ? null : Number(hrsState[0]); if (v !== w.plannedHours && (v === null || isFinite(v))) act.saveWo(w, { craa5_plannedhours: v }); }} /></td>
+            <td className="py-2"><input type="checkbox" checked={w.weekendKey === m.weekend} disabled={props.busy} onChange={function (e: any) { act.saveWo(w, { craa5_weekendkey: e.target.checked ? m.weekend : '' }); }} aria-label="This weekend" /></td>
+        </tr>
+    );
+}
+
+function PbCrewTab(props: any) {
+    var m = props.m; var act = props.act;
+    var slots = m.slots.filter(function (s: any) { return s.crews.length && s.end > m.frame.focusStart - 12 * PB_HOUR && s.start < m.frame.focusEnd; });
+    return (
+        <div className="space-y-4">
+            <PbNote>Who is on each weekend shift. Experience is worked out in the background from the last 56 days of Shift Start boards and task assignments ({props.expState}); double click a name to see it.</PbNote>
+            {!m.slotsOk && <PbNote tone="warn">The crew rotation could not be read, so shifts cannot be listed.</PbNote>}
+            {slots.map(function (s: any) {
+                var ids = s.hc.boardIds.length ? s.hc.boardIds : s.hc.rosterIds;
+                var assignedTo: any = {};
+                m.included.forEach(function (l: any) { pbKeys(l.people).forEach(function (gk: string) { (l.people[gk] || []).forEach(function (id: string) { (assignedTo[id] = assignedTo[id] || []).push(l.name); }); }); });
+                return (
+                    <PbCard key={s.start} title={'Crew ' + s.key + ' - ' + pbFmtDayTime(s.start) + ' to ' + pbFmtDayTime(s.end)} right={<PbBtn onClick={function () { act.openSlot(s); }}>{s.cap} for sanitation</PbBtn>}>
+                        <p className="text-xs text-slate-500 mb-2">{s.hc.boardIds.length ? 'From the Shift Start ' + (s.hc.boardSrc === 'plan' ? 'planned board' : 'board') : 'From the Employees table roster (no Shift Start board for this shift yet)'}.</p>
+                        {ids.length === 0 ? <p className="text-sm text-slate-500">Nobody found.</p> : (
+                            <div className="flex flex-wrap gap-1.5">
+                                {ids.map(function (id: string) {
+                                    var e = m.empById[id]; var nm = e ? e.name : id.indexOf('n:') === 0 ? id.slice(2) : 'Unknown person';
+                                    return <button key={id} type="button" onDoubleClick={function () { act.openPerson(id); }} className="px-2.5 py-1 rounded-full border border-slate-300 text-xs font-semibold text-slate-700 hover:bg-slate-50" title={assignedTo[id] ? 'Picked for ' + assignedTo[id].join(', ') : 'Double click for experience'}>{nm}{assignedTo[id] ? ' *' : ''}</button>;
+                                })}
+                            </div>
+                        )}
+                    </PbCard>
+                );
+            })}
+            <p className="text-xs text-slate-500">* = picked for a milestone on the Plan tab.</p>
+        </div>
+    );
+}
+
+function PbSetupTab(props: any) {
+    var cfg = props.config; var act = props.act; var m = props.m;
+    function setCfg(patch: any) { var n = pbClone(cfg); pbKeys(patch).forEach(function (k: string) { n[k] = patch[k]; }); act.config(n); }
+    function stepEdit(list: string, i: number, k: string, v: any) { var arr = pbClone(cfg[list]); arr[i][k] = v; var o: any = {}; o[list] = arr; setCfg(o); }
+    function stepMove(list: string, i: number, d: number) { var arr = pbClone(cfg[list]); var j = i + d; if (j < 0 || j >= arr.length) return; var t = arr[i]; arr[i] = arr[j]; arr[j] = t; var o: any = {}; o[list] = arr; setCfg(o); }
+    function stepDel(list: string, i: number) { var arr = pbClone(cfg[list]); arr.splice(i, 1); var o: any = {}; o[list] = arr; setCfg(o); }
+    function stepAdd(list: string) { var arr = pbClone(cfg[list]); arr.push({ id: 's' + Date.now().toString(36), dept: 'FSQ', name: 'New step', anchor: list === 'pre' ? 'stop' : 'chain', offset: 0, minutes: 60, hc: 0 }); var o: any = {}; o[list] = arr; setCfg(o); }
+    var order = (cfg.lineOrder || []).slice();
+    m.lines.forEach(function (l: any) { if (order.indexOf(l.key) < 0 && l.include) order.push(l.key); });
+    function moveLine(i: number, d: number) { var arr = order.slice(); var j = i + d; if (j < 0 || j >= arr.length) return; var t = arr[i]; arr[i] = arr[j]; arr[j] = t; setCfg({ lineOrder: arr }); }
+    function stepTable(list: string, title: string) {
+        return (
+            <PbCard title={title} right={<PbBtn onClick={function () { stepAdd(list); }}>Add a step</PbBtn>}>
+                <div className="space-y-2">
+                    {cfg[list].map(function (st: any, i: number) {
+                        return (
+                            <div key={st.id} className="flex flex-wrap items-center gap-2 border-b border-slate-100 pb-2">
+                                <select className="border border-slate-300 rounded px-1 py-1 text-xs" value={st.dept} onChange={function (e: any) { stepEdit(list, i, 'dept', e.target.value); }} aria-label="Department">{PB_DEPTS.map(function (d: string) { return <option key={d}>{d}</option>; })}</select>
+                                <input className="border border-slate-300 rounded px-2 py-1 text-sm flex-1 min-w-[180px]" value={st.name} onChange={function (e: any) { stepEdit(list, i, 'name', e.target.value); }} aria-label="Step name" />
+                                <select className="border border-slate-300 rounded px-1 py-1 text-xs" value={st.anchor} onChange={function (e: any) { stepEdit(list, i, 'anchor', e.target.value); }} aria-label="Starts">
+                                    <option value="stop">at the stop, plus</option><option value="chain">after the step before, plus</option><option value="restart">at the restart, plus</option>
+                                </select>
+                                <PbNumInput value={st.offset} step={15} onChange={function (v: any) { stepEdit(list, i, 'offset', v || 0); }} label="Offset minutes" className="w-20" /><span className="text-xs text-slate-500">min, lasts</span>
+                                <PbNumInput value={st.minutes} min={0} step={15} onChange={function (v: any) { stepEdit(list, i, 'minutes', v || 0); }} label="Minutes" className="w-20" /><span className="text-xs text-slate-500">min</span>
+                                {st.dept === 'SAN' && <span className="inline-flex items-center gap-1 text-xs text-slate-500"><PbNumInput value={st.hc} min={0} onChange={function (v: any) { stepEdit(list, i, 'hc', v || 0); }} label="People" className="w-16" />people</span>}
+                                <PbBtn kind="ghost" onClick={function () { stepMove(list, i, -1); }} title="Move up">Up</PbBtn>
+                                <PbBtn kind="ghost" onClick={function () { stepMove(list, i, 1); }} title="Move down">Down</PbBtn>
+                                <PbBtn kind="danger" onClick={function () { stepDel(list, i); }}>Remove</PbBtn>
+                            </div>
+                        );
+                    })}
+                </div>
+            </PbCard>
+        );
+    }
+    return (
+        <div className="space-y-4">
+            <PbNote>Setup applies to every weekend and every line. {props.canSave.plan ? 'It is saved to the _p_ Plan table (row "config") when you press Save setup.' : 'The _p_ Plan table was not found, so setup is kept on this computer.'}</PbNote>
+            <PbCard title="Rules" right={<PbBtn kind="primary" disabled={props.busy || !props.configDirty} onClick={act.saveConfig}>{props.configDirty ? 'Save setup' : 'Setup saved'}</PbBtn>}>
+                <div className="grid md:grid-cols-2 gap-4 text-sm">
+                    <label className="block"><span className="font-bold">Labor rate per hour</span><div className="mt-1 flex items-center gap-2"><span>$</span><PbNumInput value={cfg.rate} min={0} step={0.5} placeholder="not set" onChange={function (v: any) { setCfg({ rate: v }); }} label="Labor rate" /><span className="text-xs text-slate-500">Used for cost on Plan and Debrief. Blank = no dollars shown.</span></div></label>
+                    <label className="block"><span className="font-bold">Maintenance goes after the milestone named</span><input className="mt-1 block w-full border border-slate-300 rounded-lg px-2 py-1.5" value={cfg.mntPattern} onChange={function (e: any) { setCfg({ mntPattern: e.target.value }); }} /><span className="text-xs text-slate-500">A word in the subcategory name. Each line can move it.</span></label>
+                    <label className="flex items-center gap-2"><input type="checkbox" checked={cfg.excludeOnDemand} onChange={function (e: any) { setCfg({ excludeOnDemand: e.target.checked }); }} />Leave out "on demand" subcategories</label>
+                    <label className="flex items-center gap-2"><input type="checkbox" checked={cfg.monthlyRule} onChange={function (e: any) { setCfg({ monthlyRule: e.target.checked }); }} />Equipment named "2nd Wk of Month" only on the 2nd weekend (Saturday the 8th to 14th)</label>
+                </div>
+            </PbCard>
+            <PbCard title="Line order">
+                <p className="text-sm text-slate-500 mb-2">When people are short, lines higher on this list get them first.</p>
+                <ol className="space-y-1">{order.map(function (k: string, i: number) { var l = m.lines.filter(function (x: any) { return x.key === k; })[0]; if (!l) return null; return <li key={k} className="flex items-center gap-2 text-sm"><span className="w-6 text-right text-slate-400">{i + 1}.</span><span className="flex-1 font-semibold">{l.name}</span><PbBtn kind="ghost" onClick={function () { moveLine(i, -1); }}>Up</PbBtn><PbBtn kind="ghost" onClick={function () { moveLine(i, 1); }}>Down</PbBtn></li>; })}</ol>
+            </PbCard>
+            {stepTable('pre', 'Steps before the sanitation milestones')}
+            {stepTable('tail', 'Steps after the sanitation milestones')}
+            <p className="text-xs text-slate-500">The starting steps came from the PBED example sheet: handoff 1 h at the stop, FSQ inspect 1 h, swab 1.5 h, preflight 2 h from an hour before the restart, 1st pie an hour after it. Change them to fit each department.</p>
+        </div>
+    );
+}
+
+function PbDataTab(props: any) {
+    var d = props.data; var probes = props.probes; var colState = useState(null); var colBusy = useState(false);
+    var cols: any = colState[0];
+    function runCols() {
+        colBusy[1](true);
+        var out: any = {}; var chain = Promise.resolve();
+        ['plan', 'milestone', 'workorder', 'flocmap', 'timeloss'].forEach(function (k: string) {
+            var p = probes[k]; if (!p || p.state !== 'found') return;
+            chain = chain.then(function () { return pbProbeCols(props.dataApi, p.table, PB_COLS[k]).then(function (r: any) { out[k] = r; }); });
+        });
+        chain.then(function () { colState[1](out); colBusy[1](false); });
+    }
+    var readKeys = ['assets', 'runs', 'workshift', 'employees', 'shiftplan', 'shiftboard', 'checkoff', 'taskassignment', 'shiftarchive'];
+    return (
+        <div className="space-y-4">
+            <PbCard title="What this page read" right={<PbBtn onClick={props.onReload} disabled={props.busy}>Read again</PbBtn>}>
+                <p className="text-sm text-slate-600 mb-2">Every number on the page comes from these reads. When one fails, the page says what is missing instead of making anything up.</p>
+                <div className="overflow-x-auto"><table className="w-full text-sm"><thead><tr className="text-left text-[11px] uppercase tracking-wider text-slate-400"><th className="py-1 pr-3">Data</th><th className="py-1 pr-3">Table</th><th className="py-1 pr-3">Read</th><th className="py-1">Note</th></tr></thead>
+                    <tbody>{readKeys.map(function (k: string) { return <PbSourceLine key={k} label={PB_TABLES[k].label} owner={'Written by ' + PB_TABLES[k].owner} names={PB_TABLES[k].names.join(' or ')} src={d[k]} note={k === 'taskassignment' || k === 'shiftarchive' ? 'Read in the background for experience' : ''} />; })}</tbody>
+                </table></div>
+            </PbCard>
+            <PbCard title="Tables this page saves to" right={<PbBtn onClick={runCols} disabled={colBusy[0]}>{colBusy[0] ? 'Checking...' : 'Check columns'}</PbBtn>}>
+                <div className="overflow-x-auto"><table className="w-full text-sm"><thead><tr className="text-left text-[11px] uppercase tracking-wider text-slate-400"><th className="py-1 pr-3">Table</th><th className="py-1 pr-3">Found as</th><th className="py-1">Columns</th></tr></thead>
+                    <tbody>{['plan', 'milestone', 'workorder', 'flocmap', 'timeloss'].map(function (k: string) {
+                        var p = probes[k] || {};
+                        var c = cols && cols[k]; var missing = c ? pbKeys(c).filter(function (x: string) { return c[x] === 'missing'; }) : [];
+                        return (
+                            <tr key={k} className="border-t border-slate-100 align-top">
+                                <td className="py-2 pr-3 font-semibold">{PB_TABLES[k].label}<div className="text-[11px] font-mono font-normal text-slate-400">{PB_TABLES[k].names[0]}</div></td>
+                                <td className={'py-2 pr-3 ' + (p.state === 'found' ? 'text-emerald-700' : p.state === 'denied' ? 'text-amber-700' : 'text-red-700')}>{p.state === 'found' ? p.table : p.state === 'denied' ? 'No permission to read ' + p.table : p.state === 'unknown' ? 'Could not tell' : p.state === 'nohost' ? 'No Dataverse here' : p.state ? 'Not found: kept on this computer' : 'Checking...'}{p.why && p.state !== 'missing' ? <div className="text-[11px] text-slate-500">{p.why}</div> : null}</td>
+                                <td className="py-2 text-xs">{!c ? (p.state === 'found' ? 'Press Check columns' : '') : missing.length ? <span className="text-red-700">Missing: {missing.join(', ')}</span> : <span className="text-emerald-700">All {pbKeys(c).length} found</span>}</td>
+                            </tr>
+                        );
+                    })}</tbody>
+                </table></div>
+                <p className="text-xs text-slate-500 mt-2">Make the four _p_ tables with the Copilot prompts in pbed-table-prompts.md (one table per prompt, no lookups). The time loss log is the manager hub's table: if it already exists, nothing to do.</p>
+            </PbCard>
+        </div>
+    );
+}
+// ==== END PBED OTHER TABS ====
+// ==== PBED APP ====
+var PB_TABS = [['plan', 'Plan'], ['brief', 'Brief'], ['execute', 'Execute'], ['debrief', 'Debrief'], ['workorders', 'Work orders'], ['crew', 'Crew'], ['setup', 'Setup'], ['data', 'Data']];
+var PB_EXP_DAYS = 56;
+var PB_EXP_CACHE = 'pb_exp_v1';
+var PB_OWN = ['plan', 'milestone', 'workorder', 'flocmap', 'timeloss'];
+var PB_EMPTY_SRC = { rows: null, err: '', table: '' };
+
+function pbSatOf(ymd: string) {
+    var d = pbFromYmd(ymd); if (!d) return null;
+    var dow = d.getDay(); var add = dow === 0 ? -1 : dow === 1 ? -2 : 6 - dow;
+    return pbYmd(pbAddDays(d, add));
+}
+function pbLocalRows(kind: string) { var v = pbReadLocal('pb_local_' + kind, []); return Array.isArray(v) ? v : []; }
+function pbTagRows(rows: any[], table: string) { return (rows || []).map(function (r: any) { var o = r; o.__id = pbCleanId(r[table + 'id'] || r.__id || ''); return o; }); }
+
+export default function PbedApp(props: any) {
+    var dataApi = props && props.dataApi;
+    var weekendState = useState(pbDefaultWeekend(Date.now())); var weekend = weekendState[0]; var setWeekend = weekendState[1];
+    var tabState = useState('plan'); var tab = tabState[0];
+    var dataState = useState({
+        assets: PB_EMPTY_SRC, runs: PB_EMPTY_SRC, workshift: PB_EMPTY_SRC, employees: PB_EMPTY_SRC, shiftplan: PB_EMPTY_SRC, shiftboard: PB_EMPTY_SRC, shiftarchiveWk: PB_EMPTY_SRC,
+        checkoff: PB_EMPTY_SRC, workorder: PB_EMPTY_SRC, flocmap: PB_EMPTY_SRC, milestone: PB_EMPTY_SRC, timeloss: PB_EMPTY_SRC, taskassignment: PB_EMPTY_SRC, shiftarchive: PB_EMPTY_SRC
+    });
+    var data: any = dataState[0]; var setData = dataState[1];
+    var dataRef = useRef(data); dataRef.current = data;
+    var probesState = useState({}); var probes: any = probesState[0];
+    var probesRef = useRef(probes); probesRef.current = probes;
+    var planState = useState(pbEmptyPlan(weekend)); var plan: any = planState[0]; var setPlan = planState[1];
+    var planMetaState = useState({ id: null, version: 0, savedBy: '', savedOn: null, dirty: false, draftAt: null, loaded: false });
+    var planMeta: any = planMetaState[0]; var setPlanMeta = planMetaState[1];
+    var configState = useState(pbMergeConfig(pbReadLocal('pb_config', null))); var config: any = configState[0];
+    var configMetaState = useState({ id: null, dirty: false });
+    var expState = useState(null); var exp = expState[0];
+    var expNoteState = useState('waiting for the main read');
+    var modalState = useState(null); var modal: any = modalState[0]; var setModal = modalState[1];
+    var busyState = useState(false); var busy = busyState[0]; var setBusy = busyState[1];
+    var msgState = useState(null); var msg: any = msgState[0]; var setMsg = msgState[1];
+    var loadingState = useState(true);
+    var reloadState = useState(0);
+
+    function patchData(patch: any) { setData(function (cur: any) { var n: any = {}; pbKeys(cur).forEach(function (k: string) { n[k] = cur[k]; }); pbKeys(patch).forEach(function (k: string) { n[k] = patch[k]; }); return n; }); }
+    function ownFound(kind: string) { var p = probesRef.current[kind]; return !!(p && p.state === 'found'); }
+    function readOwn(kind: string, opts: any) {
+        var p = probesRef.current[kind];
+        if (!p || p.state !== 'found') return Promise.resolve({ rows: pbLocalRows(kind), err: p && p.state !== 'missing' ? p.why : '', table: '', local: true });
+        return pbQuery(dataApi, p.table, opts).then(function (r: any) { r.table = p.table; if (r.rows) r.rows = pbTagRows(r.rows, p.table); return r; });
+    }
+    function readFirst(key: string, opts: any) { return pbQueryFirst(dataApi, PB_TABLES[key].names, opts).then(function (r: any) { return r; }); }
+    // Boards: by slot start; if the column will not filter that way, by modified date, then by slot start here.
+    function readBoards(key: string, frame: any) {
+        var sel = ['craa5_name', 'craa5_crew', 'craa5_slotstart', 'craa5_slotend', 'craa5_boardjson', 'craa5_status', 'modifiedon'];
+        var from = frame.focusStart - 24 * PB_HOUR; var to = frame.readEnd;
+        return readFirst(key, { select: sel, filter: 'statecode eq 0 and craa5_slotstart ge ' + pbIsoZ(from) + ' and craa5_slotstart le ' + pbIsoZ(to), top: 500 }).then(function (r: any) {
+            if (r.rows || r.kind === 'missing' || r.kind === 'denied' || r.kind === 'nohost') return r;
+            return readFirst(key, { filter: 'modifiedon ge ' + pbIsoZ(from - 21 * PB_DAY), top: 2000, orderBy: 'modifiedon desc' }).then(function (r2: any) {
+                if (r2.rows) r2.rows = r2.rows.filter(function (x: any) { var s = pbMs(pbField(x, 'craa5_slotstart')); return s !== null && s >= from && s <= to; });
+                return r2;
+            });
+        });
+    }
+
+    // Which of our own tables exist, then everything that does not depend on the weekend.
+    useEffect(function () {
+        var alive = true;
+        loadingState[1](true);
+        Promise.all(PB_OWN.map(function (k: string) { return pbProbe(dataApi, PB_TABLES[k].names).then(function (p: any) { return [k, p]; }); })).then(function (list: any[]) {
+            if (!alive) return;
+            var pr: any = {}; list.forEach(function (x: any) { pr[x[0]] = x[1]; });
+            probesRef.current = pr; probesState[1](pr);
+            var loading = { rows: null, err: '', loading: true };
+            patchData({ assets: loading, workshift: loading, employees: loading, flocmap: loading });
+            return Promise.all([
+                readFirst('assets', { select: ['craa5_aa_assetsid', 'craa5_equipmentidentifier', 'craa5_areaname', 'craa5_roomname', 'craa5_subcategory', 'craa5_hoursrequired', 'craa5_minalrg', 'craa5_heads', 'craa5_weeklyclean', 'craa5_monthlyclean', 'craa5_month', 'statecode'], filter: 'statecode eq 0', top: 10000 }),
+                readFirst('workshift', { filter: 'statecode eq 0', top: 500 }),
+                readFirst('employees', { select: ['craa5__aa_employeeid', 'craa5_name', 'craa5_shift', 'craa5_role', 'statecode'], filter: 'statecode eq 0', top: 5000 }),
+                readOwn('flocmap', { filter: 'statecode eq 0', top: 5000 }),
+                readOwn('plan', { filter: "craa5_weekendkey eq 'config'", top: 5 })
+            ]).then(function (res: any[]) {
+                if (!alive) return;
+                patchData({ assets: res[0], workshift: res[1], employees: res[2], flocmap: res[3] });
+                var cfgRows = (res[4].rows || []).filter(function (r: any) { return pbField(r, 'craa5_weekendkey') === 'config'; });
+                if (cfgRows.length) {
+                    var row = cfgRows[0]; var saved = null;
+                    try { saved = JSON.parse(pbField(row, 'craa5_planjson') || 'null'); } catch (e) { saved = null; }
+                    if (saved) { configState[1](pbMergeConfig(saved)); pbWriteLocal('pb_config', saved); }
+                    configMetaState[1]({ id: row.__id || null, dirty: false });
+                }
+                loadingState[1](false);
+                startExperience();
+            });
+        });
+        return function () { alive = false; };
+    }, [reloadState[0]]);
+
+    // The weekend's runs, boards, check-offs, work orders, actuals, time loss and saved plan.
+    useEffect(function () {
+        var alive = true;
+        if (!pbKeys(probesRef.current).length) return function () { alive = false; };
+        var frame = pbWeekendFrame(weekend);
+        var loading = { rows: null, err: '', loading: true };
+        patchData({ runs: loading, shiftplan: loading, shiftboard: loading, shiftarchiveWk: loading, checkoff: loading, workorder: loading, milestone: loading, timeloss: loading });
+        Promise.all([
+            readFirst('runs', { select: ['craa5__aa_prd_schdid', 'craa5_area', 'craa5_line', 'craa5_datestarttime', 'craa5_dateendtime', 'craa5_product', 'craa5_allergen', 'craa5_typeofallergen'], filter: 'statecode eq 0 and craa5_datestarttime lt ' + pbIsoZ(frame.readEnd) + ' and craa5_dateendtime gt ' + pbIsoZ(frame.readStart), orderBy: 'craa5_datestarttime asc', top: 3000 }),
+            readBoards('shiftplan', frame), readBoards('shiftboard', frame), readBoards('shiftarchive', frame),
+            readFirst('checkoff', { filter: 'modifiedon ge ' + pbIsoZ(frame.readStart), top: 5000 }),
+            readOwn('workorder', { filter: 'statecode eq 0', top: 5000 }),
+            readOwn('milestone', { filter: "craa5_weekendkey eq '" + weekend + "'", top: 2000 }),
+            readOwn('timeloss', { filter: "craa5_kind eq 'Weekend clean' and craa5_occurredon ge " + pbIsoZ(frame.readStart) + ' and craa5_occurredon le ' + pbIsoZ(frame.readEnd), top: 2000 }),
+            readOwn('plan', { filter: "craa5_weekendkey eq '" + weekend + "'", top: 20 })
+        ]).then(function (res: any[]) {
+            if (!alive) return;
+            var local = function (r: any, kind: string) { if (r.local) r.rows = r.rows.filter(function (x: any) { return kind === 'milestone' ? pbField(x, 'craa5_weekendkey') === weekend : kind === 'timeloss' ? true : true; }); return r; };
+            patchData({ runs: res[0], shiftplan: res[1], shiftboard: res[2], shiftarchiveWk: res[3], checkoff: res[4], workorder: res[5], milestone: local(res[6], 'milestone'), timeloss: res[7] });
+            var rows = (res[8].rows || []).filter(function (r: any) { return pbField(r, 'craa5_weekendkey') === weekend; });
+            rows.sort(function (a: any, b: any) { return (pbNum(pbField(b, 'craa5_version')) || 0) - (pbNum(pbField(a, 'craa5_version')) || 0); });
+            var row = rows[0] || null; var saved = null;
+            if (row) { try { saved = JSON.parse(pbField(row, 'craa5_planjson') || 'null'); } catch (e) { saved = null; } }
+            var draft = pbReadLocal('pb_draft_' + weekend, null);
+            var savedOn = row ? pbMs(pbField(row, 'craa5_savedon')) || pbMs(pbField(row, 'modifiedon')) : null;
+            var meta = { id: row ? row.__id : null, version: row ? pbNum(pbField(row, 'craa5_version')) || 0 : 0, savedBy: row ? pbTrim(pbField(row, 'craa5_savedby')) : '', savedOn: savedOn, dirty: false, draftAt: null, loaded: true, local: !!res[8].local };
+            if (draft && draft.plan && (!savedOn || (draft.at || 0) > savedOn)) { setPlan(draft.plan); meta.dirty = true; meta.draftAt = draft.at; }
+            else setPlan(saved && saved.lines ? saved : pbEmptyPlan(weekend));
+            setPlanMeta(meta);
+        });
+        return function () { alive = false; };
+    }, [weekend, probes, reloadState[0]]);
+
+    function startExperience() {
+        var cached = pbReadLocal(PB_EXP_CACHE, null);
+        if (cached && cached.at && Date.now() - cached.at < 6 * PB_HOUR && cached.exp) { expState[1](cached.exp); expNoteState[1]('ready, worked out ' + pbFmtDayTime(cached.at)); return; }
+        expNoteState[1]('working it out');
+        var since = Date.now() - PB_EXP_DAYS * PB_DAY;
+        patchData({ taskassignment: { rows: null, loading: true }, shiftarchive: { rows: null, loading: true } });
+        Promise.all([
+            readFirst('taskassignment', { select: ['craa5__aaemp_guid', 'craa5_id', 'craa5_area', 'craa5_starttime', 'craa5_endtime', 'craa5_datetimeofassignment', 'createdon'], filter: 'createdon ge ' + pbIsoZ(since), top: 20000 }),
+            readFirst('shiftarchive', { select: ['craa5_slotstart', 'craa5_slotend', 'craa5_boardjson'], filter: 'createdon ge ' + pbIsoZ(since), top: 5000 })
+        ]).then(function (res: any[]) {
+            var lite = function (r: any) { return { rows: r.rows ? { length: r.rows.length } : null, err: r.err, table: r.table, droppedSelect: r.droppedSelect }; };
+            patchData({ taskassignment: lite(res[0]), shiftarchive: lite(res[1]) });
+            if (!res[0].rows && !res[1].rows) { expNoteState[1]('not available: neither history table could be read'); expState[1]({}); return; }
+            var e = pbExperience(res[0].rows || [], res[1].rows || [], since);
+            expState[1](e); expNoteState[1]('ready');
+            pbWriteLocal(PB_EXP_CACHE, { at: Date.now(), exp: e });
+        });
+    }
+
+    var model = useMemo(function () {
+        var boards: any[] = [];
+        [['shiftplan', 'plan'], ['shiftboard', 'board'], ['shiftarchiveWk', 'archive']].forEach(function (x: any) { (data[x[0]].rows || []).forEach(function (r: any) { boards.push(pbNormBoard(r, x[1])); }); });
+        var d = { assets: data.assets, runs: data.runs, workshift: data.workshift, employees: data.employees, boards: boards, checkoff: data.checkoff, workorder: data.workorder, flocmap: data.flocmap, milestone: data.milestone, timeloss: data.timeloss };
+        return pbBuildModel(d, plan, config, weekend);
+    }, [data, plan, config, weekend]);
+
+    // ---------- changing the plan ----------
+    function changePlan(fn: any) {
+        setPlan(function (cur: any) {
+            var n = pbClone(cur); fn(n); n.weekend = weekend;
+            pbWriteLocal('pb_draft_' + weekend, { plan: n, at: Date.now() });
+            return n;
+        });
+        setPlanMeta(function (m: any) { var o = pbClone(m); o.dirty = true; return o; });
+    }
+    var act: any = {
+        line: function (key: string, patch: any) { changePlan(function (n: any) { var l = n.lines[key] || (n.lines[key] = {}); pbKeys(patch).forEach(function (k: string) { if (patch[k] === null || patch[k] === undefined) delete l[k]; else l[k] = patch[k]; }); }); },
+        shiftHc: function (start: number, v: any) { changePlan(function (n: any) { n.shiftHc = n.shiftHc || {}; if (v === null || v === undefined) delete n.shiftHc[String(start)]; else n.shiftHc[String(start)] = v; }); },
+        notes: function (t: string) { changePlan(function (n: any) { n.notes = t; }); },
+        openBlock: function (l: any, b: any) { setModal({ type: b.kind === 'sub' ? 'sub' : b.kind === 'mnt' ? 'mnt' : 'step', key: l.key, id: b.id }); },
+        openLine: function (l: any) { setModal({ type: 'line', key: l.key }); },
+        openSlot: function (s: any) { setModal({ type: 'slot', start: s.start }); },
+        openPerson: function (id: string) { setModal({ type: 'person', id: id }); },
+        openActual: function (l: any, b: any) { setModal({ type: 'actual', key: l.key, id: b.id }); },
+        config: function (c: any) { configState[1](c); configMetaState[1]({ id: configMetaState[0].id, dirty: true }); pbWriteLocal('pb_config', c); },
+        saveConfig: function () { saveConfig(); },
+        actual: function (l: any, b: any, patch: any) { saveActual(l, b, patch); },
+        addLoss: function (f: any, done: any) { addLoss(f, done); },
+        removeLoss: function (x: any) { removeOwn('timeloss', x.id).then(function () { setMsg({ tone: 'good', text: 'Time loss entry removed.' }); }); },
+        importWos: function (rows: any[], done: any) { importWos(rows, done); },
+        saveWo: function (w: any, patch: any) { saveOwn('workorder', w.id, patch, w.raw).catch(function (e: any) { setMsg({ tone: 'bad', text: pbErrText(e) }); }); },
+        mapWo: function (w: any, a: any, areaKey: string) { mapWo(w, a, areaKey); }
+    };
+
+    // ---------- saving ----------
+    // One write to one of our tables (or to this computer when the table is not there). Keeps the row in state.
+    function saveOwn(kind: string, id: string, body: any, base?: any) {
+        var p = probesRef.current[kind];
+        if (p && p.state === 'found') {
+            return pbSave(dataApi, p.table, id && id.indexOf('local-') !== 0 ? id : null, body).then(function (newId: any) {
+                var cur = dataRef.current[kind] || PB_EMPTY_SRC; var rows = (cur.rows || []).slice(); var hit = false;
+                rows = rows.map(function (r: any) { if (r.__id === newId || (id && r.__id === id)) { hit = true; var o: any = {}; pbKeys(r).forEach(function (k: string) { o[k] = r[k]; }); pbKeys(body).forEach(function (k: string) { o[k] = body[k]; }); o.__id = newId; return o; } return r; });
+                if (!hit) { var o2: any = base ? pbClone(base) : {}; pbKeys(body).forEach(function (k: string) { o2[k] = body[k]; }); o2.__id = newId; rows.push(o2); }
+                if (kind !== 'plan') { var np: any = {}; np[kind] = { rows: rows, err: '', table: p.table, via: cur.via }; patchData(np); }
+                return newId;
+            });
+        }
+        var all = pbLocalRows(kind); var lid = id || ('local-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)); var found = false;
+        all = all.map(function (r: any) { if (r.__id === lid) { found = true; var o: any = {}; pbKeys(r).forEach(function (k: string) { o[k] = r[k]; }); pbKeys(body).forEach(function (k: string) { o[k] = body[k]; }); return o; } return r; });
+        if (!found) { var o3: any = base ? pbClone(base) : {}; pbKeys(body).forEach(function (k: string) { o3[k] = body[k]; }); o3.__id = lid; all.push(o3); }
+        pbWriteLocal('pb_local_' + kind, all);
+        var cur2 = dataRef.current[kind] || PB_EMPTY_SRC; var rows2 = all;
+        if (kind === 'milestone') rows2 = all.filter(function (r: any) { return pbField(r, 'craa5_weekendkey') === weekend; });
+        if (kind !== 'plan') { var np2: any = {}; np2[kind] = { rows: rows2, err: cur2.err, table: '', local: true }; patchData(np2); }
+        return Promise.resolve(lid);
+    }
+    function removeOwn(kind: string, id: string) {
+        var p = probesRef.current[kind];
+        var drop = function () { var cur = dataRef.current[kind]; var np: any = {}; np[kind] = { rows: (cur.rows || []).filter(function (r: any) { return r.__id !== id; }), err: cur.err, table: cur.table }; patchData(np); };
+        if (p && p.state === 'found' && id.indexOf('local-') !== 0) {
+            var w = pbWriter(dataApi); if (!w) return Promise.resolve();
+            return w.remove(p.table, id).then(drop, function (e: any) { setMsg({ tone: 'bad', text: 'Could not remove it: ' + pbErrText(e) }); });
+        }
+        pbWriteLocal('pb_local_' + kind, pbLocalRows(kind).filter(function (r: any) { return r.__id !== id; })); drop();
+        return Promise.resolve();
+    }
+    function savePlan(force?: boolean, baseVer?: number) {
+        var p = probesRef.current.plan; var who = pbUserName();
+        var base = baseVer !== undefined ? baseVer : (planMeta.version || 0);
+        var nextVer = base + 1;
+        var body = { craa5_name: ('PBED weekend ' + weekend).slice(0, 100), craa5_weekendkey: weekend, craa5_planjson: JSON.stringify(plan), craa5_status: 'saved', craa5_version: nextVer, craa5_savedby: who, craa5_savedon: new Date().toISOString() };
+        setBusy(true); setMsg(null);
+        var check = p && p.state === 'found' && !force ? pbQuery(dataApi, p.table, { filter: "craa5_weekendkey eq '" + weekend + "'", select: [pbIdCol(p.table), 'craa5_version', 'craa5_savedby', 'craa5_savedon'], top: 20 }) : Promise.resolve({ rows: [] });
+        check.then(function (r: any) {
+            var newest = 0; var by = ''; (r.rows || []).forEach(function (x: any) { var v = pbNum(pbField(x, 'craa5_version')) || 0; if (v > newest) { newest = v; by = pbTrim(pbField(x, 'craa5_savedby')); } });
+            if (newest > base) { setBusy(false); setModal({ type: 'conflict', by: by, version: newest }); return; }
+            return saveOwn('plan', planMeta.id, body).then(function (id: any) {
+                pbDropLocal('pb_draft_' + weekend);
+                setPlanMeta({ id: id, version: nextVer, savedBy: who, savedOn: Date.now(), dirty: false, draftAt: null, loaded: true, local: !(p && p.state === 'found') });
+                setMsg({ tone: 'good', text: p && p.state === 'found' ? 'Plan saved to Dataverse.' : 'Plan saved on this computer only: the _p_ Plan table was not found (see Data).' });
+                setBusy(false);
+            });
+        }).catch(function (e: any) { setBusy(false); setMsg({ tone: 'bad', text: 'The plan was not saved: ' + pbErrText(e) + '. Your changes are kept on this computer.' }); });
+    }
+    function saveConfig() {
+        var body = { craa5_name: 'PBED setup', craa5_weekendkey: 'config', craa5_planjson: JSON.stringify(config), craa5_status: 'config', craa5_savedby: pbUserName(), craa5_savedon: new Date().toISOString() };
+        setBusy(true);
+        saveOwn('plan', configMetaState[0].id, body).then(function (id: any) { configMetaState[1]({ id: id, dirty: false }); setBusy(false); setMsg({ tone: 'good', text: ownFound('plan') ? 'Setup saved.' : 'Setup saved on this computer only.' }); }, function (e: any) { setBusy(false); setMsg({ tone: 'bad', text: 'Setup was not saved: ' + pbErrText(e) }); });
+    }
+    function saveActual(l: any, b: any, patch: any) {
+        var a = model.actuals[l.key + '|' + b.id] || null;
+        var body: any = { craa5_name: (weekend + ' ' + l.name + ' ' + pbBlockLabel(b)).slice(0, 100), craa5_weekendkey: weekend, craa5_areakey: l.key, craa5_stepkey: b.id.slice(0, 200), craa5_stepname: pbBlockLabel(b).slice(0, 200), craa5_department: b.dept, craa5_plannedstart: pbIsoZ(b.start), craa5_plannedend: pbIsoZ(b.end), craa5_updatedby: pbUserName() };
+        if (patch.actualStart !== undefined) body.craa5_actualstart = patch.actualStart ? pbIsoZ(patch.actualStart) : null;
+        if (patch.actualEnd !== undefined) body.craa5_actualend = patch.actualEnd ? pbIsoZ(patch.actualEnd) : null;
+        if (patch.notes !== undefined) body.craa5_notes = String(patch.notes || '').slice(0, 2000);
+        if (patch.headcount !== undefined) body.craa5_headcount = patch.headcount === null ? null : Math.round(patch.headcount);
+        if (!a && body.craa5_headcount === undefined) body.craa5_headcount = b.hc || null;
+        setBusy(true);
+        return saveOwn('milestone', a ? a.id : null, body).then(function () { setBusy(false); }, function (e: any) { setBusy(false); setMsg({ tone: 'bad', text: 'Not saved: ' + pbErrText(e) }); });
+    }
+    function addLoss(f: any, done: any) {
+        var l = model.lines.filter(function (x: any) { return x.key === f.area; })[0]; if (!l) return;
+        var b = l.sched ? l.sched.blocks.filter(function (x: any) { return x.id === f.step; })[0] : null;
+        var at = b ? b.start : (l.stop || Date.now());
+        var slot = model.slotAt(at);
+        var body = {
+            craa5_name: ('Weekend ' + weekend + ' ' + l.name + ' ' + f.reason).slice(0, 100), craa5_kind: 'Weekend clean', craa5_occurredon: pbIsoZ(at), craa5_minuteslost: Math.round(f.minutes),
+            craa5_reason: String(f.reason).slice(0, 50), craa5_description: String(f.text || '').slice(0, 4000), craa5_equipment: b ? pbBlockLabel(b).slice(0, 200) : '', craa5_area: l.name.slice(0, 100),
+            craa5_department: f.dept, craa5_status: 'Open', craa5_crew: slot ? slot.key.slice(0, 10) : '', craa5_loggedby: pbUserName(),
+            craa5_data: JSON.stringify({ app: 'pbed', weekend: weekend, areaKey: l.key, stepKey: f.step || '', heads: f.heads || 1 })
+        };
+        setBusy(true);
+        saveOwn('timeloss', null, body).then(function () { setBusy(false); done(); setMsg({ tone: 'good', text: 'Time loss added.' }); }, function (e: any) { setBusy(false); setMsg({ tone: 'bad', text: 'Not saved: ' + pbErrText(e) }); });
+    }
+    function importWos(rows: any[], done: any) {
+        var who = pbUserName(); var frame = model.frame;
+        setBusy(true);
+        var chain = Promise.resolve(); var n = 0; var errs: string[] = [];
+        rows.forEach(function (r: any) {
+            chain = chain.then(function () {
+                var existing = model.wos.filter(function (w: any) { return w.order === r.order; })[0];
+                var body: any = { craa5_name: r.order, craa5_priority: r.priority.slice(0, 10), craa5_description: r.description.slice(0, 500), craa5_assetdescription: r.assetDesc.slice(0, 200), craa5_ordertype: r.orderType.slice(0, 20), craa5_functionallocation: r.floc.slice(0, 100), craa5_basicstart: r.basicStart ? pbIsoZ(r.basicStart) : null, craa5_workcenter: r.workCenter.slice(0, 50), craa5_sortfield: r.sortField.slice(0, 100), craa5_importedby: who, craa5_importedon: new Date().toISOString() };
+                if (!existing) {
+                    body.craa5_status = 'Open';
+                    body.craa5_weekendkey = r.basicStart !== null && r.basicStart <= frame.focusEnd ? weekend : '';
+                    var sug = pbSuggestAsset(r, model.assets, model.maps);
+                    if (sug.how === 'saved') { var a = model.assets.filter(function (x: any) { return x.id === sug.assetId; })[0]; body.craa5_assetguid = sug.assetId; body.craa5_areakey = sug.areaKey; body.craa5_equipment = a ? a.name.slice(0, 200) : sug.map.equipment; }
+                }
+                return saveOwn('workorder', existing ? existing.id : null, body, existing ? existing.raw : null).then(function () { n++; }, function (e: any) { errs.push(r.order + ': ' + pbErrText(e)); });
+            });
+        });
+        chain.then(function () { setBusy(false); setMsg({ tone: errs.length ? 'bad' : 'good', text: pbPlural(n, 'work order') + ' saved' + (errs.length ? '. Not saved: ' + errs.slice(0, 3).join('; ') : '.') }); if (!errs.length) done(); });
+    }
+    function mapWo(w: any, a: any, areaKey: string) {
+        var body: any = { craa5_assetguid: a ? a.id : '', craa5_equipment: a ? a.name.slice(0, 200) : '', craa5_areakey: a ? a.areaKey : areaKey };
+        setBusy(true);
+        saveOwn('workorder', w.id, body, w.raw).then(function () {
+            if (!a || !w.floc) return;
+            var key = pbFlocKey(w.floc, w.assetDesc); var old = model.maps[key];
+            return saveOwn('flocmap', old ? old.id : null, { craa5_name: key, craa5_functionallocation: w.floc.slice(0, 100), craa5_assetdescription: w.assetDesc.slice(0, 200), craa5_assetguid: a.id, craa5_equipment: a.name.slice(0, 200), craa5_areakey: a.areaKey, craa5_mappedby: pbUserName() });
+        }).then(function () { setBusy(false); }, function (e: any) { setBusy(false); setMsg({ tone: 'bad', text: 'Not saved: ' + pbErrText(e) }); });
+    }
+
+    // ---------- page ----------
+    var m = model;
+    var canSave: any = {}; PB_OWN.forEach(function (k: string) { canSave[k] = !!(probes[k] && probes[k].state === 'found'); });
+    var noHost = !pbWeb() && !(dataApi && dataApi.queryTable);
+    var problems: string[] = [];
+    if (data.assets.err) problems.push('Equipment (assets) could not be read: ' + data.assets.err);
+    else if (data.assets.rows && !data.assets.rows.length) problems.push('The assets table has no active rows, so there are no milestones.');
+    if (data.runs.err) problems.push('The production schedule could not be read: ' + data.runs.err + '. Stop and restart times must be typed by hand.');
+    if (data.employees.err) problems.push('Employees could not be read: ' + data.employees.err);
+    var mdl: any = modal; var ml = mdl && mdl.key ? m.lines.filter(function (l: any) { return l.key === mdl.key; })[0] : null;
+    var mb = ml && ml.sched && mdl.id ? ml.sched.blocks.filter(function (b: any) { return b.id === mdl.id; })[0] : null;
+    var ms = mdl && mdl.type === 'slot' ? m.slots.filter(function (s: any) { return s.start === mdl.start; })[0] : null;
+    function close() { setModal(null); }
+    function shiftWeekend(n: number) { setWeekend(pbYmd(pbAddDays(pbFromYmd(weekend), 7 * n))); setModal(null); }
+    return (
+        <div className="min-h-screen bg-slate-50 text-slate-800" style={{ fontFamily: "'Segoe UI', Arial, sans-serif" }}>
+            <header className="bg-white border-b border-slate-200 sticky top-0 z-30">
+                <div className="flex flex-wrap items-center gap-3 px-4 py-3">
+                    <div className="flex items-center gap-2 mr-2">
+                        <div className="w-9 h-9 rounded-lg bg-[#00468B] text-white font-black flex items-center justify-center text-sm">PB</div>
+                        <div><div className="font-black text-[#00468B] leading-tight">PBED weekend planner</div><div className="text-[11px] text-slate-500 leading-tight">Plan - Brief - Execute - Debrief</div></div>
+                    </div>
+                    <div className="flex items-center gap-1">
+                        <PbBtn onClick={function () { shiftWeekend(-1); }} title="Weekend before">Prev</PbBtn>
+                        <input type="date" className="border border-slate-300 rounded-lg px-2 py-1.5 text-sm" value={weekend} onChange={function (e: any) { var s = pbSatOf(e.target.value); if (s) { setWeekend(s); setModal(null); } }} aria-label="Weekend" />
+                        <PbBtn onClick={function () { shiftWeekend(1); }} title="Weekend after">Next</PbBtn>
+                        <span className="text-sm font-bold text-slate-600 ml-1">Weekend of {pbFmtDate(m.frame.sat.getTime())}{m.secondWeekend ? ' (2nd of the month)' : ''}</span>
+                    </div>
+                    <div className="flex-1" />
+                    <div className="flex items-center gap-2">
+                        {planMeta.dirty ? <PbChip cls="bg-amber-50 text-amber-700 border-amber-200">Unsaved changes{planMeta.draftAt ? ' from ' + pbFmtDayTime(planMeta.draftAt) : ''}</PbChip> : planMeta.savedOn ? <PbChip cls="bg-emerald-50 text-emerald-700 border-emerald-200" title={'Version ' + planMeta.version}>Saved {pbFmtDayTime(planMeta.savedOn)}{planMeta.savedBy ? ' by ' + planMeta.savedBy : ''}</PbChip> : <PbChip>Not saved yet</PbChip>}
+                        <PbBtn kind="primary" disabled={busy || !planMeta.dirty} onClick={function () { savePlan(false); }}>{busy ? 'Saving...' : 'Save plan'}</PbBtn>
+                    </div>
+                </div>
+                <nav className="flex gap-1 px-3 pb-2 overflow-x-auto pb-tabs" role="tablist">
+                    {PB_TABS.map(function (t: any) { return <button key={t[0]} type="button" data-testtab={t[0]} role="tab" aria-selected={tab === t[0]} onClick={function () { tabState[1](t[0]); }} className={'px-3 py-1.5 rounded-full text-sm font-bold whitespace-nowrap ' + (tab === t[0] ? 'bg-[#0072CE] text-white' : 'text-[#00468B] hover:bg-[#E6F1FB]')}>{t[1]}</button>; })}
+                </nav>
+            </header>
+            <main className="p-3 sm:p-4 space-y-4 max-w-[1600px] mx-auto">
+                {noHost && <PbNote tone="bad">This page is not connected to Dataverse (no Xrm.WebApi and no dataApi). Open it inside the model-driven app. Nothing below is real data until it is.</PbNote>}
+                {loadingState[0] && !noHost && <PbNote>Reading equipment, shifts and employees from Dataverse...</PbNote>}
+                {problems.map(function (p: string, i: number) { return <PbNote key={i} tone="warn">{p}</PbNote>; })}
+                {msg && <PbNote tone={msg.tone}><div className="flex items-start gap-2"><span className="flex-1">{msg.text}</span><button type="button" className="font-bold" onClick={function () { setMsg(null); }}>Dismiss</button></div></PbNote>}
+                {planMeta.draftAt && planMeta.dirty && <PbNote tone="warn"><div className="flex flex-wrap items-center gap-2"><span className="flex-1">These are unsaved changes kept on this computer from {pbFmtDayTime(planMeta.draftAt)}{planMeta.savedOn ? ', newer than the plan saved ' + pbFmtDayTime(planMeta.savedOn) : ''}.</span><PbBtn onClick={function () { pbDropLocal('pb_draft_' + weekend); reloadState[1](reloadState[0] + 1); }}>Throw them away</PbBtn></div></PbNote>}
+                {tab === 'plan' && <PbPlanTab m={m} act={act} plan={plan} />}
+                {tab === 'brief' && <PbBriefTab m={m} act={act} plan={plan} />}
+                {tab === 'execute' && <PbExecuteTab m={m} act={act} busy={busy} canSave={canSave} />}
+                {tab === 'debrief' && <PbDebriefTab m={m} act={act} busy={busy} canSave={canSave} />}
+                {tab === 'workorders' && <PbWorkOrdersTab m={m} act={act} busy={busy} canSave={canSave} />}
+                {tab === 'crew' && <PbCrewTab m={m} act={act} expState={expNoteState[0]} />}
+                {tab === 'setup' && <PbSetupTab m={m} act={act} config={config} busy={busy} configDirty={configMetaState[0].dirty} canSave={canSave} />}
+                {tab === 'data' && <PbDataTab data={data} probes={probes} dataApi={dataApi} busy={busy} onReload={function () { pbDropLocal(PB_EXP_CACHE); reloadState[1](reloadState[0] + 1); }} />}
+            </main>
+            {mdl && mdl.type === 'sub' && ml && mb && <PbSubModal m={m} line={ml} block={mb} act={act} plan={plan} exp={exp} onClose={close} />}
+            {mdl && mdl.type === 'mnt' && ml && <PbMntModal m={m} line={ml} block={mb} act={act} plan={plan} onClose={close} />}
+            {mdl && mdl.type === 'step' && ml && mb && <PbStepModal line={ml} block={mb} act={act} plan={plan} onClose={close} />}
+            {mdl && mdl.type === 'line' && ml && <PbLineModal line={ml} act={act} plan={plan} onClose={close} />}
+            {mdl && mdl.type === 'slot' && ms && <PbSlotModal m={m} slot={ms} act={act} plan={plan} onClose={close} />}
+            {mdl && mdl.type === 'person' && <PbPersonModal m={m} id={mdl.id} exp={exp} onClose={close} />}
+            {mdl && mdl.type === 'actual' && ml && mb && <PbActualModal line={ml} block={mb} actual={m.actuals[ml.key + '|' + mb.id]} busy={busy} onClose={close} onSave={function (p: any) { saveActual(ml, mb, p); close(); }} />}
+            {mdl && mdl.type === 'conflict' && (
+                <PbModal title="Someone saved this plan after you opened it" sub={'Version ' + mdl.version + (mdl.by ? ' by ' + mdl.by : '')} onClose={close}>
+                    <p className="text-sm text-slate-600">Saving now would replace their changes with yours.</p>
+                    <div className="flex flex-wrap gap-2 justify-end">
+                        <PbBtn onClick={function () { pbDropLocal('pb_draft_' + weekend); close(); reloadState[1](reloadState[0] + 1); }}>Load theirs (drop mine)</PbBtn>
+                        <PbBtn kind="danger" onClick={function () { close(); savePlan(true, mdl.version); }}>Save mine over theirs</PbBtn>
+                    </div>
+                </PbModal>
+            )}
+        </div>
+    );
+}
+// ==== END PBED APP ====
