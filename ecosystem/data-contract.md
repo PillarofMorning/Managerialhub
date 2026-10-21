@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.15, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.16, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -256,7 +256,7 @@ Every app computes these the same way, from the same table, with the `hub-shared
 | **Labor cost** | Labor minutes / 60 x the hourly rate for the person's role on the shift date (`_e_ Labor rate`). No default rate. With no rate, cost shows "no rate set". | MSS log + labor rate | `hubLaborCost` |
 | **Weekly cost recap** | Labor cost summed by week key, line key and clean kind | MSS log | `hubWeekKey` |
 | **Sanitation cost per pound** | (Labor cost + chemical cost for the week) / `craa5_dailyproduction.craa5_pounds` for the week. Chemical cost for the week = (drop in counts + received) between the two Sunday counts around the Monday-Sunday week, x unit price. If a count is missing, received spend is used and the number is marked so. **Draft, for Gerald to confirm.** | MSS log, chemical hub, daily production | |
-| **Time lost** | Minutes in `craa5__m_timelosslog` by kind. Kind `Weekend clean` (written by PBED) is planned weekend work: shown on its own and left out of Time lost totals. | Manager hub | |
+| **Time lost** | Minutes in `craa5__m_timelosslog` by kind. Kind `Weekend clean` rows come from PBED's Add time loss form: time lost during the weekend clean (`craa5_minuteslost`, a delay reason such as Waiting on FSQ, a department, status Open). Shown on their own as "from PBED" and left out of Time lost totals. Whether they count anywhere else is Gerald's call (asked). | Manager hub | |
 
 People thresholds (coaching below 75 % pace for 14 days, high performer list) are settings in `craa5__0_hubconfig` key `hub_people_thresholds`, not constants in an app. The coaching list is for supervisors and managers only, never shown to peers.
 
@@ -393,6 +393,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.16 (2026-10-21)** Section 7: `Weekend clean` time loss rows are time lost during the weekend clean (PBED's Add time loss form), not planned work. Still left out of Time lost totals (manager hub v6.9, PR #41).
 - **1.0.15 (2026-10-21)** 6.5: an open stop (`|last`, `details.open` set) has no restart; readers must not use its `craa5_end` as one (found by PBED).
 - **1.0.14 (2026-10-21)** contract.json rebuilt from the chemical thread's updated c-tables.json: the four kept `_c_` primary name columns (Chemical `craa5__c_chemical_name`, Cart line `craa5_cartlinename`, Chemical count `craa5_chemicalname`, Clerk checklist `craa5__c_clerkchecklist1`). Apps read the primary column from the table definition.
 - **1.0.13 (2026-10-21)** Dataverse monitor results: check-off table and Midweek column exist; skip code and access log tables missing; time loss log and quick task not made yet; 8 named tables absent; 47 unlisted tables marked abandoned (3 legacy); primary name columns kept as made. Labor rate prompt shortened (Copilot makes one table per short prompt).
