@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.10, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.11, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -161,6 +161,8 @@ Ganttly, Shift Start and the MSS Calendar do **not** keep their own copy of thes
 | `corrective` | (none: a pathogen or inspection follow-up) | Corrective / Correctiva | daily, and `craa5_pathogen` = Yes when it closes a swab hit |
 | `other` | (none) | Other / Otra | none |
 
+Old spellings the apps still use map like this (MSS LOG WRITE v1.0, `ecosystem/mss-log-write.js` on PR #40): shift, nightly -> `daily`; weekly, biweekly, 2-week -> `eow`; 2-month, 4-month, deepclean -> `monthly`; 6-month -> `semiannual`; as-needed -> `other` (no flags).
+
 The flags say which requirements the clean **satisfies**. They are set from the clean that was done, never from the piece's highest frequency. A daily clean on a piece that also has a monthly job does not count as monthly. The MSS log thread owns the exact flag rules in its shared block. Any change to them goes in this table first.
 
 ### 6.3 Writing a completion to the MSS log (`craa5__log_`)
@@ -172,7 +174,7 @@ One row = one piece of equipment, one clean, one shift date. The rules (from the
 3. Row id = `hubLogIdOf(completionKey)`, and `craa5_completionkey` = `hubCompletionKey(asset, shiftDate, kind)`. Before creating, read by that key. If it exists, update it. Never rely on a per-browser "already sent" list.
 4. `craa5_lastcleaned` = `hubDateOnlyUtc(shiftDate)`. `craa5_shiftdate` = shiftDate, `craa5_shiftcode` = crew.
 5. `craa5_cleankind` = the kind from 6.2. The flags are set from it.
-6. `craa5_sap` = the real SAP order number, or `auto-<kind>` (e.g. `auto-eow`). `craa5_sapw` = the piece's work area code. `craa5_uid` keeps its current meaning (the SAP code) and is **not** reused as a key.
+6. `craa5_sap` = the real SAP order number, or `auto-<kind>` (e.g. `auto-eow`). `craa5_sapw` = the piece's work area code. `craa5_uid` keeps its current meaning (the SAP code) and is **not** reused as a key. It is the table's primary name column, so writers should still fill it with the SAP code (the same value as `craa5_sapw`), or the row shows blank in forms and views.
 7. People: `craa5_employeeguids` = every person who did it (`hubGuidList`). `craa5_lastcleanedby` = their names, "First Last", joined with ` / `, never "Crew". `craa5_markedby` = the signed-in person who pressed Done.
 8. Minutes: `craa5_laborminutes` = **person-minutes** actually spent (see 7). `craa5_hoursworked` = `Math.round(laborminutes / 60)` for older readers.
 9. `craa5_doneat` = when Done was pressed. `craa5_plankey` and `craa5_linekey` = the clean window it belonged to, when known.
@@ -376,12 +378,14 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 - **Q4.** What does `craa5_month` on Equipment mean (it is set on "2nd week of month" pieces)? Is it different from `craa5_monthlyclean`?
 - **Q5.** Labor rate: one rate for everyone, or by role (Sanitor, Lead, Supervisor)? The table allows both.
 - **Q6.** A Spanish-speaking lead to check the shared words (section 9) once.
+- **Q8.** What type is `craa5__log_.craa5_allergenclean` (Yes/No, or text like `craa5_pathogen`)? The log block sends text `Yes` and drops the column if Dataverse refuses it.
 - **Q7.** Ganttly browser-only features (obstacles, handovers, personnel notes): which ones do you still use? Those move to tables. The rest go.
 
 ---
 
 ## 15. Change log
 
+- **1.0.11 (2026-10-21)** Section 6.2: old frequency spellings mapped (MSS LOG WRITE v1.0, PR #40). 6.3: fill `craa5_uid` (primary name) with the SAP code. Q8: `craa5_allergenclean` type.
 - **1.0.10 (2026-10-21)** BOLO v2.2: `craa5__b_swabresult` columns and keys, and four new text columns on the swab catalog.
 - **1.0.9 (2026-10-21)** Section 6.5 points to the Scheduler's reader guide; adds scope and alert rows and window details v2. `craa5_cleanoverride` ("midweek|who|why" or "skip|who|why") is for the Scheduler only.
 - **1.0.8 (2026-10-21)** Section 6.5: the clean plan's columns, keys and details JSON for readers.
