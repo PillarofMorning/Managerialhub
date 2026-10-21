@@ -73,13 +73,29 @@ import {
   out among its pieces, so the other lines keep theirs. Nothing in the SAP rows
   changes.
   Missing equipment can also be added to the order. One craa5__log_ row is
-  written per equipment:
+  written per equipment, by the shared MSS LOG WRITE rule (data contract 6.3):
+  one row per piece, clean kind and shift date, with a fixed row id. When that
+  clean is already in the log (Ganttly saved it), the SAP order and paperwork
+  are added to that row instead of saving a second one. The columns:
     craa5_equipmentguid     = craa5_aa_assetsid (what mss - calendar matches on)
     craa5_equipment/room/area = display copies taken from the asset
     craa5_sap               = SAP order entered (upper case)
     craa5_lastcleaned       = completion date, midnight UTC
     craa5_lastcleanedby     = initials, upper case, "/" separated
     craa5_hoursworked       = number (the order's hours split across equipment, in whole hours)
+    craa5_completionkey     = equipment id | date | clean kind; craa5_shiftdate = the date
+    craa5_cleankind         = the clean (daily, midweek, eow, monthly ...), from the frequency or SAP order
+    craa5_laborminutes      = the hours x 60; craa5_pathogen = Yes when "Pathogen follow-up" is ticked, else No
+    craa5_markedby          = the signed-in user; craa5_source = "Log input"
+  Columns the table does not have yet are left out until they are added.
+
+  CHECK
+  Reads the last days of the log (rows from every app) and lists the entries that break the rule: no
+  equipment ID, a date in the future, "Crew" instead of names, no clean kind, pathogen empty, the same
+  automatic clean saved twice. Fixes are offered and nothing is saved until the admin applies one.
+
+  NO SAMPLE DATA
+  Without a Dataverse connection the page shows nothing and saves nothing, and says so.
 
   PAPERWORK (SAP sheets)
   The Paperwork field of a row takes a picture, a PDF, or several of either (pages). One picture is attached
@@ -236,7 +252,14 @@ const ES_MX_EXACT = {
   "Low": "Baja",
   "No match": "Sin coincidencia",
   "Manual": "Manual",
-  "Linked": "Vinculado"
+  "Linked": "Vinculado",
+  "Check": "Revisar",
+  "Check Tab": "Pestana Revisar",
+  "Pathogen follow-up": "Seguimiento de patogeno",
+  "Each entry row": "Cada fila de registro",
+  "Why an entry says it was already in the log": "Por que un registro dice que ya estaba en el registro MSS",
+  "Pathogen": "Patogeno",
+  "Pathogen follow-up (closes a positive swab)": "Seguimiento de patogeno (cierra un hisopo positivo)"
 };
 
 const ES_MX_PATTERNS = [
@@ -790,210 +813,518 @@ const LINKED = `craa5_equipmentguid ne null and craa5_equipmentguid ne ''`;
 const EVIDENCE_SELECT = ['craa5__log_id', 'craa5_equipment', 'craa5_equipmentguid', 'craa5_room', 'craa5_area'];
 const uniqueRows = (rows) => Array.from(new Map(rows.map(r => [r.craa5__log_id, r])).values());
 
-// --- DATA ACCESS (Xrm.WebApi, Power Apps dataApi, or an in-memory preview) ---
+/* ============================== START HUB SHARED v1.0 ============================== */
+// The ecosystem data contract in code (ecosystem/data-contract.md). Paste this whole block into every hub app, unchanged,
+// and use these helpers instead of local copies, so every app builds the same keys, dates and numbers.
+// Plain ES5 and 7-bit ASCII on purpose: it runs in every Power Apps page and passes the GEMINI.md ASCII check.
+// Change it only through the contract (bump HUB_CONTRACT_VERSION and say what changed in the contract's change log).
+
+var HUB_CONTRACT_VERSION = '1.0';
+var HUB_TZ = 'America/Chicago';              // the plant's clock: every plant day and shift date is read on it
+
+// ---------- keys ----------
+// Letters and digits only, lower case: "IBL 4", "IBL-4" and "ibl4" are the same name.
+function hubCanon(s) { return String(s === undefined || s === null ? '' : s).toLowerCase().replace(/[^a-z0-9]+/g, ''); }
+// Line key, the Production Scheduler's canonLine: area "IBL4" line 1 -> "ibl4"; area "Breading" line 2 -> "breading2".
+function hubLineKey(area, line) { var n = Math.floor(Number(line)); return hubCanon(area) + (n > 1 ? String(n) : ''); }
+// Two area (or room) names are the same area when their hubCanon is the same.
+function hubSameName(a, b) { var x = hubCanon(a); return x !== '' && x === hubCanon(b); }
+// Row ids (GUIDs): lower case, no braces. Every stored GUID goes through this.
+function hubGuid(v) { return String(v === undefined || v === null ? '' : v).replace(/[{}]/g, '').trim().toLowerCase(); }
+function hubIsGuid(v) { return /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(hubGuid(v)); }
+// A list of GUIDs in one text column: "; " between them, sorted, no repeats.
+function hubGuidList(list) {
+    var seen = {}, out = [];
+    (list || []).forEach(function (v) { var g = hubGuid(v); if (g && !seen[g]) { seen[g] = true; out.push(g); } });
+    return out.sort().join('; ');
+}
+function hubSplitGuids(text) { return String(text || '').split(/[;,\s]+/).map(hubGuid).filter(hubIsGuid); }
+// Crew letter A-D from a choice value, a number 1-4 or a label ("Shift B", "D - Nights"). '' when it is none of these.
+function hubCrew(val) {
+    if (val === undefined || val === null || val === '') return '';
+    var s = String(typeof val === 'object' ? (val.Label || val.Value || val.name || '') : val).toUpperCase().trim();
+    if (s.indexOf('256000000') > -1 || s === '1') return 'A';
+    if (s.indexOf('256000001') > -1 || s === '2') return 'B';
+    if (s.indexOf('256000002') > -1 || s === '3') return 'C';
+    if (s.indexOf('256000003') > -1 || s === '4') return 'D';
+    var m = s.match(/(?:^|[^A-Z])([ABCD])(?=$|[^A-Z])/);
+    return m ? m[1] : '';
+}
+// FNV-1a with four seeds, shaped like a version 4 GUID (the same swGuid as Ganttly and the Manager hub).
+// A row whose id is hubIdFromKey(its key) can be saved again and again without ever making a second row.
+function hubIdFromKey(key) {
+    var s = String(key).toLowerCase();
+    var h = function (seed) {
+        var x = (0x811c9dc5 ^ (seed * 0x9e3779b1)) >>> 0;
+        for (var i = 0; i < s.length; i++) { x ^= s.charCodeAt(i); x = Math.imul ? Math.imul(x, 0x01000193) >>> 0 : (x * 0x01000193) >>> 0; }
+        return ('0000000' + x.toString(16)).slice(-8);
+    };
+    var g = h(1) + h(2) + h(3) + h(4);
+    return g.slice(0, 8) + '-' + g.slice(8, 12) + '-4' + g.slice(13, 16) + '-' + '89ab'.charAt(parseInt(g.charAt(16), 16) % 4) + g.slice(17, 20) + '-' + g.slice(20, 32);
+}
+
+// ---------- dates ----------
+function hubPad2(n) { return (n < 10 ? '0' : '') + n; }
+// Year, month, day, hour, minute of a moment on the plant clock (daylight saving included).
+function hubPlantParts(ms) {
+    var d = new Date(typeof ms === 'number' ? ms : Date.parse(ms));
+    if (isNaN(d.getTime())) return null;
+    var f = new Intl.DateTimeFormat('en-US', { timeZone: HUB_TZ, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+    var o = {};
+    f.formatToParts(d).forEach(function (p) { if (p.type !== 'literal') o[p.type] = Number(p.value); });
+    return { y: o.year, m: o.month, d: o.day, h: o.hour === 24 ? 0 : o.hour, min: o.minute };
+}
+// The plant day of a moment, YYYY-MM-DD. Never toISOString().slice(0, 10): that is the UTC day.
+function hubPlantDay(ms) { var p = hubPlantParts(ms); return p ? p.y + '-' + hubPad2(p.m) + '-' + hubPad2(p.d) : ''; }
+// The shift date: the plant day the shift STARTED (the board's craa5_slotstart). A night shift that starts Tuesday 18:00
+// and finishes Wednesday 06:00 is Tuesday's shift, for everything it does.
+function hubShiftDate(slotStart) { return hubPlantDay(slotStart); }
+function hubShiftKey(shiftDate, crew) { return String(shiftDate) + '|' + hubCrew(crew); }
+// How a shift date goes into a Dataverse date column (MSS log craa5_lastcleaned): midnight UTC of that day,
+// so every reader gets the day back with value.slice(0, 10) whatever its own clock says.
+function hubDateOnlyUtc(day) { return /^\d{4}-\d{2}-\d{2}$/.test(String(day)) ? String(day) + 'T00:00:00Z' : ''; }
+function hubDayFromDateOnly(v) { var s = String(v || ''); return /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : ''; }
+function hubAddDays(day, n) {
+    var t = Date.UTC(Number(day.slice(0, 4)), Number(day.slice(5, 7)) - 1, Number(day.slice(8, 10))) + n * 86400000, d = new Date(t);
+    return d.getUTCFullYear() + '-' + hubPad2(d.getUTCMonth() + 1) + '-' + hubPad2(d.getUTCDate());
+}
+// The week key: the Monday of the plant week a day is in (weeks run Monday to Sunday, as in the Clean Plan 'k|Monday' rows).
+function hubWeekKey(day) {
+    var dow = new Date(Date.UTC(Number(day.slice(0, 4)), Number(day.slice(5, 7)) - 1, Number(day.slice(8, 10)))).getUTCDay();
+    return hubAddDays(day, dow === 0 ? -6 : 1 - dow);
+}
+
+// ---------- cleans and completions ----------
+// What kind of clean a completion was. The Clean Plan (Production Scheduler) uses its own words; hubCleanKind maps them.
+var HUB_CLEAN_KINDS = ['daily', 'midweek', 'eow', 'allergen', 'changeover', 'monthly', 'quarterly', 'semiannual', 'annual', 'corrective', 'other'];
+var HUB_PLAN_KIND_MAP = { full: 'daily', weekly: 'eow', midweek: 'midweek', allergen: 'allergen', changeover: 'changeover' };
+function hubCleanKind(k) {
+    var s = String(k || '').toLowerCase().trim();
+    if (HUB_PLAN_KIND_MAP[s]) return HUB_PLAN_KIND_MAP[s];
+    return HUB_CLEAN_KINDS.indexOf(s) > -1 ? s : '';
+}
+// One clean of one piece of equipment on one shift date: the key that stops a second row (MSS log craa5_completionkey).
+function hubCompletionKey(assetGuid, shiftDate, kind) {
+    var g = hubGuid(assetGuid), k = hubCleanKind(kind);
+    return g && /^\d{4}-\d{2}-\d{2}$/.test(String(shiftDate)) && k ? g + '|' + shiftDate + '|' + k : '';
+}
+// The MSS log row id for a completion, so a retried or second-device save updates the same row.
+function hubLogIdOf(completionKey) { return completionKey ? hubIdFromKey('log|' + completionKey) : ''; }
+
+// ---------- numbers ----------
+// Standard minutes of a piece: craa5_aa_assets.craa5_hoursrequired holds MINUTES of labor. Never divide it by 60
+// "when it looks big". Blank, zero or not a number -> null (unknown), never a guess.
+function hubStdMinutes(v) { var n = Number(v); return v === null || v === undefined || v === '' || !isFinite(n) || n <= 0 ? null : n; }
+// Pace: standard minutes / actual minutes x 100, over the same pieces. 100 = on standard, 125 = a quarter faster.
+function hubPace(stdMinutes, actualMinutes) { return stdMinutes > 0 && actualMinutes > 0 ? Math.round(1000 * stdMinutes / actualMinutes) / 10 : null; }
+// Each person on a completion gets an equal share of its minutes.
+function hubShare(minutes, people) { return people > 0 && minutes > 0 ? minutes / people : 0; }
+// Labor cost of minutes at an hourly rate (dollars, two decimals).
+function hubLaborCost(minutes, hourlyRate) { return minutes > 0 && hourlyRate > 0 ? Math.round(minutes * hourlyRate / 60 * 100) / 100 : 0; }
+
+// ---------- language ----------
+// One choice for every app, remembered per computer: 'en' or 'es' (Spanish, Mexico). Older per-app keys are read once.
+var HUB_LANG_KEY = 'hub_lang';
+var HUB_OLD_LANG_KEYS = ['itp_lang_v1', 'ss_lang_v1', 'prodsched_lang_v1', 'stillwell_mst_lang_v1', 'stillwell_org_lang_v1'];
+function hubGetLang() {
+    try {
+        var v = window.localStorage.getItem(HUB_LANG_KEY);
+        if (v === 'en' || v === 'es') return v;
+        for (var i = 0; i < HUB_OLD_LANG_KEYS.length; i++) if (window.localStorage.getItem(HUB_OLD_LANG_KEYS[i]) === 'es') return 'es';
+    } catch (e) {}
+    return 'en';
+}
+function hubSetLang(l) { try { window.localStorage.setItem(HUB_LANG_KEY, l === 'es' ? 'es' : 'en'); } catch (e) {} }
+// Spanish is written in ASCII with a % code per accented letter (the PBED convention):
+// %a %e %i %o %u = acute a e i o u, %n = n tilde, capitals %A %E %I %O %U %N, %? and %! = opening marks, %w = u with two dots, %% = %.
+var HUB_ACC = { a: 225, e: 233, i: 237, o: 243, u: 250, n: 241, A: 193, E: 201, I: 205, O: 211, U: 218, N: 209, '?': 191, '!': 161, w: 252 };
+function hubDecodeEs(s) { return String(s).replace(/%([aeiounAEIOUN?!w%])/g, function (m, c) { return c === '%' ? '%' : String.fromCharCode(HUB_ACC[c]); }); }
+// The shared words (data-contract.md section 9). An app's own word list adds to these; it never gives one of these another Spanish.
+var HUB_ES = {
+    'Planned': 'Planeado', 'Started': 'En proceso', 'Done': 'Terminado', 'Skipped': 'Omitido', 'Overdue': 'Atrasado', 'At risk': 'En riesgo',
+    'Daily': 'Diaria', 'Midweek 72h': 'Media semana 72h', 'End of week': 'Fin de semana', 'EOW': 'FDS', 'Allergen': 'Al%ergeno',
+    'Changeover': 'Cambio de producto', 'Monthly': 'Mensual', 'Quarterly': 'Trimestral', 'Semiannual': 'Semestral', 'Annual': 'Anual',
+    'Corrective': 'Correctiva', 'Other': 'Otra',
+    'Present': 'Presente', 'Late': 'Lleg%o tarde', 'Sick': 'Enfermo', 'PTO': 'Vacaciones (PTO)', 'Left early': 'Sali%o temprano',
+    'No call': 'Falta sin aviso', 'Loaned': 'Prestado', 'Training': 'Entrenamiento',
+    'Sanitor': 'Sanitizador', 'Lead': 'L%ider', 'Supervisor': 'Supervisor', 'Manager': 'Gerente',
+    'Loading': 'Cargando', 'Ready': 'Listo', 'Nothing here yet': 'Todav%ia no hay datos', 'Table missing': 'Falta la tabla',
+    'No access': 'Sin acceso', 'Could not load': 'No se pudo cargar',
+    'Area': '%Area', 'Room': 'Sala', 'Line': 'L%inea', 'Equipment': 'Equipo', 'Shift': 'Turno', 'Crew': 'Cuadrilla', 'Team': 'Grupo',
+    'Clean': 'Limpieza', 'Run': 'Corrida', 'Headcount': 'Personal', 'Minutes': 'Minutos', 'Standard': 'Est%andar', 'Pace': 'Ritmo',
+    'On time': 'A tiempo', 'Labor cost': 'Costo de mano de obra', 'Swab': 'Hisopo', 'Pathogen': 'Pat%ogeno', 'Work order': 'Orden de trabajo',
+    'Skip code': 'C%odigo de omisi%on', 'High five': 'Reconocimiento', 'Sign-off': 'Aprobaci%on', 'Help': 'Ayuda', 'Print': 'Imprimir'
+};
+var HUB_ES_DONE = null;
+// hubT('Done') -> 'Done' or 'Terminado'. extra = the app's own { English: '%-coded Spanish' } list (optional).
+function hubT(s, lang, extra) {
+    if ((lang || hubGetLang()) !== 'es') return s;
+    if (!HUB_ES_DONE) { HUB_ES_DONE = {}; for (var k in HUB_ES) if (Object.prototype.hasOwnProperty.call(HUB_ES, k)) HUB_ES_DONE[k] = hubDecodeEs(HUB_ES[k]); }
+    if (Object.prototype.hasOwnProperty.call(HUB_ES_DONE, s)) return HUB_ES_DONE[s];
+    if (extra && Object.prototype.hasOwnProperty.call(extra, s)) return hubDecodeEs(extra[s]);
+    return s;
+}
+
+// ---------- look ----------
+var HUB_THEME_KEY = 'hub_theme';          // 'light' or 'dark', remembered per computer
+function hubGetTheme() { try { var v = window.localStorage.getItem(HUB_THEME_KEY) || window.localStorage.getItem('itp_theme_v1'); return v === 'dark' ? 'dark' : 'light'; } catch (e) { return 'light'; } }
+function hubSetTheme(t) { try { window.localStorage.setItem(HUB_THEME_KEY, t === 'dark' ? 'dark' : 'light'); } catch (e) {} }
+var HUB_COLORS = {
+    light: { bg: '#F1F5F9', card: '#FFFFFF', border: '#E2E8F0', text: '#1E293B', muted: '#64748B', primary: '#0072CE', primaryDark: '#00468B', accent: '#FFB81C', accentSoft: '#FFF6E0', primarySoft: '#E6F1FB' },
+    dark: { bg: '#1B2740', card: '#24324D', border: '#33425F', text: '#E2E8F0', muted: '#94A3B8', primary: '#4DA3E8', primaryDark: '#B3D4F2', accent: '#FFB81C', accentSoft: '#3A3320', primarySoft: '#1E2A42' }
+};
+// Status colors mean one thing in every app. Red is only for overdue, a failed save and a positive swab.
+var HUB_STATUS_COLORS = { done: '#059669', started: '#0072CE', planned: '#64748B', overdue: '#DC2626', atrisk: '#D97706', skipped: '#D97706' };
+var HUB_BRAND_RED = '#E4002B';            // the logo only, never a status
+/* ============================== END HUB SHARED v1.0 ============================== */
+
+/* ============================== START MSS LOG WRITE v1.0 ============================== */
+// The one place in the ecosystem that builds and saves a finished clean in the MSS log (craa5__log_), by the rule in the data
+// contract, section 6.3. Paste it unchanged into every app that logs a clean (Ganttly, MSS Log Input, MSS Calendar), right after
+// the HUB SHARED block, which it needs (hubGuid, hubShiftDate, hubCompletionKey, hubLogIdOf, hubCleanKind, hubCrew, ...).
+// 7-bit ASCII and ES5 apart from async/await (every host compiles that). Change it only with the contract (6.2 and 6.3) and bump MLW_VERSION.
+//
+//   - One row = one piece of equipment, one clean, one shift date, saved only when someone marked that piece done (or typed it in).
+//   - No equipment id, no row: craa5_equipmentguid = craa5_aa_assetsid.
+//   - The day is the SHIFT date (the plant day the shift started, on the plant clock), never the clock day it was marked.
+//   - craa5_completionkey = equipment | shift date | kind, and the row id is fixed from it (hubLogIdOf), so a retry or a second
+//     device updates the same row instead of adding one. Before saving, that row is read: there and active = already logged.
+//   - The flags (craa5_daily / weekly / monthly) come from the kind of clean done (contract 6.2), never from the piece's highest
+//     frequency. Midweek = daily only; EOW = daily + weekly; monthly and longer = all three; other = none.
+//   - People: craa5_lastcleanedby = names joined with " / ", never "Crew"; craa5_employeeguids; craa5_markedby = who pressed Done.
+//   - craa5_laborminutes = person-minutes; craa5_hoursworked = round(minutes / 60) for older pages.
+//   - craa5_pathogen = Yes or No, never blank. craa5_source = Ganttly, Log input, Calendar or Import.
+//   - A failed save waits in this browser's queue (mlwQueue) and is tried again (mlwRetryQueue). It is never dropped or marked sent.
+//   - Undo (mlwUndo) deactivates the row (statecode 1); it never deletes it.
+// The new columns are optional: a column the table does not have yet is left out (remembered for the page session).
+// The host passes an api with query(table, { select, filter, top }) -> rows, create(table, body) and update(table, id, body);
+// mlwApi(xrm, dataApi) builds one from Xrm.WebApi or the page's dataApi.
+
+var MLW_VERSION = '1.0';
+var MLW_TABLE = 'craa5__log_';
+var MLW_ID = 'craa5__log_id';
+var MLW_QUEUE_KEY = 'mss_log_write_queue_v1';
+var MLW_SOURCES = ['Ganttly', 'Log input', 'Calendar', 'Import'];
+// Optional columns (data contract 13, part 1, plus the allergen flag). Left out of a save while the table does not have them.
+var MLW_OPTIONAL = ['craa5_completionkey', 'craa5_shiftdate', 'craa5_shiftcode', 'craa5_cleankind', 'craa5_laborminutes', 'craa5_employeeguids',
+    'craa5_markedby', 'craa5_source', 'craa5_doneat', 'craa5_plankey', 'craa5_linekey', 'craa5_sapw', 'craa5_allergenclean'];
+// Contract 6.2: kind -> flags (D daily, W weekly, M monthly), and the English label (Spanish from HUB_ES)
+var MLW_KINDS = {
+    daily: { d: 1, w: 0, m: 0, en: 'Daily' },
+    midweek: { d: 1, w: 0, m: 0, en: 'Midweek 72h' },
+    eow: { d: 1, w: 1, m: 0, en: 'End of week' },
+    allergen: { d: 1, w: 0, m: 0, en: 'Allergen' },
+    changeover: { d: 1, w: 0, m: 0, en: 'Changeover' },
+    monthly: { d: 1, w: 1, m: 1, en: 'Monthly' },
+    quarterly: { d: 1, w: 1, m: 1, en: 'Quarterly' },
+    semiannual: { d: 1, w: 1, m: 1, en: 'Semiannual' },
+    annual: { d: 1, w: 1, m: 1, en: 'Annual' },
+    corrective: { d: 1, w: 0, m: 0, en: 'Corrective' },
+    other: { d: 0, w: 0, m: 0, en: 'Other' }
+};
+// Words for the codes the block returns. Spanish in % codes (hubDecodeEs).
+var MLW_TEXT = {
+    saved: ['Saved to the MSS log.', 'Guardado en el registro MSS.'],
+    already: ['Already in the MSS log for this shift.', 'Ya est%a en el registro MSS de este turno.'],
+    queued: ['Not saved yet. It will be tried again.', 'A%un no se guarda. Se intentar%a de nuevo.'],
+    undone: ['Taken off the MSS log.', 'Quitado del registro MSS.'],
+    no_equipment: ['No equipment ID. Pick the equipment first.', 'Sin ID de equipo. Elija el equipo primero.'],
+    bad_equipment: ['The equipment ID is not valid.', 'El ID de equipo no es v%alido.'],
+    no_kind: ['Which clean was this? (daily, midweek, end of week ...)', '%?Qu%e limpieza fue? (diaria, media semana, fin de semana ...)'],
+    no_day: ['No shift date.', 'Falta la fecha del turno.'],
+    future_day: ['The date is in the future.', 'La fecha es futura.'],
+    no_names: ['Who cleaned it? Add at least one name.', '%?Qui%en lo limpi%o? Agregue al menos un nombre.'],
+    crew_name: ['"Crew" is not a name. Add who cleaned it.', '"Crew" no es un nombre. Agregue qui%en lo limpi%o.'],
+    bad_minutes: ['Minutes must be a number from 0 to 1440.', 'Los minutos deben ser un n%umero de 0 a 1440.'],
+    long_minutes: ['Over 8 hours on one piece. Check the time.', 'M%as de 8 horas en una pieza. Revise el tiempo.'],
+    bad_source: ['Unknown app name for the log.', 'Nombre de app desconocido para el registro.'],
+    no_pathogen: ['Pathogen is empty (should be Yes or No).', 'Pat%ogeno vac%io (debe ser S%i o No).'],
+    duplicate: ['Same clean saved twice for this day.', 'La misma limpieza se guard%o dos veces este d%ia.']
+};
+function mlwSay(code, lang) { var t = MLW_TEXT[code]; return t ? ((lang || hubGetLang()) === 'es' ? hubDecodeEs(t[1]) : t[0]) : String(code || ''); }
+function mlwKindLabel(kind, lang) { var k = MLW_KINDS[mlwKind(kind)]; return k ? hubT(k.en, lang) : ''; }
+
+// Any way an app spells a clean -> a contract kind (hubCleanKind's list), or '' when it cannot tell
+function mlwKind(raw) {
+    var k = hubCleanKind(raw);
+    if (k) return k;
+    var s = String(raw === undefined || raw === null ? '' : raw).trim().toLowerCase().replace(/^auto\s*-\s*/, '').replace(/[\s_]+/g, '');
+    if (!s) return '';
+    k = hubCleanKind(s);
+    if (k) return k;
+    if (/^(d|day|dailyclean|shift|sh|pershift|nightly)$/.test(s)) return 'daily';
+    if (/^(mw|mid|mid-week|midweekclean|midweek72h|72h)$/.test(s)) return 'midweek';
+    if (/^(eow|endofweek|end-of-week|weekend|fullclean|w|wk|week|weeklyclean|bw|2w|2-week|2week|bi-weekly|biweekly|biweek)$/.test(s)) return 'eow';
+    if (/^(m|mo|month|monthlyclean|2m|2-month|2month|bm|bimonthly|4m|4-month|4month|deep|deepclean|deep-clean|project)$/.test(s)) return 'monthly';
+    if (/^(q|qtr|quarter|3m)$/.test(s)) return 'quarterly';
+    if (/^(6m|6-month|6month|sa|semi-annual)$/.test(s)) return 'semiannual';
+    if (/^(a|y|yr|year|yearly|annually)$/.test(s)) return 'annual';
+    if (/^(allergenclean|allergenchangeover)$/.test(s)) return 'allergen';
+    if (/^(pathogen|swab|reclean|re-clean)$/.test(s)) return 'corrective';
+    if (/^(as-needed|asneeded|perrun|per-run)$/.test(s)) return 'other';
+    return '';
+}
+function mlwFlags(kind) { var k = MLW_KINDS[kind] || MLW_KINDS.other; return { craa5_daily: !!k.d, craa5_weekly: !!k.w, craa5_monthly: !!k.m }; }
+function mlwNames(v) {
+    var list = Array.isArray(v) ? v : String(v === undefined || v === null ? '' : v).split(/\s*\/\s*|\s*,\s*|\s*;\s*/);
+    var out = [];
+    list.forEach(function (n) { var t = String(n === undefined || n === null ? '' : (n && n.name) || n).replace(/\s+/g, ' ').trim(); if (t && out.indexOf(t) === -1) out.push(t); });
+    return out;
+}
+function mlwIsCrew(n) { return /^(crew|equipo|cuadrilla|team|grupo|n\/?a|tbd|operator|operador)$/i.test(String(n).trim()); }
+function mlwYes(v) { return v === true || v === 1 || /^(true|yes|si|y|1)$/i.test(String(v === undefined || v === null ? '' : v).trim()); }
+function mlwDay(v) { var s = String(v || ''); return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ''; }
+
+// entry: { equipmentGuid, equipment, room, area, workArea (craa5_workareacode), kind, sap (real SAP order, optional),
+//          shiftDate 'YYYY-MM-DD' or slotStart (the board's craa5_slotstart), crew, cleanedBy (names: array or "A / B"),
+//          employeeGuids [ ], markedBy, minutes (person-minutes) or durationMins + heads, doneAt, planKey, lineKey,
+//          pathogen (true when the clean closes a swab hit), source ('Ganttly' | 'Log input' | 'Calendar' | 'Import') }
+// -> { ok, row, id, key, kind, day, problems: [codes that stop the save], warnings: [codes that do not] }
+function mlwBuildRow(entry, now) {
+    var e = entry || {}, problems = [], warnings = [];
+    var rawGuid = String(e.equipmentGuid === undefined || e.equipmentGuid === null ? '' : e.equipmentGuid).trim();
+    var guid = hubIsGuid(rawGuid) ? hubGuid(rawGuid) : '';
+    if (!rawGuid) problems.push('no_equipment'); else if (!guid) problems.push('bad_equipment');
+    var kind = mlwKind(e.kind);
+    if (!kind) problems.push('no_kind');
+    var day = mlwDay(e.shiftDate) || (e.slotStart ? hubShiftDate(e.slotStart) : '');
+    if (!day) problems.push('no_day');
+    else if (day > hubAddDays(hubPlantDay(now || Date.now()), 1)) problems.push('future_day');
+    var names = mlwNames(e.cleanedBy);
+    if (!names.length) problems.push('no_names');
+    else if (names.some(mlwIsCrew)) problems.push('crew_name');
+    var minutes = e.minutes;
+    if ((minutes === undefined || minutes === null || minutes === '') && e.durationMins !== undefined) minutes = Number(e.durationMins) * Math.max(1, Number(e.heads) || 1);
+    minutes = minutes === undefined || minutes === null || minutes === '' ? NaN : Number(minutes);
+    if (isNaN(minutes) || minutes < 0 || minutes > 1440) problems.push('bad_minutes');
+    else if (minutes > 480) warnings.push('long_minutes');
+    var source = String(e.source || '').trim();
+    if (MLW_SOURCES.indexOf(source) === -1) problems.push('bad_source');
+    var mins = isNaN(minutes) ? 0 : Math.round(minutes);
+    var key = hubCompletionKey(guid, day, kind);
+    var sap = String(e.sap || '').trim();
+    var row = {
+        craa5_equipmentguid: guid,
+        craa5_equipment: String(e.equipment || '').trim(),
+        craa5_room: String(e.room || '').trim(),
+        craa5_area: String(e.area || '').trim(),
+        craa5_sap: sap && !/^auto\s*-/i.test(sap) ? sap.toUpperCase() : (kind ? 'auto-' + kind : ''),
+        craa5_lastcleaned: hubDateOnlyUtc(day),
+        craa5_lastcleanedby: names.join(' / ').slice(0, 100),
+        craa5_hoursworked: Math.round(mins / 60),
+        craa5_pathogen: mlwYes(e.pathogen) ? 'Yes' : 'No',
+        craa5_completionkey: key,
+        craa5_shiftdate: day,
+        craa5_shiftcode: hubCrew(e.crew),
+        craa5_cleankind: kind,
+        craa5_laborminutes: mins,
+        craa5_employeeguids: hubGuidList(e.employeeGuids || []),
+        craa5_markedby: String(e.markedBy || '').trim().slice(0, 200),
+        craa5_source: source,
+        craa5_doneat: e.doneAt ? new Date(e.doneAt).toISOString() : new Date(now || Date.now()).toISOString(),
+        craa5_plankey: String(e.planKey || '').trim(),
+        craa5_linekey: String(e.lineKey || '').trim(),
+        craa5_sapw: String(e.workArea || '').trim()
+    };
+    var f = mlwFlags(kind);
+    row.craa5_daily = f.craa5_daily; row.craa5_weekly = f.craa5_weekly; row.craa5_monthly = f.craa5_monthly;
+    if (kind === 'allergen') row.craa5_allergenclean = 'Yes';   // text Yes / No like craa5_pathogen; dropped if the column is another type
+    return { ok: problems.length === 0, row: row, id: hubLogIdOf(key), key: key, kind: kind, day: day, problems: problems, warnings: warnings };
+}
+
+// The kind a stored row stands for: craa5_cleankind first, then the flags; '' = none (the calendar counts such a row for every frequency)
+function mlwRowKind(r) {
+    var k = mlwKind(r && r.craa5_cleankind);
+    if (k) return k;
+    if (mlwYes(r && r.craa5_monthly)) return 'monthly';
+    if (mlwYes(r && r.craa5_weekly)) return 'eow';
+    if (mlwYes(r && r.craa5_daily)) return 'daily';
+    return '';
+}
+function mlwIsSkip(r) {
+    if (!r) return false;
+    if (r.craa5_skipcode) return true;
+    if (/^SKIPPED\s*[(:]/i.test(String(r.craa5_lastcleanedby || ''))) return true;
+    return /^SKIP:/i.test(String(r.craa5_bundle || '')) || /^SKIP:/i.test(String(r.craa5_idofssop || ''));
+}
+// What is wrong with a row already in the log, by the same rule (for MSS Log Input's Check tab). -> codes, [] when fine
+function mlwCheckRow(r, now) {
+    if (mlwIsSkip(r)) return [];
+    var p = [], rawGuid = String((r && r.craa5_equipmentguid) || '').trim();
+    if (!rawGuid) p.push('no_equipment'); else if (!hubIsGuid(rawGuid)) p.push('bad_equipment');
+    var day = mlwDay(r && r.craa5_shiftdate) || hubDayFromDateOnly(r && r.craa5_lastcleaned);
+    if (!day) p.push('no_day');
+    else if (day > hubAddDays(hubPlantDay(now || Date.now()), 1)) p.push('future_day');
+    var names = mlwNames(r && r.craa5_lastcleanedby);
+    if (!names.length) p.push('no_names'); else if (names.some(mlwIsCrew)) p.push('crew_name');
+    if (!mlwRowKind(r)) p.push('no_kind');
+    if (r && (r.craa5_pathogen === null || r.craa5_pathogen === undefined || String(r.craa5_pathogen).trim() === '')) p.push('no_pathogen');
+    return p;
+}
+
+// Columns this table turned out not to have (for the page session)
+var mlwMissing = {};
+function mlwErrText(e) { return String((e && (e.message || e.errorMessage || (e.error && e.error.message))) || e || ''); }
+function mlwIsMissingCol(msg) { return /could not find a property|undeclared property|not a valid property|invalid property|0x80060888|does not exist|isn't valid|is not valid for|cannot find property/i.test(msg); }
+function mlwIsDuplicate(msg) { return /duplicate|already exists|0x80040237|matching key values/i.test(msg); }
+function mlwStrip(row) { var o = {}; Object.keys(row).forEach(function (k) { if (!mlwMissing[k] && row[k] !== '') o[k] = row[k]; }); return o; }
+// Drop the optional column an error names (or every optional column that was sent, when it names none). false = not a column
+// problem. A column another save already dropped still counts (saves run side by side), so the retry goes without it.
+function mlwDropFor(e, sent) {
+    var msg = mlwErrText(e);
+    var low = msg.toLowerCase();
+    // craa5_allergenclean's type is not known yet: a value it cannot take only drops that column
+    if (sent.indexOf('craa5_allergenclean') > -1 && (low.indexOf('craa5_allergenclean') > -1 || /cannot convert|edm\.|type mismatch|incompatible/.test(low))) { mlwMissing.craa5_allergenclean = true; return true; }
+    if (!mlwIsMissingCol(msg)) return false;
+    var named = MLW_OPTIONAL.filter(function (c) { return sent.indexOf(c) > -1 && low.indexOf(c) > -1; });
+    var drop = named.length ? named : MLW_OPTIONAL.filter(function (c) { return sent.indexOf(c) > -1; });
+    if (!drop.length) return false;
+    drop.forEach(function (c) { mlwMissing[c] = true; });
+    return true;
+}
+function mlwIsDenied(e) { return /privilege|permission|not authorized|access is denied|0x80040220|prvread/i.test(mlwErrText(e)); }
+
+// ---------- retry queue (this browser only; facts are in Dataverse once saved) ----------
+function mlwQueue() { try { var q = JSON.parse(window.localStorage.getItem(MLW_QUEUE_KEY) || '[]'); return Array.isArray(q) ? q : []; } catch (e) { return []; } }
+function mlwQueueSave(q) { try { window.localStorage.setItem(MLW_QUEUE_KEY, JSON.stringify(q)); } catch (e) { /* storage blocked: the caller still gets 'queued' */ } }
+function mlwQueueCount() { return mlwQueue().length; }
+function mlwEnqueue(built, e) {
+    var q = mlwQueue().filter(function (x) { return x.key !== built.key; });
+    q.push({ key: built.key, id: built.id, row: built.row, tries: (built.tries || 0) + 1, at: Date.now(), error: mlwErrText(e).slice(0, 300) });
+    mlwQueueSave(q);
+}
+function mlwDequeue(key) { mlwQueueSave(mlwQueue().filter(function (x) { return x.key !== key; })); }
+
+// The row of this completion, if any: by its fixed id, or by the completion key (a row saved where the id was not kept)
+async function mlwFind(api, built) {
+    var sel = [MLW_ID, 'statecode'];
+    var useKey = !mlwMissing.craa5_completionkey;
+    for (var i = 0; i < 3; i++) {
+        var filter = MLW_ID + ' eq ' + built.id + (useKey ? " or craa5_completionkey eq '" + built.key.replace(/'/g, "''") + "'" : '');
+        try {
+            var rows = await api.query(MLW_TABLE, { select: sel, filter: filter, top: 5 });
+            return (rows || [])[0] || null;
+        } catch (e) {
+            if (useKey && mlwIsMissingCol(mlwErrText(e))) { mlwMissing.craa5_completionkey = true; useKey = false; continue; }
+            throw e;
+        }
+    }
+    return null;
+}
+async function mlwSave(api, how, id, row) {
+    for (var i = 0; i < 16; i++) {
+        var body = mlwStrip(row);
+        try {
+            if (how === 'create') { body[MLW_ID] = id; await api.create(MLW_TABLE, body); }
+            else await api.update(MLW_TABLE, id, body);
+            return;
+        } catch (e) {
+            if (!mlwDropFor(e, Object.keys(body))) throw e;
+        }
+    }
+    throw new Error('MSS log: too many missing columns');
+}
+
+// Save one finished piece. -> { status: 'saved' | 'already' | 'invalid' | 'queued', key, id, problems, warnings, error }
+async function mlwWrite(api, entry, opts) {
+    var built = mlwBuildRow(entry, opts && opts.now);
+    if (!built.ok) return { status: 'invalid', key: built.key, id: built.id, problems: built.problems, warnings: built.warnings };
+    return mlwSend(api, built, opts);
+}
+async function mlwSend(api, built, opts) {
+    var out = { key: built.key, id: built.id, problems: [], warnings: built.warnings || [] };
+    var fail = function (e) { mlwEnqueue(built, e); out.status = 'queued'; out.error = mlwErrText(e); return out; };
+    if (!api || typeof api.create !== 'function') return fail('No Dataverse connection');
+    var found = null;
+    try { found = await mlwFind(api, built); }
+    catch (e) { if (!mlwIsDenied(e)) return fail(e); }   // no Read rights: the fixed id still stops a second row
+    try {
+        if (found && Number(found.statecode || 0) === 0 && !(opts && opts.overwrite)) { mlwDequeue(built.key); out.status = 'already'; return out; }
+        if (found) {
+            var upd = {}; Object.keys(built.row).forEach(function (k) { upd[k] = built.row[k]; });
+            upd.statecode = 0; upd.statuscode = 1;   // a clean undone and then done again comes back
+            await mlwSave(api, 'update', hubGuid(found[MLW_ID]) || built.id, upd);
+        } else {
+            try { await mlwSave(api, 'create', built.id, built.row); }
+            catch (e) {
+                // Another device saved it between the read and the create: the fixed id is taken, so it is logged
+                if (!mlwIsDuplicate(mlwErrText(e))) throw e;
+                mlwDequeue(built.key); out.status = 'already'; return out;
+            }
+        }
+        mlwDequeue(built.key);
+        out.status = 'saved';
+        return out;
+    } catch (e) { return fail(e); }
+}
+// Try every queued save again, oldest first. -> { saved, already, left }
+async function mlwRetryQueue(api) {
+    var q = mlwQueue(), res = { saved: 0, already: 0, left: 0 };
+    for (var i = 0; i < q.length; i++) {
+        var r = await mlwSend(api, { key: q[i].key, id: q[i].id, row: q[i].row, tries: q[i].tries || 1, warnings: [] });
+        if (r.status === 'saved') res.saved++; else if (r.status === 'already') res.already++;
+    }
+    res.left = mlwQueueCount();
+    return res;
+}
+// Undo a Done within the shift: the row is deactivated (statecode 1), never deleted, so every device drops it.
+async function mlwUndo(api, equipmentGuid, shiftDate, kind) {
+    var key = hubCompletionKey(equipmentGuid, shiftDate, mlwKind(kind));
+    if (!key) return { status: 'invalid', key: key };
+    mlwDequeue(key);
+    try { await api.update(MLW_TABLE, hubLogIdOf(key), { statecode: 1, statuscode: 2 }); return { status: 'undone', key: key }; }
+    catch (e) { return { status: 'failed', key: key, error: mlwErrText(e) }; }
+}
+
+// An api for the block from Xrm.WebApi (model-driven host) or the page's dataApi (generative page host)
+function mlwApi(xrm, dataApi) {
+    var web = xrm && xrm.WebApi && typeof xrm.WebApi.createRecord === 'function' ? xrm.WebApi : null;
+    if (web) return {
+        query: async function (table, o) {
+            var parts = [];
+            if (o.select && o.select.length) parts.push('$select=' + o.select.join(','));
+            if (o.filter) parts.push('$filter=' + o.filter.replace(/'(?:[^']|'')*'/g, function (lit) { return "'" + encodeURIComponent(lit.slice(1, -1)) + "'"; }));
+            if (o.top) parts.push('$top=' + o.top);
+            var res = await web.retrieveMultipleRecords(table, '?' + parts.join('&'));
+            return (res && res.entities) || [];
+        },
+        create: function (table, body) { return web.createRecord(table, body); },
+        update: function (table, id, body) { return web.updateRecord(table, id, body); }
+    };
+    if (dataApi && typeof dataApi.createRow === 'function') return {
+        query: async function (table, o) {
+            var page = await dataApi.queryTable(table, { select: o.select, filter: o.filter, pageSize: o.top || 50, top: o.top });
+            return (page && page.rows) || [];
+        },
+        create: function (table, body) { return dataApi.createRow(table, body); },
+        update: function (table, id, body) { return dataApi.updateRow(table, id, body); }
+    };
+    return null;
+}
+/* ============================== END MSS LOG WRITE v1.0 ============================== */
+
+// The clean kind (data contract 6.2) of an entry: an "auto-" order names it, else the frequency column of the SAP order, else
+// the order's suffix (W, M, Q ...). strict: '' when the order says nothing (no weekly guess), for the Check tab's fixes.
+const sapSuffixCol = (sapCode) => {
+  const c = safeString(sapCode).toUpperCase().replace(/[\s\-_\/]+/g, '');
+  if (!c || /^AUTO/.test(c)) return '';
+  for (const f of FREQUENCIES) for (const suf of (f.suffixes || [])) if (c.length > suf.length + 3 && c.endsWith(suf)) return f.col;
+  return '';
+};
+const logKindOf = (sapCode, col, strict = false) => {
+  if (isAutoSap(sapCode)) return mlwKind(sapCode);
+  const f = col ? (ALL_FREQUENCIES.find(x => x.key === col) || ALL_FREQUENCIES.find(x => x.col === col)) : null;
+  if (f) return mlwKind(f.auto);
+  const sc = sapSuffixCol(sapCode);
+  if (sc) return mlwKind((FREQUENCIES.find(x => x.col === sc) || {}).auto);
+  return strict ? '' : 'eow';
+};
+// Who is signed in, for craa5_markedby (set by the app once the user is known)
+let MLW_MARKED_BY = '';
+
+// --- DATA ACCESS (Xrm.WebApi or the Power Apps dataApi; without either, nothing is shown or saved) ---
 // Every query takes a row limit (default 100). There is deliberately no "load everything" call.
 
-// Tiny OData $filter evaluator so the preview data answers the same filters Dataverse does
-// (eq/ne/gt/ge/lt/le, and/or/not, contains/startswith/endswith, null). Text compares ignore case unless cs is set.
-const parseFilter = (src, cs = false) => {
-  const toks = src.match(/'(?:[^']|'')*'|[()]|,|[^\s(),']+/g) || [];
-  let i = 0;
-  const next = () => toks[i++];
-  const lit = (t) => (t === 'null' ? null : t[0] === "'" ? t.slice(1, -1).replace(/''/g, "'") : t);
-  const fold = (x) => (cs ? x : x.toLowerCase());
-  const norm = (x) => (x === undefined || x === null || x === '' ? null : fold(String(x)));
-  const orExpr = () => {
-    let l = andExpr();
-    while (toks[i] === 'or') { next(); const a = l, b = andExpr(); l = (r) => a(r) || b(r); }
-    return l;
-  };
-  const andExpr = () => {
-    let l = unary();
-    while (toks[i] === 'and') { next(); const a = l, b = unary(); l = (r) => a(r) && b(r); }
-    return l;
-  };
-  const unary = () => {
-    const t = next();
-    if (t === 'not') { const f = unary(); return (r) => !f(r); }
-    if (t === '(') { const f = orExpr(); next(); return f; }
-    if (t === 'contains' || t === 'startswith' || t === 'endswith') {
-      next(); const col = next(); next(); const v = fold(String(lit(next()))); next();
-      return (r) => { const s = fold(safeString(r[col])); return t === 'contains' ? s.includes(v) : t === 'startswith' ? s.startsWith(v) : s.endsWith(v); };
-    }
-    const op = next(); const v = norm(lit(next()));
-    return (r) => {
-      const a = norm(r[t]);
-      if (op === 'eq') return a === v;
-      if (op === 'ne') return a !== v;
-      if (a === null || v === null) return false;
-      return op === 'gt' ? a > v : op === 'ge' ? a >= v : op === 'lt' ? a < v : a <= v;
-    };
-  };
-  return orExpr();
-};
-
-const gid = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
-
-const makeMock = (opts = {}) => {
-  const today = toDateInput(new Date());
-  const asset = (n, name, room, area, uniqueId = '', sapObj = {}) => ({
-    craa5_aa_assetsid: gid(n),
-    craa5_equipmentidentifier: name,
-    craa5_roomname: room,
-    craa5_areaname: area,
-    craa5_uniqueid: uniqueId || `AST-0320-${String(n).padStart(4, '0')}`,
-    createdon: `2025-01-${String((n % 27) + 1).padStart(2, '0')}T09:00:00Z`,
-    ...sapObj,
-  });
-  const USERS = { [gid(500)]: 'Preview Admin (U1010051)', [gid(501)]: 'Preview Sanitation Lead' };
-  const by = (id) => ({ [CREATED_BY]: id, [`${CREATED_BY}${FORMATTED}`]: USERS[id] });
-  const log = (n, guid, name, sap, room, area, date, who, hours) => ({
-    craa5__log_id: gid(n),
-    craa5_equipmentguid: guid,
-    craa5_equipment: name,
-    craa5_sap: sap,
-    craa5_room: room,
-    craa5_area: area,
-    craa5_lastcleaned: `${date}T00:00:00Z`,
-    craa5_lastcleanedby: who,
-    craa5_hoursworked: hours,
-    createdon: `${date}T${String(8 + (n % 9)).padStart(2, '0')}:15:00Z`,
-    ...by(gid(500 + (n % 2))),
-  });
-  const db = {
-    [ASSET_TABLE]: [
-      asset(1, 'Mixer 01', 'Kitchen', 'South', 'EQ-KITCH-001', { craa5_sapdaily: 'SSANKSMIX', craa5_sapw: 'SSANKSMIXW' }),
-      asset(2, 'Oven 05', 'Kitchen', 'South', 'EQ-KITCH-002', { craa5_sapw: 'SSANKSOVN5W' }),
-      asset(3, 'Slicer 12', 'Deli', 'Front', 'EQ-DELI-012', { craa5_sapdaily: 'SSANDLSLICD' }),
-      asset(4, 'Pallets', 'Creme', 'IBL4', 'EQ-CRM-004', { craa5_sapw: 'SSANIBL4PSW' }),
-      asset(5, 'Racking', 'Creme', 'IBL4', 'EQ-CRM-005', { craa5_sapw: 'SSANIBL4PSW' }),
-      asset(6, 'Mixer 02', 'Kitchen', 'South', 'EQ-KITCH-006', { craa5_sapdaily: 'SSANKSMIX', craa5_sapw: 'SSANKSMIXW' }),
-      asset(7, 'Gyro Mixer (+)', 'Bakery', 'Dough', 'EQ-BAK-007', { craa5_sapw: 'SSANBKGYROW' }),
-      asset(8, 'Floors', 'Bakery', 'Breading', 'EQ-BAK-008', { craa5_sapw: 'SSANBKBRW' }),
-      asset(9, 'Floors', 'Bakery', 'Breading', 'EQ-BAK-009', { craa5_sapw: 'SSANBKBRW' }),
-      asset(10, 'Floor', 'Bakery', 'Breading', 'EQ-BAK-010', { craa5_sapw: 'SSANBKBRW' }),
-      asset(11, 'Floors', 'Warehouse', 'Trash', 'EQ-WH-011', { craa5_sapw: 'SSANWHTRW' }),
-      asset(12, 'Pallet Inverter', 'Warehouse', 'Dock', 'EQ-WH-012', { craa5_sapw: 'SSANWHDKW' }),
-      asset(13, 'Spiral Freezer North Belt', 'Spiral Freezer', 'Line 1', 'EQ-SPF-013', { craa5_sapw: '10045892', craa5_sapmonthly: '10045892M' }),
-      asset(14, 'Spiral Freezer South Belt', 'Spiral Freezer', 'Line 2', 'EQ-SPF-014', { craa5_sapw: '10045892', craa5_sapmonthly: '10045892M' }),
-      asset(15, 'Trim Table Conveyor 01', 'Trim Room', 'North', 'EQ-TRM-015', { craa5_sapdaily: 'SSANTRMCV1D', craa5_sapw: 'SSANTRMCV1W' }),
-      asset(16, 'Trim Table Conveyor 02', 'Trim Room', 'North', 'EQ-TRM-016', { craa5_sapdaily: 'SSANTRMCV1D', craa5_sapw: 'SSANTRMCV1W' }),
-      asset(17, 'Multivac Thermoformer 01', 'Packaging', 'Line 1', 'EQ-PKG-017', { craa5_sapdaily: 'SSANPKGMV1D', craa5_sapw: 'SSANPKGMV1W' }),
-      asset(18, 'Ishida Multihead Scale 01', 'Packaging', 'Line 1', 'EQ-PKG-018', { craa5_sapdaily: 'SSANPKGSCLD', craa5_sapw: 'SSANPKGSCLW' }),
-      asset(19, 'Smock Racking Left', 'Creme', 'IBL4', 'EQ-CRM-019', { craa5_sapw: 'SSANIBL4SMK' }),
-      asset(20, 'Smock Racking Right', 'Creme', 'IBL4', 'EQ-CRM-020', { craa5_sapw: 'SSANIBL4SMK' }),
-    ],
-    [MS_TABLE]: [
-      { craa5_aa_ms_assetsid: gid(101), craa5_title: 'SSANKSMIX', craa5_sapdaily: 'SSANKSMIX', craa5_sapw: 'SSANKSMIXW', craa5_equipment: 'Mixer 01', craa5_textroom: 'Kitchen', craa5_textarea: 'South', craa5_olduid: 'EQ-KITCH-001', _craa5_asset_value: gid(1) },
-      { craa5_aa_ms_assetsid: gid(102), craa5_title: 'SSANIBL4PSW', craa5_sapw: 'SSANIBL4PSW', craa5_equipment: 'Pallets', craa5_textroom: 'Creme', craa5_textarea: 'IBL4', craa5_olduid: 'EQ-CRM-004', _craa5_asset_value: gid(4) },
-      { craa5_aa_ms_assetsid: gid(103), craa5_title: 'SSANIBL4PSW', craa5_sapw: 'SSANIBL4PSW', craa5_equipment: 'Racking', craa5_textroom: 'Creme', craa5_textarea: 'IBL4', craa5_olduid: 'EQ-CRM-005', _craa5_asset_value: null },
-      { craa5_aa_ms_assetsid: gid(104), craa5_title: 'SSANTEMPRW', craa5_sapw: 'SSANTEMPRW', craa5_equipment: 'Floors', craa5_textroom: 'Temp', craa5_textarea: 'Hall', _craa5_asset_value: null },
-      { craa5_aa_ms_assetsid: gid(105), craa5_title: 'SSANBKBRW', craa5_sapw: 'SSANBKBRW', craa5_equipment: 'Floors', craa5_textroom: 'Bakery', craa5_textarea: 'Breading', _craa5_asset_value: null },
-      { craa5_aa_ms_assetsid: gid(106), craa5_title: 'SSANWHTRW', craa5_sapw: 'SSANWHTRW', craa5_equipment: 'Floors', craa5_textroom: 'Warehouse', craa5_textarea: 'Trash', _craa5_asset_value: null },
-      { craa5_aa_ms_assetsid: gid(107), craa5_title: 'SSANWHDKW', craa5_sapw: 'SSANWHDKW', craa5_equipment: 'Sanitize pallet inverter', craa5_textroom: 'Warehouse', craa5_textarea: 'Dock', _craa5_asset_value: null },
-      { craa5_aa_ms_assetsid: gid(108), craa5_title: '10045892', craa5_sapw: '10045892', craa5_sapmonthly: '10045892M', craa5_equipment: 'Spiral Freezer North Belt', craa5_textroom: 'Spiral Freezer', craa5_textarea: 'Line 1', _craa5_asset_value: gid(13) },
-      { craa5_aa_ms_assetsid: gid(109), craa5_title: '10045892', craa5_sapw: '10045892', craa5_sapmonthly: '10045892M', craa5_equipment: 'Spiral Freezer South Belt', craa5_textroom: 'Spiral Freezer', craa5_textarea: 'Line 2', _craa5_asset_value: gid(14) },
-      { craa5_aa_ms_assetsid: gid(110), craa5_title: 'SSANTRMCV1W', craa5_sapdaily: 'SSANTRMCV1D', craa5_sapw: 'SSANTRMCV1W', craa5_equipment: 'Trim Table Conveyor 01', craa5_textroom: 'Trim Room', craa5_textarea: 'North', _craa5_asset_value: gid(15) },
-      { craa5_aa_ms_assetsid: gid(111), craa5_title: 'SSANPKGMV1W', craa5_sapdaily: 'SSANPKGMV1D', craa5_sapw: 'SSANPKGMV1W', craa5_equipment: 'Multivac Thermoformer 01', craa5_textroom: 'Packaging', craa5_textarea: 'Line 1', _craa5_asset_value: gid(17) },
-    ],
-    [LOG_TABLE]: [
-      log(200, gid(1), 'Mixer 01', 'SSANKSMIX', 'Kitchen', 'South', today, 'ES', 1),
-      log(201, null, 'mixer-1', '', 'Kitchen', 'South', '2026-03-02', 'EL', 2),
-      log(202, '', 'Mixer 1', '', 'Kitchen', 'South', '2026-03-09', 'EL', 2),
-      log(203, null, 'Pallet', 'SSANIBL4PSW', 'Creme', 'IBL4', '2026-04-01', 'LH', 2),
-      log(204, gid(999), 'Oven #5', '', 'Kitchen', 'South', '2026-04-02', 'LH', 1),
-      log(205, null, 'Gyro Mixer', '', '', '', '2026-04-03', 'AB', 1),
-      log(206, null, 'Unknown thing', '', 'Nowhere', '', '2026-04-04', 'AB', 1),
-      log(207, gid(9), 'Floors', 'SSANBKBRW', 'Bakery', 'Breading', '2026-05-01', 'EL', 1),
-      log(208, gid(8), 'Floors', '', 'Bakery', 'Breading', '2026-05-02', 'EL', 1),
-      log(209, gid(10), 'Floor', '', 'Bakery', 'Breading', '2026-05-03', 'LH', 1),
-      log(210, gid(8), 'Floors', '', 'Warehouse', 'Trash', '2026-05-04', 'LH', 1),
-      log(211, gid(13), 'Spiral Freezer North Belt', '10045892', 'Spiral Freezer', 'Line 1', today, 'JM', 2),
-    ],
-    [USER_TABLE]: Object.keys(USERS).map(id => ({ systemuserid: id, fullname: USERS[id], domainname: id === gid(500) ? 'U1010051' : 'SANLEAD01', internalemailaddress: id === gid(500) ? 'U1010051@schwans.com' : 'sanlead@schwans.com' })),
-    [SKIP_TABLE]: DEFAULT_SKIP_CODES.map((sc, idx) => ({
-      craa5_mss_skipcodeid: gid(300 + idx),
-      craa5_code: sc.code,
-      craa5_label: sc.label,
-      craa5_category: sc.category,
-      craa5_requiresnote: sc.requiresNote,
-      craa5_active: sc.active,
-      craa5_sortorder: sc.sortOrder,
-    })),
-    [HUB_CONFIG_TABLE]: [],
-    [ACCESS_LOG_TABLE]: [],
-  };
-  const bindId = (payload, row) => {
-    const bind = payload['craa5_asset@odata.bind'];
-    if (bind) row._craa5_asset_value = bind.match(/\(([^)]+)\)/)[1];
-    delete row['craa5_asset@odata.bind'];
-  };
-  const select = (table, rows, cols) => rows.map(r => {
-    if (!cols) return { ...r };
-    const o = { [ID_COL[table]]: r[ID_COL[table]] };
-    cols.forEach(c => { o[c] = r[c] === undefined ? null : r[c]; if (r[`${c}${FORMATTED}`] !== undefined) o[`${c}${FORMATTED}`] = r[`${c}${FORMATTED}`]; });
-    return o;
-  });
-  const match = (table, filter) => {
-    const rows = db[table] || [];
-    return filter ? rows.filter(parseFilter(filter, !!opts.caseSensitive)) : rows;
-  };
-  let n = 1000;
-  const files = new Map(); // uploaded files, by table|id|column
-  const mock = {
-    mode: 'preview',
-    db,
-    async query(table, { select: cols, filter, top, orderBy } = {}) {
-      let rows = match(table, filter);
-      if (orderBy) {
-        const keys = orderBy.split(',').map(s => s.trim().split(/\s+/));
-        rows = [...rows].sort((a, b) => {
-          for (const [k, d] of keys) {
-            const x = safeString(a[k]).toLowerCase(), y = safeString(b[k]).toLowerCase();
-            if (x !== y) return (x < y ? -1 : 1) * (d === 'desc' ? -1 : 1);
-          }
-          return 0;
-        });
-      }
-      return select(table, rows.slice(0, top || 100), cols);
-    },
-    // Server-style paging: each page continues after the last row id of the previous one.
-    async page(table, { select: cols, filter, top = 100 } = {}, after = '') {
-      const idc = ID_COL[table];
-      const rows = match(table, filter).filter(r => r[idc] > after).sort((a, b) => (a[idc] < b[idc] ? -1 : 1));
-      const got = rows.slice(0, top);
-      return { rows: select(table, got, cols), next: rows.length > top ? () => mock.page(table, { select: cols, filter, top }, got[got.length - 1][idc]) : null };
-    },
-    async create(table, payload) {
-      const id = gid(n++);
-      const row = { ...payload, [ID_COL[table]]: id, createdon: new Date(Date.now() + n).toISOString(), ...by(gid(500)) };
-      bindId(payload, row);
-      if (!db[table]) db[table] = [];
-      db[table].push(row);
-      return id;
-    },
-    async update(table, id, payload) {
-      const row = (db[table] || []).find(r => r[ID_COL[table]] === id);
-      if (!row) throw new Error('Row not found');
-      Object.assign(row, payload);
-      bindId(payload, row);
-    },
-    async remove(table, id) { db[table] = (db[table] || []).filter(r => r[ID_COL[table]] !== id); },
-    async uploadFile(table, id, column, data, fileName) {
-      const row = (db[table] || []).find(r => r[ID_COL[table]] === id);
-      if (!row) throw new Error('Row not found');
-      row[column] = `file ${fileName} (${Math.round((data.length * 3) / 4)} bytes)`;
-      row[`${column}_name`] = fileName;
-      files.set(`${table}|${id}|${column}`, { name: fileName, data });
-    },
-    async downloadFile(table, id, column) {
-      const f = files.get(`${table}|${id}|${column}`);
-      if (!f) throw new Error('no file is attached');
-      return { name: f.name, mime: mimeOf(f.name), data: f.data };
-    },
-  };
-  return mock;
-};
 
 // Xrm.WebApi appends the options string to the URL as is, so text typed into a filter (& # + %) must be percent-encoded inside its quotes.
 const encodeFilterText = (filter) => filter.replace(/'(?:[^']|'')*'/g, (lit) => `'${encodeURIComponent(lit.slice(1, -1))}'`);
@@ -1390,15 +1721,21 @@ const sanitizeLogPayload = (t, p) => {
   return { ...p, craa5_hoursworked: Number.isFinite(n) ? Math.max(0, Math.ceil(n)) : 0 };
 };
 
+// No Dataverse connection: reads come back empty and saves are refused. The page never shows made-up data.
+const makeOffline = () => {
+  const refuse = async () => { throw new Error(tr('Not connected to Dataverse. Nothing was saved.', 'Sin conexion a Dataverse. No se guardo nada.')); };
+  return { mode: 'offline', async query() { return []; }, async page() { return { rows: [], next: null }; }, create: refuse, update: refuse, remove: refuse, uploadFile: refuse, downloadFile: refuse };
+};
+
 const makeApi = (dataApiRef, props) => {
-  const mockFallback = makeMock();
+  const offline = makeOffline();
   const resolveBase = () => {
     const w = findWebApi(props);
     if (w) return webApiAdapter(w);
     if (dataApiRef && dataApiRef.current) return dataApiAdapter(dataApiRef);
     const dvUrl = getDataverseBaseUrl();
     if (dvUrl && typeof fetch === 'function') return odataFetchAdapter(dvUrl);
-    return mockFallback;
+    return offline;
   };
   const initialBase = resolveBase();
   const limit = makeLimiter(6);
@@ -1459,6 +1796,7 @@ const makeStore = (api) => {
   let lookup = null;          // does craa5_aa_ms_assets have the craa5_asset lookup? null until first probed
   let bindFailed = false;     // writing the lookup failed once: stop trying for this session
   let logFlagsOk = null;      // can craa5__log_ be written with craa5_daily/weekly/monthly boolean flags?
+  let mergedCount = 0;        // completions that were already in the log (another app saved them): SAP order added to that row
   let logSkipColsOk = null;   // can craa5__log_ be written with craa5_skipcode / craa5_skipreason?
   let assetSelectMode = null; // 'full' | 'ext' | 'base' | 'unscoped' for craa5_aa_assets columns
   let msExtColsOk = null;     // does craa5_aa_ms_assets have craa5_sapmidweek / craa5_sapbiweekly?
@@ -2245,39 +2583,66 @@ const makeStore = (api) => {
       } catch (_) { return []; }
     },
 
-    // Create a log entry with automatic clean-kind boolean flags (craa5_daily, craa5_weekly, craa5_monthly)
-    // so Ganttly & Shift Start overdue/triggering queries recognize the completion rank immediately.
-    // Note: craa5_skipcode and craa5_skipnote do not exist on craa5__log_ in live Dataverse, so skip metadata
-    // is encoded into existing columns craa5_lastcleanedby ("SKIPPED (CODE) - USER"), craa5_idofssop, and craa5_bundle.
-    async createLog(payload, sapCode, freqCol, skipMeta = null) {
-      const normalizedPayload = payload && payload.craa5_hoursworked !== undefined
-        ? { ...payload, craa5_hoursworked: Math.max(0, Math.ceil(Number(payload.craa5_hoursworked) || 0)) }
-        : { ...payload };
-      delete normalizedPayload.craa5_skipcode;
-      delete normalizedPayload.craa5_skipnote;
-      const flags = skipMeta ? { craa5_daily: false, craa5_weekly: false, craa5_monthly: false } : inferCleanKindFlags(sapCode !== undefined ? sapCode : normalizedPayload.craa5_sap, freqCol);
-      if (skipMeta) {
-        const skipCodeVal = safeString(skipMeta.skipCode !== undefined ? skipMeta.skipCode : (skipMeta.code || 'SKIP')) || 'SKIP';
-        const skipNoteVal = safeString(skipMeta.skipReason !== undefined ? skipMeta.skipReason : (skipMeta.note || skipMeta.reason || ''));
-        const rawWho = safeString(normalizedPayload.craa5_lastcleanedby || 'Operator');
-        const cleanedWho = /^SKIPPED\s*\(/i.test(rawWho) ? rawWho : `SKIPPED (${skipCodeVal}) - ${rawWho}`;
-        const skipMarker = `SKIP:${skipCodeVal}${skipNoteVal ? ':' + skipNoteVal : ''}`;
-        normalizedPayload.craa5_lastcleanedby = cleanedWho.slice(0, 100);
-        normalizedPayload.craa5_idofssop = skipMarker.slice(0, 100);
-        normalizedPayload.craa5_bundle = skipMarker.slice(0, 100);
-      }
-      if (logFlagsOk !== false) {
-        try {
-          const id = await api.create(LOG_TABLE, { ...normalizedPayload, ...flags });
-          logFlagsOk = true;
+    // Save one entry. A clean goes through the shared MSS LOG WRITE rule: one row per piece, kind and date with a fixed id; when
+    // that clean is already in the log (Ganttly saved it), the SAP order (and, on the caller's side, the paperwork) is added to that
+    // row instead of a second row. A skip is saved as before (it is not a clean): its code goes into craa5_lastcleanedby
+    // ("SKIPPED (CODE) - USER"), craa5_idofssop and craa5_bundle, since craa5_skipcode / craa5_skipnote do not exist on the log.
+    // extra: { minutes, pathogen }. Returns the row id.
+    async createLog(payload, sapCode, freqCol, skipMeta = null, extra = null) {
+      const p = { ...payload };
+      delete p.craa5_skipcode;
+      delete p.craa5_skipnote;
+      const code = sapCode !== undefined ? sapCode : p.craa5_sap;
+      if (!skipMeta) {
+        const built = mlwBuildRow({
+          equipmentGuid: p.craa5_equipmentguid, equipment: p.craa5_equipment, room: p.craa5_room, area: p.craa5_area,
+          kind: logKindOf(code, freqCol), sap: isAutoSap(code) ? '' : code, shiftDate: dayKey(p.craa5_lastcleaned),
+          cleanedBy: p.craa5_lastcleanedby, markedBy: MLW_MARKED_BY,
+          minutes: extra && extra.minutes !== undefined ? extra.minutes : Math.round((Number(p.craa5_hoursworked) || 0) * 60),
+          pathogen: !!(extra && extra.pathogen), source: 'Log input',
+        });
+        if (!built.ok) throw new Error(built.problems.map(c => mlwSay(c)).join(' '));
+        const found = await mlwFind(api, built).catch(e => { if (mlwIsDenied(e)) return null; throw e; });
+        if (found && Number(found.statecode || 0) === 0) {
+          const id = cleanGuid(found[MLW_ID]);
+          const add = {};
+          if (!isAutoSap(code) && safeString(code)) add.craa5_sap = built.row.craa5_sap;
+          if (built.row.craa5_pathogen === 'Yes') add.craa5_pathogen = 'Yes';
+          if (Object.keys(add).length) await api.update(LOG_TABLE, id, add);
+          mergedCount += 1;
           return id;
-        } catch (e) {
-          if (logFlagsOk === true || !MISSING_COLUMN.test(errText(e))) throw e;
-          logFlagsOk = false;
         }
+        const row = { ...built.row, craa5_hoursworked: Math.max(0, Math.ceil(Number(p.craa5_hoursworked) || 0)) };
+        for (let i = 0; i < 16; i++) {
+          const body = mlwStrip(row);
+          try {
+            if (found) { await api.update(LOG_TABLE, cleanGuid(found[MLW_ID]), { ...body, statecode: 0, statuscode: 1 }); return cleanGuid(found[MLW_ID]); }
+            return await api.create(LOG_TABLE, { ...body, [MLW_ID]: built.id });
+          } catch (e) {
+            if (!found && mlwIsDuplicate(errText(e))) { mergedCount += 1; return built.id; }
+            if (!mlwDropFor(e, Object.keys(body))) throw e;
+          }
+        }
+        throw new Error('MSS log: too many missing columns');
       }
-      return api.create(LOG_TABLE, normalizedPayload);
+      const skipCodeVal = safeString(skipMeta.skipCode !== undefined ? skipMeta.skipCode : (skipMeta.code || 'SKIP')) || 'SKIP';
+      const skipNoteVal = safeString(skipMeta.skipReason !== undefined ? skipMeta.skipReason : (skipMeta.note || skipMeta.reason || ''));
+      const rawWho = safeString(p.craa5_lastcleanedby || 'Operator');
+      const cleanedWho = /^SKIPPED\s*\(/i.test(rawWho) ? rawWho : `SKIPPED (${skipCodeVal}) - ${rawWho}`;
+      const skipMarker = `SKIP:${skipCodeVal}${skipNoteVal ? ':' + skipNoteVal : ''}`;
+      const row = {
+        ...p, craa5_hoursworked: 0, craa5_lastcleanedby: cleanedWho.slice(0, 100), craa5_idofssop: skipMarker.slice(0, 100), craa5_bundle: skipMarker.slice(0, 100),
+        craa5_daily: false, craa5_weekly: false, craa5_monthly: false, craa5_pathogen: 'No',
+        craa5_shiftdate: dayKey(p.craa5_lastcleaned), craa5_markedby: MLW_MARKED_BY, craa5_source: 'Log input',
+      };
+      for (let i = 0; i < 16; i++) {
+        const body = mlwStrip(row);
+        try { return await api.create(LOG_TABLE, body); }
+        catch (e) { if (!mlwDropFor(e, Object.keys(body))) throw e; }
+      }
+      throw new Error('MSS log: too many missing columns');
     },
+    takeMerged() { const n = mergedCount; mergedCount = 0; return n; },
 
     // SAP order typeahead. Queries the assets (craa5_aa_ms_assets and craa5_aa_assets) and pulls the SAP order from all frequency SAP columns.
     async searchOrders(q) {
@@ -4767,6 +5132,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
   const [initials, setInitials] = useState(initialInitials || '');
   const [totalHours, setTotalHours] = useState('');
   const [photo, setPhoto] = useState(null);
+  const [pathogen, setPathogen] = useState(false);   // this clean closes a pathogen swab hit (MSS log craa5_pathogen = Yes)
   const [photoName, setPhotoName] = useState('');
   const [photoNote, setPhotoNote] = useState(''); // why the last picture could not be used (gone as soon as another is picked)
   const [photoBusy, setPhotoBusy] = useState(false);
@@ -5759,7 +6125,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
         craa5_lastcleaned: toLogDate(dateStr),
         craa5_lastcleanedby: ini,
         craa5_hoursworked: 0,
-      }, normalizedCode, sr.col, { skipCode: sr.skipCode, skipReason: sr.skipReason }));
+      }, normalizedCode, sr.col, { skipCode: sr.skipCode, skipReason: sr.skipReason }, { minutes: 0, pathogen: false }));
       skipResults.forEach((r, idx) => {
         if (r.ok) {
           savedSkips += 1;
@@ -5775,10 +6141,10 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
     let merged = 0;
     includedActive.forEach((l) => {
       const a = assetOf(l);
-      if (at[a.id] !== undefined) { toLog[at[a.id]].hours = Math.ceil(toLog[at[a.id]].hours + lineHours(l)); merged += 1; return; }
+      if (at[a.id] !== undefined) { toLog[at[a.id]].hours = Math.ceil(toLog[at[a.id]].hours + lineHours(l)); toLog[at[a.id]].minutes += Math.round((lineHours(l) || 0) * 60); merged += 1; return; }
       at[a.id] = toLog.length;
       const fromAsset = !!resolved[l.key];
-      toLog.push({ asset: a, col: l.col, name: fromAsset ? a.name : l.name, room: fromAsset ? a.room : l.room, area: fromAsset ? a.area : l.area, hours: Math.max(0, Math.ceil(lineHours(l) || 0)) });
+      toLog.push({ asset: a, col: l.col, name: fromAsset ? a.name : l.name, room: fromAsset ? a.room : l.room, area: fromAsset ? a.area : l.area, hours: Math.max(0, Math.ceil(lineHours(l) || 0)), minutes: Math.round((lineHours(l) || 0) * 60) });
     });
     if (merged) notes.push(`${plural(merged, 'line named', 'lines named')} equipment that another line has too, so ${merged === 1 ? 'it was' : 'they were'} saved with that entry and the hours added.`);
     if (toLog.length === 0 && skippedLines.length > 0) {
@@ -5795,7 +6161,10 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
       craa5_lastcleaned: toLogDate(dateStr),
       craa5_lastcleanedby: ini,
       craa5_hoursworked: Math.max(0, Math.ceil(l.hours || 0)),
-    }, normalizedCode, l.col));
+    }, normalizedCode, l.col, null, { minutes: l.minutes, pathogen }));
+    const already = store.takeMerged();
+    if (already) info.push(tr(`${plural(already, 'piece was', 'pieces were')} already in the log for this date and clean (saved by Ganttly or an earlier entry); the SAP order was added to ${already === 1 ? 'that entry' : 'those entries'} instead of a second one.`,
+      `${already} pieza(s) ya estaban en el registro para esta fecha y limpieza (guardadas por Ganttly o un registro anterior); la orden SAP se agrego a ese registro en lugar de uno nuevo.`));
     const savedIds = [];
     const failedNames = [];
     results.forEach((r, i) => {
@@ -6091,6 +6460,10 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
               <Checkbox label={<Text size={200}>Read the sheet when it is added</Text>} checked={sheetAuto} disabled={saving} onChange={(e, d) => changeSheetAuto(!!d.checked)} />
             </div>
           )}
+        </div>
+        <div className={styles.field}>
+          <Text className={styles.label}>Pathogen</Text>
+          <Checkbox label={<Text size={200}>Pathogen follow-up (closes a positive swab)</Text>} checked={pathogen} disabled={saving} onChange={(e, d) => setPathogen(!!d.checked)} />
         </div>
         <Button appearance="subtle" style={{ alignSelf: 'flex-start', marginTop: '16px' }} aria-label={`Remove row ${index + 1}`} disabled={!canRemove || saving} onClick={onRemove}>Remove</Button>
       </div>
@@ -7654,12 +8027,12 @@ const LogTableTab = ({ ctx }) => {
   const optCols = useRef({ [PAPERWORK_NAME]: true, [CREATED_ON]: true, [CREATED_BY]: true });
 
   const buildFilter = (a) => {
-    const f = [];
+    const f = ['statecode eq 0'];
     const term = a.term.trim();
     if (term) f.push(`(${ciContains('craa5_sap', term)} or ${ciContains('craa5_equipment', term)} or ${ciStarts('craa5_lastcleanedby', term)})`);
     if (a.start) f.push(`craa5_lastcleaned ge ${a.start}T00:00:00Z`);
     if (a.end) f.push(`craa5_lastcleaned lt ${nextDay(a.end)}T00:00:00Z`);
-    return f.length ? f.join(' and ') : undefined;
+    return f.join(' and ');
   };
 
   // Only the newest request may update the table
@@ -7863,6 +8236,204 @@ const LogTableTab = ({ ctx }) => {
   );
 };
 
+// --- CHECK (the log rows of every app for the last days, held to the MSS LOG WRITE rule; nothing changes until an admin applies a fix) ---
+const CHECK_DAYS = ['1', '3', '7', '14', '30'];
+const CHECK_MAX = 2000;
+const CHECK_SELECT = ['craa5__log_id', 'craa5_equipment', 'craa5_equipmentguid', 'craa5_sap', 'craa5_room', 'craa5_area', 'craa5_lastcleaned', 'craa5_lastcleanedby', 'craa5_hoursworked', 'craa5_daily', 'craa5_weekly', 'craa5_monthly', 'craa5_pathogen', 'craa5_uid', 'craa5_bundle', 'craa5_idofssop'];
+const CHECK_OPT = ['craa5_cleankind', 'craa5_shiftdate', 'craa5_completionkey', 'craa5_laborminutes', 'craa5_markedby', 'craa5_source', CREATED_ON];
+const CHECK_CODES = ['no_equipment', 'bad_equipment', 'future_day', 'duplicate', 'crew_name', 'no_names', 'no_kind', 'no_pathogen', 'no_day'];
+// Which app saved a row: the source column, else a guess (an "auto-" SAP text came from Ganttly or Shift Start)
+const checkSourceOf = (r) => safeString(r.craa5_source) || (isAutoSap(r.craa5_sap) ? 'Ganttly / Shift Start' : 'Log input');
+// Every row with its problems. A repeat = a second "auto-" row of the same equipment, day and clean kind as another row (the SAP
+// row, or the first saved, is the one kept). Old Log input rows are never called repeats: the same order was allowed twice then.
+const checkRows = (list) => {
+  const out = list.map(r => ({
+    id: cleanGuid(r.craa5__log_id), raw: r, date: safeString(r.craa5_shiftdate) || dayKey(r.craa5_lastcleaned), equipment: safeString(r.craa5_equipment),
+    place: [safeString(r.craa5_room), safeString(r.craa5_area)].filter(Boolean).join(' / '), by: safeString(r.craa5_lastcleanedby),
+    sap: safeString(r.craa5_sap), kind: mlwRowKind(r), source: checkSourceOf(r), skip: mlwIsSkip(r),
+    minutes: r.craa5_laborminutes !== undefined && r.craa5_laborminutes !== null ? Number(r.craa5_laborminutes) : null,
+    hours: r.craa5_hoursworked, pathogen: safeString(r.craa5_pathogen), at: safeString(r[CREATED_ON]), problems: mlwCheckRow(r),
+  }));
+  const groups = new Map();
+  out.forEach(x => {
+    const g = hubIsGuid(x.raw.craa5_equipmentguid) ? hubGuid(x.raw.craa5_equipmentguid) : "";
+    if (x.skip || !g || !x.date) return;
+    const k = `${g}|${x.date}|${x.kind}`;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(x);
+  });
+  groups.forEach((g) => {
+    if (g.length < 2) return;
+    const sorted = g.slice().sort((a, b) => (isAutoSap(a.sap) === isAutoSap(b.sap) ? (a.at < b.at ? -1 : a.at > b.at ? 1 : 0) : isAutoSap(a.sap) ? 1 : -1));
+    sorted.slice(1).forEach(x => { if (isAutoSap(x.sap)) x.problems = x.problems.concat(['duplicate']); });
+  });
+  return out;
+};
+const dayBefore = (dateStr) => { const d = new Date(`${dateStr}T00:00:00Z`); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); };
+
+const CheckTab = ({ ctx }) => {
+  const styles = useStyles();
+  const { api, lang } = ctx;
+  const [days, setDays] = useState('7');
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [capped, setCapped] = useState(false);
+  const [message, setMessage] = useState(null);
+  const [only, setOnly] = useState('');   // '' = every row with a problem, 'all' = every row, or one problem code
+  const [names, setNames] = useState({});  // Cleaned by being typed, by row id
+  const [busy, setBusy] = useState(false);
+  const [queued, setQueued] = useState(mlwQueueCount());
+  const optCols = useRef(CHECK_OPT.slice());
+  const reqId = useRef(0);
+  const say = (code) => mlwSay(code, lang);
+
+  const load = useCallback(async (d) => {
+    const id = ++reqId.current;
+    setLoading(true);
+    try {
+      const filter = `statecode eq 0 and craa5_lastcleaned ge ${daysAgo(Number(d) - 1)}T00:00:00Z`;
+      let cols = optCols.current.slice();
+      let pg;
+      // The new columns may not exist yet: a column the error names is left out for the session (all of them when none is named)
+      for (;;) {
+        try { pg = await api.page(LOG_TABLE, { select: CHECK_SELECT.concat(cols), filter, top: 250 }); break; }
+        catch (e) {
+          const msg = errText(e);
+          if (!cols.length || !(MISSING_COLUMN.test(msg) || /invalid property|does not exist/i.test(msg))) throw e;
+          const named = cols.filter(c => msg.toLowerCase().indexOf(c) >= 0);
+          cols = named.length ? cols.filter(c => named.indexOf(c) < 0) : [];
+          optCols.current = cols;
+        }
+      }
+      const all = pg.rows.slice();
+      while (pg.next && all.length < CHECK_MAX) { pg = await pg.next(); pg.rows.forEach(r => all.push(r)); }
+      if (id !== reqId.current) return;
+      setCapped(!!pg.next || all.length > CHECK_MAX);
+      setRows(checkRows(all.slice(0, CHECK_MAX)));
+      setLoaded(true);
+    } catch (e) {
+      if (id === reqId.current) setMessage({ kind: 'error', text: tr(`Could not read the log: ${errText(e)}`, `No se pudo leer el registro: ${errText(e)}`) });
+    } finally { if (id === reqId.current) setLoading(false); }
+  }, [api]);
+  useEffect(() => { load(days); }, [load]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const withProblem = rows.filter(r => r.problems.length);
+  const counts = {};
+  withProblem.forEach(r => r.problems.forEach(p => { counts[p] = (counts[p] || 0) + 1; }));
+  const shown = (only === 'all' ? rows : only ? rows.filter(r => r.problems.indexOf(only) >= 0) : withProblem)
+    .slice().sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : a.equipment.localeCompare(b.equipment)));
+
+  // Apply one change to many rows, then read the log again
+  const applyAll = async (list, make, doneEn, doneEs) => {
+    if (!list.length) return;
+    setBusy(true); setMessage(null);
+    const res = await pool(list, 6, (r) => make(r));
+    const bad = res.filter(x => !x.ok);
+    setMessage(bad.length
+      ? { kind: 'error', text: tr(`${bad.length} of ${list.length} could not be changed: ${errText(bad[0].error)}`, `${bad.length} de ${list.length} no se pudieron cambiar: ${errText(bad[0].error)}`) }
+      : { kind: 'ok', text: tr(`${doneEn} (${list.length}).`, `${doneEs} (${list.length}).`) });
+    setBusy(false);
+    ctx.dataChanged && ctx.dataChanged();
+    await load(days);
+  };
+  const fixPathogen = () => applyAll(rows.filter(r => r.problems.indexOf('no_pathogen') >= 0), (r) => api.update(LOG_TABLE, r.id, { craa5_pathogen: 'No' }),
+    'Pathogen set to No', 'Patogeno puesto en No');
+  const kindFromSap = (r) => (r.sap ? logKindOf(r.sap, null, true) : '');
+  const fixKinds = () => applyAll(rows.filter(r => r.problems.indexOf('no_kind') >= 0 && kindFromSap(r)), (r) => {
+    const k = kindFromSap(r);
+    const body = mlwFlags(k);
+    if (optCols.current.indexOf('craa5_cleankind') >= 0) body.craa5_cleankind = k;
+    return api.update(LOG_TABLE, r.id, body);
+  }, 'Clean kind filled in from the SAP order', 'Tipo de limpieza tomado de la orden SAP');
+  const removeRepeats = () => {
+    const list = rows.filter(r => r.problems.indexOf('duplicate') >= 0);
+    if (!list.length) return;
+    if (!window.confirm(tr(`Turn off ${list.length} repeated automatic entries? The first entry of each clean is kept. The repeats are deactivated, not deleted.`, `Desactivar ${list.length} registros automaticos repetidos? Se conserva el primer registro de cada limpieza. Los repetidos se desactivan, no se borran.`))) return;
+    applyAll(list, (r) => api.update(LOG_TABLE, r.id, { statecode: 1, statuscode: 2 }), 'Repeated entries turned off', 'Registros repetidos desactivados');
+  };
+  const moveBack = (r) => applyAll([r], (x) => api.update(LOG_TABLE, x.id, { craa5_lastcleaned: toLogDate(dayBefore(x.date)) }), 'Moved to the day before', 'Movido al dia anterior');
+  const saveName = (r) => {
+    const v = mlwNames(names[r.id] || '');
+    if (!v.length || v.some(n => /^(crew|equipo|team|n\/?a|tbd)$/i.test(n))) { setMessage({ kind: 'error', text: say('crew_name') }); return; }
+    applyAll([r], (x) => api.update(LOG_TABLE, x.id, { craa5_lastcleanedby: v.join(' / ').slice(0, 100) }), 'Cleaned by saved', 'Limpiado por guardado')
+      .then(() => setNames(p => { const n = { ...p }; delete n[r.id]; return n; }));
+  };
+  const retryQueue = async () => {
+    setBusy(true);
+    const res = await mlwRetryQueue(mlwApi(findXrm(), null) || api);
+    setQueued(res.left); setBusy(false);
+    setMessage({ kind: res.left ? 'error' : 'ok', text: tr(`Saved ${res.saved}, already there ${res.already}, still waiting ${res.left}.`, `Guardados ${res.saved}, ya estaban ${res.already}, en espera ${res.left}.`) });
+    await load(days);
+  };
+
+  const cell = { padding: '6px 8px', borderBottom: `1px solid ${BRAND.line}`, verticalAlign: 'top', textAlign: 'left' };
+  const fixable = { no_pathogen: counts.no_pathogen || 0, no_kind: rows.filter(r => r.problems.indexOf('no_kind') >= 0 && kindFromSap(r)).length, duplicate: counts.duplicate || 0 };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+      <Text size={600} weight="semibold" block className={styles.sectionTitle}>{tr('Check the log', 'Revisar el registro')}</Text>
+      <Text className={styles.hint} block>
+        {tr('Every app saves cleans to the same MSS log. This page holds each entry to one rule: an equipment ID, the shift day, the names of who cleaned it, the kind of clean and a pathogen Yes or No. Nothing changes until you apply a fix.',
+          'Todas las apps guardan las limpiezas en el mismo registro MSS. Esta pagina revisa cada registro con una sola regla: ID de equipo, dia del turno, nombres de quien limpio, tipo de limpieza y patogeno Si o No. Nada cambia hasta que aplique una correccion.')}
+      </Text>
+      <div className={styles.filterBar}>
+        <Text>{tr('Days to check', 'Dias a revisar')}</Text>
+        <Select aria-label={tr('Days to check', 'Dias a revisar')} value={days} disabled={loading} onChange={(e, d) => { setDays(d.value); load(d.value); }}>
+          {CHECK_DAYS.map(d => <option key={d} value={d}>{d === '1' ? tr('Today', 'Hoy') : tr(`Last ${d} days`, `Ultimos ${d} dias`)}</option>)}
+        </Select>
+        <Select aria-label={tr('Show', 'Mostrar')} value={only} onChange={(e, d) => setOnly(d.value)}>
+          <option value="">{tr(`Entries with a problem (${withProblem.length})`, `Registros con problema (${withProblem.length})`)}</option>
+          {CHECK_CODES.filter(c => counts[c]).map(c => <option key={c} value={c}>{`${say(c)} (${counts[c]})`}</option>)}
+          <option value="all">{tr(`Every entry (${rows.length})`, `Todos los registros (${rows.length})`)}</option>
+        </Select>
+        <Button disabled={loading || busy} onClick={() => load(days)}>{tr('Read again', 'Leer de nuevo')}</Button>
+      </div>
+      <div className={styles.actionBar}>
+        <Button disabled={busy || !fixable.no_pathogen} onClick={fixPathogen}>{tr(`Set empty pathogen to No (${fixable.no_pathogen})`, `Poner patogeno vacio en No (${fixable.no_pathogen})`)}</Button>
+        <Button disabled={busy || !fixable.no_kind} onClick={fixKinds}>{tr(`Fill in the clean kind from the SAP order (${fixable.no_kind})`, `Tomar el tipo de limpieza de la orden SAP (${fixable.no_kind})`)}</Button>
+        <Button className={styles.btnDanger} appearance="primary" disabled={busy || !fixable.duplicate} onClick={removeRepeats}>{tr(`Turn off repeated automatic entries (${fixable.duplicate})`, `Desactivar registros automaticos repetidos (${fixable.duplicate})`)}</Button>
+        {queued > 0 && <Button disabled={busy} onClick={retryQueue}>{tr(`Save the ${queued} waiting on this device`, `Guardar los ${queued} en espera en este equipo`)}</Button>}
+        <Text className={styles.hint} aria-live="polite">{loading ? tr('Reading the log...', 'Leyendo el registro...') : loaded ? tr(`${rows.length} entries read, ${withProblem.length} with a problem.`, `${rows.length} registros leidos, ${withProblem.length} con problema.`) : ''}</Text>
+      </div>
+      {capped && <Text className={styles.warnText} block>{tr(`Only the first ${CHECK_MAX} entries were read. Pick fewer days to see the rest.`, `Solo se leyeron los primeros ${CHECK_MAX} registros. Elija menos dias para ver el resto.`)}</Text>}
+      {(counts.no_equipment || counts.bad_equipment) ? <Text className={styles.hint} block>{tr('Entries with no equipment ID are fixed on the Fix Missing IDs tab.', 'Los registros sin ID de equipo se corrigen en la pestana Corregir IDs Faltantes.')}</Text> : null}
+      {message && <Text className={message.kind === 'ok' ? styles.okText : styles.errorText} block role={message.kind === 'ok' ? 'status' : 'alert'}>{message.text}</Text>}
+      <div style={{ maxHeight: '60vh', overflow: 'auto', border: `1px solid ${BRAND.line}`, borderRadius: '4px' }}>
+        <table style={{ borderCollapse: 'collapse', width: '100%', minWidth: 1100, fontSize: 13 }}>
+          <thead>
+            <tr>
+              {[tr('Date', 'Fecha'), tr('Equipment', 'Equipo'), tr('Room / Area', 'Cuarto / Area'), tr('Kind', 'Tipo'), tr('Cleaned by', 'Limpiado por'), tr('Labor', 'Mano de obra'), tr('Pathogen', 'Patogeno'), tr('Saved by app', 'Guardado por app'), tr('Problem', 'Problema')].map(h => <th key={h} style={{ ...cell, fontWeight: 600 }}>{h}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {shown.map(r => (
+              <tr key={r.id}>
+                <td style={cell}>{r.date || '...'}
+                  {r.problems.indexOf('future_day') >= 0 && <div><Button size="small" disabled={busy} onClick={() => moveBack(r)}>{tr('Move to the day before', 'Mover al dia anterior')}</Button></div>}
+                </td>
+                <td style={cell}>{r.equipment || '...'}</td>
+                <td style={cell}>{r.place}</td>
+                <td style={cell}>{r.skip ? tr('Skipped', 'Omitido') : (mlwKindLabel(r.kind, lang) || '...')}{r.sap ? <div className={styles.hint}>{r.sap}</div> : null}</td>
+                <td style={cell}>{(r.problems.indexOf('crew_name') >= 0 || r.problems.indexOf('no_names') >= 0) ? (
+                  <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                    <Input size="small" aria-label={tr(`Who cleaned ${r.equipment}`, `Quien limpio ${r.equipment}`)} placeholder={r.by || tr('Names, / between', 'Nombres, / entre ellos')} value={names[r.id] || ''} onChange={(e, d) => setNames(p => ({ ...p, [r.id]: d.value }))} />
+                    <Button size="small" disabled={busy || !safeString(names[r.id])} onClick={() => saveName(r)}>{tr('Save', 'Guardar')}</Button>
+                  </div>) : r.by}</td>
+                <td style={cell}>{r.minutes !== null && !Number.isNaN(r.minutes) ? tr(`${r.minutes} min`, `${r.minutes} min`) : r.hours !== undefined && r.hours !== null ? tr(`${r.hours} h`, `${r.hours} h`) : ''}</td>
+                <td style={cell}>{r.pathogen === 'Yes' ? tr('Yes', 'Si') : r.pathogen === 'No' ? 'No' : ''}</td>
+                <td style={cell}>{r.source}</td>
+                <td style={cell}>{r.problems.length ? r.problems.map(p => <div key={p}><span className={mergeClasses(styles.tag, p === 'no_pathogen' || p === 'no_kind' ? styles.tagWarn : styles.tagBad)}>{say(p)}</span></div>) : <span className={mergeClasses(styles.tag, styles.tagOk)}>{tr('OK', 'Bien')}</span>}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {loaded && !loading && shown.length === 0 && <Text className={styles.hint} block style={{ padding: 12 }}>{only === 'all' ? tr('No entries in these days.', 'No hay registros en estos dias.') : tr('No problems found in these days.', 'No se encontraron problemas en estos dias.')}</Text>}
+      </div>
+    </div>
+  );
+};
+
 // --- DASHBOARD (one period, the newest entries up to a limit) ---
 const DashboardTab = ({ ctx }) => {
   const styles = useStyles();
@@ -7877,7 +8448,7 @@ const DashboardTab = ({ ctx }) => {
     setLoading(true); setError('');
     api.query(LOG_TABLE, {
       select: ['craa5__log_id', 'craa5_sap', 'craa5_lastcleanedby', 'craa5_hoursworked', 'craa5_equipmentguid'],
-      filter: `craa5_lastcleaned ge ${daysAgo(Number(days))}T00:00:00Z`, orderBy: 'craa5_lastcleaned desc', top: LIMITS.dashboard + 1,
+      filter: `statecode eq 0 and craa5_lastcleaned ge ${daysAgo(Number(days))}T00:00:00Z`, orderBy: 'craa5_lastcleaned desc', top: LIMITS.dashboard + 1,
     })
       .then(rows => { if (live) setData({ rows: rows.slice(0, LIMITS.dashboard), capped: rows.length > LIMITS.dashboard }); })
       .catch(e => { if (live) setError(errText(e)); })
@@ -7948,7 +8519,7 @@ const CalendarTab = ({ ctx }) => {
     const from = `${y}-${String(m + 1).padStart(2, '0')}-01`;
     const to = toDateInput(new Date(y, m + 1, 1));
     setLoading(true); setError(''); setOpen(null);
-    api.query(LOG_TABLE, { select: ['craa5__log_id', 'craa5_sap', 'craa5_equipment', 'craa5_lastcleaned', 'craa5_lastcleanedby'], filter: `craa5_lastcleaned ge ${from}T00:00:00Z and craa5_lastcleaned lt ${to}T00:00:00Z`, orderBy: 'craa5_lastcleaned asc', top: LIMITS.calendar })
+    api.query(LOG_TABLE, { select: ['craa5__log_id', 'craa5_sap', 'craa5_equipment', 'craa5_lastcleaned', 'craa5_lastcleanedby'], filter: `statecode eq 0 and craa5_lastcleaned ge ${from}T00:00:00Z and craa5_lastcleaned lt ${to}T00:00:00Z`, orderBy: 'craa5_lastcleaned asc', top: LIMITS.calendar })
       .then(rows => { if (live) setEntries(rows.map(mapLog)); })
       .catch(e => { if (live) setError(errText(e)); })
       .finally(() => { if (live) setLoading(false); });
@@ -8379,6 +8950,7 @@ const ALL_APP_TABS = [
   { id: 'skipcodes', label: 'Skip Codes & Table', group: 'Configuration', alwaysAvailable: false, desc: 'Configure standardized plant skip/not-done reason codes and sync with Dataverse.' },
   { id: 'dashboard', label: 'Dashboard', group: 'Analytics & Compliance', alwaysAvailable: false, desc: 'MSS completion KPIs, overdue equipment tracking, and room/area compliance breakdowns.' },
   { id: 'calendar', label: 'Calendar', group: 'Analytics & Compliance', alwaysAvailable: false, desc: 'Monthly visual calendar of completed equipment cleanings by date and operator.' },
+  { id: 'check', label: 'Check', group: 'Data Maintenance', alwaysAvailable: false, desc: 'Every app\'s log entries for the last days, checked against the one MSS log rule (equipment ID, shift date, names, clean kind, pathogen), with fixes.' },
   { id: 'fix', label: 'Fix Missing IDs', group: 'Data Maintenance', alwaysAvailable: false, desc: 'Scan and batch-repair historical log rows missing Equipment GUIDs or Room/Area metadata.' },
   { id: 'manual', label: 'How-To Manual', group: 'Training & Help', alwaysAvailable: false, desc: 'Annotated visual screen guide, interactive Help Chatbot, and complete function & button reference.' },
   { id: 'viewmodule', label: 'View Module', group: 'Permissions & Views', alwaysAvailable: false, desc: 'Configure personal tab/feature visibility or (for Admins) assign and lock views for specific users.' },
@@ -8413,7 +8985,7 @@ const VIEW_ROLE_PRESETS = {
     label: 'Sanitation Lead',
     badge: 'Lead View',
     desc: 'Floor entry plus Skip Codes, Calendar, Batch Edit, and Asset Catalog browser.',
-    tabs: ['add', 'table', 'skipcodes', 'calendar', 'manual', 'viewmodule'],
+    tabs: ['add', 'table', 'skipcodes', 'calendar', 'check', 'manual', 'viewmodule'],
     features: {
       showAssetStatusBar: true,
       showRecentSidebar: true,
@@ -8441,7 +9013,7 @@ const VIEW_ROLE_PRESETS = {
     label: 'Supervisor / Manager',
     badge: 'Supervisor View',
     desc: 'Full operational & analytics view including Dashboard, Calendar, Fix Missing IDs, and Batch Edit.',
-    tabs: ['add', 'table', 'skipcodes', 'dashboard', 'calendar', 'fix', 'manual', 'viewmodule'],
+    tabs: ['add', 'table', 'skipcodes', 'dashboard', 'calendar', 'check', 'fix', 'manual', 'viewmodule'],
     features: {
       showAssetStatusBar: true,
       showRecentSidebar: true,
@@ -8455,7 +9027,7 @@ const VIEW_ROLE_PRESETS = {
     label: 'Full Admin / All Modules',
     badge: 'Full Admin View',
     desc: 'Unrestricted access to every tab, feature, View Module assignment manager, and Dev & Access Console.',
-    tabs: ['add', 'table', 'skipcodes', 'dashboard', 'calendar', 'fix', 'manual', 'viewmodule', 'devconsole'],
+    tabs: ['add', 'table', 'skipcodes', 'dashboard', 'calendar', 'check', 'fix', 'manual', 'viewmodule', 'devconsole'],
     features: {
       showAssetStatusBar: true,
       showRecentSidebar: true,
@@ -8640,7 +9212,7 @@ const detectActiveUserIdentity = async (api, hostProps = null) => {
   }
 
   if (!microsoftId) {
-    microsoftId = api && api.mode === 'preview' ? 'U1010051' : 'FLOOR-USER';
+    microsoftId = 'FLOOR-USER';
   }
   if (!userName) {
     userName = microsoftId === 'U1010051' ? 'Plant Admin' : `MSS Operator`;
@@ -8800,6 +9372,18 @@ const MSS_DATAVERSE_TABLE_BLUEPRINTS = [
       { logicalName: 'craa5_daily', displayName: 'Daily Clean Flag', type: 'Two Options (Boolean)', tier: 'Current Extended', required: false, notes: 'Rollup boolean flag indicating Daily clean rank completion.' },
       { logicalName: 'craa5_weekly', displayName: 'Weekly Clean Flag', type: 'Two Options (Boolean)', tier: 'Current Extended', required: false, notes: 'Rollup boolean flag indicating Weekly clean rank completion.' },
       { logicalName: 'craa5_monthly', displayName: 'Monthly Clean Flag', type: 'Two Options (Boolean)', tier: 'Current Extended', required: false, notes: 'Rollup boolean flag indicating Monthly/Quarterly/Annual clean rank completion.' },
+      { logicalName: 'craa5_pathogen', displayName: 'Pathogen', type: 'Single Line of Text', tier: 'Current Extended', required: false, notes: 'Yes when the clean closes a positive swab, else No. Never blank.' },
+      { logicalName: 'craa5_completionkey', displayName: 'Completion key', type: 'Single Line of Text (200)', tier: 'Current Extended', required: false, notes: 'Data contract 6.3: equipment id | shift date | clean kind. Stops a second row for the same clean.' },
+      { logicalName: 'craa5_shiftdate', displayName: 'Shift date', type: 'Single Line of Text (10)', tier: 'Current Extended', required: false, notes: 'YYYY-MM-DD, the plant day the shift started.' },
+      { logicalName: 'craa5_shiftcode', displayName: 'Shift code', type: 'Single Line of Text (5)', tier: 'Current Extended', required: false, notes: 'Crew letter A-D.' },
+      { logicalName: 'craa5_cleankind', displayName: 'Clean kind', type: 'Single Line of Text (20)', tier: 'Current Extended', required: false, notes: 'daily, midweek, eow, allergen, changeover, monthly, quarterly, semiannual, annual, corrective, other.' },
+      { logicalName: 'craa5_laborminutes', displayName: 'Labor minutes', type: 'Whole Number', tier: 'Current Extended', required: false, notes: 'Person-minutes spent. Hours worked = round(minutes / 60).' },
+      { logicalName: 'craa5_employeeguids', displayName: 'Employee guids', type: 'Multiple Lines of Text (4000)', tier: 'Current Extended', required: false, notes: 'Employee ids, "; " between them.' },
+      { logicalName: 'craa5_markedby', displayName: 'Marked by', type: 'Single Line of Text (200)', tier: 'Current Extended', required: false, notes: 'The signed-in person who saved it.' },
+      { logicalName: 'craa5_source', displayName: 'Source', type: 'Single Line of Text (50)', tier: 'Current Extended', required: false, notes: 'Ganttly, Log input, Calendar or Import.' },
+      { logicalName: 'craa5_doneat', displayName: 'Done at', type: 'Date and Time', tier: 'Current Extended', required: false, notes: 'When Done was pressed.' },
+      { logicalName: 'craa5_plankey', displayName: 'Plan key', type: 'Single Line of Text (200)', tier: 'Current Extended', required: false, notes: 'The Clean Plan window (craa5_cleanplan.craa5_plankey).' },
+      { logicalName: 'craa5_linekey', displayName: 'Line key', type: 'Single Line of Text (50)', tier: 'Current Extended', required: false, notes: 'hubLineKey of the line.' },
       { logicalName: 'craa5_pictureorfileofpaperwork', displayName: 'Paperwork Photo / File (craa5_pictureorfileofpaperwork)', type: 'File / Image Column', tier: 'Current Extended', required: false, notes: 'Paperwork photo or PDF uploaded for audit / PIC-required equipment.' },
       { logicalName: 'craa5_skipcode', displayName: 'Skip / Not-Done Code', type: 'Single Line of Text (30)', tier: 'Current Extended', required: false, notes: 'Standardized skip reason code (e.g. PROD, MAINT, LOTO) when an item on an order is skipped.' },
       { logicalName: 'craa5_skipnote', displayName: 'Skip / Operator Note', type: 'Multiple Lines of Text (2000)', tier: 'Current Extended', required: false, notes: 'Operator explanation for skipped equipment or exception notes.' },
@@ -9654,12 +10238,20 @@ const MANUAL_REFERENCE_ITEMS = [
   { name: 'How-To Manual & Help Bot Tab', topic: 'Add Log Entries', where: 'Navigation Bar', desc: 'Annotated SVG visual walkthrough of all 6 app screens, interactive Q&A Help Chatbot, and searchable button reference.' },
   { name: 'Dashboard Tab', topic: 'Dashboard & Calendar', where: 'Navigation Bar', desc: 'Displays plant MSS compliance rates, overdue equipment counts, and room-by-room completion charts.' },
   { name: 'Calendar Tab', topic: 'Dashboard & Calendar', where: 'Navigation Bar', desc: 'Monthly calendar view of completed sanitation log entries by date.' },
+  { name: 'Check Tab', topic: 'Fix Missing IDs', where: 'Navigation Bar', desc: 'Lists the last days of log entries from every app (Ganttly, this page, the Calendar) that break the one MSS log rule, and fixes them: empty pathogen to No, clean kind from the SAP order, repeated automatic entries turned off, a date one day too late moved back, "Crew" replaced by names.' },
+  { name: 'Pathogen follow-up', topic: 'Add Log Entries', where: 'Each entry row', desc: 'Tick it when this clean closes a positive swab. The entry is saved with Pathogen = Yes; otherwise No.' },
   { name: 'Fix Missing IDs Tab', topic: 'Fix Missing IDs', where: 'Navigation Bar', desc: 'Scans historical log entries missing Equipment GUIDs or Room/Area fields and repairs them in batches using the Asset Catalog.' },
   { name: 'Dev & Access Console Tab', topic: 'Dataverse & Admin', where: 'Navigation Bar (Admin / Unlocked)', desc: 'Provides the Live Dataverse Column Prober, ChatGPT Powerverse Prompt Generator (current + future features), User Access Audit Log, and 10-Point Health Scanner.' },
   { name: 'CJ Schwan\'s Logo (Top Right)', topic: 'Dataverse & Admin', where: 'Header Bar', desc: 'Click to toggle Admin Unlock mode, revealing all restricted tabs, Per-User View Lock controls, and the Dev & Access Console.' },
 ];
 
 const MANUAL_BOT_QA = [
+  {
+    keywords: ['already', 'ganttly', 'twice', 'duplicate', 'double', 'same day', 'merged', 'pathogen', 'check'],
+    title: 'Why an entry says it was already in the log',
+    answer: 'Every app saves a clean by one rule: one entry per piece of equipment, kind of clean and date. When Ganttly (or an earlier entry here) already saved that clean, Submit adds the SAP order and the paperwork to that entry instead of saving a second one. Open the Check tab to see entries that break the rule (no equipment ID, "Crew" instead of names, a date in the future, the same clean twice, pathogen empty) and fix them.',
+    screenIdx: 0,
+  },
   {
     keywords: ['asset', 'load', 'missing', 'catalog', 'equipment', 'sap', 'order', 'not showing', 'reload'],
     title: 'Fixing or Reloading Equipment Assets & SAP Orders',
@@ -10376,7 +10968,7 @@ const DevConsoleTab = ({
             missingColumns.push(col);
           } else {
             // In preview mode or generic select support, mark core/extended as FOUND
-            columnStatus[col.logicalName] = api.mode === 'preview' && col.tier !== 'Future Feature' ? 'FOUND' : 'MISSING';
+            columnStatus[col.logicalName] = 'MISSING';
             if (columnStatus[col.logicalName] === 'FOUND') foundColumns.push(col);
             else missingColumns.push(col);
           }
@@ -11315,6 +11907,7 @@ export default function GeneratedComponent(props) {
 
   const [saving, setSaving] = useState(false);
   // saving: the Fix tab waits while the Add tab is writing, so the two never move the same entries at once
+  useEffect(() => { MLW_MARKED_BY = currentUser.source === 'Detecting...' ? '' : safeString(currentUser.userName || currentUser.microsoftId); }, [currentUser]);
   const ctx = useMemo(
     () => ({ api, store, maxDate, minDate, dataVer, dataChanged, saving, viewFeatures: effectiveView.features || {}, currentUser, isDark, lang }),
     [api, store, maxDate, minDate, dataVer, dataChanged, saving, effectiveView.features, currentUser, isDark, lang]
@@ -11388,7 +11981,7 @@ export default function GeneratedComponent(props) {
   // Sidebar: the 10 newest entries by when they were saved (one tiny query)
   const loadRecent = useCallback(async () => {
     try {
-      const res = await api.query(LOG_TABLE, { select: ['craa5__log_id', 'craa5_sap', 'craa5_equipment', 'craa5_lastcleaned', 'craa5_lastcleanedby'], orderBy: 'createdon desc', top: 10 });
+      const res = await api.query(LOG_TABLE, { select: ['craa5__log_id', 'craa5_sap', 'craa5_equipment', 'craa5_lastcleaned', 'craa5_lastcleanedby'], filter: 'statecode eq 0', orderBy: 'createdon desc', top: 10 });
       setRecent({ status: 'ok', list: res.map(mapLog), error: '' });
     } catch (e) { setRecent(r => ({ ...r, status: 'error', error: errText(e) })); }
   }, [api]);
@@ -11468,6 +12061,8 @@ export default function GeneratedComponent(props) {
   const visibleTabs = useMemo(() => {
     const allowedSet = new Set(effectiveView.tabs || ['add', 'table', 'manual', 'viewmodule']);
     allowedSet.add('add');
+    // Views saved before the Check tab existed: whoever may fix IDs or batch edit may check the log
+    if (allowedSet.has('fix') || (effectiveView.features && effectiveView.features.allowBatchEdit)) allowedSet.add('check');
     // Unless previewing a specific locked user, unlocking the CJ Schwan's logo reveals all admin/diagnostic tabs
     if (logoUnlocked && !previewTargetKey) {
       ALL_APP_TABS.forEach(t => allowedSet.add(t.id));
@@ -11478,13 +12073,14 @@ export default function GeneratedComponent(props) {
       skipcodes: 'Skip Codes & Table',
       dashboard: 'Dashboard',
       calendar: 'Calendar',
+      check: 'Check',
       fix: `Fix Missing IDs${fixLabel}`,
       manual: 'How-To Manual',
       viewmodule: 'View Module',
       devconsole: 'Dev & Access Console',
     };
     return ALL_APP_TABS.filter(t => allowedSet.has(t.id)).map(t => [t.id, tabLabels[t.id] || t.label]);
-  }, [effectiveView.tabs, logoUnlocked, previewTargetKey, fixLabel]);
+  }, [effectiveView.tabs, effectiveView.features, logoUnlocked, previewTargetKey, fixLabel]);
 
   useEffect(() => {
     if (!visibleTabs.some(([v]) => v === activeTab)) {
@@ -11539,8 +12135,8 @@ export default function GeneratedComponent(props) {
           <div className={styles.title}>
             <span className={styles.titleMain}>{lang === 'es' ? 'Registro de Sanitizacion MSS' : 'MSS Log Input'}</span>
             <span className={styles.titleSub}>
-              {api.mode === 'preview'
-                ? (lang === 'es' ? 'Datos de vista previa (sin conexion a Dataverse)' : 'Preview data (no Dataverse connection)')
+              {api.mode === 'offline'
+                ? (lang === 'es' ? 'Sin conexion a Dataverse' : 'Not connected to Dataverse')
                 : (lang === 'es' ? 'Conectado a Dataverse' : 'Connected to Dataverse')} - {currentUser.microsoftId} ({effectiveView.presetLabel})
             </span>
           </div>
@@ -11746,7 +12342,7 @@ export default function GeneratedComponent(props) {
             </div>
           </div>
         </div>
-        {api.mode === 'preview' && <div className={styles.banner} role="alert">Not connected to Dataverse: this is sample data, and nothing entered here is saved.</div>}
+        {api.mode === 'offline' && <div className={styles.banner} role="alert">{tr('Not connected to Dataverse. Open this page inside Power Apps: nothing is shown or saved here until then.', 'Sin conexion a Dataverse. Abra esta pagina dentro de Power Apps: aqui no se muestra ni se guarda nada hasta entonces.')}</div>}
 
         <TabList selectedValue={activeTab} aria-label="Sections" onTabSelect={(_, d) => { setActiveTab(d.value); if (d.value === 'fix') setFixVisited(true); }} className={styles.navBar}>
           {visibleTabs.map(([v, label]) => (
@@ -11800,7 +12396,7 @@ export default function GeneratedComponent(props) {
                       {catInfo.loaded ? `Asset Catalog Ready: ${catInfo.count} Equipment Assets` : 'Loading Asset Catalog...'}
                     </span>
                     <Text size={200} style={{ color: '#1E3A8A' }}>
-                      <strong>{catInfo.msCount || 0}</strong> SAP Orders Linked - <strong>{catInfo.roomCount || catalogRooms.length}</strong> Rooms ({(api.mode === 'dataverse' || api.mode === 'live') ? `Dataverse ${catInfo.tier || 'live'}` : 'Preview Catalog'})
+                      <strong>{catInfo.msCount || 0}</strong> SAP Orders Linked - <strong>{catInfo.roomCount || catalogRooms.length}</strong> Rooms ({(api.mode === 'dataverse' || api.mode === 'live') ? `Dataverse ${catInfo.tier || 'live'}` : 'not connected'})
                     </Text>
                     {catInfo.error && <Text className={styles.errorText}>Catalog Note: {catInfo.error}</Text>}
                   </div>
@@ -11902,6 +12498,7 @@ export default function GeneratedComponent(props) {
           {activeTab === 'skipcodes' && <div className={styles.contentArea}><SkipCodesTab ctx={ctx} /></div>}
           {activeTab === 'dashboard' && <div className={styles.contentArea}><DashboardTab ctx={ctx} /></div>}
           {activeTab === 'calendar' && <div className={styles.contentArea}><CalendarTab ctx={ctx} /></div>}
+          {activeTab === 'check' && <div className={styles.contentArea}><CheckTab ctx={ctx} /></div>}
           {fixVisited && <div className={styles.contentArea} style={show('fix')}><FixIdsTab ctx={ctx} onCount={setFixCount} /></div>}
           {activeTab === 'manual' && <div className={styles.contentArea}><HowToManualTab onNavigateTab={setActiveTab} /></div>}
           {activeTab === 'viewmodule' && (
