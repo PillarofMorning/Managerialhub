@@ -21,6 +21,8 @@ The row id (`craa5_cleanplanid`) never changes for a given plan key, so it is sa
 
 ## 2. Window rows (one stop of a line)
 
+**Open stops.** An open stop has a plan key ending in `|last` and `details.open` set to `read` (no run after it in the weeks read) or `unplanned` (nothing planned after it yet). It has no restart yet: its `craa5_end` is only where the plan ends, so readers must not use it as a restart time. Show "no restart planned yet" instead.
+
 | Column | Meaning |
 |---|---|
 | `craa5_cleankind` | `allergen`, `weekly` (End of Week), `midweek` (the IBL4 72 h clean), `full` (a Daily clean), `changeover`, `none`. Map these with `hubCleanKind`: `full` is daily, `weekly` is EOW. |
