@@ -176,6 +176,8 @@ One row = one piece of equipment, one clean, one shift date. The rules (from the
 10. `craa5_source` = `Ganttly`, `Log input`, `Calendar` or `Import`. `craa5_pathogen` = `Yes` or `No`, never blank.
 11. Mark the row "sent" only after the save succeeds. Keep failed saves in the retry queue.
 
+**Transition (until Ganttly logs piece by piece):** Shift Start may keep logging an area at 100%, only that clean's pieces, behind its switch `SHIFT_START_LOGS_MSS`, dated by `hubShiftDate`. Those rows should use the same completion key and row id as above, so Ganttly's later row for the same piece updates them instead of adding a second. The switch goes off when Ganttly's per-piece logging is live.
+
 Undo of a Done within the same shift sets the check-off back and **deactivates** the log row (statecode 1). It does not delete it, so every device drops it too.
 
 ### 6.4 Live progress (`craa5_cleancheckoff`)
@@ -340,4 +342,5 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.1 (2026-10-21)** Section 6.3: Shift Start's interim area logging (switch `SHIFT_START_LOGS_MSS`) allowed until Ganttly logs per piece, using the same completion keys.
 - **1.0 (2026-10-21)** First version. Keys, owners, dates, clean kinds, MSS log write rule, number definitions, status words, language, theme, browser storage moves, prefixes, new columns and the labor rate table. The Ganttly plan's new Completion table is replaced by the existing check-off table plus new MSS log columns.
