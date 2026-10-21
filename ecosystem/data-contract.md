@@ -345,7 +345,7 @@ New tables are named `_<letter>_ Name`, so the schema name is `craa5__<letter>_n
 | `_p_` | PBED | in use (the BOLO "_p_ swab result" idea must use `_b_` instead) |
 | `_b_` | Pathogen BOLO | new |
 | `_t_` | Training matrix | new |
-| `_g_` | Ganttly / Shift Start (merged floor app) | reserved |
+| `_g_` | Ganttly / Shift Start (merged floor app) | in use: obstacle, handover, personnel note (1.0.25) |
 | `_e_` | Shared by the whole ecosystem (owned by this contract) | new |
 | `_0_` | Abandoned set | do not use (except `craa5__0_hubconfig`) |
 
