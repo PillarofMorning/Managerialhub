@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.9, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.10, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -100,7 +100,7 @@ Time loss log keeps the column names it was created with: `craa5_assetguid` hold
 | `craa5__facilityobservation` Map problems and pins | live | Map submission tool | Pathogen BOLO, Manager hub |
 | `craa5___maps` Floor maps | live | Map submission tool | Pathogen BOLO |
 | `craa5_pathogenboloswabcatalog0320` Swab sites | live | Pathogen BOLO | Pathogen BOLO, Ganttly, Map tool |
-| `_b_ Swab result` | **proposed** (BOLO thread) | Pathogen BOLO | Manager hub, Ganttly, MSS log (section 13) |
+| `craa5__b_swabresult` Swab results (columns in contract.json; open hit = `craa5_result` positive and `craa5_closedkey` blank) | **proposed** (BOLO v2.2, PR #37) | Pathogen BOLO | Manager hub, Ganttly, MSS Calendar |
 | `craa5__supervisor_todo` | live | Manager hub | Manager hub |
 | `craa5__m_formtemplate`, `craa5__m_quicktask` (both User-owned; quick tasks are a personal list on purpose) | live | Manager hub | Manager hub |
 | `craa5__m_employeenote` Manager notes on people | live | Manager hub | Manager hub, manager role only. Sensitive: User-owned, never shown to peers, never in exports or the repo. Key `craa5_employeeguid`. |
@@ -382,6 +382,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.10 (2026-10-21)** BOLO v2.2: `craa5__b_swabresult` columns and keys, and four new text columns on the swab catalog.
 - **1.0.9 (2026-10-21)** Section 6.5 points to the Scheduler's reader guide; adds scope and alert rows and window details v2. `craa5_cleanoverride` ("midweek|who|why" or "skip|who|why") is for the Scheduler only.
 - **1.0.8 (2026-10-21)** Section 6.5: the clean plan's columns, keys and details JSON for readers.
 - **1.0.7 (2026-10-21)** contract.json takes the 14 `_c_` entries from the chemical hub's c-tables.json (columns, keys, statuses). Clerk checklist date-only shift date noted as an exception.
