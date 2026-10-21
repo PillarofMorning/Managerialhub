@@ -1,11 +1,11 @@
 # Ecosystem data contract
 
-Version 1.0.16, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.17, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
 - `contract.json`: the same tables and keys in a form a program can read (the Dataverse monitor reads it).
-- `hub-shared.js`: the helpers that build every key, date and number below. Paste the whole `HUB SHARED v1.0` block into each app, unchanged.
+- `hub-shared.js`: the helpers that build every key, date and number below. Paste the whole `HUB SHARED` block (now v1.1) into each app, unchanged. v1.0 apps keep working; v1.1 only adds the manifest helpers (12.1).
 - `table-prompts.md`: Copilot prompts and click-steps for the new table and columns.
 - `test/hub-shared.test.js`: `node ecosystem/test/hub-shared.test.js` checks the helpers (58 checks).
 
@@ -347,7 +347,21 @@ New tables are named `_<letter>_ Name`, so the schema name is `craa5__<letter>_n
 Apps look a table up by its prefixed name first and its plain name second, as Manager hub v6.8 does, because Gerald may create either.
 
 **Shared settings** in `craa5__0_hubconfig` (one row per `craa5_configkey`, JSON in `craa5_configjson`, each key written by one app):
-`hub_people_thresholds` (Manager hub), `ganttly_settings` (Ganttly), `mss_view_rules` (MSS Log Input), `scheduler_shared` (Production Scheduler; today its `config` row in the Clean Plan, which may stay there), `training_settings` (Training page: minimum shifts, refresher days), `mss_completion_exclusions` and `mss_line_downtime` (MSS Calendar; downtime only for lines the Scheduler does not plan).
+`hub_people_thresholds` (Manager hub), `ganttly_settings` (Ganttly), `mss_view_rules` (MSS Log Input), `scheduler_shared` (Production Scheduler; today its `config` row in the Clean Plan, which may stay there), `training_settings` (Training page: minimum shifts, refresher days), `mss_completion_exclusions` and `mss_line_downtime` (MSS Calendar; downtime only for lines the Scheduler does not plan). Plus one `manifest|<appId>` row per app, written by that app (12.1).
+
+### 12.1 App manifests (self-check)
+
+Each app says in its own code which tables and columns it uses, and saves that list to Dataverse when it opens. The Dataverse monitor then checks every app at once against what really exists, with nothing pasted by hand. Smallest version: no new table.
+
+- **Where:** `craa5__0_hubconfig`, `craa5_configkey` = `manifest|<appId>`, JSON in `craa5_configjson`, name "<App> manifest". One row per app, fixed row id `hubIdFromKey('hubconfig|manifest|<appId>')`.
+- **appIds:** `ganttly`, `shiftstart`, `prodsched`, `msscalendar`, `msslog`, `pbed`, `bolo`, `managerhub`, `chemicals`, `mapsubmit`, `monitor`, `training`.
+- **What the app writes:** `{ appId, app, version, tables: [{ t, names, read, write, opt }], config }`. `t` is the table's logical name, `names` the names the app tries in order (prefixed first), `read`/`write` the columns, `opt` the columns it works without (the monitor shows them as "not yet", not "missing"), `config` the hubconfig keys it writes. Logical names only, never data or people.
+- **What gets stored:** `hubManifest()` adds `m: 1`, the pasted block's `contract` version, a `hash` and `savedAt`, and sorts every list.
+- **When:** call `hubSaveManifest(io, manifest)` once after the app loads. It reads the row (one small read), writes only when the hash changed, never blocks the app and never shows an error. `io` is the app's own query / create / update (Ganttly: `swQuery` + `swWriter`).
+- **Who reads it:** the Dataverse monitor. It reports "Ganttly 2.0.0 (saved <date>) needs X, missing Y", and builds the one-table Copilot prompts and click-steps for what is missing.
+- **How it relates to `contract.json`:** `contract.json` is the plan: which tables should exist, keys, statuses, owners. Manifests are what each app build really uses. The monitor checks manifests against Dataverse (does it exist?) and against `contract.json` (is the app writing a table it does not own, or reading an abandoned one?). When a manifest and the contract disagree, the contract thread fixes one of them.
+- **Dataverse setup (Gerald, once):** `craa5_configjson` must hold the larger manifests (up to about 8 KB). If its maximum length is under 100,000, raise it (Tables > hubconfig > Columns > Config json > Maximum character count). Roles need Organization Read on hubconfig. With User ownership, only the person who first saved a manifest can update it unless roles also have Organization Write. Without that, a manifest stays at the older version until that person opens the newer app.
+- **First app:** Ganttly, in its Phase 2. The others add theirs when they next change.
 
 ---
 
@@ -393,6 +407,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.17 (2026-10-21)** 12.1 App manifests: each app saves the tables and columns it uses to hubconfig `manifest|<appId>`; the Dataverse monitor checks them. `hub-shared.js` v1.1 adds `hubManifest`, `hubManifestKey`, `hubSaveManifest` (77 checks). `contract.json` gains a `manifests` block.
 - **1.0.16 (2026-10-21)** Section 7: `Weekend clean` time loss rows are time lost during the weekend clean (PBED's Add time loss form), not planned work. Still left out of Time lost totals (manager hub v6.9, PR #41).
 - **1.0.15 (2026-10-21)** 6.5: an open stop (`|last`, `details.open` set) has no restart; readers must not use its `craa5_end` as one (found by PBED).
 - **1.0.14 (2026-10-21)** contract.json rebuilt from the chemical thread's updated c-tables.json: the four kept `_c_` primary name columns (Chemical `craa5__c_chemical_name`, Cart line `craa5_cartlinename`, Chemical count `craa5_chemicalname`, Clerk checklist `craa5__c_clerkchecklist1`). Apps read the primary column from the table definition.

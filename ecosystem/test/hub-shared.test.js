@@ -5,7 +5,7 @@ assert.strictEqual(/[^\x00-\x7F]/.test(src), false, 'hub-shared.js must be 7-bit
 assert.strictEqual(/\\u[0-9a-fA-F]{4}/.test(src), false, 'no \\u escapes');
 var store = {};
 global.window = { localStorage: { getItem: function (k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; }, setItem: function (k, v) { store[k] = String(v); } } };
-var H = new Function(src + '; return { hubCanon: hubCanon, hubLineKey: hubLineKey, hubSameName: hubSameName, hubGuid: hubGuid, hubGuidList: hubGuidList, hubSplitGuids: hubSplitGuids, hubCrew: hubCrew, hubIdFromKey: hubIdFromKey, hubPlantDay: hubPlantDay, hubShiftDate: hubShiftDate, hubShiftKey: hubShiftKey, hubDateOnlyUtc: hubDateOnlyUtc, hubDayFromDateOnly: hubDayFromDateOnly, hubWeekKey: hubWeekKey, hubCleanKind: hubCleanKind, hubCompletionKey: hubCompletionKey, hubLogIdOf: hubLogIdOf, hubStdMinutes: hubStdMinutes, hubPace: hubPace, hubShare: hubShare, hubLaborCost: hubLaborCost, hubGetLang: hubGetLang, hubSetLang: hubSetLang, hubT: hubT, hubDecodeEs: hubDecodeEs };')();
+var H = new Function(src + '; return { hubCanon: hubCanon, hubLineKey: hubLineKey, hubSameName: hubSameName, hubGuid: hubGuid, hubGuidList: hubGuidList, hubSplitGuids: hubSplitGuids, hubCrew: hubCrew, hubIdFromKey: hubIdFromKey, hubPlantDay: hubPlantDay, hubShiftDate: hubShiftDate, hubShiftKey: hubShiftKey, hubDateOnlyUtc: hubDateOnlyUtc, hubDayFromDateOnly: hubDayFromDateOnly, hubWeekKey: hubWeekKey, hubCleanKind: hubCleanKind, hubCompletionKey: hubCompletionKey, hubLogIdOf: hubLogIdOf, hubStdMinutes: hubStdMinutes, hubPace: hubPace, hubShare: hubShare, hubLaborCost: hubLaborCost, hubGetLang: hubGetLang, hubSetLang: hubSetLang, hubT: hubT, hubDecodeEs: hubDecodeEs, hubManifest: hubManifest, hubManifestKey: hubManifestKey, hubSaveManifest: hubSaveManifest };')();
 var n = 0; function ok(a, b, m) { assert.deepStrictEqual(a, b, m); n++; }
 ok(H.hubLineKey('IBL4', 1), 'ibl4'); ok(H.hubLineKey('IBL 4', 1), 'ibl4'); ok(H.hubLineKey('Breading', 2), 'breading2'); ok(H.hubLineKey('Highspeed', null), 'highspeed');
 ok(H.hubSameName(' Dough Room', 'dough-room'), true); ok(H.hubSameName('', ''), false);
@@ -40,4 +40,33 @@ ok(H.hubGetLang(), 'en'); store.itp_lang_v1 = 'es'; ok(H.hubGetLang(), 'es'); H.
 ok(H.hubT('Done'), 'Terminado'); ok(H.hubT('Allergen'), 'Alérgeno'); ok(H.hubT('Late'), 'Llegó tarde'); ok(H.hubT('Overdue'), 'Atrasado');
 ok(H.hubT('Unknown words'), 'Unknown words'); ok(H.hubT('Mine', 'es', { 'Mine': 'M%io' }), 'Mío'); ok(H.hubT('Done', 'en'), 'Done');
 ok(H.hubDecodeEs('%%5 %?Listo%!'), '%5 ¿Listo¡');
-console.log('hub-shared: ' + n + ' checks passed');
+// app manifest
+var man = { appId: 'Ganttly', app: 'Ganttly', version: '2.0.0', config: ['ganttly_settings'],
+    tables: [{ t: 'craa5_cleancheckoff', read: ['craa5_status', 'craa5_assetguid', 'craa5_status'], write: ['craa5_status'], opt: ['craa5_shiftdate'] }, { t: 'craa5_aa_assets', names: ['craa5_aa_assets'], read: ['craa5_midweek'] }] };
+var m1 = H.hubManifest(man, '2026-10-21T17:00:00Z'), m2 = H.hubManifest(JSON.parse(JSON.stringify(man)), '2026-10-22T09:00:00Z');
+ok(m1.appId, 'ganttly'); ok(m1.tables[0].t, 'craa5_aa_assets'); ok(m1.tables[1].read, ['craa5_assetguid', 'craa5_status']); ok(m1.tables[1].names, ['craa5_cleancheckoff']);
+ok(m1.hash, m2.hash); ok(m1.hash === H.hubManifest({ appId: 'ganttly', app: 'Ganttly', version: '2.0.1', tables: man.tables, config: man.config }).hash, false);
+ok(H.hubManifestKey('Ganttly'), 'manifest|ganttly'); ok(/[^\x00-\x7F]/.test(JSON.stringify(m1)), false);
+var db = [], calls = [];
+var io = {
+    query: function (t, q) { calls.push('q'); var key = /'([^']+)'/.exec(q.filter)[1]; return Promise.resolve({ rows: db.filter(function (r) { return r.craa5_configkey === key; }) }); },
+    create: function (t, b) { calls.push('c'); db.push(b); return Promise.resolve(b[t + 'id']); },
+    update: function (t, id, b) { calls.push('u'); db.forEach(function (r) { if (r.craa5__0_hubconfigid === id) { for (var k in b) r[k] = b[k]; } }); return Promise.resolve(); }
+};
+var bad = { query: function () { return Promise.reject(new Error('403')); }, create: null, update: null };
+H.hubSaveManifest(io, man).then(function (r1) {
+    ok(r1, 'saved'); ok(db.length, 1); ok(db[0].craa5__0_hubconfigid, H.hubIdFromKey('hubconfig|manifest|ganttly')); ok(JSON.parse(db[0].craa5_configjson).version, '2.0.0');
+    return H.hubSaveManifest(io, man);
+}).then(function (r2) {
+    ok(r2, 'same'); ok(calls.join(''), 'qcq');
+    return H.hubSaveManifest(io, { appId: 'ganttly', app: 'Ganttly', version: '2.0.1', tables: man.tables });
+}).then(function (r3) {
+    ok(r3, 'saved'); ok(db.length, 1); ok(JSON.parse(db[0].craa5_configjson).version, '2.0.1');
+    return H.hubSaveManifest(bad, man);
+}).then(function (r4) {
+    ok(r4, 'failed: 403');
+    return H.hubSaveManifest(io, { app: 'x' });
+}).then(function (r5) {
+    ok(r5, 'failed: no appId');
+    console.log('hub-shared: ' + n + ' checks passed');
+}).catch(function (e) { console.error(e); process.exit(1); });
