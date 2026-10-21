@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.14, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.15, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -230,7 +230,9 @@ Written only by the Production Scheduler. **The full reader guide is the Schedul
 | `craa5_details` | JSON. Window rows: `{v, stop, open, gapMin, idle, prev, next, allergen, need: {basis, work, floor, manual, pieces, weekly, midweek, crumb, noDaily, sapOrder}, crew: {assumed, heads}, cleanStart, cleanEnd, shortMin, spareMin, maint: [[start, end]...], area, line, areaId}`, now `v: 2`, adding `scope {key, parts, hash, pieces, left}`, `run72 {hours, limit, overBy, by, mode}` and `support [{area, off, start, end, ready, mins, late}]`. Over 1,900 characters, fields drop in this order: maint, crew, need, support. `cleanStart`/`cleanEnd` are the planned clean slot inside the stop. `prev`/`next` are short run summaries. Day rows: `{v, prod, len, kind, weekOn, planned, job, lines, areaId}`. Scope rows: `{v, line, kind, part, parts, hash, cols, pieces: [[assetId, name, area, room, mins, heads, offsetMins, leftOutBy]]}`. Config row: the shared cleaning settings |
 | `craa5_cleanplanname`, `craa5_name`, `craa5_contenthash`, `craa5_publishbatch` | Label for people; change fingerprint; which publish wrote it. Not for logic |
 
-For PBED's weekend: the stop is the `window` row whose `craa5_start` falls in the weekend; restart = its `craa5_end`; the clean slot = `details.cleanStart`/`cleanEnd`; status = `craa5_status`.
+For PBED's weekend: the stop is the `window` row whose `craa5_start` falls in the weekend; restart = its `craa5_end`, except on an open stop; the clean slot = `details.cleanStart`/`cleanEnd`; status = `craa5_status`.
+
+An open stop (plan key ending in `|last`, `details.open` set) has no restart yet: readers must not use `craa5_end` as one. Show "restart not planned yet" instead. This is the normal Thursday/Friday state before next week's runs are entered.
 
 ---
 
@@ -391,6 +393,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.15 (2026-10-21)** 6.5: an open stop (`|last`, `details.open` set) has no restart; readers must not use its `craa5_end` as one (found by PBED).
 - **1.0.14 (2026-10-21)** contract.json rebuilt from the chemical thread's updated c-tables.json: the four kept `_c_` primary name columns (Chemical `craa5__c_chemical_name`, Cart line `craa5_cartlinename`, Chemical count `craa5_chemicalname`, Clerk checklist `craa5__c_clerkchecklist1`). Apps read the primary column from the table definition.
 - **1.0.13 (2026-10-21)** Dataverse monitor results: check-off table and Midweek column exist; skip code and access log tables missing; time loss log and quick task not made yet; 8 named tables absent; 47 unlisted tables marked abandoned (3 legacy); primary name columns kept as made. Labor rate prompt shortened (Copilot makes one table per short prompt).
 - **1.0.12 (2026-10-21)** MSS Calendar config keys `mss_completion_exclusions` and `mss_line_downtime`. Line downtime comes from the Clean Plan; hand-entered ranges only for lines the Scheduler does not plan.
