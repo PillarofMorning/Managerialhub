@@ -70,6 +70,8 @@ For the Map submission tool. It writes them only once they exist.
 
 ## Part 6. Shared settings (`craa5__0_hubconfig`): maybe one column
 
+**Done 2026-10-21:** Gerald added Manifest json (`craa5_manifestjson`). Only step 3 (roles) remains if not done yet.
+
 Apps now save a short list of the tables and columns they use here, so the Dataverse monitor can check every app by itself (contract section 12.1). The lists are up to about 8 KB. Do **not** recreate this table: seven apps keep their settings in it. Its Config json column cannot be resized or deleted (the "dependencies" are just the form and views that show it), and that is fine.
 
 1. Tables > hubconfig > Columns > **Config json** > Advanced options: read **Maximum character count**. If it is 10,000 or more, stop here.
