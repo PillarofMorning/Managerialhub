@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.8, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.9, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -207,21 +207,21 @@ This replaces the "new Completion table" in the Ganttly overhaul plan: the check
 
 ### 6.5 The clean plan (`craa5_cleanplan`), as readers see it
 
-Written only by the Production Scheduler (read from its 2026-10-21 source; the Scheduler thread's reader guide, when published, wins on any detail). All date-times are UTC. Readers select only active rows (`statecode eq 0`).
+Written only by the Production Scheduler. **The full reader guide is the Scheduler's own: `/mnt/project-files/production-schedule/clean-plan-contract.md` (code on draft PR #39). Where it and this summary differ, the guide wins.** All date-times are UTC. Readers select only active rows (`statecode eq 0`).
 
 | Column | Meaning |
 |---|---|
-| `craa5_rowtype` | `window` (a stop between runs), `day` (one line, one plant day), `week` (one row per Monday), `config` (shared settings), `alert` (added by the Scheduler thread, e.g. IBL4 72 h) |
-| `craa5_plankey` | Window: `w|<run before id>|<run after id or "last">`, or `o|<run>|<run>` for runs that overlap. Day: `d|<line key>|YYYY-MM-DD`. Week: `k|<Monday>`. Config: `config` |
+| `craa5_rowtype` | `window` (a stop between runs), `day` (one line, one plant day), `week` (one row per Monday), `config` (shared settings), `scope` (which pieces a line's clean kind includes), `alert` (a rule needing attention) |
+| `craa5_plankey` | Window: `w|<run before id>|<run after id or "last">`, or `o|<run>|<run>` for runs that overlap. Day: `d|<line key>|YYYY-MM-DD`. Week: `k|<Monday>`. Config: `config`. Scope: `s|<line>|<kind>|<part>` (start/end 2000-01-01). Alert: `a|over72|<line>|<runId>`, `a|noeow|<line>|<Monday>`, `a|apart|<runIdA>|<runIdB>` |
 | `craa5_linekey` | The line key (`hubLineKey`); day rows hold the MSS area key; week rows hold `*` |
 | `craa5_start` / `craa5_end` | Window: when the line stops (end of the run before) / when the next run starts (open stops: where the plan ends). Day: plant midnight to next midnight. Week: Monday midnight to next Monday |
 | `craa5_day` | The plant day, YYYY-MM-DD (window: the day the stop starts) |
 | `craa5_cleankind` | Window: `allergen`, `weekly` (EOW), `midweek`, `full` (daily), `changeover`, `none` (map with `hubCleanKind`). Day: `due`, `stretch`, `covered`, `none`, `unplanned` |
 | `craa5_minutes` | Window: minutes the clean takes with the crew on shift. Day: minutes of production that day |
-| `craa5_status` | Window: `ok`, `tight`, `short`, `overlap`, `nocrew`, `none`. Day: `ran`, `idle`, `unplanned`. Week: `writing`, `done` |
+| `craa5_status` | Window: `ok`, `tight`, `short`, `overlap`, `nocrew`, `none`. Day: `ran`, `idle`, `unplanned`. Week: `writing`, `done`. Alert: `open`, `approved` (the alert's kind is in `craa5_cleankind`) |
 | `craa5_area`, `craa5_line`, `craa5_mssareaguid` | Area as the runs spell it, line number (window rows), MSS area id |
 | `craa5_reason` | One plain sentence: why this clean, how long, what is short |
-| `craa5_details` | JSON. Window rows: `{v, stop, open, gapMin, idle, prev, next, allergen, need: {basis, work, floor, manual, pieces, weekly, midweek, crumb, noDaily, sapOrder}, crew: {assumed, heads}, cleanStart, cleanEnd, shortMin, spareMin, maint: [[start, end]...], area, line, areaId}`, plus `scope`, `support`, `run72` being added by the Scheduler thread. `cleanStart`/`cleanEnd` are the planned clean slot inside the stop. `prev`/`next` are short run summaries. Day rows: `{v, prod, len, kind, weekOn, planned, job, lines, areaId}`. Config row: the shared cleaning settings |
+| `craa5_details` | JSON. Window rows: `{v, stop, open, gapMin, idle, prev, next, allergen, need: {basis, work, floor, manual, pieces, weekly, midweek, crumb, noDaily, sapOrder}, crew: {assumed, heads}, cleanStart, cleanEnd, shortMin, spareMin, maint: [[start, end]...], area, line, areaId}`, now `v: 2`, adding `scope {key, parts, hash, pieces, left}`, `run72 {hours, limit, overBy, by, mode}` and `support [{area, off, start, end, ready, mins, late}]`. Over 1,900 characters, fields drop in this order: maint, crew, need, support. `cleanStart`/`cleanEnd` are the planned clean slot inside the stop. `prev`/`next` are short run summaries. Day rows: `{v, prod, len, kind, weekOn, planned, job, lines, areaId}`. Scope rows: `{v, line, kind, part, parts, hash, cols, pieces: [[assetId, name, area, room, mins, heads, offsetMins, leftOutBy]]}`. Config row: the shared cleaning settings |
 | `craa5_cleanplanname`, `craa5_name`, `craa5_contenthash`, `craa5_publishbatch` | Label for people; change fingerprint; which publish wrote it. Not for logic |
 
 For PBED's weekend: the stop is the `window` row whose `craa5_start` falls in the weekend; restart = its `craa5_end`; the clean slot = `details.cleanStart`/`cleanEnd`; status = `craa5_status`.
@@ -382,6 +382,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.9 (2026-10-21)** Section 6.5 points to the Scheduler's reader guide; adds scope and alert rows and window details v2. `craa5_cleanoverride` ("midweek|who|why" or "skip|who|why") is for the Scheduler only.
 - **1.0.8 (2026-10-21)** Section 6.5: the clean plan's columns, keys and details JSON for readers.
 - **1.0.7 (2026-10-21)** contract.json takes the 14 `_c_` entries from the chemical hub's c-tables.json (columns, keys, statuses). Clerk checklist date-only shift date noted as an exception.
 - **1.0.6 (2026-10-21)** Section 6.4 lists the check-off columns exactly; `updatesjson.work` is a display copy only; check-off stored statuses are started/done/undone; section 9: no reuse of a shared key with another meaning; table-prompts part 3 adds Employee guids.
