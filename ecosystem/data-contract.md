@@ -328,7 +328,7 @@ Prompts and click-steps: `table-prompts.md`.
 |---|---|---|
 | 11 optional columns on `craa5__log_` (completion key, shift date, shift code, clean kind, labor minutes, employee ids, marked by, source, done at, plan key, line key) | One honest completion record with dedup, shift date, people and minutes | Gerald, part 1 |
 | `craa5_midweek` (Yes/No) on `craa5_aa_assets`, only if the data check says it is missing | IBL4 midweek list | Gerald, part 2 |
-| 3 optional columns on `craa5_cleancheckoff` (shift date, clean kind, completion key) | Join live progress to the log | Gerald, part 3 |
+| 4 optional columns on `craa5_cleancheckoff` (shift date, clean kind, completion key, employee guids) | Join live progress to the log and record who is on each piece | Gerald, part 3 |
 | `_e_ Labor rate` table | The one labor rate for cost recap | Gerald, part 4 |
 | `craa5_cleanoverride` text on `craa5__aa_prd_schd` | IBL4 72 h override (Scheduler thread) | Scheduler thread's prompt |
 | `_b_ Swab result` | Swab results as rows (BOLO thread) | BOLO thread's prompt, keys per section 2 |
