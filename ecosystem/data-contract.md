@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.20, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.21, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -254,6 +254,7 @@ Every app computes these the same way, from the same table, with the `hub-shared
 | **Run hours since a full clean** (IBL4 72 h) | Sum of run hours on the line since the end of its last midweek or EOW clean. Computed **only** by the Production Scheduler, published in the clean plan (`run72` in details, and `alert` rows). Others display it and do not recompute it. | Clean plan | |
 | **Headcount planned / present** | Board rows assigned / board rows with attendance `present`, `late` or `loaned` | Shift board | |
 | **Labor cost** | Labor minutes / 60 x the hourly rate for the person's role on the shift date (`_e_ Labor rate`). No default rate. With no rate, cost shows "no rate set". | MSS log + labor rate | `hubLaborCost` |
+| **Projected clean cost** | Planned, not actual: labor + chemical for a line's clean from the standards. Labor = standard labor minutes (`craa5_hoursrequired` and its kind columns) / 60 x the `_e_ Labor rate` row (role `Sanitor`, else `All`; newest Effective from on or before the plant day; undated rows not used; no default, "no rate set"). Chemical = gallons per clean (`_c_ Chemical standard`, newest Valid from on or before the plant day) x price per gallon (price per container / gallons per container). Always labeled "projected", never added to actual cost. | Equipment, labor rate, chemical standard, chemical | |
 | **Weekly cost recap** | Labor cost summed by week key, line key and clean kind | MSS log | `hubWeekKey` |
 | **Sanitation cost per pound** | (Labor cost + chemical cost for the week) / `craa5_dailyproduction.craa5_pounds` for the week. Chemical cost for the week = (drop in counts + received) between the two Sunday counts around the Monday-Sunday week, x unit price. If a count is missing, received spend is used and the number is marked so. **Draft, for Gerald to confirm.** | MSS log, chemical hub, daily production | |
 | **Time lost** | Minutes in `craa5__m_timelosslog` by kind. Kind `Weekend clean` rows come from PBED's Add time loss form: time lost during the weekend clean (`craa5_minuteslost`, a delay reason such as Waiting on FSQ, a department, status Open). Shown on their own as "from PBED" and left out of Time lost totals. Whether they count anywhere else is Gerald's call (asked). | Manager hub | |
@@ -403,12 +404,14 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 - **Q5.** Labor rate: one rate for everyone, or by role (Sanitor, Lead, Supervisor)? The table allows both.
 - **Q6.** A Spanish-speaking lead to check the shared words (section 9) once.
 - **Q8.** What type is `craa5__log_.craa5_allergenclean` (Yes/No, or text like `craa5_pathogen`)? The log block sends text `Yes` and drops the column if Dataverse refuses it.
+- **Q9.** Is the hourly rate in `_e_ Labor rate` the plain wage or a loaded rate (with benefits and taxes)? Apps use it as entered and say which on screen; if you want loaded cost, enter loaded rates.
 - **Q7.** Ganttly browser-only features (obstacles, handovers, personnel notes): which ones do you still use? Those move to tables. The rest go.
 
 ---
 
 ## 15. Change log
 
+- **1.0.21 (2026-10-21)** Section 7: Projected clean cost (manager hub v7.0 Line clean cost tab, PR #42). Q9: wage or loaded labor rate.
 - **1.0.20 (2026-10-21)** 12.1: Config json's length cannot be changed, so manifests go in a new optional hubconfig column Manifest json (`craa5_manifestjson`) when present; `hubSaveManifest` falls back to Config json (82 checks). hubconfig is not recreated.
 - **1.0.19 (2026-10-21)** One writer per hubconfig key again: MSS Log Input owns `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG`; the Calendar writes its own `MSS_CALENDAR_ACCESS_LOG` (Calendar PR #38).
 - **1.0.18 (2026-10-21)** `contract.json` gains `configKeys` (every hubconfig key, its owner app and status) for the monitor's hubconfig check. Section 12 lists the keys in use today; `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG` have two writers (open).
