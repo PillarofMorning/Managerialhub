@@ -220,7 +220,7 @@ var HUB_STATUS_COLORS = { done: '#059669', started: '#0072CE', planned: '#64748B
 var HUB_BRAND_RED = '#E4002B';            // the logo only, never a status
 /* ============================== END HUB SHARED v1.0 ============================== */
 
-/* ============================== START MSS LOG WRITE v1.0 ============================== */
+/* ============================== START MSS LOG WRITE v1.1 ============================== */
 // The one place in the ecosystem that builds and saves a finished clean in the MSS log (craa5__log_), by the rule in the data
 // contract, section 6.3. Paste it unchanged into every app that logs a clean (Ganttly, MSS Log Input, MSS Calendar), right after
 // the HUB SHARED block, which it needs (hubGuid, hubShiftDate, hubCompletionKey, hubLogIdOf, hubCleanKind, hubCrew, ...).
@@ -242,7 +242,7 @@ var HUB_BRAND_RED = '#E4002B';            // the logo only, never a status
 // The host passes an api with query(table, { select, filter, top }) -> rows, create(table, body) and update(table, id, body);
 // mlwApi(xrm, dataApi) builds one from Xrm.WebApi or the page's dataApi.
 
-var MLW_VERSION = '1.0';
+var MLW_VERSION = '1.1';
 var MLW_TABLE = 'craa5__log_';
 var MLW_ID = 'craa5__log_id';
 var MLW_QUEUE_KEY = 'mss_log_write_queue_v1';
@@ -366,7 +366,8 @@ function mlwBuildRow(entry, now) {
         craa5_doneat: e.doneAt ? new Date(e.doneAt).toISOString() : new Date(now || Date.now()).toISOString(),
         craa5_plankey: String(e.planKey || '').trim(),
         craa5_linekey: String(e.lineKey || '').trim(),
-        craa5_sapw: String(e.workArea || '').trim()
+        craa5_sapw: String(e.workArea || '').trim(),
+        craa5_uid: String(e.workArea || '').trim().slice(0, 100)   // primary name: the SAP code, same as craa5_sapw (contract 6.3)
     };
     var f = mlwFlags(kind);
     row.craa5_daily = f.craa5_daily; row.craa5_weekly = f.craa5_weekly; row.craa5_monthly = f.craa5_monthly;
@@ -543,7 +544,7 @@ function mlwApi(xrm, dataApi) {
     };
     return null;
 }
-/* ============================== END MSS LOG WRITE v1.0 ============================== */
+/* ============================== END MSS LOG WRITE v1.1 ============================== */
 
 // ============================================================================
 // COMPANY THEME (same blue / yellow / red as the Production Manager, Ganttly and Sanitation Scheduler)
@@ -1221,7 +1222,7 @@ const computeCompletion = ({ assets, byAsset, loaded, idColumn, year, today, vis
     ids.push(id);
     cur = bucketsOf ? bucketsOf(asset, ai).map(bucket) : [];
     for (let ci = 0; ci < cur.length; ci++) cur[ci].equipment += 1;
-    const g = groupFor(rules ? rules.groupOf(asset) : '');
+    const g = groupFor(rules ? (rules.calKeyOf ? rules.calKeyOf(asset) : rules.groupOf(asset)) : '');
     freqs.forEach(f => { nJobs[f.code] += 1; if (g.nJobs[f.code] !== undefined) g.nJobs[f.code] += 1; });
     const rm = {};
     const isRead = (y, m) => { const k = y * 12 + m; if (rm[k] === undefined) rm[k] = monthIsRead(loaded, idColumn, id, name, y, m); return rm[k]; };
@@ -1667,7 +1668,89 @@ const lrManualDown = (rec, date, dow) => !!(rec.manual && (rec.manual.days.index
 //   jobs       [{ at, cover: [day indexes], from, to }] the shared jobs: the job sits on day `at` (the last day of the run, from..to) and a clean on any covered day does it
 //   weekOn[w]  1 when mid-week and weekly jobs count in week w
 //   prod[i]    minutes of production that day, len[i] minutes in the day, planned[w] true when the plan is known for that week (all null for the old rule)
-const buildLineRules = ({ plan, lines }) => {
+// CLEAN PLAN DAYS (data contract 1.0, Clean Plan reader guide section 6): the Production Scheduler publishes, per MSS area and
+// plant day, whether a Daily clean is due (craa5_cleankind due / stretch / covered / none / unplanned) and whether the week ran
+// (craa5_status ran / idle). For a week whose 'k|Monday' row says done, those rows replace the calendar's own line rules for that
+// area: the Scheduler is the one place downtime is decided. Weeks not published (or still writing) keep the calendar's own rule.
+const CP_TABLE = 'craa5_cleanplan';
+const CP_DAY_KIND = { none: 0, due: 1, covered: 2, stretch: 3 };
+const CP_SEP = String.fromCharCode(3);
+// rows -> { byArea: Map<normalized area, Map<date, { kind, weekOn, prod, len, job }>>, weeksDone: Set<Monday>, areas, weeks }
+const cpDaysModel = (rows) => {
+  const byArea = new Map(), weeksDone = new Set();
+  (rows || []).forEach((r) => {
+    const type = safeString(r.craa5_rowtype).toLowerCase();
+    if (type === 'week') {
+      const mon = safeString(r.craa5_plankey).split('|')[1] || '';
+      if (/^\d{4}-\d{2}-\d{2}$/.test(mon) && safeString(r.craa5_status).toLowerCase() === 'done') weeksDone.add(mon);
+      return;
+    }
+    if (type !== 'day') return;
+    const kindWord = safeString(r.craa5_cleankind).toLowerCase();
+    if (!(kindWord in CP_DAY_KIND)) return;   // 'unplanned': the calendar keeps its own rule for that day
+    const day = safeString(r.craa5_day) || (safeString(r.craa5_plankey).split('|')[2] || '');
+    const area = normalizeName(safeString(r.craa5_area));
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !area) return;
+    let det = {};
+    try { det = JSON.parse(r.craa5_details || '{}') || {}; } catch (e) { det = {}; }
+    const status = safeString(r.craa5_status).toLowerCase();
+    let m = byArea.get(area);
+    if (!m) { m = new Map(); byArea.set(area, m); }
+    m.set(day, {
+      kind: CP_DAY_KIND[kindWord], weekOn: status === 'ran' ? 1 : status === 'idle' ? 0 : (det.weekOn ? 1 : 0),
+      prod: Number(det.prod) >= 0 ? Number(det.prod) : null, len: Number(det.len) > 0 ? Number(det.len) : null,
+      job: det.job && det.job.from && det.job.to && det.job.at ? det.job : null
+    });
+  });
+  return { byArea: byArea, weeksDone: weeksDone, areas: byArea.size, weeks: weeksDone.size };
+};
+// A line calendar (see buildLineRules) with the published Clean Plan days of one area laid over it.
+const cpOverlay = (base, area, days, weeks) => {
+  const n = days.length;
+  const at = [];
+  let any = false;
+  for (let i = 0; i < n; i++) {
+    const wk = weeks[Math.floor(i / 7)];
+    const r = wk && area.done.has(wk.monday) ? area.days.get(days[i].date) : null;
+    at.push(r || null);
+    if (r) any = true;
+  }
+  if (!any) return base;
+  const kind = base.kind.slice(), weekOn = base.weekOn.slice();
+  const prod = base.prod ? base.prod.slice() : days.map(() => 0);
+  const len = base.len ? base.len.slice() : days.map(() => 1440);
+  const planned = base.planned ? base.planned.slice() : weeks.map(() => false);
+  for (let i = 0; i < n; i++) {
+    const r = at[i];
+    if (!r) continue;
+    kind[i] = r.kind;
+    if (r.prod !== null) prod[i] = r.prod;
+    if (r.len !== null) len[i] = r.len;
+    const w = Math.floor(i / 7);
+    weekOn[w] = r.weekOn;
+    planned[w] = true;
+  }
+  // shared Daily jobs: the calendar's own where no published day is involved, the Scheduler's where one is
+  const idx = {};
+  days.forEach((d, i) => { idx[d.date] = i; });
+  const jobs = base.jobs.filter((j) => !j.cover.some((c) => at[c]));
+  const seen = {};
+  for (let i = 0; i < n; i++) {
+    const r = at[i];
+    if (!r || !r.job || (r.kind !== 2 && r.kind !== 3)) continue;
+    const k = r.job.from + '|' + r.job.to;
+    if (seen[k]) continue;
+    seen[k] = true;
+    const a = idx[r.job.at];
+    if (a === undefined) continue;   // the job sits outside these days: whoever builds those days counts it
+    const cover = [];
+    for (let d = r.job.from; d && d <= r.job.to; d = hubAddDays(d, 1)) if (idx[d] !== undefined) cover.push(idx[d]);
+    jobs.push({ at: a, cover: cover, from: r.job.from, to: r.job.to });
+  }
+  return { kind: kind, jobs: jobs, weekOn: weekOn, prod: prod, planned: planned, len: len };
+};
+
+const buildLineRules = ({ plan, lines, cleanPlan }) => {
   const recs = new Map();
   plan.lines.forEach((m) => { recs.set(m.key, { key: m.key, area: m.area, line: m.line, model: m, manual: null }); });
   (lines || []).forEach((l) => {
@@ -1795,10 +1878,23 @@ const buildLineRules = ({ plan, lines }) => {
   const build = (key, days, weeks) => {
     const ck = key + String.fromCharCode(2) + (days.length ? days[0].date : '') + String.fromCharCode(2) + days.length;
     let c = cache.get(ck);
-    if (!c) { c = buildOne(key, days, weeks); cache.set(ck, c); }
+    if (!c) {
+      if (key.indexOf('cp' + CP_SEP) === 0) {
+        const parts = key.split(CP_SEP), orig = parts.slice(2).join(CP_SEP);
+        const base = orig ? buildOne(orig, days, weeks) : lrOldRule(days, weeks);
+        c = cpOverlay(base, { days: cleanPlan.byArea.get(parts[1]), done: cleanPlan.weeksDone }, days, weeks);
+      } else c = buildOne(key, days, weeks);
+      cache.set(ck, c);
+    }
     return c;
   };
-  return { groupOf: groupOf, build: build, recs: recs, areaTo: areaTo };
+  // The calendar an equipment is judged by: its area's published Clean Plan days over its line's calendar, when there are any
+  const calKeyOf = (asset) => {
+    const g = groupOf(asset);
+    const area = normalizeName(safeString(getProp(asset, 'craa5_areaname')));
+    return cleanPlan && cleanPlan.weeksDone.size && area && cleanPlan.byArea.has(area) ? 'cp' + CP_SEP + area + CP_SEP + g : g;
+  };
+  return { groupOf: groupOf, calKeyOf: calKeyOf, build: build, recs: recs, areaTo: areaTo };
 };
 // A calendar built over a wider window (pdays, seven days to a week, Monday first), cut back to the n days that start at index off and
 // the nWeeks weeks that start at week offW. A job (a run of days sharing one Daily job) stays when its last day (`at`) is inside; its
@@ -2452,6 +2548,13 @@ const DV_COLUMN_GROUPS = [
   ] }
 ];
 const planIso = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');   // the format the Production Schedule hub filters with
+// The Clean Plan's day and week rows for the same days as the plan (see CLEAN PLAN DAYS). A missing table or column is not an
+// error for the figures: they keep the calendar's own rule, and the Line Downtime tab says why.
+const readCleanPlanDays = async (year) => {
+  const from = new Date(year, 0, 1 - (CAL_PAD_WEEKS * 7 + 8)).getTime(), to = new Date(year, 11, 31 + CAL_PAD_WEEKS * 7 + 9).getTime();
+  const filter = `statecode eq 0 and (craa5_rowtype eq 'day' or craa5_rowtype eq 'week') and craa5_start ge ${planIso(from)} and craa5_start lt ${planIso(to)}`;
+  return retrievePaged(CP_TABLE, `?$select=craa5_rowtype,craa5_plankey,craa5_day,craa5_area,craa5_cleankind,craa5_status,craa5_details&$filter=${filter}`, 60000, PLAN_PAGE_SIZE);
+};
 const readPlanRows = async (year) => {
   const from = new Date(year, 0, 1 - (CAL_PAD_WEEKS * 7 + 8)).getTime(), to = new Date(year, 11, 31 + CAL_PAD_WEEKS * 7 + 9).getTime();   // the year, and the weeks the line calendars are padded with
   const filter = `statecode eq 0 and craa5_datestarttime lt ${planIso(to)} and craa5_dateendtime gt ${planIso(from)}`;
@@ -2682,6 +2785,77 @@ const GroupDays = React.memo(({ g, groupKey, timelineDays, dayColWidth, onEnter,
 }, (p, q) => p.groupKey === q.groupKey && p.timelineDays === q.timelineDays && p.dayColWidth === q.dayColWidth && p.onEnter === q.onEnter && p.onLeave === q.onLeave && sameDays(p.g, q.g));
 
 // ----------------------------------------------------------------------------
+// SHARED SETTINGS (data contract section 12): craa5__0_hubconfig, one row per craa5_configkey, JSON in craa5_configjson.
+// The calendar is the only writer of 'mss_completion_exclusions' and 'mss_line_downtime'. The browser copy stays as a fallback
+// (not connected, or Dataverse refused the save); the Dataverse row wins when the page opens.
+const HC_EXCLUSIONS_KEY = 'mss_completion_exclusions';
+const HC_DOWNTIME_KEY = 'mss_line_downtime';
+const hcFind = async (key) => {
+  const web = getXrmWebApi();
+  if (!web) return null;
+  const res = await web.retrieveMultipleRecords(HUB_CONFIG_TABLE, `?$select=craa5__0_hubconfigid,craa5_configjson&$filter=craa5_configkey eq '${key}'&$top=1`);
+  return (res && res.entities && res.entities[0]) || null;
+};
+const hcRead = async (key) => {
+  const row = await hcFind(key);
+  if (!row) return { found: false, value: null };
+  try { return { found: true, value: JSON.parse(row.craa5_configjson || 'null') }; } catch (e) { return { found: true, value: null }; }
+};
+const hcWrite = async (key, value) => {
+  const web = getXrmWebApi();
+  if (!web) throw new Error('Not connected to Dataverse');
+  const row = await hcFind(key);
+  const payload = { craa5_configkey: key, craa5_configname: key, craa5_configjson: JSON.stringify(value), craa5_scope: 'PlantWide' };
+  if (row) await web.updateRecord(HUB_CONFIG_TABLE, row.craa5__0_hubconfigid, payload);
+  else await web.createRecord(HUB_CONFIG_TABLE, payload);
+};
+// Keeps one setting in step with its Dataverse row: read once when the page opens (unless it was already changed here), written
+// shortly after every change. -> 'offline' | 'loading' | 'shared' | 'saving' | 'failed'
+function useSharedConfig(key, value, setValue, clean, serialize) {
+  const [state, setState] = useState(() => (hasXrmConnection() ? 'loading' : 'offline'));
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  const loaded = useRef(false), skip = useRef(false), dirty = useRef(false), first = useRef(true), timer = useRef(null);
+  const push = useCallback(() => {
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = setTimeout(() => {
+      setState('saving');
+      hcWrite(key, serialize(valueRef.current)).then(() => setState('shared'), () => setState('failed'));
+    }, 800);
+  }, [key, serialize]);
+  useEffect(() => {
+    if (!hasXrmConnection()) return undefined;
+    let off = false;
+    hcRead(key).then((r) => {
+      if (off) return;
+      loaded.current = true;
+      if (dirty.current) { push(); return; }
+      if (r.found && r.value) { skip.current = true; setValue(clean(r.value)); }
+      setState('shared');
+    }, () => { if (!off) { loaded.current = true; setState('failed'); } });
+    return () => { off = true; };
+    // eslint-disable-next-line
+  }, []);
+  useEffect(() => {
+    if (first.current) { first.current = false; return; }
+    if (skip.current) { skip.current = false; return; }
+    if (!hasXrmConnection()) return;
+    dirty.current = true;
+    if (loaded.current) push();
+    // eslint-disable-next-line
+  }, [value]);
+  useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
+  return state;
+}
+const SHARED_TEXT = {
+  offline: 'Not connected to Dataverse: kept in this browser only.',
+  loading: 'Reading the shared setting from Dataverse...',
+  shared: 'Shared through Dataverse: everyone sees the same.',
+  saving: 'Saving to Dataverse...',
+  failed: 'Dataverse did not save it (check the Hub Config table and your access): kept in this browser only.'
+};
+const dtSerialize = (lines) => ({ v: 2, lines: lines });
+
 // LINE DOWNTIME TAB: kept in App so the days survive a switch of tab, and so the matrix can use them.
 // ----------------------------------------------------------------------------
 function useLineDowntime() {
@@ -2692,7 +2866,8 @@ function useLineDowntime() {
     if (!mounted.current) { mounted.current = true; return; }
     setSaved(dtStore(lines));
   }, [lines]);
-  return { lines, setLines, saved };
+  const shared = useSharedConfig(HC_DOWNTIME_KEY, lines, setLines, dtClean, dtSerialize);
+  return { lines, setLines, saved, shared };
 }
 
 // What counts toward the completion percentages (see COMPLETION SELECTION): kept in App so the choice survives a switch of tab.
@@ -2713,7 +2888,8 @@ function useExclusions() {
     window.addEventListener('storage', onStorage);
     return () => { window.removeEventListener('storage', onStorage); };
   }, []);
-  return { ex, setEx, saved };
+  const shared = useSharedConfig(HC_EXCLUSIONS_KEY, ex, setEx, exClean, exSerialize);
+  return { ex, setEx, saved, shared };
 }
 
 // ============================================================================
@@ -3017,7 +3193,11 @@ const LineCard = React.memo(({ card, view, now, todayStr, assetsReady, areaCount
   );
 });
 
-function LineDowntimeTab({ assets, lines, setLines, saved, plan, planYear, planModel, rules, onReadPlan }) {
+function LineDowntimeTab({ assets, lines, setLines, saved, shared, plan, planYear, planModel, rules, onReadPlan }) {
+  const cpData = plan && plan.data && plan.data.year === planYear ? plan.data : null;
+  const cpNote = !cpData ? '' : cpData.cleanPlan
+    ? (cpData.cleanPlan.weeks ? ' Clean Plan: ' + cpData.cleanPlan.areas + ' areas, ' + cpData.cleanPlan.weeks + ' published weeks read.' : ' Clean Plan: no published week yet, so the calendar uses its own rule.')
+    : cpData.cleanPlanError ? ' Clean Plan could not be read (' + cpData.cleanPlanError + '), so the calendar uses its own rule.' : '';
   const todayStr = dtYmd(new Date());
   const [area, setArea] = useState('');
   const [num, setNum] = useState(null);                   // what was typed in the Line box; until then (null) it offers the next free number of the area
@@ -3068,10 +3248,12 @@ function LineDowntimeTab({ assets, lines, setLines, saved, plan, planYear, planM
           These rules set the Completion tab and the daily and weekly rows of the MSS in full mode (the CJ Schwan's logo).
         </p>
         <PlanPanel plan={plan} planYear={planYear} planModel={planModel} coverage={coverage} assetsReady={assets.length > 0} todayStr={todayStr} onRead={onReadPlan} />
-        <p className={'dt-foot' + (saved ? '' : ' warn')} data-testid="dt-saved">
-          {saved
-            ? 'What you type here (areas, off-schedule days) is saved in this browser. Other people and other browsers do not see it yet.'
-            : 'This browser would not save what you type here, so it lasts only until the page is closed.'}
+        <p className={'dt-foot' + (saved || (shared && shared !== 'offline' && shared !== 'failed') ? '' : ' warn')} data-testid="dt-saved">
+          {shared && shared !== 'offline'
+            ? 'What you type here (areas, off-schedule days): ' + SHARED_TEXT[shared] + ' Lines the Production Scheduler plans take their downtime from its Clean Plan when it is published; what you type counts only for lines it does not plan.' + cpNote
+            : saved
+              ? 'What you type here (areas, off-schedule days) is saved in this browser. Other people and other browsers do not see it.'
+              : 'This browser would not save what you type here, so it lasts only until the page is closed.'}
         </p>
 
         <form className="diag-card dt-add" noValidate onSubmit={(e) => { e.preventDefault(); addLine(); }}>
@@ -3120,7 +3302,7 @@ function LineDowntimeTab({ assets, lines, setLines, saved, plan, planYear, planM
 const MISSED_PAGE = 10;
 const FREQ_ORDER = FREQS.map((f) => f.code);
 const freqLabelOf = (code) => (FREQS.filter((f) => f.code === code)[0] || { label: code }).label;
-function CompletionTab({ comp, count, ex, setEx, exSaved, assets, assetsById, connected, anchorYear, thisYear, monthsLabel, tiles, planText, reading, locked, onReadIds, freqEdits, setFreqEdits, freqSave, onSave, onDismissSave }) {
+function CompletionTab({ comp, count, ex, setEx, exSaved, exShared, assets, assetsById, connected, anchorYear, thisYear, monthsLabel, tiles, planText, reading, locked, onReadIds, freqEdits, setFreqEdits, freqSave, onSave, onDismissSave }) {
   const [lens, setLens] = useState('equipment');
   const [metric, setMetric] = useState('tf');
   const [code, setCode] = useState('');                  // '' = every frequency letter
@@ -3246,7 +3428,7 @@ function CompletionTab({ comp, count, ex, setEx, exSaved, assets, assetsById, co
               </span>
             )}
           </div>
-          <p className="dt-hint">Untick a room or an area to leave it out of every percentage, here and in the daily and weekly rows of the MSS in full mode. Leaving things out also makes Read year to date lighter. {exSaved ? 'Your choice is saved in this browser.' : 'This browser would not save it, so it lasts until the page is closed.'}</p>
+          <p className="dt-hint">Untick a room or an area to leave it out of every percentage, here and in the daily and weekly rows of the MSS in full mode. Leaving things out also makes Read year to date lighter. {exShared && exShared !== 'offline' ? SHARED_TEXT[exShared] : exSaved ? 'Your choice is saved in this browser.' : 'This browser would not save it, so it lasts until the page is closed.'}</p>
           {count && count.tree.length === 0 && <p className="dt-note" data-testid="comp-tree-empty">{assets.length ? 'No equipment to list.' : 'Press Sync Dataverse to load the rooms and areas.'}</p>}
           <div className="comp-tree" data-testid="comp-tree">
             {count && count.tree.map((r) => {
@@ -5779,7 +5961,7 @@ const buildPrioritizationModel = ({ assets, freqStatus, completionIndex, lineRul
     const normArea = normalizeName(area);
     let lineInfo = areaLineState.get(normArea);
     if (!lineInfo) {
-      const grpKey = rulesObj.groupOf ? rulesObj.groupOf(asset) : '';
+      const grpKey = rulesObj.calKeyOf ? rulesObj.calKeyOf(asset) : rulesObj.groupOf ? rulesObj.groupOf(asset) : '';
       if (!grpKey) {
         lineInfo = { status: 'FLEX', label: 'Independent / Any Shift', detail: 'Not tied to a continuous line run', opsPts: 16, downToday: true, down48h: true };
       } else {
@@ -7922,7 +8104,11 @@ export default function App() {
       const runs = [];
       let bad = 0;
       res.rows.forEach(row => { const r = lrRunFromRow(row); if (r) runs.push(r); else bad += 1; });
-      setPlan({ state: 'ready', data: { year, runs, rows: res.rows.length, bad, truncated: res.truncated, noProduct: missingPlanColumns.has('craa5_product') }, error: '' });
+      let cp = null, cpError = '';
+      try { const c = await readCleanPlanDays(year); cp = cpDaysModel(c.rows); }
+      catch (e) { cpError = String(e && e.message ? e.message : e).slice(0, 200); }
+      if (seq !== planSeqRef.current) return;
+      setPlan({ state: 'ready', data: { year, runs, rows: res.rows.length, bad, truncated: res.truncated, noProduct: missingPlanColumns.has('craa5_product'), cleanPlan: cp, cleanPlanError: cpError }, error: '' });
     } catch (err) {
       if (seq !== planSeqRef.current) return;
       const text = String(err && err.message ? err.message : err).replace(/[.\s]+$/, '') + '.';
@@ -7938,7 +8124,8 @@ export default function App() {
   }, [anchorYear, activeTab, fullMode, assets.length, readPlan]);
   const planModel = useMemo(() => (plan.data && plan.data.year === anchorYear ? buildPlanModel(plan.data.runs) : null), [plan.data, anchorYear]);
   // Which equipment follows which line, and each line's calendar (see LINE RULES); the figures and the Line Downtime tab use the same one.
-  const lineRules = useMemo(() => buildLineRules({ plan: planModel || buildPlanModel([]), lines: downtime.lines }), [planModel, downtime.lines]);
+  const cleanPlanDays = plan.data && plan.data.year === anchorYear ? plan.data.cleanPlan || null : null;
+  const lineRules = useMemo(() => buildLineRules({ plan: planModel || buildPlanModel([]), lines: downtime.lines, cleanPlan: cleanPlanDays }), [planModel, downtime.lines, cleanPlanDays]);
   const wantsPlan = fullMode || activeTab === 'completion';
   const planPending = wantsPlan && hasXrmConnection() && assets.length > 0 && !planModel && plan.state !== 'error';
   const planFailed = wantsPlan && plan.state === 'error' && !planModel;
@@ -10465,10 +10652,10 @@ export default function App() {
         ) : activeTab === 'manual' ? (
           <HowToManualTab onNavigateTab={setActiveTab} />
         ) : activeTab === 'downtime' && fullMode ? (
-          <LineDowntimeTab assets={assets} lines={downtime.lines} setLines={downtime.setLines} saved={downtime.saved} plan={plan} planYear={anchorYear} planModel={planModel} rules={lineRules} onReadPlan={() => readPlan(anchorYear)} />
+          <LineDowntimeTab assets={assets} lines={downtime.lines} setLines={downtime.setLines} saved={downtime.saved} shared={downtime.shared} plan={plan} planYear={anchorYear} planModel={planModel} rules={lineRules} onReadPlan={() => readPlan(anchorYear)} />
         ) : activeTab === 'completion' && fullMode ? (
           <CompletionTab
-            comp={compTab} count={countList} ex={exclusions.ex} setEx={exclusions.setEx} exSaved={exclusions.saved} assets={assets} assetsById={assetsById} connected={hasXrmConnection()}
+            comp={compTab} count={countList} ex={exclusions.ex} setEx={exclusions.setEx} exSaved={exclusions.saved} exShared={exclusions.shared} assets={assets} assetsById={assetsById} connected={hasXrmConnection()}
             anchorYear={anchorYear} thisYear={today.getFullYear()} monthsLabel={monthsLabel} tiles={compTiles} planText={planText}
             locked={isLoading || isSaving || loadAllOn} reading={pinnedRuns.length > 0} onReadIds={readMonths}
             freqEdits={freqEdits} setFreqEdits={setFreqEdits} freqSave={freqSave} onSave={saveFreqEdits} onDismissSave={() => setFreqSave(null)}
