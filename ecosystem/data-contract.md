@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.2, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.3, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -36,7 +36,7 @@ These are the keys that join the apps. When a column holds one of these keys, it
 | **Area** (MSS area) | Area name exactly as in `craa5_aa_mss_area.craa5_area`, e.g. `IBL5`, `Smock Room`, `Dough Room` | `craa5_aa_mss_area` | `craa5_area` (text). Optionally also `craa5_mssareaguid` = `craa5_aa_mss_areaid` | The name |
 | **Line** | Line key = `hubLineKey(area, line)`: lower-case letters and digits, line number added when above 1: `ibl4`, `ibl5`, `waterjet`, `highspeed`, `breading2` | `craa5__aa_prd_schd.craa5_area` + `craa5_line` | `craa5_linekey` | Area name + "Line n" |
 | **SAP work area** | `craa5_aa_assets.craa5_workareacode`, e.g. `SSANIBL5W` | `craa5_aa_assets`, `craa5_aa_ms_assets.craa5_title` | `craa5_sapw` (as in the MSS log) | The code |
-| **Equipment** (one piece) | `craa5_aa_assets.craa5_aa_assetsid` (GUID, lower case, no braces) | `craa5_aa_assets` | `craa5_equipmentguid` (one), `craa5_equipmentguids` (several, `; ` between them, built with `hubGuidList`) | `craa5_equipmentidentifier`, plus `#` + `craa5_uniqueid` when a number helps (e.g. "#549") |
+| **Equipment** (one piece) | `craa5_aa_assets.craa5_aa_assetsid` (GUID, lower case, no braces) | `craa5_aa_assets` | `craa5_equipmentguid` (one), `craa5_equipmentguids` (several, lower case, `; ` between them: sorted with `hubGuidList`, except where a column is paired position by position with a names column, as on Map observations, where the order follows the names. Read with `hubSplitGuids`.) | `craa5_equipmentidentifier`, plus `#` + `craa5_uniqueid` when a number helps (e.g. "#549") |
 | **Employee** | `craa5__aa_employee.craa5__aa_employeeid` (GUID) | `craa5__aa_employee` | `craa5_employeeguid` (one), `craa5_employeeguids` (several). The old `craa5__aaemp_guid` on Task assignment means the same. | `craa5_name` turned to "First Last". Badge `craa5_badgenumber` is for badge readers later, not for joins. |
 | **Signed-in user** | `systemuser` id | `Xrm.Utility.getGlobalContext().userSettings` | `craa5_markedby` (full name, text) | Full name. Matched to an employee by e-mail (`craa5__aa_employee.craa5_email`) |
 | **Crew** | Letter `A`, `B`, `C` or `D` = `hubCrew(value)` | `craa5__aa_employee.craa5_shift` (1-4 or choice), `craa5_workshift.craa5_shiftcode` | `craa5_shiftcode` | "A shift" |
@@ -89,6 +89,8 @@ Ownership: User-owned tables need **Organization-level Read** on every hub secur
 | 4. A clean finished (record of truth) | `craa5__log_` MSS log | live | **Ganttly** (piece marked Done), **MSS Log Input** (paper, SAP, by hand), **MSS Calendar** (quick log). All three use the one shared "MSS LOG WRITE" block (section 6.3). **Shift Start does not write here.** | MSS Calendar, MSS Log Input, Manager hub, PBED, Ganttly People, metrics |
 | 4b. Skip codes | `craa5_mss_skipcode` | live | MSS Log Input | MSS Calendar |
 | 5. Time lost / call-outs | `craa5__m_timelosslog` | live | Manager hub, PBED (Kind = `Weekend clean`) | Manager hub, PBED |
+
+Time loss log keeps the column names it was created with: `craa5_assetguid` holds the equipment key, `craa5_responsibleguid` the employee key and `craa5_crew` the crew letter. The contract names (`craa5_equipmentguid`, `craa5_employeeguid`, `craa5_shiftcode`) are for new tables. A reader of this table uses its own names.
 | 6. Weekend plan | `craa5__p_plan`, `_p_milestone`, `_p_workorder`, `_p_flocmap` | live | PBED | PBED, Manager hub |
 
 ### 3.3 Other apps
@@ -100,7 +102,8 @@ Ownership: User-owned tables need **Organization-level Read** on every hub secur
 | `craa5_pathogenboloswabcatalog0320` Swab sites | live | Pathogen BOLO | Pathogen BOLO, Ganttly, Map tool |
 | `_b_ Swab result` | **proposed** (BOLO thread) | Pathogen BOLO | Manager hub, Ganttly, MSS log (section 13) |
 | `craa5__supervisor_todo` | live | Manager hub | Manager hub |
-| `craa5__m_formtemplate`, `craa5__m_quicktask` | live | Manager hub | Manager hub |
+| `craa5__m_formtemplate`, `craa5__m_quicktask` (both User-owned; quick tasks are a personal list on purpose) | live | Manager hub | Manager hub |
+| `craa5__m_employeenote` Manager notes on people | live | Manager hub | Manager hub, manager role only. Sensitive: User-owned, never shown to peers, never in exports or the repo. Key `craa5_employeeguid`. |
 | `craa5__c_*` chemical tables (13) | live | Chemical hub | Chemical hub; Manager hub for cost |
 | `craa5_dailyproduction` | live | (import) | Chemical hub, cost per pound |
 | `craa5__0_hubconfig` Shared settings | live | Each app writes only its own `craa5_configkey` rows | The same app; shared keys in section 12 |
@@ -208,7 +211,7 @@ Every app computes these the same way, from the same table, with the `hub-shared
 | **Labor cost** | Labor minutes / 60 x the hourly rate for the person's role on the shift date (`_e_ Labor rate`). No default rate. With no rate, cost shows "no rate set". | MSS log + labor rate | `hubLaborCost` |
 | **Weekly cost recap** | Labor cost summed by week key, line key and clean kind | MSS log | `hubWeekKey` |
 | **Sanitation cost per pound** | (Labor cost + chemical cost for the week) / `craa5_dailyproduction.craa5_pounds` for the week | MSS log, chemical hub, daily production | |
-| **Time lost** | Minutes in `craa5__m_timelosslog` by kind | Manager hub | |
+| **Time lost** | Minutes in `craa5__m_timelosslog` by kind. Kind `Weekend clean` (written by PBED) is planned weekend work: shown on its own and left out of Time lost totals. | Manager hub | |
 
 People thresholds (coaching below 75 % pace for 14 days, high performer list) are settings in `craa5__0_hubconfig` key `hub_people_thresholds`, not constants in an app. The coaching list is for supervisors and managers only, never shown to peers.
 
@@ -342,6 +345,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.3 (2026-10-21)** Manager hub review: time loss log keeps its column names (listed), Weekend clean left out of Time lost, quick task User-owned, `craa5__m_employeenote` added. Map: equipment id lists may follow a paired names column's order. table-prompts.md part 5 (observation columns).
 - **1.0.2 (2026-10-21)** Training matrix tables added (sections 3.3, 12, 13; contract.json).
 - **1.0.1 (2026-10-21)** Section 6.3: Shift Start's interim area logging (switch `SHIFT_START_LOGS_MSS`) allowed until Ganttly logs per piece, using the same completion keys.
 - **1.0 (2026-10-21)** First version. Keys, owners, dates, clean kinds, MSS log write rule, number definitions, status words, language, theme, browser storage moves, prefixes, new columns and the labor rate table. The Ganttly plan's new Completion table is replaced by the existing check-off table plus new MSS log columns.

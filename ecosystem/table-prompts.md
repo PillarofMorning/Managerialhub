@@ -69,3 +69,12 @@ Keep the column names exactly as written.
 ```
 
 What goes in it: one row per role, e.g. Name "Sanitor 2026", Role `Sanitor`, Hourly rate, Effective from `2026-01-01`. Use Role `All` for a single plant-wide rate. When a rate changes, add a new row with the new date. Do not edit the old one, so past weeks keep their cost. Apps use the newest row whose Effective from is on or before the shift date.
+
+## Part 5. Map observations (`craa5__facilityobservation`): 2 columns
+
+For the Map submission tool. It writes them only once they exist.
+
+| Display name | Schema name | Type |
+|---|---|---|
+| Equipment guids | `craa5_equipmentguids` | Multiple lines of text, max 4000 |
+| MSS area guid | `craa5_mssareaguid` | Single line of text, max 100 |
