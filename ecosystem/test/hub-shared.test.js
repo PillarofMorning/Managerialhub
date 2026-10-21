@@ -29,6 +29,7 @@ ok(H.hubWeekKey('2026-10-21'), '2026-10-19'); ok(H.hubWeekKey('2026-10-25'), '20
 ok(H.hubCleanKind('full'), 'daily'); ok(H.hubCleanKind('weekly'), 'eow'); ok(H.hubCleanKind('Midweek'), 'midweek'); ok(H.hubCleanKind('none'), ''); ok(H.hubCleanKind('monthly'), 'monthly');
 ok(H.hubCompletionKey('{' + g2 + '}', '2026-10-20', 'weekly'), g2.toLowerCase() + '|2026-10-20|eow');
 ok(H.hubCompletionKey(g1, '2026-10-20', 'none'), '');
+ok(H.hubCleanKind('Egg'), 'egg'); ok(H.hubCleanKind('pecan'), 'pecan'); ok(H.hubT('Pecan allergen', 'es'), 'Alérgeno nuez pecana');
 var k = H.hubCompletionKey(g1, '2026-10-20', 'daily');
 ok(H.hubLogIdOf(k), H.hubLogIdOf(k)); ok(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(H.hubLogIdOf(k)), true);
 ok(H.hubLogIdOf(k) === H.hubLogIdOf(H.hubCompletionKey(g1, '2026-10-20', 'eow')), false);

@@ -81,7 +81,7 @@ function hubWeekKey(day) {
 
 // ---------- cleans and completions ----------
 // What kind of clean a completion was. The Clean Plan (Production Scheduler) uses its own words; hubCleanKind maps them.
-var HUB_CLEAN_KINDS = ['daily', 'midweek', 'eow', 'allergen', 'changeover', 'monthly', 'quarterly', 'semiannual', 'annual', 'corrective', 'other'];
+var HUB_CLEAN_KINDS = ['daily', 'midweek', 'eow', 'allergen', 'egg', 'pecan', 'changeover', 'monthly', 'quarterly', 'semiannual', 'annual', 'corrective', 'other'];
 var HUB_PLAN_KIND_MAP = { full: 'daily', weekly: 'eow', midweek: 'midweek', allergen: 'allergen', changeover: 'changeover' };
 function hubCleanKind(k) {
     var s = String(k || '').toLowerCase().trim();
@@ -127,7 +127,7 @@ function hubDecodeEs(s) { return String(s).replace(/%([aeiounAEIOUN?!w%])/g, fun
 // The shared words (data-contract.md section 9). An app's own word list adds to these; it never gives one of these another Spanish.
 var HUB_ES = {
     'Planned': 'Planeado', 'Started': 'En proceso', 'Done': 'Terminado', 'Skipped': 'Omitido', 'Overdue': 'Atrasado', 'At risk': 'En riesgo',
-    'Daily': 'Diaria', 'Midweek 72h': 'Media semana 72h', 'End of week': 'Fin de semana', 'EOW': 'FDS', 'Allergen': 'Al%ergeno',
+    'Daily': 'Diaria', 'Midweek 72h': 'Media semana 72h', 'End of week': 'Fin de semana', 'EOW': 'FDS', 'Allergen': 'Al%ergeno', 'Egg allergen': 'Al%ergeno huevo', 'Pecan allergen': 'Al%ergeno nuez pecana',
     'Changeover': 'Cambio de producto', 'Monthly': 'Mensual', 'Quarterly': 'Trimestral', 'Semiannual': 'Semestral', 'Annual': 'Anual',
     'Corrective': 'Correctiva', 'Other': 'Otra',
     'Present': 'Presente', 'Late': 'Lleg%o tarde', 'Sick': 'Enfermo', 'PTO': 'Vacaciones (PTO)', 'Left early': 'Sali%o temprano',

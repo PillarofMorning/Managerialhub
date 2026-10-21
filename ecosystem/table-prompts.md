@@ -84,3 +84,19 @@ Apps now save a short list of the tables and columns they use here, so the Datav
 3. Security roles: every hub role needs **Organization** Read on hubconfig, and **Organization** Write too, so a newer app version can update a list someone else saved.
 
 Apps use Manifest json when it is there and Config json when it is not, so nothing breaks either way.
+
+## Part 7. Equipment (`craa5_aa_assets`): 4 columns for egg and pecan allergen cleans
+
+Egg and pecan cleans cover different pieces and take different times, so each gets its own flag and minutes. Add by hand (New > Column). Then tick the pieces and fill the minutes, like Daily clean and Hours required.
+
+| Display name | Schema name | Type |
+|---|---|---|
+| Egg clean | `craa5_eggclean` | Yes/No |
+| Egg clean minutes | `craa5_eggminutes` | Whole number |
+| Pecan clean | `craa5_pecanclean` | Yes/No |
+| Pecan clean minutes | `craa5_pecanminutes` | Whole number |
+
+Until these are filled, apps keep using the old combined allergen minutes.
+
+Optional: on the same table, rename the display name of the **Month** column (`craa5_month`) to "6 month". Only the display name changes; the schema name stays and nothing breaks.
+
