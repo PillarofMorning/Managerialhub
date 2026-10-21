@@ -1,7 +1,7 @@
-/* ============================== START MSS LOG WRITE v1.1 ============================== */
+/* ============================== START MSS LOG WRITE v1.2 ============================== */
 // The one place in the ecosystem that builds and saves a finished clean in the MSS log (craa5__log_), by the rule in the data
 // contract, section 6.3. Paste it unchanged into every app that logs a clean (Ganttly, MSS Log Input, MSS Calendar), right after
-// the HUB SHARED block, which it needs (hubGuid, hubShiftDate, hubCompletionKey, hubLogIdOf, hubCleanKind, hubCrew, ...).
+// the HUB SHARED block (1.1 or later), which it needs (hubGuid, hubShiftDate, hubCompletionKey, hubLogIdOf, hubCleanKind, hubCrew, ...).
 // 7-bit ASCII and ES5 apart from async/await (every host compiles that). Change it only with the contract (6.2 and 6.3) and bump MLW_VERSION.
 //
 //   - One row = one piece of equipment, one clean, one shift date, saved only when someone marked that piece done (or typed it in).
@@ -20,7 +20,7 @@
 // The host passes an api with query(table, { select, filter, top }) -> rows, create(table, body) and update(table, id, body);
 // mlwApi(xrm, dataApi) builds one from Xrm.WebApi or the page's dataApi.
 
-var MLW_VERSION = '1.1';
+var MLW_VERSION = '1.2';
 var MLW_TABLE = 'craa5__log_';
 var MLW_ID = 'craa5__log_id';
 var MLW_QUEUE_KEY = 'mss_log_write_queue_v1';
@@ -34,6 +34,8 @@ var MLW_KINDS = {
     midweek: { d: 1, w: 0, m: 0, en: 'Midweek 72h' },
     eow: { d: 1, w: 1, m: 0, en: 'End of week' },
     allergen: { d: 1, w: 0, m: 0, en: 'Allergen' },
+    egg: { d: 1, w: 0, m: 0, en: 'Egg allergen' },
+    pecan: { d: 1, w: 0, m: 0, en: 'Pecan allergen' },
     changeover: { d: 1, w: 0, m: 0, en: 'Changeover' },
     monthly: { d: 1, w: 1, m: 1, en: 'Monthly' },
     quarterly: { d: 1, w: 1, m: 1, en: 'Quarterly' },
@@ -51,6 +53,7 @@ var MLW_TEXT = {
     no_equipment: ['No equipment ID. Pick the equipment first.', 'Sin ID de equipo. Elija el equipo primero.'],
     bad_equipment: ['The equipment ID is not valid.', 'El ID de equipo no es v%alido.'],
     no_kind: ['Which clean was this? (daily, midweek, end of week ...)', '%?Qu%e limpieza fue? (diaria, media semana, fin de semana ...)'],
+    old_shared: ['This app has an old HUB SHARED block. Paste HUB SHARED 1.1 or later.', 'Esta app tiene un bloque HUB SHARED viejo. Pegue HUB SHARED 1.1 o posterior.'],
     no_day: ['No shift date.', 'Falta la fecha del turno.'],
     future_day: ['The date is in the future.', 'La fecha es futura.'],
     no_names: ['Who cleaned it? Add at least one name.', '%?Qui%en lo limpi%o? Agregue al menos un nombre.'],
@@ -79,6 +82,8 @@ function mlwKind(raw) {
     if (/^(q|qtr|quarter|3m)$/.test(s)) return 'quarterly';
     if (/^(6m|6-month|6month|sa|semi-annual)$/.test(s)) return 'semiannual';
     if (/^(a|y|yr|year|yearly|annually)$/.test(s)) return 'annual';
+    if (/^(egg|eggs|eggallergen|allergenegg|eggclean|huevo|alergenohuevo)$/.test(s)) return 'egg';
+    if (/^(pecan|pecans|pecanallergen|allergenpecan|pecanclean|nuez|pecana|nuezpecana|alergenonuez|alergenonuezpecana)$/.test(s)) return 'pecan';
     if (/^(allergenclean|allergenchangeover)$/.test(s)) return 'allergen';
     if (/^(pathogen|swab|reclean|re-clean)$/.test(s)) return 'corrective';
     if (/^(as-needed|asneeded|perrun|per-run)$/.test(s)) return 'other';
@@ -107,6 +112,7 @@ function mlwBuildRow(entry, now) {
     if (!rawGuid) problems.push('no_equipment'); else if (!guid) problems.push('bad_equipment');
     var kind = mlwKind(e.kind);
     if (!kind) problems.push('no_kind');
+    else if (!hubCleanKind(kind)) problems.push('old_shared');   // egg / pecan need HUB SHARED 1.1 or later
     var day = mlwDay(e.shiftDate) || (e.slotStart ? hubShiftDate(e.slotStart) : '');
     if (!day) problems.push('no_day');
     else if (day > hubAddDays(hubPlantDay(now || Date.now()), 1)) problems.push('future_day');
@@ -149,7 +155,7 @@ function mlwBuildRow(entry, now) {
     };
     var f = mlwFlags(kind);
     row.craa5_daily = f.craa5_daily; row.craa5_weekly = f.craa5_weekly; row.craa5_monthly = f.craa5_monthly;
-    if (kind === 'allergen') row.craa5_allergenclean = 'Yes';   // text Yes / No like craa5_pathogen; dropped if the column is another type
+    if (kind === 'allergen' || kind === 'egg' || kind === 'pecan') row.craa5_allergenclean = 'Yes';   // text Yes / No like craa5_pathogen; dropped if the column is another type
     return { ok: problems.length === 0, row: row, id: hubLogIdOf(key), key: key, kind: kind, day: day, problems: problems, warnings: warnings };
 }
 
@@ -322,4 +328,4 @@ function mlwApi(xrm, dataApi) {
     };
     return null;
 }
-/* ============================== END MSS LOG WRITE v1.1 ============================== */
+/* ============================== END MSS LOG WRITE v1.2 ============================== */

@@ -7,12 +7,12 @@ const vm = require('vm');
 
 const HUB = fs.readFileSync(path.join(__dirname, '..', 'hub-shared.js'), 'utf8');
 const MLW = fs.readFileSync(path.join(__dirname, '..', 'mss-log-write.js'), 'utf8');
-function load() {
+function load(hub) {
     const store = {};
     const ctx = { console, Intl, Date, JSON, Math, Object, Array, String, Number, Promise, Error, isNaN, isFinite, RegExp, encodeURIComponent, parseInt };
     ctx.window = { localStorage: { getItem: k => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); } } };
     vm.createContext(ctx);
-    vm.runInContext(HUB + '\n' + MLW + '\n;globalThis.__x = { MLW_KINDS, hubLogIdOf, hubCompletionKey, mlwKind, mlwBuildRow, mlwWrite, mlwRetryQueue, mlwQueueCount, mlwUndo, mlwCheckRow, mlwApi, mlwSay, mlwKindLabel, mlwMissing };', ctx);
+    vm.runInContext((hub || HUB) + '\n' + MLW + '\n;globalThis.__x = { MLW_KINDS, hubLogIdOf, hubCompletionKey, mlwKind, mlwBuildRow, mlwWrite, mlwRetryQueue, mlwQueueCount, mlwUndo, mlwCheckRow, mlwApi, mlwSay, mlwKindLabel, mlwMissing };', ctx);
     return ctx.__x;
 }
 const eq = (a, b, msg) => assert.deepStrictEqual(JSON.parse(JSON.stringify(a)), b, msg);
@@ -286,4 +286,28 @@ test('allergen flag of another type: the save drops only that column', async () 
     assert.strictEqual(r.status, 'saved');
     assert.strictEqual(api.created[0].craa5_cleankind, 'allergen');
     assert.strictEqual(api.created[0].craa5_allergenclean, undefined);
+});
+
+test('egg and pecan allergen cleans (contract 1.0.23): daily flag plus craa5_allergenclean, own completion key', () => {
+    const m = load();
+    for (const [raw, k] of [['egg', 'egg'], ['auto- egg', 'egg'], ['Egg allergen', 'egg'], ['huevo', 'egg'], ['pecan', 'pecan'], ['auto- pecan', 'pecan'], ['Pecan allergen', 'pecan'], ['nuez pecana', 'pecan']])
+        assert.strictEqual(m.mlwKind(raw), k, raw);
+    for (const k of ['egg', 'pecan']) {
+        const b = m.mlwBuildRow(Object.assign({}, base, { kind: k }), NOW);
+        assert.ok(b.ok, k + ' ' + b.problems);
+        eq([b.row.craa5_daily, b.row.craa5_weekly, b.row.craa5_monthly, b.row.craa5_allergenclean, b.row.craa5_cleankind, b.row.craa5_sap], [true, false, false, 'Yes', k, 'auto-' + k]);
+        assert.ok(b.key.endsWith('|' + k));
+    }
+    assert.strictEqual(m.mlwKindLabel('egg', 'es'), 'Al\u00e9rgeno huevo');
+    assert.strictEqual(m.mlwKindLabel('pecan', 'es'), 'Al\u00e9rgeno nuez pecana');
+});
+
+test('egg / pecan with an old HUB SHARED (1.0) stop with old_shared instead of a row without a key', () => {
+    const old = HUB.replace("'allergen', 'egg', 'pecan',", "'allergen',");
+    assert.notStrictEqual(old, HUB);
+    const m = load(old);
+    const b = m.mlwBuildRow(Object.assign({}, base, { kind: 'egg' }), NOW);
+    assert.strictEqual(b.ok, false);
+    eq(b.problems, ['old_shared']);
+    assert.ok(m.mlwBuildRow(base, NOW).ok);
 });

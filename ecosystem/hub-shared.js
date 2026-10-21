@@ -1,10 +1,10 @@
-/* ============================== START HUB SHARED v1.0 ============================== */
+/* ============================== START HUB SHARED v1.1 ============================== */
 // The ecosystem data contract in code (ecosystem/data-contract.md). Paste this whole block into every hub app, unchanged,
 // and use these helpers instead of local copies, so every app builds the same keys, dates and numbers.
 // Plain ES5 and 7-bit ASCII on purpose: it runs in every Power Apps page and passes the GEMINI.md ASCII check.
 // Change it only through the contract (bump HUB_CONTRACT_VERSION and say what changed in the contract's change log).
 
-var HUB_CONTRACT_VERSION = '1.0';
+var HUB_CONTRACT_VERSION = '1.1';
 var HUB_TZ = 'America/Chicago';              // the plant's clock: every plant day and shift date is read on it
 
 // ---------- keys ----------
@@ -81,7 +81,7 @@ function hubWeekKey(day) {
 
 // ---------- cleans and completions ----------
 // What kind of clean a completion was. The Clean Plan (Production Scheduler) uses its own words; hubCleanKind maps them.
-var HUB_CLEAN_KINDS = ['daily', 'midweek', 'eow', 'allergen', 'changeover', 'monthly', 'quarterly', 'semiannual', 'annual', 'corrective', 'other'];
+var HUB_CLEAN_KINDS = ['daily', 'midweek', 'eow', 'allergen', 'egg', 'pecan', 'changeover', 'monthly', 'quarterly', 'semiannual', 'annual', 'corrective', 'other'];
 var HUB_PLAN_KIND_MAP = { full: 'daily', weekly: 'eow', midweek: 'midweek', allergen: 'allergen', changeover: 'changeover' };
 function hubCleanKind(k) {
     var s = String(k || '').toLowerCase().trim();
@@ -127,7 +127,7 @@ function hubDecodeEs(s) { return String(s).replace(/%([aeiounAEIOUN?!w%])/g, fun
 // The shared words (data-contract.md section 9). An app's own word list adds to these; it never gives one of these another Spanish.
 var HUB_ES = {
     'Planned': 'Planeado', 'Started': 'En proceso', 'Done': 'Terminado', 'Skipped': 'Omitido', 'Overdue': 'Atrasado', 'At risk': 'En riesgo',
-    'Daily': 'Diaria', 'Midweek 72h': 'Media semana 72h', 'End of week': 'Fin de semana', 'EOW': 'FDS', 'Allergen': 'Al%ergeno',
+    'Daily': 'Diaria', 'Midweek 72h': 'Media semana 72h', 'End of week': 'Fin de semana', 'EOW': 'FDS', 'Allergen': 'Al%ergeno', 'Egg allergen': 'Al%ergeno huevo', 'Pecan allergen': 'Al%ergeno nuez pecana',
     'Changeover': 'Cambio de producto', 'Monthly': 'Mensual', 'Quarterly': 'Trimestral', 'Semiannual': 'Semestral', 'Annual': 'Anual',
     'Corrective': 'Correctiva', 'Other': 'Otra',
     'Present': 'Presente', 'Late': 'Lleg%o tarde', 'Sick': 'Enfermo', 'PTO': 'Vacaciones (PTO)', 'Left early': 'Sali%o temprano',
@@ -161,4 +161,66 @@ var HUB_COLORS = {
 // Status colors mean one thing in every app. Red is only for overdue, a failed save and a positive swab.
 var HUB_STATUS_COLORS = { done: '#059669', started: '#0072CE', planned: '#64748B', overdue: '#DC2626', atrisk: '#D97706', skipped: '#D97706' };
 var HUB_BRAND_RED = '#E4002B';            // the logo only, never a status
-/* ============================== END HUB SHARED v1.0 ============================== */
+// ---------- app manifest (self-check for the Dataverse monitor) ----------
+// Each app declares the tables and columns it reads and writes (logical names only, never data) and saves that list
+// once per change in craa5__0_hubconfig, key 'manifest|' + appId. The Dataverse monitor reads every manifest| row and
+// checks it against Dataverse (missing tables / columns) and contract.json (owners, statuses). Contract section 12.1.
+//   m = { appId: 'ganttly', app: 'Ganttly', version: '2.0.0',
+//         tables: [ { t: 'craa5_cleancheckoff', names: ['craa5_cleancheckoff'], read: [cols], write: [cols], opt: [cols] } ],
+//         config: ['ganttly_settings'] }
+//   names = table names the app tries, in order (default [t]); opt = columns the app works without (shown as "not yet").
+var HUB_APP_IDS = ['ganttly', 'shiftstart', 'prodsched', 'msscalendar', 'msslog', 'pbed', 'bolo', 'managerhub', 'chemicals', 'mapsubmit', 'monitor', 'training'];
+var HUB_CONFIG_TABLE = 'craa5__0_hubconfig';
+function hubNameList(a) {
+    var out = [], seen = {};
+    (a || []).forEach(function (x) { var v = String(x === undefined || x === null ? '' : x).trim().toLowerCase(); if (v && !seen[v]) { seen[v] = 1; out.push(v); } });
+    return out;
+}
+// The manifest as stored: fixed key order, sorted lists, so the same app build always gives the same text and hash.
+function hubManifest(m, nowIso) {
+    m = m || {};
+    var tables = (m.tables || []).map(function (t) {
+        var name = String(t.t || '').trim().toLowerCase();
+        return { t: name, names: hubNameList(t.names && t.names.length ? t.names : [name]), read: hubNameList(t.read).sort(), write: hubNameList(t.write).sort(), opt: hubNameList(t.opt).sort() };
+    }).filter(function (t) { return !!t.t; }).sort(function (a, b) { return a.t < b.t ? -1 : a.t > b.t ? 1 : 0; });
+    var out = { m: 1, appId: hubCanon(m.appId), app: String(m.app || ''), version: String(m.version || ''), contract: HUB_CONTRACT_VERSION, tables: tables, config: hubNameList(m.config).sort() };
+    out.hash = hubIdFromKey(JSON.stringify(out)).slice(0, 8);
+    out.savedAt = nowIso || new Date().toISOString();
+    return out;
+}
+function hubManifestKey(appId) { return 'manifest|' + hubCanon(appId); }
+// io = { query(table, { select, filter, top }) -> Promise of rows (or { rows }), create(table, body), update(table, id, body) }
+// (Ganttly: swQuery + swWriter). Never rejects and never blocks the app: resolves 'same', 'saved' or 'failed: why'.
+// The list goes in craa5_manifestjson when hubconfig has that column (made with room for it); otherwise in craa5_configjson.
+// With the new column, craa5_configjson keeps only a short stub (app, version, hash, where the list is).
+var HUB_MANIFEST_COL = 'craa5_manifestjson';
+function hubSaveManifest(io, m) {
+    try {
+        var man = hubManifest(m), key = hubManifestKey(man.appId), table = HUB_CONFIG_TABLE, idCol = table + 'id';
+        if (!man.appId) return Promise.resolve('failed: no appId');
+        var fail = function (e) { return 'failed: ' + String(e && e.message || e); };
+        var read = function (cols) {
+            return Promise.resolve(io.query(table, { select: [idCol].concat(cols), filter: "craa5_configkey eq '" + key + "' and statecode eq 0", top: 5 })).then(function (res) {
+                var rows = res && res.rows !== undefined ? res.rows : res;
+                if (!rows) throw new Error(res && res.err || 'read failed');
+                return rows;
+            });
+        };
+        return read([HUB_MANIFEST_COL, 'craa5_configjson']).then(function (rows) { return { rows: rows, col: HUB_MANIFEST_COL }; },
+            function () { return read(['craa5_configjson']).then(function (rows) { return { rows: rows, col: 'craa5_configjson' }; }); }).then(function (r) {
+            var body = { craa5_configkey: key, craa5_configname: (man.app || man.appId) + ' manifest' };
+            body[r.col] = JSON.stringify(man);
+            if (r.col === HUB_MANIFEST_COL) body.craa5_configjson = JSON.stringify({ m: 1, appId: man.appId, version: man.version, hash: man.hash, savedAt: man.savedAt, in: HUB_MANIFEST_COL });
+            var row = r.rows[0];
+            if (row) {
+                var old = {}; try { old = JSON.parse(row[r.col] || row.craa5_configjson || '{}'); } catch (e) {}
+                if (old && old.hash === man.hash && (r.col !== HUB_MANIFEST_COL || row[HUB_MANIFEST_COL])) return 'same';
+                return Promise.resolve(io.update(table, hubGuid(row[idCol]), body)).then(function () { return 'saved'; }, fail);
+            }
+            var create = {}; for (var k in body) create[k] = body[k];
+            create[idCol] = hubIdFromKey('hubconfig|' + key);      // fixed id: two people opening at once still make one row
+            return Promise.resolve(io.create(table, create)).then(function () { return 'saved'; }, fail);
+        }, fail);
+    } catch (e) { return Promise.resolve('failed: ' + String(e && e.message || e)); }
+}
+/* ============================== END HUB SHARED v1.1 ============================== */
