@@ -2,7 +2,7 @@
  * [PERSISTENT MEMORY & APP REGISTRATION BLOCK]
  * APP NAME:        Floor Ganttly
  * PHASE ID:        P3.1 (Ref: _00 - list of apps - defined how to integrate - link to masterplan)
- * CURRENT VERSION: v1.2
+ * CURRENT VERSION: v1.3 (Phase 1: clean plan read from craa5_cleanplan, MSS LOG WRITE v1.1, HUB SHARED v1.0)
  * FOLDER STATUS:   Root Workspace
  * REPO SOURCE:     P3.1 - supp - ganttly
  * 
@@ -15,6 +15,9 @@
  * - craa5__aa_prd_schd (craa5__aa_prd_schds, OTC: 10797)     | Role: Read-Only
  * - craa5_changeover_rule (craa5_changeover_rules, OTC: 10854)| Role: Read-Only
  * - craa5_aa_assets (craa5_aa_assetses, OTC: 10772)         | Role: Read-Only
+ * - craa5_cleanplan (craa5_cleanplans)                      | Role: Read-Only (the Production Scheduler is its only writer)
+ * - craa5_cleancheckoff (craa5_cleancheckoffs)              | Role: Read + Write (Start / Done / Undo, live progress)
+ * - craa5__log_ (MSS log)                                   | Role: Write through MSS LOG WRITE (one row per piece, shift date, kind)
  * 
  * UPSTREAM INPUTS:
  * - P2.1 - shift start: Dispatched worker roster & line assignments
@@ -115,6 +118,497 @@ const Lock = (props) => <svg {...IconProps} {...props}><rect width="18" height="
 const AlertTriangle = (props) => <svg {...IconProps} {...props}><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" x2="12" y1="9" y2="13"/><line x1="12" x2="12.01" y1="17" y2="17"/></svg>;
 const X = (props) => <svg {...IconProps} {...props}><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>;
 const Trash = Trash2;
+
+/* ============================== START HUB SHARED v1.0 ============================== */
+// The ecosystem data contract in code (ecosystem/data-contract.md). Paste this whole block into every hub app, unchanged,
+// and use these helpers instead of local copies, so every app builds the same keys, dates and numbers.
+// Plain ES5 and 7-bit ASCII on purpose: it runs in every Power Apps page and passes the GEMINI.md ASCII check.
+// Change it only through the contract (bump HUB_CONTRACT_VERSION and say what changed in the contract's change log).
+
+var HUB_CONTRACT_VERSION = '1.0';
+var HUB_TZ = 'America/Chicago';              // the plant's clock: every plant day and shift date is read on it
+
+// ---------- keys ----------
+// Letters and digits only, lower case: "IBL 4", "IBL-4" and "ibl4" are the same name.
+function hubCanon(s) { return String(s === undefined || s === null ? '' : s).toLowerCase().replace(/[^a-z0-9]+/g, ''); }
+// Line key, the Production Scheduler's canonLine: area "IBL4" line 1 -> "ibl4"; area "Breading" line 2 -> "breading2".
+function hubLineKey(area, line) { var n = Math.floor(Number(line)); return hubCanon(area) + (n > 1 ? String(n) : ''); }
+// Two area (or room) names are the same area when their hubCanon is the same.
+function hubSameName(a, b) { var x = hubCanon(a); return x !== '' && x === hubCanon(b); }
+// Row ids (GUIDs): lower case, no braces. Every stored GUID goes through this.
+function hubGuid(v) { return String(v === undefined || v === null ? '' : v).replace(/[{}]/g, '').trim().toLowerCase(); }
+function hubIsGuid(v) { return /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(hubGuid(v)); }
+// A list of GUIDs in one text column: "; " between them, sorted, no repeats.
+function hubGuidList(list) {
+    var seen = {}, out = [];
+    (list || []).forEach(function (v) { var g = hubGuid(v); if (g && !seen[g]) { seen[g] = true; out.push(g); } });
+    return out.sort().join('; ');
+}
+function hubSplitGuids(text) { return String(text || '').split(/[;,\s]+/).map(hubGuid).filter(hubIsGuid); }
+// Crew letter A-D from a choice value, a number 1-4 or a label ("Shift B", "D - Nights"). '' when it is none of these.
+function hubCrew(val) {
+    if (val === undefined || val === null || val === '') return '';
+    var s = String(typeof val === 'object' ? (val.Label || val.Value || val.name || '') : val).toUpperCase().trim();
+    if (s.indexOf('256000000') > -1 || s === '1') return 'A';
+    if (s.indexOf('256000001') > -1 || s === '2') return 'B';
+    if (s.indexOf('256000002') > -1 || s === '3') return 'C';
+    if (s.indexOf('256000003') > -1 || s === '4') return 'D';
+    var m = s.match(/(?:^|[^A-Z])([ABCD])(?=$|[^A-Z])/);
+    return m ? m[1] : '';
+}
+// FNV-1a with four seeds, shaped like a version 4 GUID (the same swGuid as Ganttly and the Manager hub).
+// A row whose id is hubIdFromKey(its key) can be saved again and again without ever making a second row.
+function hubIdFromKey(key) {
+    var s = String(key).toLowerCase();
+    var h = function (seed) {
+        var x = (0x811c9dc5 ^ (seed * 0x9e3779b1)) >>> 0;
+        for (var i = 0; i < s.length; i++) { x ^= s.charCodeAt(i); x = Math.imul ? Math.imul(x, 0x01000193) >>> 0 : (x * 0x01000193) >>> 0; }
+        return ('0000000' + x.toString(16)).slice(-8);
+    };
+    var g = h(1) + h(2) + h(3) + h(4);
+    return g.slice(0, 8) + '-' + g.slice(8, 12) + '-4' + g.slice(13, 16) + '-' + '89ab'.charAt(parseInt(g.charAt(16), 16) % 4) + g.slice(17, 20) + '-' + g.slice(20, 32);
+}
+
+// ---------- dates ----------
+function hubPad2(n) { return (n < 10 ? '0' : '') + n; }
+// Year, month, day, hour, minute of a moment on the plant clock (daylight saving included).
+function hubPlantParts(ms) {
+    var d = new Date(typeof ms === 'number' ? ms : Date.parse(ms));
+    if (isNaN(d.getTime())) return null;
+    var f = new Intl.DateTimeFormat('en-US', { timeZone: HUB_TZ, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+    var o = {};
+    f.formatToParts(d).forEach(function (p) { if (p.type !== 'literal') o[p.type] = Number(p.value); });
+    return { y: o.year, m: o.month, d: o.day, h: o.hour === 24 ? 0 : o.hour, min: o.minute };
+}
+// The plant day of a moment, YYYY-MM-DD. Never toISOString().slice(0, 10): that is the UTC day.
+function hubPlantDay(ms) { var p = hubPlantParts(ms); return p ? p.y + '-' + hubPad2(p.m) + '-' + hubPad2(p.d) : ''; }
+// The shift date: the plant day the shift STARTED (the board's craa5_slotstart). A night shift that starts Tuesday 18:00
+// and finishes Wednesday 06:00 is Tuesday's shift, for everything it does.
+function hubShiftDate(slotStart) { return hubPlantDay(slotStart); }
+function hubShiftKey(shiftDate, crew) { return String(shiftDate) + '|' + hubCrew(crew); }
+// How a shift date goes into a Dataverse date column (MSS log craa5_lastcleaned): midnight UTC of that day,
+// so every reader gets the day back with value.slice(0, 10) whatever its own clock says.
+function hubDateOnlyUtc(day) { return /^\d{4}-\d{2}-\d{2}$/.test(String(day)) ? String(day) + 'T00:00:00Z' : ''; }
+function hubDayFromDateOnly(v) { var s = String(v || ''); return /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : ''; }
+function hubAddDays(day, n) {
+    var t = Date.UTC(Number(day.slice(0, 4)), Number(day.slice(5, 7)) - 1, Number(day.slice(8, 10))) + n * 86400000, d = new Date(t);
+    return d.getUTCFullYear() + '-' + hubPad2(d.getUTCMonth() + 1) + '-' + hubPad2(d.getUTCDate());
+}
+// The week key: the Monday of the plant week a day is in (weeks run Monday to Sunday, as in the Clean Plan 'k|Monday' rows).
+function hubWeekKey(day) {
+    var dow = new Date(Date.UTC(Number(day.slice(0, 4)), Number(day.slice(5, 7)) - 1, Number(day.slice(8, 10)))).getUTCDay();
+    return hubAddDays(day, dow === 0 ? -6 : 1 - dow);
+}
+
+// ---------- cleans and completions ----------
+// What kind of clean a completion was. The Clean Plan (Production Scheduler) uses its own words; hubCleanKind maps them.
+var HUB_CLEAN_KINDS = ['daily', 'midweek', 'eow', 'allergen', 'changeover', 'monthly', 'quarterly', 'semiannual', 'annual', 'corrective', 'other'];
+var HUB_PLAN_KIND_MAP = { full: 'daily', weekly: 'eow', midweek: 'midweek', allergen: 'allergen', changeover: 'changeover' };
+function hubCleanKind(k) {
+    var s = String(k || '').toLowerCase().trim();
+    if (HUB_PLAN_KIND_MAP[s]) return HUB_PLAN_KIND_MAP[s];
+    return HUB_CLEAN_KINDS.indexOf(s) > -1 ? s : '';
+}
+// One clean of one piece of equipment on one shift date: the key that stops a second row (MSS log craa5_completionkey).
+function hubCompletionKey(assetGuid, shiftDate, kind) {
+    var g = hubGuid(assetGuid), k = hubCleanKind(kind);
+    return g && /^\d{4}-\d{2}-\d{2}$/.test(String(shiftDate)) && k ? g + '|' + shiftDate + '|' + k : '';
+}
+// The MSS log row id for a completion, so a retried or second-device save updates the same row.
+function hubLogIdOf(completionKey) { return completionKey ? hubIdFromKey('log|' + completionKey) : ''; }
+
+// ---------- numbers ----------
+// Standard minutes of a piece: craa5_aa_assets.craa5_hoursrequired holds MINUTES of labor. Never divide it by 60
+// "when it looks big". Blank, zero or not a number -> null (unknown), never a guess.
+function hubStdMinutes(v) { var n = Number(v); return v === null || v === undefined || v === '' || !isFinite(n) || n <= 0 ? null : n; }
+// Pace: standard minutes / actual minutes x 100, over the same pieces. 100 = on standard, 125 = a quarter faster.
+function hubPace(stdMinutes, actualMinutes) { return stdMinutes > 0 && actualMinutes > 0 ? Math.round(1000 * stdMinutes / actualMinutes) / 10 : null; }
+// Each person on a completion gets an equal share of its minutes.
+function hubShare(minutes, people) { return people > 0 && minutes > 0 ? minutes / people : 0; }
+// Labor cost of minutes at an hourly rate (dollars, two decimals).
+function hubLaborCost(minutes, hourlyRate) { return minutes > 0 && hourlyRate > 0 ? Math.round(minutes * hourlyRate / 60 * 100) / 100 : 0; }
+
+// ---------- language ----------
+// One choice for every app, remembered per computer: 'en' or 'es' (Spanish, Mexico). Older per-app keys are read once.
+var HUB_LANG_KEY = 'hub_lang';
+var HUB_OLD_LANG_KEYS = ['itp_lang_v1', 'ss_lang_v1', 'prodsched_lang_v1', 'stillwell_mst_lang_v1', 'stillwell_org_lang_v1'];
+function hubGetLang() {
+    try {
+        var v = window.localStorage.getItem(HUB_LANG_KEY);
+        if (v === 'en' || v === 'es') return v;
+        for (var i = 0; i < HUB_OLD_LANG_KEYS.length; i++) if (window.localStorage.getItem(HUB_OLD_LANG_KEYS[i]) === 'es') return 'es';
+    } catch (e) {}
+    return 'en';
+}
+function hubSetLang(l) { try { window.localStorage.setItem(HUB_LANG_KEY, l === 'es' ? 'es' : 'en'); } catch (e) {} }
+// Spanish is written in ASCII with a % code per accented letter (the PBED convention):
+// %a %e %i %o %u = acute a e i o u, %n = n tilde, capitals %A %E %I %O %U %N, %? and %! = opening marks, %w = u with two dots, %% = %.
+var HUB_ACC = { a: 225, e: 233, i: 237, o: 243, u: 250, n: 241, A: 193, E: 201, I: 205, O: 211, U: 218, N: 209, '?': 191, '!': 161, w: 252 };
+function hubDecodeEs(s) { return String(s).replace(/%([aeiounAEIOUN?!w%])/g, function (m, c) { return c === '%' ? '%' : String.fromCharCode(HUB_ACC[c]); }); }
+// The shared words (data-contract.md section 9). An app's own word list adds to these; it never gives one of these another Spanish.
+var HUB_ES = {
+    'Planned': 'Planeado', 'Started': 'En proceso', 'Done': 'Terminado', 'Skipped': 'Omitido', 'Overdue': 'Atrasado', 'At risk': 'En riesgo',
+    'Daily': 'Diaria', 'Midweek 72h': 'Media semana 72h', 'End of week': 'Fin de semana', 'EOW': 'FDS', 'Allergen': 'Al%ergeno',
+    'Changeover': 'Cambio de producto', 'Monthly': 'Mensual', 'Quarterly': 'Trimestral', 'Semiannual': 'Semestral', 'Annual': 'Anual',
+    'Corrective': 'Correctiva', 'Other': 'Otra',
+    'Present': 'Presente', 'Late': 'Lleg%o tarde', 'Sick': 'Enfermo', 'PTO': 'Vacaciones (PTO)', 'Left early': 'Sali%o temprano',
+    'No call': 'Falta sin aviso', 'Loaned': 'Prestado', 'Training': 'Entrenamiento',
+    'Sanitor': 'Sanitizador', 'Lead': 'L%ider', 'Supervisor': 'Supervisor', 'Manager': 'Gerente',
+    'Loading': 'Cargando', 'Ready': 'Listo', 'Nothing here yet': 'Todav%ia no hay datos', 'Table missing': 'Falta la tabla',
+    'No access': 'Sin acceso', 'Could not load': 'No se pudo cargar',
+    'Area': '%Area', 'Room': 'Sala', 'Line': 'L%inea', 'Equipment': 'Equipo', 'Shift': 'Turno', 'Crew': 'Cuadrilla', 'Team': 'Grupo',
+    'Clean': 'Limpieza', 'Run': 'Corrida', 'Headcount': 'Personal', 'Minutes': 'Minutos', 'Standard': 'Est%andar', 'Pace': 'Ritmo',
+    'On time': 'A tiempo', 'Labor cost': 'Costo de mano de obra', 'Swab': 'Hisopo', 'Pathogen': 'Pat%ogeno', 'Work order': 'Orden de trabajo',
+    'Skip code': 'C%odigo de omisi%on', 'High five': 'Reconocimiento', 'Sign-off': 'Aprobaci%on', 'Help': 'Ayuda', 'Print': 'Imprimir'
+};
+var HUB_ES_DONE = null;
+// hubT('Done') -> 'Done' or 'Terminado'. extra = the app's own { English: '%-coded Spanish' } list (optional).
+function hubT(s, lang, extra) {
+    if ((lang || hubGetLang()) !== 'es') return s;
+    if (!HUB_ES_DONE) { HUB_ES_DONE = {}; for (var k in HUB_ES) if (Object.prototype.hasOwnProperty.call(HUB_ES, k)) HUB_ES_DONE[k] = hubDecodeEs(HUB_ES[k]); }
+    if (Object.prototype.hasOwnProperty.call(HUB_ES_DONE, s)) return HUB_ES_DONE[s];
+    if (extra && Object.prototype.hasOwnProperty.call(extra, s)) return hubDecodeEs(extra[s]);
+    return s;
+}
+
+// ---------- look ----------
+var HUB_THEME_KEY = 'hub_theme';          // 'light' or 'dark', remembered per computer
+function hubGetTheme() { try { var v = window.localStorage.getItem(HUB_THEME_KEY) || window.localStorage.getItem('itp_theme_v1'); return v === 'dark' ? 'dark' : 'light'; } catch (e) { return 'light'; } }
+function hubSetTheme(t) { try { window.localStorage.setItem(HUB_THEME_KEY, t === 'dark' ? 'dark' : 'light'); } catch (e) {} }
+var HUB_COLORS = {
+    light: { bg: '#F1F5F9', card: '#FFFFFF', border: '#E2E8F0', text: '#1E293B', muted: '#64748B', primary: '#0072CE', primaryDark: '#00468B', accent: '#FFB81C', accentSoft: '#FFF6E0', primarySoft: '#E6F1FB' },
+    dark: { bg: '#1B2740', card: '#24324D', border: '#33425F', text: '#E2E8F0', muted: '#94A3B8', primary: '#4DA3E8', primaryDark: '#B3D4F2', accent: '#FFB81C', accentSoft: '#3A3320', primarySoft: '#1E2A42' }
+};
+// Status colors mean one thing in every app. Red is only for overdue, a failed save and a positive swab.
+var HUB_STATUS_COLORS = { done: '#059669', started: '#0072CE', planned: '#64748B', overdue: '#DC2626', atrisk: '#D97706', skipped: '#D97706' };
+var HUB_BRAND_RED = '#E4002B';            // the logo only, never a status
+/* ============================== END HUB SHARED v1.0 ============================== */
+
+/* ============================== START MSS LOG WRITE v1.1 ============================== */
+// The one place in the ecosystem that builds and saves a finished clean in the MSS log (craa5__log_), by the rule in the data
+// contract, section 6.3. Paste it unchanged into every app that logs a clean (Ganttly, MSS Log Input, MSS Calendar), right after
+// the HUB SHARED block, which it needs (hubGuid, hubShiftDate, hubCompletionKey, hubLogIdOf, hubCleanKind, hubCrew, ...).
+// 7-bit ASCII and ES5 apart from async/await (every host compiles that). Change it only with the contract (6.2 and 6.3) and bump MLW_VERSION.
+//
+//   - One row = one piece of equipment, one clean, one shift date, saved only when someone marked that piece done (or typed it in).
+//   - No equipment id, no row: craa5_equipmentguid = craa5_aa_assetsid.
+//   - The day is the SHIFT date (the plant day the shift started, on the plant clock), never the clock day it was marked.
+//   - craa5_completionkey = equipment | shift date | kind, and the row id is fixed from it (hubLogIdOf), so a retry or a second
+//     device updates the same row instead of adding one. Before saving, that row is read: there and active = already logged.
+//   - The flags (craa5_daily / weekly / monthly) come from the kind of clean done (contract 6.2), never from the piece's highest
+//     frequency. Midweek = daily only; EOW = daily + weekly; monthly and longer = all three; other = none.
+//   - People: craa5_lastcleanedby = names joined with " / ", never "Crew"; craa5_employeeguids; craa5_markedby = who pressed Done.
+//   - craa5_laborminutes = person-minutes; craa5_hoursworked = round(minutes / 60) for older pages.
+//   - craa5_pathogen = Yes or No, never blank. craa5_source = Ganttly, Log input, Calendar or Import.
+//   - A failed save waits in this browser's queue (mlwQueue) and is tried again (mlwRetryQueue). It is never dropped or marked sent.
+//   - Undo (mlwUndo) deactivates the row (statecode 1); it never deletes it.
+// The new columns are optional: a column the table does not have yet is left out (remembered for the page session).
+// The host passes an api with query(table, { select, filter, top }) -> rows, create(table, body) and update(table, id, body);
+// mlwApi(xrm, dataApi) builds one from Xrm.WebApi or the page's dataApi.
+
+var MLW_VERSION = '1.1';
+var MLW_TABLE = 'craa5__log_';
+var MLW_ID = 'craa5__log_id';
+var MLW_QUEUE_KEY = 'mss_log_write_queue_v1';
+var MLW_SOURCES = ['Ganttly', 'Log input', 'Calendar', 'Import'];
+// Optional columns (data contract 13, part 1, plus the allergen flag). Left out of a save while the table does not have them.
+var MLW_OPTIONAL = ['craa5_completionkey', 'craa5_shiftdate', 'craa5_shiftcode', 'craa5_cleankind', 'craa5_laborminutes', 'craa5_employeeguids',
+    'craa5_markedby', 'craa5_source', 'craa5_doneat', 'craa5_plankey', 'craa5_linekey', 'craa5_sapw', 'craa5_allergenclean'];
+// Contract 6.2: kind -> flags (D daily, W weekly, M monthly), and the English label (Spanish from HUB_ES)
+var MLW_KINDS = {
+    daily: { d: 1, w: 0, m: 0, en: 'Daily' },
+    midweek: { d: 1, w: 0, m: 0, en: 'Midweek 72h' },
+    eow: { d: 1, w: 1, m: 0, en: 'End of week' },
+    allergen: { d: 1, w: 0, m: 0, en: 'Allergen' },
+    changeover: { d: 1, w: 0, m: 0, en: 'Changeover' },
+    monthly: { d: 1, w: 1, m: 1, en: 'Monthly' },
+    quarterly: { d: 1, w: 1, m: 1, en: 'Quarterly' },
+    semiannual: { d: 1, w: 1, m: 1, en: 'Semiannual' },
+    annual: { d: 1, w: 1, m: 1, en: 'Annual' },
+    corrective: { d: 1, w: 0, m: 0, en: 'Corrective' },
+    other: { d: 0, w: 0, m: 0, en: 'Other' }
+};
+// Words for the codes the block returns. Spanish in % codes (hubDecodeEs).
+var MLW_TEXT = {
+    saved: ['Saved to the MSS log.', 'Guardado en el registro MSS.'],
+    already: ['Already in the MSS log for this shift.', 'Ya est%a en el registro MSS de este turno.'],
+    queued: ['Not saved yet. It will be tried again.', 'A%un no se guarda. Se intentar%a de nuevo.'],
+    undone: ['Taken off the MSS log.', 'Quitado del registro MSS.'],
+    no_equipment: ['No equipment ID. Pick the equipment first.', 'Sin ID de equipo. Elija el equipo primero.'],
+    bad_equipment: ['The equipment ID is not valid.', 'El ID de equipo no es v%alido.'],
+    no_kind: ['Which clean was this? (daily, midweek, end of week ...)', '%?Qu%e limpieza fue? (diaria, media semana, fin de semana ...)'],
+    no_day: ['No shift date.', 'Falta la fecha del turno.'],
+    future_day: ['The date is in the future.', 'La fecha es futura.'],
+    no_names: ['Who cleaned it? Add at least one name.', '%?Qui%en lo limpi%o? Agregue al menos un nombre.'],
+    crew_name: ['"Crew" is not a name. Add who cleaned it.', '"Crew" no es un nombre. Agregue qui%en lo limpi%o.'],
+    bad_minutes: ['Minutes must be a number from 0 to 1440.', 'Los minutos deben ser un n%umero de 0 a 1440.'],
+    long_minutes: ['Over 8 hours on one piece. Check the time.', 'M%as de 8 horas en una pieza. Revise el tiempo.'],
+    bad_source: ['Unknown app name for the log.', 'Nombre de app desconocido para el registro.'],
+    no_pathogen: ['Pathogen is empty (should be Yes or No).', 'Pat%ogeno vac%io (debe ser S%i o No).'],
+    duplicate: ['Same clean saved twice for this day.', 'La misma limpieza se guard%o dos veces este d%ia.']
+};
+function mlwSay(code, lang) { var t = MLW_TEXT[code]; return t ? ((lang || hubGetLang()) === 'es' ? hubDecodeEs(t[1]) : t[0]) : String(code || ''); }
+function mlwKindLabel(kind, lang) { var k = MLW_KINDS[mlwKind(kind)]; return k ? hubT(k.en, lang) : ''; }
+
+// Any way an app spells a clean -> a contract kind (hubCleanKind's list), or '' when it cannot tell
+function mlwKind(raw) {
+    var k = hubCleanKind(raw);
+    if (k) return k;
+    var s = String(raw === undefined || raw === null ? '' : raw).trim().toLowerCase().replace(/^auto\s*-\s*/, '').replace(/[\s_]+/g, '');
+    if (!s) return '';
+    k = hubCleanKind(s);
+    if (k) return k;
+    if (/^(d|day|dailyclean|shift|sh|pershift|nightly)$/.test(s)) return 'daily';
+    if (/^(mw|mid|mid-week|midweekclean|midweek72h|72h)$/.test(s)) return 'midweek';
+    if (/^(eow|endofweek|end-of-week|weekend|fullclean|w|wk|week|weeklyclean|bw|2w|2-week|2week|bi-weekly|biweekly|biweek)$/.test(s)) return 'eow';
+    if (/^(m|mo|month|monthlyclean|2m|2-month|2month|bm|bimonthly|4m|4-month|4month|deep|deepclean|deep-clean|project)$/.test(s)) return 'monthly';
+    if (/^(q|qtr|quarter|3m)$/.test(s)) return 'quarterly';
+    if (/^(6m|6-month|6month|sa|semi-annual)$/.test(s)) return 'semiannual';
+    if (/^(a|y|yr|year|yearly|annually)$/.test(s)) return 'annual';
+    if (/^(allergenclean|allergenchangeover)$/.test(s)) return 'allergen';
+    if (/^(pathogen|swab|reclean|re-clean)$/.test(s)) return 'corrective';
+    if (/^(as-needed|asneeded|perrun|per-run)$/.test(s)) return 'other';
+    return '';
+}
+function mlwFlags(kind) { var k = MLW_KINDS[kind] || MLW_KINDS.other; return { craa5_daily: !!k.d, craa5_weekly: !!k.w, craa5_monthly: !!k.m }; }
+function mlwNames(v) {
+    var list = Array.isArray(v) ? v : String(v === undefined || v === null ? '' : v).split(/\s*\/\s*|\s*,\s*|\s*;\s*/);
+    var out = [];
+    list.forEach(function (n) { var t = String(n === undefined || n === null ? '' : (n && n.name) || n).replace(/\s+/g, ' ').trim(); if (t && out.indexOf(t) === -1) out.push(t); });
+    return out;
+}
+function mlwIsCrew(n) { return /^(crew|equipo|cuadrilla|team|grupo|n\/?a|tbd|operator|operador)$/i.test(String(n).trim()); }
+function mlwYes(v) { return v === true || v === 1 || /^(true|yes|si|y|1)$/i.test(String(v === undefined || v === null ? '' : v).trim()); }
+function mlwDay(v) { var s = String(v || ''); return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ''; }
+
+// entry: { equipmentGuid, equipment, room, area, workArea (craa5_workareacode), kind, sap (real SAP order, optional),
+//          shiftDate 'YYYY-MM-DD' or slotStart (the board's craa5_slotstart), crew, cleanedBy (names: array or "A / B"),
+//          employeeGuids [ ], markedBy, minutes (person-minutes) or durationMins + heads, doneAt, planKey, lineKey,
+//          pathogen (true when the clean closes a swab hit), source ('Ganttly' | 'Log input' | 'Calendar' | 'Import') }
+// -> { ok, row, id, key, kind, day, problems: [codes that stop the save], warnings: [codes that do not] }
+function mlwBuildRow(entry, now) {
+    var e = entry || {}, problems = [], warnings = [];
+    var rawGuid = String(e.equipmentGuid === undefined || e.equipmentGuid === null ? '' : e.equipmentGuid).trim();
+    var guid = hubIsGuid(rawGuid) ? hubGuid(rawGuid) : '';
+    if (!rawGuid) problems.push('no_equipment'); else if (!guid) problems.push('bad_equipment');
+    var kind = mlwKind(e.kind);
+    if (!kind) problems.push('no_kind');
+    var day = mlwDay(e.shiftDate) || (e.slotStart ? hubShiftDate(e.slotStart) : '');
+    if (!day) problems.push('no_day');
+    else if (day > hubAddDays(hubPlantDay(now || Date.now()), 1)) problems.push('future_day');
+    var names = mlwNames(e.cleanedBy);
+    if (!names.length) problems.push('no_names');
+    else if (names.some(mlwIsCrew)) problems.push('crew_name');
+    var minutes = e.minutes;
+    if ((minutes === undefined || minutes === null || minutes === '') && e.durationMins !== undefined) minutes = Number(e.durationMins) * Math.max(1, Number(e.heads) || 1);
+    minutes = minutes === undefined || minutes === null || minutes === '' ? NaN : Number(minutes);
+    if (isNaN(minutes) || minutes < 0 || minutes > 1440) problems.push('bad_minutes');
+    else if (minutes > 480) warnings.push('long_minutes');
+    var source = String(e.source || '').trim();
+    if (MLW_SOURCES.indexOf(source) === -1) problems.push('bad_source');
+    var mins = isNaN(minutes) ? 0 : Math.round(minutes);
+    var key = hubCompletionKey(guid, day, kind);
+    var sap = String(e.sap || '').trim();
+    var row = {
+        craa5_equipmentguid: guid,
+        craa5_equipment: String(e.equipment || '').trim(),
+        craa5_room: String(e.room || '').trim(),
+        craa5_area: String(e.area || '').trim(),
+        craa5_sap: sap && !/^auto\s*-/i.test(sap) ? sap.toUpperCase() : (kind ? 'auto-' + kind : ''),
+        craa5_lastcleaned: hubDateOnlyUtc(day),
+        craa5_lastcleanedby: names.join(' / ').slice(0, 100),
+        craa5_hoursworked: Math.round(mins / 60),
+        craa5_pathogen: mlwYes(e.pathogen) ? 'Yes' : 'No',
+        craa5_completionkey: key,
+        craa5_shiftdate: day,
+        craa5_shiftcode: hubCrew(e.crew),
+        craa5_cleankind: kind,
+        craa5_laborminutes: mins,
+        craa5_employeeguids: hubGuidList(e.employeeGuids || []),
+        craa5_markedby: String(e.markedBy || '').trim().slice(0, 200),
+        craa5_source: source,
+        craa5_doneat: e.doneAt ? new Date(e.doneAt).toISOString() : new Date(now || Date.now()).toISOString(),
+        craa5_plankey: String(e.planKey || '').trim(),
+        craa5_linekey: String(e.lineKey || '').trim(),
+        craa5_sapw: String(e.workArea || '').trim(),
+        craa5_uid: String(e.workArea || '').trim().slice(0, 100)   // primary name: the SAP code, same as craa5_sapw (contract 6.3)
+    };
+    var f = mlwFlags(kind);
+    row.craa5_daily = f.craa5_daily; row.craa5_weekly = f.craa5_weekly; row.craa5_monthly = f.craa5_monthly;
+    if (kind === 'allergen') row.craa5_allergenclean = 'Yes';   // text Yes / No like craa5_pathogen; dropped if the column is another type
+    return { ok: problems.length === 0, row: row, id: hubLogIdOf(key), key: key, kind: kind, day: day, problems: problems, warnings: warnings };
+}
+
+// The kind a stored row stands for: craa5_cleankind first, then the flags; '' = none (the calendar counts such a row for every frequency)
+function mlwRowKind(r) {
+    var k = mlwKind(r && r.craa5_cleankind);
+    if (k) return k;
+    if (mlwYes(r && r.craa5_monthly)) return 'monthly';
+    if (mlwYes(r && r.craa5_weekly)) return 'eow';
+    if (mlwYes(r && r.craa5_daily)) return 'daily';
+    return '';
+}
+function mlwIsSkip(r) {
+    if (!r) return false;
+    if (r.craa5_skipcode) return true;
+    if (/^SKIPPED\s*[(:]/i.test(String(r.craa5_lastcleanedby || ''))) return true;
+    return /^SKIP:/i.test(String(r.craa5_bundle || '')) || /^SKIP:/i.test(String(r.craa5_idofssop || ''));
+}
+// What is wrong with a row already in the log, by the same rule (for MSS Log Input's Check tab). -> codes, [] when fine
+function mlwCheckRow(r, now) {
+    if (mlwIsSkip(r)) return [];
+    var p = [], rawGuid = String((r && r.craa5_equipmentguid) || '').trim();
+    if (!rawGuid) p.push('no_equipment'); else if (!hubIsGuid(rawGuid)) p.push('bad_equipment');
+    var day = mlwDay(r && r.craa5_shiftdate) || hubDayFromDateOnly(r && r.craa5_lastcleaned);
+    if (!day) p.push('no_day');
+    else if (day > hubAddDays(hubPlantDay(now || Date.now()), 1)) p.push('future_day');
+    var names = mlwNames(r && r.craa5_lastcleanedby);
+    if (!names.length) p.push('no_names'); else if (names.some(mlwIsCrew)) p.push('crew_name');
+    if (!mlwRowKind(r)) p.push('no_kind');
+    if (r && (r.craa5_pathogen === null || r.craa5_pathogen === undefined || String(r.craa5_pathogen).trim() === '')) p.push('no_pathogen');
+    return p;
+}
+
+// Columns this table turned out not to have (for the page session)
+var mlwMissing = {};
+function mlwErrText(e) { return String((e && (e.message || e.errorMessage || (e.error && e.error.message))) || e || ''); }
+function mlwIsMissingCol(msg) { return /could not find a property|undeclared property|not a valid property|invalid property|0x80060888|does not exist|isn't valid|is not valid for|cannot find property/i.test(msg); }
+function mlwIsDuplicate(msg) { return /duplicate|already exists|0x80040237|matching key values/i.test(msg); }
+function mlwStrip(row) { var o = {}; Object.keys(row).forEach(function (k) { if (!mlwMissing[k] && row[k] !== '') o[k] = row[k]; }); return o; }
+// Drop the optional column an error names (or every optional column that was sent, when it names none). false = not a column
+// problem. A column another save already dropped still counts (saves run side by side), so the retry goes without it.
+function mlwDropFor(e, sent) {
+    var msg = mlwErrText(e);
+    var low = msg.toLowerCase();
+    // craa5_allergenclean's type is not known yet: a value it cannot take only drops that column
+    if (sent.indexOf('craa5_allergenclean') > -1 && (low.indexOf('craa5_allergenclean') > -1 || /cannot convert|edm\.|type mismatch|incompatible/.test(low))) { mlwMissing.craa5_allergenclean = true; return true; }
+    if (!mlwIsMissingCol(msg)) return false;
+    var named = MLW_OPTIONAL.filter(function (c) { return sent.indexOf(c) > -1 && low.indexOf(c) > -1; });
+    var drop = named.length ? named : MLW_OPTIONAL.filter(function (c) { return sent.indexOf(c) > -1; });
+    if (!drop.length) return false;
+    drop.forEach(function (c) { mlwMissing[c] = true; });
+    return true;
+}
+function mlwIsDenied(e) { return /privilege|permission|not authorized|access is denied|0x80040220|prvread/i.test(mlwErrText(e)); }
+
+// ---------- retry queue (this browser only; facts are in Dataverse once saved) ----------
+function mlwQueue() { try { var q = JSON.parse(window.localStorage.getItem(MLW_QUEUE_KEY) || '[]'); return Array.isArray(q) ? q : []; } catch (e) { return []; } }
+function mlwQueueSave(q) { try { window.localStorage.setItem(MLW_QUEUE_KEY, JSON.stringify(q)); } catch (e) { /* storage blocked: the caller still gets 'queued' */ } }
+function mlwQueueCount() { return mlwQueue().length; }
+function mlwEnqueue(built, e) {
+    var q = mlwQueue().filter(function (x) { return x.key !== built.key; });
+    q.push({ key: built.key, id: built.id, row: built.row, tries: (built.tries || 0) + 1, at: Date.now(), error: mlwErrText(e).slice(0, 300) });
+    mlwQueueSave(q);
+}
+function mlwDequeue(key) { mlwQueueSave(mlwQueue().filter(function (x) { return x.key !== key; })); }
+
+// The row of this completion, if any: by its fixed id, or by the completion key (a row saved where the id was not kept)
+async function mlwFind(api, built) {
+    var sel = [MLW_ID, 'statecode'];
+    var useKey = !mlwMissing.craa5_completionkey;
+    for (var i = 0; i < 3; i++) {
+        var filter = MLW_ID + ' eq ' + built.id + (useKey ? " or craa5_completionkey eq '" + built.key.replace(/'/g, "''") + "'" : '');
+        try {
+            var rows = await api.query(MLW_TABLE, { select: sel, filter: filter, top: 5 });
+            return (rows || [])[0] || null;
+        } catch (e) {
+            if (useKey && mlwIsMissingCol(mlwErrText(e))) { mlwMissing.craa5_completionkey = true; useKey = false; continue; }
+            throw e;
+        }
+    }
+    return null;
+}
+async function mlwSave(api, how, id, row) {
+    for (var i = 0; i < 16; i++) {
+        var body = mlwStrip(row);
+        try {
+            if (how === 'create') { body[MLW_ID] = id; await api.create(MLW_TABLE, body); }
+            else await api.update(MLW_TABLE, id, body);
+            return;
+        } catch (e) {
+            if (!mlwDropFor(e, Object.keys(body))) throw e;
+        }
+    }
+    throw new Error('MSS log: too many missing columns');
+}
+
+// Save one finished piece. -> { status: 'saved' | 'already' | 'invalid' | 'queued', key, id, problems, warnings, error }
+async function mlwWrite(api, entry, opts) {
+    var built = mlwBuildRow(entry, opts && opts.now);
+    if (!built.ok) return { status: 'invalid', key: built.key, id: built.id, problems: built.problems, warnings: built.warnings };
+    return mlwSend(api, built, opts);
+}
+async function mlwSend(api, built, opts) {
+    var out = { key: built.key, id: built.id, problems: [], warnings: built.warnings || [] };
+    var fail = function (e) { mlwEnqueue(built, e); out.status = 'queued'; out.error = mlwErrText(e); return out; };
+    if (!api || typeof api.create !== 'function') return fail('No Dataverse connection');
+    var found = null;
+    try { found = await mlwFind(api, built); }
+    catch (e) { if (!mlwIsDenied(e)) return fail(e); }   // no Read rights: the fixed id still stops a second row
+    try {
+        if (found && Number(found.statecode || 0) === 0 && !(opts && opts.overwrite)) { mlwDequeue(built.key); out.status = 'already'; return out; }
+        if (found) {
+            var upd = {}; Object.keys(built.row).forEach(function (k) { upd[k] = built.row[k]; });
+            upd.statecode = 0; upd.statuscode = 1;   // a clean undone and then done again comes back
+            await mlwSave(api, 'update', hubGuid(found[MLW_ID]) || built.id, upd);
+        } else {
+            try { await mlwSave(api, 'create', built.id, built.row); }
+            catch (e) {
+                // Another device saved it between the read and the create: the fixed id is taken, so it is logged
+                if (!mlwIsDuplicate(mlwErrText(e))) throw e;
+                mlwDequeue(built.key); out.status = 'already'; return out;
+            }
+        }
+        mlwDequeue(built.key);
+        out.status = 'saved';
+        return out;
+    } catch (e) { return fail(e); }
+}
+// Try every queued save again, oldest first. -> { saved, already, left }
+async function mlwRetryQueue(api) {
+    var q = mlwQueue(), res = { saved: 0, already: 0, left: 0 };
+    for (var i = 0; i < q.length; i++) {
+        var r = await mlwSend(api, { key: q[i].key, id: q[i].id, row: q[i].row, tries: q[i].tries || 1, warnings: [] });
+        if (r.status === 'saved') res.saved++; else if (r.status === 'already') res.already++;
+    }
+    res.left = mlwQueueCount();
+    return res;
+}
+// Undo a Done within the shift: the row is deactivated (statecode 1), never deleted, so every device drops it.
+async function mlwUndo(api, equipmentGuid, shiftDate, kind) {
+    var key = hubCompletionKey(equipmentGuid, shiftDate, mlwKind(kind));
+    if (!key) return { status: 'invalid', key: key };
+    mlwDequeue(key);
+    try { await api.update(MLW_TABLE, hubLogIdOf(key), { statecode: 1, statuscode: 2 }); return { status: 'undone', key: key }; }
+    catch (e) { return { status: 'failed', key: key, error: mlwErrText(e) }; }
+}
+
+// An api for the block from Xrm.WebApi (model-driven host) or the page's dataApi (generative page host)
+function mlwApi(xrm, dataApi) {
+    var web = xrm && xrm.WebApi && typeof xrm.WebApi.createRecord === 'function' ? xrm.WebApi : null;
+    if (web) return {
+        query: async function (table, o) {
+            var parts = [];
+            if (o.select && o.select.length) parts.push('$select=' + o.select.join(','));
+            if (o.filter) parts.push('$filter=' + o.filter.replace(/'(?:[^']|'')*'/g, function (lit) { return "'" + encodeURIComponent(lit.slice(1, -1)) + "'"; }));
+            if (o.top) parts.push('$top=' + o.top);
+            var res = await web.retrieveMultipleRecords(table, '?' + parts.join('&'));
+            return (res && res.entities) || [];
+        },
+        create: function (table, body) { return web.createRecord(table, body); },
+        update: function (table, id, body) { return web.updateRecord(table, id, body); }
+    };
+    if (dataApi && typeof dataApi.createRow === 'function') return {
+        query: async function (table, o) {
+            var page = await dataApi.queryTable(table, { select: o.select, filter: o.filter, pageSize: o.top || 50, top: o.top });
+            return (page && page.rows) || [];
+        },
+        create: function (table, body) { return dataApi.createRow(table, body); },
+        update: function (table, id, body) { return dataApi.updateRow(table, id, body); }
+    };
+    return null;
+}
+/* ============================== END MSS LOG WRITE v1.1 ============================== */
 
 // ============================================================================
 // SECTION 2: OBJECT-ORIENTED DOMAIN MODELS 
@@ -1502,7 +1996,12 @@ const CHECKOFF_SPEC = {
         { key: 'area', logical: 'craa5_area', label: 'Area', type: 'Single line of text', required: false, note: 'The room.' },
         { key: 'startedat', logical: 'craa5_startedat', label: 'Started at', type: 'Date and time', required: false, note: 'When Start was pressed.' },
         { key: 'doneat', logical: 'craa5_doneat', label: 'Done at', type: 'Date and time', required: false, note: 'When Done was pressed.' },
-        { key: 'keepuntil', logical: 'craa5_keepuntil', label: 'Keep until', type: 'Date and time', required: false, note: 'Until when the check-off still counts (a monthly clean: a month). A computer opened for the first time, like the TV, reads these too.' }
+        { key: 'keepuntil', logical: 'craa5_keepuntil', label: 'Keep until', type: 'Date and time', required: false, note: 'Until when the check-off still counts (a monthly clean: a month). A computer opened for the first time, like the TV, reads these too.' },
+        // Data contract 6.4 (proposed): left out while the table does not have them.
+        { key: 'shiftdate', logical: 'craa5_shiftdate', label: 'Shift date', type: 'Single line of text', required: false, note: 'YYYY-MM-DD: the plant day the shift clocked in.' },
+        { key: 'cleankind', logical: 'craa5_cleankind', label: 'Clean kind', type: 'Single line of text', required: false, note: 'daily, midweek, eow, allergen, changeover, monthly ...' },
+        { key: 'completionkey', logical: 'craa5_completionkey', label: 'Completion key', type: 'Single line of text', required: false, note: 'Equipment id | shift date | kind, the same key as the MSS log row.' },
+        { key: 'employeeguids', logical: 'craa5_employeeguids', label: 'Employee guids', type: 'Multiple lines of text', required: false, note: 'The people on the piece: employee row ids with "; " between them.' }
     ]
 };
 const CHECKOFF_STORE_KEY = 'itp_current_sync_v1';
@@ -1828,14 +2327,12 @@ function lastRunEndBefore(lines, ms) {
     });
     return best;
 }
-// Determines whether a downtime gap on a production line is a Weekly Wash Window:
-// User rule: full 'weekly' washes are always done end of week or a 24 hour gap.
+// Fallback only (no clean plan for the room): is a stop on a production line the End of Week stop? The Production Scheduler's
+// clean plan decides this when it is published; a long stop in the middle of the week is no longer taken as a weekly clean.
 function isWeeklyWashWindow(downStartMs, downEndMs) {
     if (!downStartMs) return false;
     const durMs = (downEndMs || Infinity) - downStartMs;
-    // 1. Production gap is >= 24 hours
-    if (durMs >= 24 * 3600000) return true;
-    // 2. End of Week (EOW) window: starts Friday afternoon/evening (>= 12:00) through Sunday
+    // End of Week (EOW) stop: starts Friday afternoon/evening (>= 12:00) through Sunday
     const d = new Date(downStartMs);
     const day = d.getDay(); // 0 = Sun, 5 = Fri, 6 = Sat
     const hour = d.getHours();
@@ -1846,10 +2343,8 @@ function isWeeklyWashWindow(downStartMs, downEndMs) {
 // Determines the MSS frequency of an asset
 function mssFrequencyOf(asset) {
     if (!asset) return 'weekly';
-    const area = String((asset.area || asset.room || '')).trim().toUpperCase();
-    const isIbl5 = /IBL\s*5/i.test(area) || /IBL5/i.test(area);
-    const isCustard = /CUSTARD/i.test(area);
-    if (isIbl5 || isCustard) return 'daily'; // "ibl5 almost all equipment should be daily. same for custard."
+    // No line is "always daily" here any more: which clean a line gets is the Production Scheduler's clean plan (see CLEAN PLAN).
+    // This is only the piece's own MSS frequency, used when the plan has nothing for its room.
     if (asset.frequency) return asset.frequency;
     const flags = Array.isArray(asset.flags) ? asset.flags : [];
     if (flags.indexOf('craa5_dailyclean') > -1) return 'daily';
@@ -1865,9 +2360,12 @@ function mssFrequencyOf(asset) {
 //   "daily tasks should be done 1 time any time a line is shut down."
 // - Weekly items: valid until the next weekly wash window (EOW or >= 24-hour gap)
 // - Other MSS frequencies: valid for their MSS period (Midweek 7d, Monthly 31d, etc.)
-function nextCleanDueMs(asset, doneMs, prodLinesWide, lineIndex, roomProdLines) {
+function nextCleanDueMs(asset, doneMs, prodLinesWide, lineIndex, roomProdLines, planDue) {
     if (!doneMs || isNaN(doneMs)) return Date.now() + 86400000;
     if (String(asset && asset.id).indexOf('custom_') === 0) return Infinity;
+    // The Production Scheduler's clean plan first (the room's next published clean that covers the piece).
+    const byPlan = typeof planDue === 'function' ? planDue(asset, doneMs) : null;
+    if (byPlan) return byPlan;
 
     const freq = mssFrequencyOf(asset);
     const area = String((asset && (asset.area || asset.room)) || '').trim();
@@ -4396,6 +4894,227 @@ function planSupportDuty(inp) {
 }
 
 // ============================================================================
+// CLEAN PLAN (craa5_cleanplan)
+// [!] ARCHITECTURE NOTE: the Production Scheduler is the only app that decides which clean a line gets at each stop (daily, IBL4's
+// 72 h midweek, End of Week, allergen, changeover) and which pieces it covers. It publishes that to craa5_cleanplan (reader guide:
+// production-schedule/clean-plan-contract.md). Ganttly only reads it: a room's type of clean, the pieces in it, the 72 h / overlap
+// alerts and when a checked-off piece is due again all come from these rows. Ganttly keeps no clean rules of its own; a room with
+// no published window (or a week still being written) falls back to its own pick on Setup, else to a daily clean, and says so.
+// One filtered read of windows / alerts / weeks around the plan window, one read of the scope rows. Never the whole table.
+// ============================================================================
+const CPL_TABLE = 'craa5_cleanplan';
+const CPL_COLS_ALL = ['craa5_cleanplanid', 'craa5_plankey', 'craa5_rowtype', 'craa5_linekey', 'craa5_start', 'craa5_end', 'craa5_cleankind', 'craa5_minutes', 'craa5_status', 'craa5_details', 'craa5_reason', 'craa5_area', 'craa5_line', 'craa5_mssareaguid'];
+const CPL_COLS_REQ = ['craa5_cleanplanid', 'craa5_plankey', 'craa5_rowtype', 'craa5_linekey', 'craa5_start', 'craa5_end', 'craa5_cleankind', 'craa5_minutes', 'craa5_status', 'craa5_details'];
+const CPL_BACK_MS = 2 * 86400000;      // windows read before the plan start (a clean under way, the last clean of a piece)
+const CPL_AHEAD_MS = 8 * 86400000;     // and after the plan end (when a checked-off piece is due again)
+const CPL_TOP = 2000;
+const CPL_READ_MS = 5 * 60000;         // read again every 5 minutes while Ganttly is open
+const CPL_SCOPE_COLS = ['id', 'name', 'area', 'room', 'mins', 'heads', 'offsetMins', 'leftOutBy'];
+// Clean kind -> the equipment yes/no column that lists its pieces when the plan has no scope rows for it ([] = every piece).
+const CPL_KIND_COLS = { daily: ['craa5_dailyclean'], midweek: ['craa5_midweek'], eow: [], allergen: [], changeover: ['craa5_dailyclean'] };
+// The words people see for a planned clean (English; Spanish from HUB_ES through tr / hubT).
+const CPL_KIND_LABEL = { daily: 'Daily', midweek: 'Midweek 72h', eow: 'End of week', allergen: 'Allergen', changeover: 'Changeover' };
+// Clean kind colors on clocks and Gantts (data contract 10).
+const CPL_KIND_COLOR = { daily: '#0072CE', midweek: '#D97706', eow: '#00468B', allergen: '#7C3AED', changeover: '#64748B' };
+function cplMs(v) { if (v === null || v === undefined || v === '') return NaN; const t = typeof v === 'number' ? v : Date.parse(v); return isNaN(t) ? NaN : t; }
+function cplJson(v) { if (v && typeof v === 'object') return v; try { const o = JSON.parse(String(v || '')); return o && typeof o === 'object' ? o : null; } catch (e) { return null; } }
+function cplErrKind(e) {
+    const m = String((e && (e.message || (e.error && e.error.message))) || e || '');
+    if (/privilege|permission|not authorized|access is denied|0x80040220|prvread/i.test(m)) return 'denied';
+    if (gbMissing(m) && !/property|column|attribute/i.test(m)) return 'missing';
+    return 'error';
+}
+// One query with the columns the table has: all of them, then only the required ones (the optional ones not made yet).
+async function cplQuery(dataApi, filter, top) {
+    let lastErr = null;
+    const tries = [CPL_COLS_ALL, CPL_COLS_REQ];
+    for (let i = 0; i < tries.length; i++) {
+        try {
+            const rows = await gbQueryTable(dataApi, CPL_TABLE, filter, tries[i], top, 'craa5_start asc');
+            return rows || [];
+        } catch (e) {
+            lastErr = e;
+            if (cplErrKind(e) !== 'error') throw e;   // no table or no rights: asking with fewer columns won't help
+        }
+    }
+    throw lastErr || new Error('Clean plan could not be read');
+}
+// -> { status: 'ready' | 'missing' | 'denied' | 'error', rows: [...], err }
+async function fetchCleanPlan(dataApi, fromMs, toMs) {
+    const xrm = safeGetXrm();
+    if (!(xrm && xrm.WebApi) && !(dataApi && (typeof dataApi.queryTable === 'function' || typeof dataApi.retrieveMultipleRecords === 'function'))) return { status: 'error', rows: [], err: 'No Dataverse connection' };
+    const timed = "(craa5_rowtype eq 'window' or craa5_rowtype eq 'alert' or craa5_rowtype eq 'week') and craa5_start lt " + odataDate(toMs) + ' and craa5_end gt ' + odataDate(fromMs);
+    try {
+        const a = await cplQuery(dataApi, 'statecode eq 0 and ' + timed, CPL_TOP);
+        let b = [];
+        try { b = await cplQuery(dataApi, "statecode eq 0 and craa5_rowtype eq 'scope'", CPL_TOP); } catch (e) { b = []; }   // no scope rows = the yes/no columns decide
+        return { status: 'ready', rows: a.concat(b), err: '' };
+    } catch (e) {
+        return { status: cplErrKind(e), rows: [], err: String((e && e.message) || e || '') };
+    }
+}
+// Line key of an area + line number as Ganttly's production lines name it (buildProdLines: "IBL5" = area IBL line 5).
+function cplGanttLineKey(rawArea, rawLine) {
+    let area = String(rawArea || '').trim();
+    const n0 = parseInt(rawLine, 10);
+    let line = !isNaN(n0) && n0 > 0 ? n0 : 1;
+    const tail = area.match(/^(.*?)\s*(?:line\s*)?(\d+)$/i);
+    if (tail && tail[1] && tail[1].trim()) {
+        const n = parseInt(tail[2], 10);
+        if (isNaN(n0) || n0 <= 1 || n0 === n) { area = tail[1].trim(); line = n; }
+    }
+    return compactKey(area) + '|' + line;
+}
+// The rows -> { windows, alerts, weeks: { 'YYYY-MM-DD' (Monday): 'done' | 'writing' }, scopes: { 'ibl4|midweek': { hash, parts, pieces: { id: piece } } } }
+function parseCleanPlan(rows) {
+    const out = { windows: [], alerts: [], weeks: {}, scopes: {} };
+    const scopeParts = {};
+    (rows || []).forEach(function(r) {
+        const g = function(c) { return r[c] !== undefined ? r[c] : getRowField(r, c); };
+        const type = String(g('craa5_rowtype') || '').trim().toLowerCase();
+        const key = String(g('craa5_plankey') || '').trim();
+        const d = cplJson(g('craa5_details')) || {};
+        const start = cplMs(g('craa5_start')), end = cplMs(g('craa5_end'));
+        const rawKind = String(g('craa5_cleankind') || '').trim().toLowerCase();
+        const status = String(g('craa5_status') || '').trim().toLowerCase();
+        if (type === 'week') {
+            const mon = key.replace(/^k\|/, '');
+            if (/^\d{4}-\d{2}-\d{2}$/.test(mon)) out.weeks[mon] = status;
+            return;
+        }
+        if (type === 'scope') {
+            const m = key.split('|');   // s|line|kind|part
+            if (m.length < 4) return;
+            const sk = m[1] + '|' + m[2];
+            const part = parseInt(m[3], 10) || Number(d.part) || 1;
+            (scopeParts[sk] = scopeParts[sk] || { hash: '', parts: 0, list: {}, cols: null }).list[part] = Array.isArray(d.pieces) ? d.pieces : [];
+            const sp = scopeParts[sk];
+            if (d.hash) sp.hash = String(d.hash);
+            if (Number(d.parts) > sp.parts) sp.parts = Number(d.parts);
+            if (Array.isArray(d.cols) && d.cols.length) sp.cols = d.cols;
+            return;
+        }
+        const lineKey = String(g('craa5_linekey') || d.line || '').trim().toLowerCase();
+        const area = String(g('craa5_area') || d.area || '').trim();
+        const lineNo = g('craa5_line') !== undefined && g('craa5_line') !== null && g('craa5_line') !== '' ? g('craa5_line') : d.line;
+        if (type === 'alert') {
+            out.alerts.push({ key: key, kind: rawKind, lineKey: lineKey, area: area, start: start, end: end, status: status, minutes: Number(g('craa5_minutes')) || 0, reason: String(g('craa5_reason') || ''), d: d });
+            return;
+        }
+        if (type !== 'window') return;
+        const kind = hubCleanKind(rawKind);
+        const open = /\|last$/.test(key) || !!d.open;
+        const support = (Array.isArray(d.support) ? d.support : []).map(function(s) {
+            return { area: String((s && s.area) || ''), off: Number(s && s.off) || 0, start: cplMs(s && s.start), end: cplMs(s && s.end), ready: cplMs(s && s.ready), late: !!(s && s.late) };
+        }).filter(function(s) { return s.area; });
+        out.windows.push({
+            key: key, id: String(g('craa5_cleanplanid') || ''), lineKey: lineKey, ganttLine: area ? cplGanttLineKey(area, lineNo) : '',
+            area: area, areaId: hubGuid(g('craa5_mssareaguid') || d.areaId || ''), start: start, end: end, rawKind: rawKind, kind: kind,
+            minutes: Number(g('craa5_minutes')) || 0, status: status, reason: String(g('craa5_reason') || ''), open: open,
+            cleanStart: cplMs(d.cleanStart), cleanEnd: cplMs(d.cleanEnd), scopeKey: d.scope && d.scope.key ? String(d.scope.key).toLowerCase() : '',
+            scopeHash: d.scope && d.scope.hash ? String(d.scope.hash) : '', run72: d.run72 || null, support: support
+        });
+    });
+    Object.keys(scopeParts).forEach(function(sk) {
+        const sp = scopeParts[sk];
+        const cols = sp.cols || CPL_SCOPE_COLS;
+        const at = function(c) { return cols.indexOf(c); };
+        const pieces = {};
+        let count = 0;
+        Object.keys(sp.list).map(Number).sort(function(a, b) { return a - b; }).forEach(function(p) {
+            sp.list[p].forEach(function(row) {
+                if (!Array.isArray(row)) return;
+                const id = hubGuid(row[at('id')]);
+                if (!id) return;
+                count++;
+                pieces[id] = { id: id, name: String(row[at('name')] || ''), area: String(row[at('area')] || ''), mins: Number(row[at('mins')]) || 0,
+                    heads: Number(row[at('heads')]) || 1, offsetMins: Number(row[at('offsetMins')]) || 0, leftOutBy: String(row[at('leftOutBy')] || '') };
+            });
+        });
+        const partsRead = Object.keys(sp.list).length;
+        out.scopes[sk] = { hash: sp.hash, parts: sp.parts || partsRead, complete: !sp.parts || partsRead >= sp.parts, pieces: pieces, count: count };
+    });
+    out.windows.sort(function(a, b) { return (a.cleanStart || a.start) - (b.cleanStart || b.start); });
+    return out;
+}
+// A window is used only when its week is published in full (its k|Monday row says done).
+function cplWeekDone(plan, ms) { return !!plan && plan.weeks[hubWeekKey(hubPlantDay(ms))] === 'done'; }
+// When a window's clean runs, for a room: its own slot (support areas start early), else the clean slot, else the stop.
+// An open stop has no restart: its end is only where the plan ends.
+function cplSlot(w, supportOf) {
+    if (supportOf && !isNaN(supportOf.start)) return { start: supportOf.start, end: !isNaN(supportOf.end) ? supportOf.end : (!isNaN(supportOf.ready) ? supportOf.ready : w.end), early: true };
+    const s = !isNaN(w.cleanStart) ? w.cleanStart : w.start;
+    const e = !isNaN(w.cleanEnd) ? w.cleanEnd : w.end;
+    return { start: s, end: e, early: false };
+}
+// Does window w belong to this room? room = { name, areaId, lineKeys: { key: true } } (lineKeys hold hubLineKey spellings and
+// Ganttly's 'area|line' keys). -> { support } (the support entry when the room is one of the early-start areas), or null.
+function cplRoomMatch(w, room) {
+    const sup = (w.support || []).filter(function(s) { return hubSameName(s.area, room.name); })[0];
+    if (sup) return { support: sup };
+    if (room.areaId && w.areaId && room.areaId === w.areaId) return { support: null };
+    if (w.lineKey && room.lineKeys[w.lineKey]) return { support: null };
+    if (w.ganttLine && room.lineKeys[w.ganttLine]) return { support: null };
+    if (w.area && hubSameName(w.area, room.name)) return { support: null };
+    return null;
+}
+// The clean a room gets inside [fromMs, toMs): the first published window (with a real clean) whose slot ends after fromMs and
+// starts before toMs. -> { w, slot, support, kind, scope } or { unsafe: true } (a window of a week still being written), or null.
+function cplRoomClean(plan, room, fromMs, toMs) {
+    if (!plan) return null;
+    let unsafe = false;
+    for (let i = 0; i < plan.windows.length; i++) {
+        const w = plan.windows[i];
+        if (!w.kind || w.rawKind === 'none') continue;
+        const m = cplRoomMatch(w, room);
+        if (!m) continue;
+        const slot = cplSlot(w, m.support);
+        if (!(slot.end > fromMs && slot.start < toMs)) continue;
+        if (!cplWeekDone(plan, w.start)) { unsafe = true; continue; }
+        return { w: w, slot: slot, support: m.support, kind: w.kind, scope: w.scopeKey ? plan.scopes[w.scopeKey] || null : null };
+    }
+    return unsafe ? { unsafe: true } : null;
+}
+// Is a piece in the room's planned clean? -> true / false, or null when the plan does not list pieces (the yes/no columns decide).
+function cplPieceIn(rc, assetId) {
+    if (!rc || !rc.w || !rc.scope || !rc.scope.count) return null;
+    const p = rc.scope.pieces[hubGuid(assetId)];
+    return !!p && !p.leftOutBy;
+}
+// Why a piece is left out of the planned clean ('caseout', 'dry clean', 'freezer', ...), or ''.
+function cplLeftOut(rc, assetId) {
+    if (!rc || !rc.scope) return '';
+    const p = rc.scope.pieces[hubGuid(assetId)];
+    return p ? p.leftOutBy : '';
+}
+// When a piece checked off at doneMs is due again: the start of the room's next published clean that covers it (a window whose
+// scope lists the piece, or any window when the plan lists none). null = not in what was read (the MSS frequency decides).
+function cplNextDueMs(plan, room, assetId, doneMs) {
+    if (!plan) return null;
+    const id = hubGuid(assetId);
+    for (let i = 0; i < plan.windows.length; i++) {
+        const w = plan.windows[i];
+        if (!w.kind || w.rawKind === 'none') continue;
+        const m = cplRoomMatch(w, room);
+        if (!m) continue;
+        const slot = cplSlot(w, m.support);
+        if (!(slot.start > doneMs)) continue;
+        if (!cplWeekDone(plan, w.start)) continue;
+        const sc = w.scopeKey ? plan.scopes[w.scopeKey] : null;
+        if (sc && sc.count) { const p = sc.pieces[id]; if (!p || p.leftOutBy) continue; }
+        return slot.start;
+    }
+    return null;
+}
+// The alerts to show in [fromMs, toMs): open over-72 h, Highspeed + Custard overlap, no End of Week. Newest problem first.
+function cplAlertsIn(plan, fromMs, toMs) {
+    if (!plan) return [];
+    return plan.alerts.filter(function(a) {
+        if (a.status !== 'open' && a.status !== 'approved') return false;
+        return a.end > fromMs - 86400000 && a.start < toMs;
+    }).sort(function(a, b) { return b.start - a.start; });
+}
+// ============================================================================
 // TYPE OF CLEAN
 // ============================================================================
 // The equipment table's yes/no columns (craa5_dailyclean, craa5_weeklyclean, craa5_monthlyclean, craa5_quarterly, ...) say how
@@ -4446,7 +5165,7 @@ function cadenceDaysOf(flags, types) {
 // ============================================================================
 const OD_FREQS = [
     { code: 'D', label: 'Daily', days: 1, rank: 1, flags: ['craa5_dailyclean'] },
-    { code: 'MW', label: 'Midweek', days: 4, rank: 1, flags: ['craa5_midweek'] },
+    { code: 'MW', label: 'Midweek', days: 7, rank: 1, flags: ['craa5_midweek'] },   // 7 days, as the MSS calendar counts it
     { code: 'W', label: 'Weekly', days: 7, rank: 2, flags: ['craa5_weeklyclean'] },
     { code: 'BW', label: 'Bi-Weekly', days: 14, rank: 2, flags: ['craa5_biweekly', 'craa5_2week'] },
     { code: 'M', label: 'Monthly', days: 31, rank: 3, flags: ['craa5_monthlyclean', 'craa5_month'] },
@@ -4611,58 +5330,6 @@ async function fetchOverdue(dataApi, cands, todayNo, onProgress, isStale) {
     await Promise.all(workers);
     return { logs: logs, failed: failed, chunks: jobs.length };
 }
-let mssLogKindSupported = true;
-async function writeAutoLogToMss(dataApi, entry) {
-    if (!entry || !entry.equipmentGuid) return false;
-    const ymd = entry.dateYmd || getLocalYMD(new Date());
-    const dedupKey = 'itp_autolog_v1_' + ymd;
-    try {
-        const sent = JSON.parse(localStorage.getItem(dedupKey) || '{}');
-        if (sent[entry.equipmentGuid]) return true;
-        sent[entry.equipmentGuid] = Date.now();
-        localStorage.setItem(dedupKey, JSON.stringify(sent));
-    } catch (e) {}
-    const freq = String(entry.freqLabel || 'daily').trim().toLowerCase();
-    const autoSap = /^auto\s*-/i.test(freq) ? freq : ('auto- ' + freq);
-    const rank = odSapRank(autoSap) || 1;
-    const basePayload = {
-        craa5_sap: autoSap,
-        craa5_room: String(entry.room || entry.area || ''),
-        craa5_area: String(entry.area || entry.room || ''),
-        craa5_equipment: String(entry.equipment || 'Equipment'),
-        craa5_equipmentguid: normGuid(entry.equipmentGuid),
-        craa5_lastcleaned: ymd + 'T00:00:00Z',
-        craa5_lastcleanedby: String(entry.cleanedBy || 'Crew'),
-        craa5_hoursworked: Math.max(1, Math.round(Number(entry.hoursWorked) || 1))
-    };
-    const payloadWithKind = mssLogKindSupported ? Object.assign({}, basePayload, {
-        craa5_daily: true,
-        craa5_weekly: rank >= 2,
-        craa5_monthly: rank >= 3
-    }) : basePayload;
-    const xrm = safeGetXrm();
-    const tryCreate = async function(body) {
-        if (xrm && xrm.WebApi && typeof xrm.WebApi.createRecord === 'function') {
-            await xrm.WebApi.createRecord('craa5__log_', body);
-            return true;
-        }
-        if (dataApi && typeof dataApi.createRow === 'function') {
-            await dataApi.createRow('craa5__log_', body);
-            return true;
-        }
-        return false;
-    };
-    try {
-        return await tryCreate(payloadWithKind);
-    } catch (e) {
-        const msg = String(e && e.message || e);
-        if (mssLogKindSupported && /could not find a property|0x80060888|does not exist|invalid property|craa5_daily|craa5_weekly|craa5_monthly/i.test(msg)) {
-            mssLogKindSupported = false;
-            try { return await tryCreate(basePayload); } catch (e2) { return false; }
-        }
-        return false;
-    }
-}
 function yesNoValue(v) {
     if (v === true || v === false) return v;
     if (typeof v === 'string') {
@@ -4715,15 +5382,6 @@ async function fetchColumnLabels(entityName, keys) {
     return out;
 }
 
-const MOCK_ASSETS = [
-    { id: 'eq1', name: 'Freezer Deep Clean', area: 'CUSTARD', minutesRequired: 1440, heads: 1, priority: 1, isComplete: false },
-    { id: 'eq2', name: 'Norman Area', area: 'CUSTARD', minutesRequired: 720, heads: 1, priority: 2, isComplete: false },
-    { id: 'eq3', name: 'HindsBach Depositor', area: 'CUSTARD', minutesRequired: 600, heads: 1, priority: 2, isComplete: false },
-    { id: 'eq4', name: 'Custard Drains', area: 'CUSTARD', minutesRequired: 480, heads: 2, priority: 3, isComplete: true },
-    { id: 'eq5', name: 'Cartoner 1', area: 'PACKAGING', subcategory: '1 - pic', minutesRequired: 480, heads: 1, priority: 2, isComplete: false },
-    { id: 'eq6', name: 'Drains - Attachment', area: 'WATERJET', minutesRequired: 180, heads: 1, priority: 2, isComplete: false },
-];
-
 // ============================================================================
 // COMPANY THEME (same blue / yellow / red as the Sanitation Scheduler 2.0)
 // ============================================================================
@@ -4742,7 +5400,7 @@ const BRAND_FONT = '"Segoe UI", system-ui, -apple-system, sans-serif';
 // ============================================================================
 let _ACTIVE_LANG = (function() {
     try {
-        return typeof localStorage !== 'undefined' && localStorage.getItem('itp_lang_v1') === 'es' ? 'es' : 'en';
+        return hubGetLang();   // the one language key every hub app shares (hub_lang); Ganttly's old itp_lang_v1 is read once
     } catch (e) { return 'en'; }
 })();
 
@@ -5629,8 +6287,7 @@ export default function App(props) {
     // Language state: English ('en') vs Mexican Spanish ('es')
     const [lang, setLang] = useState(function() {
         try {
-            const saved = localStorage.getItem('itp_lang_v1');
-            return saved === 'es' ? 'es' : 'en';
+            return hubGetLang();
         } catch (e) {
             return 'en';
         }
@@ -5643,7 +6300,7 @@ export default function App(props) {
         const target = nextMode === 'es' || nextMode === 'en' ? nextMode : (lang === 'es' ? 'en' : 'es');
         _ACTIVE_LANG = target;
         setLang(target);
-        try { localStorage.setItem('itp_lang_v1', target); } catch (e) {}
+        hubSetLang(target);
     };
 
     useEffect(function() {
@@ -5669,10 +6326,7 @@ export default function App(props) {
     // Theme state: Light Mode vs Dark Mode (saved in localStorage)
     const [isDark, setIsDark] = useState(function() {
         try {
-            const saved = localStorage.getItem('itp_theme_v1');
-            if (saved === 'dark') return true;
-            if (saved === 'light') return false;
-            return false;
+            return hubGetTheme() === 'dark';   // the shared theme key (hub_theme); itp_theme_v1 is read once
         } catch (e) {
             return false;
         }
@@ -5681,7 +6335,7 @@ export default function App(props) {
     const toggleTheme = function(mode) {
         const nextDark = mode ? mode === 'dark' : !isDark;
         setIsDark(nextDark);
-        try { localStorage.setItem('itp_theme_v1', nextDark ? 'dark' : 'light'); } catch (e) {}
+        hubSetTheme(nextDark ? 'dark' : 'light');
         try {
             if (nextDark) document.documentElement.classList.add('dark');
             else document.documentElement.classList.remove('dark');
@@ -6489,7 +7143,7 @@ export default function App(props) {
         const end = (rec.doneAt || (rec.startMs + rec.durationMins * 60000)) || Date.now();
         if (rec.status !== 'done') return end + 86400000;
         const a = assets.find(function(x) { return String(x.id) === String(rec.parentId); });
-        const due = nextCleanDueMs(a, end, prodLinesWide, lineIndex, roomProdLines);
+        const due = nextCleanDueMs(a, end, prodLinesWide, lineIndex, roomProdLines, planDueOf);
         return (isFinite(due) ? due : end + 86400000) + 2 * 86400000;
     };
     // Queue what changed here since it was last saved (or read). A record gone from taskStatus was undone (saved as 'undone') or
@@ -6545,6 +7199,16 @@ export default function App(props) {
             opt[C.area] = String(item.area || '').slice(0, 100);
             opt[C.startedat] = isoOrNull(rec.startedAt);
             opt[C.doneat] = isoOrNull(rec.doneAt);
+            // The shift date, kind and people, so readers never have to work them out (contract 6.4).
+            const aObj = assets.find(function(a) { return normGuid(a.id) === g; });
+            const f = doneLogFacts(item.area || (aObj && aObj.area) || '', aObj, rec.doneAt || rec.startedAt || rec.startMs);
+            const day = hubShiftDate(f.slotStart);
+            if (C.shiftdate) opt[C.shiftdate] = day;
+            if (C.cleankind) opt[C.cleankind] = f.kind;
+            if (C.completionkey && hubIsGuid(g)) opt[C.completionkey] = hubCompletionKey(g, day, f.kind);
+            const emp = [];
+            (rec.laneKeys || []).forEach(function(k) { (laneRoster || []).forEach(function(lr) { if (lr && lr.key === k && !lr.isPlaceholder && hubIsGuid(lr.empId)) emp.push(lr.empId); }); });
+            if (C.employeeguids && emp.length) opt[C.employeeguids] = hubGuidList(emp);
         }
         opt[C.keepuntil] = isoOrNull(item.keep || Date.now() + 86400000);   // an Undo row only matters until the other computers have read it
         const optCols = Object.keys(opt);
@@ -6891,7 +7555,7 @@ export default function App(props) {
                     setRotationSource('Dataverse');
                 }
 
-                let parsed = MOCK_ASSETS;
+                let parsed = [];   // never sample data: no equipment rows = an empty plan that says so (data contract 8.6)
                 if (dvAssets && dvAssets.length > 0) {
                     const ynCols = detectYesNoColumns(dvAssets);
                     setCleanTypeCols(ynCols);
@@ -6909,6 +7573,7 @@ export default function App(props) {
                             name: a.craa5_equipmentidentifier || 'Unnamed Equipment',
                             area: a.craa5_areaname || 'General Area',
                             room: a.craa5_roomname || '',
+                            workArea: String(a.craa5_workareacode || '').trim(),   // the SAP work area code the MSS log keeps (craa5_sapw)
                             subcategory: String(a['craa5_subcategory@OData.Community.Display.V1.FormattedValue'] || a.craa5_subcategory || a.craa5_Subcategory || '').trim(),
                             minutesRequired: parseFloat(a.craa5_hoursrequired) || 0,
                             allergenMins: parseFloat(a.craa5_MINALRG || a.craa5_minalrg) || 0,
@@ -6924,7 +7589,7 @@ export default function App(props) {
                     }).filter(function(a) { return a.minutesRequired > 0; });
                 }
 
-                setDataDiag({ source: dvAssets && dvAssets.length > 0 ? 'Dataverse' : 'Sample data', assetCount: parsed.length, employeeTable: dvEmps.table, shiftRows: dvShifts.rows.length });
+                setDataDiag({ source: dvAssets && dvAssets.length > 0 ? 'Dataverse' : 'Nothing here yet', assetCount: parsed.length, employeeTable: dvEmps.table, shiftRows: dvShifts.rows.length });
                 parsed = applyEdits(parsed.concat(customTasks));
                 setAssets(parsed);
                 const areaPriMap = {};
@@ -6936,44 +7601,11 @@ export default function App(props) {
                 const initialPri = {};
                 parsed.forEach(function(a) { if (!initialPri[a.area]) initialPri[a.area] = areaPriMap[a.area] || 2; });
                 setRoomPriority(function(prev) { return Object.assign({}, initialPri, prev); });
-                // Sync per-area allergen clean flags from Shift Start (ss_area_cleantypes_v1) and Production Scheduler (prodsched_clean_windows_v1)
-                try {
-                    if (typeof window !== 'undefined' && window.localStorage) {
-                        const ssCleanRaw = window.localStorage.getItem('ss_area_cleantypes_v1');
-                        const ssCleanMap = ssCleanRaw ? JSON.parse(ssCleanRaw) : null;
-                        const psCleanRaw = window.localStorage.getItem('prodsched_clean_windows_v1');
-                        const psCleanList = psCleanRaw ? JSON.parse(psCleanRaw) : null;
-                        if ((ssCleanMap && typeof ssCleanMap === 'object') || Array.isArray(psCleanList)) {
-                            setRoomAllergen(function(prev) {
-                                const next = Object.assign({}, prev);
-                                let changed = false;
-                                if (ssCleanMap && typeof ssCleanMap === 'object') {
-                                    Object.keys(ssCleanMap).forEach(function(areaName) {
-                                        if (/allergen/i.test(String(ssCleanMap[areaName] || '')) && !next[areaName]) {
-                                            next[areaName] = true;
-                                            changed = true;
-                                        }
-                                    });
-                                }
-                                if (Array.isArray(psCleanList)) {
-                                    psCleanList.forEach(function(cw) {
-                                        const aName = cw && cw.area ? String(cw.area) : '';
-                                        if (aName && /allergen/i.test(String(cw.cleanType || '')) && !next[aName]) {
-                                            next[aName] = true;
-                                            changed = true;
-                                        }
-                                    });
-                                }
-                                return changed ? next : prev;
-                            });
-                        }
-                    }
-                } catch (err) {}
+                // Allergen cleans come from the clean plan (roomAllergenOn), no longer from browser keys that never cleared.
 
             } catch (e) {
-                setDataDiag({ source: 'Sample data (load error: ' + (e && e.message ? e.message : e) + ')', assetCount: MOCK_ASSETS.length, employeeTable: '', shiftRows: 0 });
-                setAssets(applyEdits(MOCK_ASSETS.map(function(a) { return Object.assign({}, a, { pbMins: 0, allergenMins: 45 }); }).concat(customTasks)));
-                setRoomPriority(function(prev) { return Object.assign({}, { 'CUSTARD': 2, 'WATERJET': 2, 'PACKAGING': 2 }, prev); });
+                setDataDiag({ source: 'Could not load (' + (e && e.message ? e.message : e) + ')', assetCount: 0, employeeTable: '', shiftRows: 0 });
+                setAssets(applyEdits(customTasks));
             } finally {
                 setIsLoading(false);
             }
@@ -7108,6 +7740,151 @@ export default function App(props) {
     // so the chart never shows them free while they are still on it.
     const overrunTo = IS_CURRENT && nowMin > 0 ? Math.min(Math.ceil(nowMin / 15) * 15, planHorizonMins) : 0;
 
+    const lineIndex = useMemo(function() { return buildLineIndex(lineRows); }, [lineRows]);
+    const prodLinesWide = useMemo(function() { return buildProdLines(prodRows); }, [prodRows]);
+
+    // ---- Clean plan (see CLEAN PLAN): the Production Scheduler's windows, scope and alerts, read every 5 minutes ----
+    const [cleanPlanRead, setCleanPlanRead] = useState({ status: 'idle', rows: [], readAt: 0, err: '' });
+    const cplReqRef = useRef(0);
+    const loadCleanPlan = function() {
+        const req = ++cplReqRef.current;   // a slower answer for an earlier plan window is dropped
+        const from = globalStartMs - CPL_BACK_MS, to = globalStartMs + planHorizonMins * 60000 + CPL_AHEAD_MS;
+        return fetchCleanPlan(props.dataApi, from, to).then(function(res) {
+            if (req !== cplReqRef.current) return;
+            setCleanPlanRead(function(prev) {
+                // A failed read keeps the last good rows (shown as not fresh), never an empty plan.
+                if (res.status !== 'ready' && prev.rows.length) return Object.assign({}, prev, { status: res.status, err: res.err });
+                return { status: res.status, rows: res.rows, readAt: Date.now(), err: res.err };
+            });
+        });
+    };
+    const loadCleanPlanRef = useRef(loadCleanPlan);
+    loadCleanPlanRef.current = loadCleanPlan;
+    useEffect(function() {
+        if (isLoading) return undefined;
+        loadCleanPlanRef.current();
+        const t = setInterval(function() { loadCleanPlanRef.current(); }, CPL_READ_MS);
+        return function() { clearInterval(t); };
+    }, [props.dataApi, isLoading, globalStartMs, planHorizonMins]);
+    const cleanPlan = useMemo(function() { return cleanPlanRead.rows.length ? parseCleanPlan(cleanPlanRead.rows) : null; }, [cleanPlanRead.rows]);
+    // A room as the clean plan knows it: its name, its MSS area id (exact name only) and every spelling of its lines.
+    const cplRoomOf = useMemo(function() {
+        const cache = {};
+        const addKey = function(keys, k) {
+            const c = hubCanon(k);
+            if (!c) return;
+            keys[c] = true;
+            // The Scheduler's line families: Waterjet is "wj", High Speed is "highspeed" (hs).
+            const fam = [['waterjet', 'wj'], ['highspeed', 'hs']];
+            fam.forEach(function(f) {
+                if (c.indexOf(f[0]) === 0) keys[f[1] + c.slice(f[0].length)] = true;
+                if (c.indexOf(f[1]) === 0 && c.indexOf(f[0]) !== 0) keys[f[0] + c.slice(f[1].length)] = true;
+            });
+        };
+        return function(area) {
+            const k = String(area === undefined || area === null ? '' : area);
+            if (cache[k]) return cache[k];
+            const ln = lineForArea(lineIndex, k);
+            const exact = ln && hubSameName(ln.name, k) ? ln : null;
+            const keys = {};
+            addKey(keys, k);
+            if (ln) addKey(keys, ln.name);
+            const assoc = ln && Array.isArray(ln.assocLines) ? ln.assocLines : [];
+            const m = linesForRoom([k, ln ? ln.name : ''].concat(assoc), prodLinesWide, roomProdLines[k]);
+            (m.lines || []).forEach(function(L) { keys[L.key] = true; addKey(keys, hubLineKey(L.area, L.line)); });
+            cache[k] = { name: k, areaId: exact && hubIsGuid(exact.id) ? hubGuid(exact.id) : '', lineKeys: keys };
+            return cache[k];
+        };
+    }, [lineIndex, prodLinesWide, roomProdLines]);
+    // The clean a room gets in this plan window (null = nothing published for it, { unsafe } = its week is still being written).
+    const roomPlan = useMemo(function() {
+        const cache = {};
+        const from = globalStartMs, to = globalStartMs + planHorizonMins * 60000;
+        return function(area) {
+            const k = String(area === undefined || area === null ? '' : area);
+            if (!(k in cache)) cache[k] = cleanPlan ? cplRoomClean(cleanPlan, cplRoomOf(k), from, to) : null;
+            return cache[k];
+        };
+    }, [cleanPlan, cplRoomOf, globalStartMs, planHorizonMins]);
+    // When a checked-off piece is due again by the plan (null = the plan does not say; the MSS frequency decides).
+    const planDueOf = function(asset, doneMs) {
+        if (!cleanPlan || !asset) return null;
+        return cplNextDueMs(cleanPlan, cplRoomOf(String(asset.area || asset.room || '')), asset.id, doneMs);
+    };
+    // Allergen clean mode: the room's own tick on Setup, or an allergen clean in the published plan.
+    const roomAllergenOn = function(area) {
+        if (roomAllergen[area]) return true;
+        const rc = roomPlan(area);
+        return !!(rc && rc.w && rc.kind === 'allergen');
+    };
+    // What to say about the clean plan read: null when it is fine.
+    const cleanPlanNote = function() {
+        const st = cleanPlanRead.status;
+        const fallback = tr('Rooms use their own pick on Setup, else a daily clean.', 'Las areas usan su eleccion en Configuracion, si no una limpieza diaria.');
+        if (st === 'missing') return { title: tr('Clean plan table not found', 'No se encontro la tabla del plan de limpieza'), sub: fallback };
+        if (st === 'denied') return { title: tr('No access to the clean plan', 'Sin acceso al plan de limpieza'), sub: tr('Ask for Read on Clean Plan (craa5_cleanplan). ', 'Pida permiso de lectura en Clean Plan (craa5_cleanplan). ') + fallback };
+        if (st === 'error') return { title: tr('Clean plan could not be read', 'No se pudo leer el plan de limpieza'), sub: (cleanPlanRead.rows.length ? tr('Using the read at ', 'Usando la lectura de las ') + new Date(cleanPlanRead.readAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) + '. ' : '') + fallback };
+        if (st !== 'ready' || !cleanPlan) return null;
+        const mon = hubWeekKey(hubPlantDay(globalStartMs));
+        if (cleanPlan.weeks[mon] !== 'done') return { title: cleanPlan.weeks[mon] === 'writing' ? tr('Clean plan is being published', 'El plan de limpieza se esta publicando') : tr('This week is not in the clean plan yet', 'Esta semana aun no esta en el plan de limpieza'), sub: tr('Publish it in the Production Scheduler. ', 'Publiquelo en el Production Scheduler. ') + fallback };
+        return null;
+    };
+    // An alert row in plain words (clean plan guide, section 4).
+    const cplAlertText = function(al) {
+        const d = al.d || {};
+        const when = isNaN(al.start) ? '' : new Date(al.start).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+        if (al.kind === 'over72') return { title: tr('Over 72 h without a Midweek clean', 'Mas de 72 h sin limpieza de media semana') + (al.lineKey ? ' | ' + al.lineKey.toUpperCase() : ''),
+            sub: (d.hours ? Math.round(d.hours) + ' h' : '') + (when ? ' | ' + when : '') + (al.status === 'approved' ? ' | ' + tr('approved by ', 'aprobado por ') + (d.by || '?') + (d.why ? ': ' + d.why : '') : '') };
+        if (al.kind === 'apart') return { title: tr('Highspeed and Custard both scheduled', 'Highspeed y Custard programadas a la vez'), sub: (al.minutes ? Math.round(al.minutes) + ' min' : '') + (when ? ' | ' + when : '') };
+        if (al.kind === 'noeow') return { title: tr('No End of Week clean this week', 'Sin limpieza de fin de semana esta semana') + (al.lineKey ? ' | ' + al.lineKey.toUpperCase() : ''), sub: al.reason || '' };
+        return { title: al.kind, sub: al.reason || '' };
+    };
+    // ---- MSS log (MSS LOG WRITE): one row per piece, shift date and clean kind; a failed save waits in a queue, never lost ----
+    // The facts a Done at atMs needs: the shift it falls in (shift date = plant day of its clock-in, crew), the kind of clean
+    // (the room's own pick, else the clean plan, else the piece's yes/no columns), and the plan keys.
+    const doneLogFacts = function(areaStr, assetObj, atMs) {
+        const t = Number(atMs) || Date.now();
+        let clockIn = NaN, crew = '';
+        shiftWindows.forEach(function(w) {
+            const s0 = globalStartMs + w.shiftStart * 60000, e0 = globalStartMs + w.shiftEnd * 60000;
+            if (t >= s0 - TASK_PRE_SHIFT_MIN * 60000 && t < e0 && (isNaN(clockIn) || s0 > clockIn)) { clockIn = s0; crew = w.crew; }
+        });
+        const own = roomCleanType[String(areaStr)];
+        const rc = own ? null : roomPlan(areaStr);
+        let kind = own === 'all' ? 'eow' : (own ? mlwKind(String(own).replace(/^craa5_/, '')) : '');
+        if (!kind && rc && rc.w) kind = rc.kind;
+        if (!kind) {
+            const flags = assetObj && Array.isArray(assetObj.flags) ? assetObj.flags : [];
+            const has = function(re) { return flags.some(function(c) { return re.test(c); }); };
+            kind = has(/dailyclean/i) || !flags.length ? 'daily' : has(/midweek/i) ? 'midweek' : has(/week/i) ? 'eow' : has(/month/i) ? 'monthly'
+                : has(/quarter/i) ? 'quarterly' : has(/6month|semiannual/i) ? 'semiannual' : has(/annual/i) ? 'annual' : 'daily';
+        }
+        return { slotStart: isNaN(clockIn) ? t : clockIn, crew: crew, kind: kind, planKey: rc && rc.w ? rc.w.key : '', lineKey: rc && rc.w ? rc.w.lineKey : '' };
+    };
+    const mlwApiNow = function() { return mlwApi(safeGetXrm(), props.dataApi); };
+    // What the last saves to the MSS log said: pieces waiting in the queue, and pieces that could not be saved (and why).
+    const [mssLogNote, setMssLogNote] = useState(function() { return { queued: mlwQueueCount(), invalid: [], at: 0 }; });
+    const noteMssLog = function(res, eqName, areaStr) {
+        setMssLogNote(function(prev) {
+            const invalid = prev.invalid.filter(function(x) { return x.key !== res.key; });
+            if (res.status === 'invalid') invalid.push({ key: res.key || eqName + '|' + areaStr, name: eqName, area: areaStr, codes: res.problems || [] });
+            return { queued: mlwQueueCount(), invalid: invalid.slice(-20), at: Date.now() };
+        });
+    };
+    const retryMssLog = function() {
+        const api = mlwApiNow();
+        if (!api) return;
+        mlwRetryQueue(api).then(function() { setMssLogNote(function(prev) { return Object.assign({}, prev, { queued: mlwQueueCount(), at: Date.now() }); }); });
+    };
+    // Saves that failed on an earlier visit are tried again once the page has loaded.
+    useEffect(function() {
+        if (isLoading || !IS_CURRENT) return;
+        if (mlwQueueCount()) retryMssLog();
+        // The old "sent" marks (itp_autolog_v1_<day>) said a log was saved before it was; they are no longer read.
+        try { Object.keys(window.localStorage).forEach(function(k) { if (k.indexOf('itp_autolog_v1_') === 0) window.localStorage.removeItem(k); }); } catch (e) { /* storage off */ }
+    }, [isLoading]);
+    const planAlerts = useMemo(function() { return cplAlertsIn(cleanPlan, globalStartMs, globalStartMs + planHorizonMins * 60000); }, [cleanPlan, globalStartMs, planHorizonMins]);
+
     // ---- Type of clean (see TYPE OF CLEAN) ----
     const cleanTypeLabel = function(k) { return cleanTypeLabels[k] || CLEAN_TYPE_LABELS[k] || humanizeColumn(k); };
     const planCleanTypes = cleanTypes.filter(function(k) { return cleanTypeCols.indexOf(k) > -1; });
@@ -7144,8 +7921,18 @@ export default function App(props) {
         const own = roomCleanType[String(area)];
         if (own === 'weekly' || own === 'eow' || own === 'all' || own === 'overdueweekly') return false;
         if (own === 'daily') return true;
+        // No pick of its own: the Production Scheduler's clean plan says which clean the room gets.
+        const rc = own ? null : roomPlan(area);
+        if (rc && rc.w) return rc.kind === 'daily' || rc.kind === 'changeover';
         if (Array.isArray(planCleanTypes) && planCleanTypes.some(function(k) { return k !== 'craa5_dailyclean'; })) return false;
         return IS_CURRENT || planHours <= 36;
+    };
+    // Is a piece in its room's planned clean? true / false when the plan lists the pieces, null when it does not (or the room has
+    // its own pick on Setup, which wins).
+    const planPieceIn = function(a, area) {
+        const rm = String(area !== undefined && area !== null ? area : a.area);
+        if (roomCleanType[rm]) return null;
+        return cplPieceIn(roomPlan(rm), a.id);
     };
     const isWeeklyEq = function(a) { return Array.isArray(a && a.flags) && a.flags.some(function(c) { return OD_WEEKLY_COLS.indexOf(c) > -1; }); };
     const isNonDailyEq = function(a) {
@@ -7156,6 +7943,8 @@ export default function App(props) {
     const isAllowedOnDailyClean = function(a, area) {
         if (!a || a.removed) return false;
         const rm = area !== undefined && area !== null ? area : a.area;
+        const pin = planPieceIn(a, rm);
+        if (pin !== null) return pin;
         if (isDailyTimeframeClean(rm)) {
             if (isNonDailyEq(a) || (isWeeklyEq(a) && a.flags.indexOf('craa5_dailyclean') === -1)) {
                 return false;
@@ -7170,14 +7959,22 @@ export default function App(props) {
         if (own === 'eow' || own === 'weekly') return ['craa5_weeklyclean'];
         if (own === 'all' || (odUsable && (own === 'overdue' || own === 'overdueweekly'))) return [];
         if (own && cleanTypeCols.indexOf(own) > -1) return [own];
+        if (!own) {
+            const rc = roomPlan(area);
+            // The plan's clean: its yes/no column when the table has it, else every piece (End of Week and allergen are everything).
+            if (rc && rc.w) return (CPL_KIND_COLS[rc.kind] || []).filter(function(c) { return cleanTypeCols.indexOf(c) > -1; });
+        }
         if (isDailyTimeframeClean(area) && (!planCleanTypes || !planCleanTypes.length)) return ['craa5_dailyclean'];
         return roomMode(area) === 'type' ? planCleanTypes : [];
     };
     const inCleanType = function(a) {
         if (!a) return false;
-        if (!Array.isArray(a.flags) || a.flags.length === 0) return true;   // custom tasks and sample data have no yes/no columns
+        if (!Array.isArray(a.flags) || a.flags.length === 0) return true;   // custom tasks have no yes/no columns
         if (!isAllowedOnDailyClean(a, a.area)) return false;
         if (isEquipReset(a && a.id, a && a.area, a && a.subcategory)) return true;
+        const pin = planPieceIn(a);
+        if (pin !== null) return pin;
+        if (!roomCleanType[String(a.area)]) { const rc = roomPlan(a.area); if (rc && rc.w) { const t = roomCleanTypes(a.area); return !t.length || t.some(function(k) { return a.flags.indexOf(k) > -1; }); } }
         const mode = roomMode(a.area);
         if (mode !== 'type') {
             const st = odStatus[a.id];
@@ -7222,7 +8019,6 @@ export default function App(props) {
     loadTaskRowsRef.current = loadTaskRows;
     useEffect(function() { loadTaskRowsRef.current(); }, [props.dataApi, globalStartMs, planHorizonMins, taskSinceMs]);
 
-    const lineIndex = useMemo(function() { return buildLineIndex(lineRows); }, [lineRows]);
     // Each room's place on the line order (LINE_PRIORITY_NONE = not a listed line), worked out once per room.
     const lineRankOf = useMemo(function() {
         const cache = {};
@@ -7424,7 +8220,6 @@ export default function App(props) {
         const lim = globalStartMs + planHorizonMins * 60000 + PROD_AFTER_MS;
         return buildProdLines(prodRows.filter(function(r) { return !(prodMs(r.craa5_datestarttime) >= lim); }));
     }, [prodRows, globalStartMs, planHorizonMins]);
-    const prodLinesWide = useMemo(function() { return buildProdLines(prodRows); }, [prodRows]);
     // Ganttly down lines turned into per-room handoffs, closings after a restart and the bands the Gantt draws (see TIME BLOCKS).
     const downLinePlan = useMemo(function() { return IS_CURRENT ? expandDownLines(downLineList, globalStartMs, planHorizonMins) : { handoff: {}, blocks: {}, bands: [] }; }, [downLineList, globalStartMs, planHorizonMins]);
     // The rooms (equipment areas), as one string so a change of equipment minutes doesn't redo the handoffs.
@@ -7595,7 +8390,7 @@ export default function App(props) {
             if (r.labels.indexOf(label) === -1) r.labels.push(label);
             r.support = r.labels.every(function(lb) { return !!supportRooms[lb]; });
             r.priority = Math.min(r.priority, roomPriority[label] || 2);
-            const mins = roomAllergen[label] && a.allergenMins > 0 ? a.allergenMins : (Number(a.minutesRequired) || 0);
+            const mins = roomAllergenOn(label) && a.allergenMins > 0 ? a.allergenMins : (Number(a.minutesRequired) || 0);
             r.work += mins;
             if ((a.kind || taskKind(a)) === 'pic') r.picWork += mins;
         });
@@ -7641,7 +8436,7 @@ export default function App(props) {
             }
         });
         return { boards: boards, views: views, rooms: roomList };
-    }, [autoCrews, shiftWindows, assets, supportRooms, hiddenRooms, roomPriority, roomAllergen, cleanTypes, roomCleanType, cleanTypeCols, planMode, odStatus, lineIndex, expMap, crewRosters, leadRosters, empById, absentEmployees, absentByShift, extraPeople, crewHeadcountOverrides, globalStartMs]);
+    }, [autoCrews, shiftWindows, assets, supportRooms, hiddenRooms, roomPriority, roomAllergen, roomPlan, cleanTypes, roomCleanType, cleanTypeCols, planMode, odStatus, lineIndex, expMap, crewRosters, leadRosters, empById, absentEmployees, absentByShift, extraPeople, crewHeadcountOverrides, globalStartMs]);
     // Shift Start boards that line up with each shift in the plan (same crew, started within 90 min of the shift). A supervisor
     // with no board row gets the board built from their saved task assignments instead.
     const windowBoards = useMemo(function() {
@@ -9054,7 +9849,7 @@ export default function App(props) {
     }, [areaCompletions, boardRows, taskRows, shiftStartCheckedAt]);
 
     const engineOn = !LAZY_ENGINE || printing || ENGINE_TABS.indexOf(activeTab) > -1;
-    const engineDepsNow = [assets, supportRooms, cleanTypes, roomCleanType, cleanTypeCols, planMode, odStatus, roomLimits, handoffMs, roomPriority, roomCleanTogether, roomAllergen, overrides, taskStatus, targetDowntimes, planBlocks, allInterrupts, includeTransit, includeInspection, pbMode, hiddenRooms, roomSource, shiftStartLines, plannerCheck, shiftCheckpoints, areaLine, customOnlyAreas, windowPlans, laneByEmpCrew, shiftWindows, laneRoster, maxCrewSize, planHorizonMins, handoverMins, tailFillMins, reforecastFrom, ganttStartDate, ganttStartHour, shiftRotation, focusK, overrunTo, removedGanttTasks, skippedTasks, shiftStartCompletions, cleanResets];
+    const engineDepsNow = [assets, supportRooms, cleanTypes, roomCleanType, cleanTypeCols, planMode, odStatus, roomLimits, handoffMs, roomPriority, roomCleanTogether, roomAllergen, overrides, taskStatus, targetDowntimes, planBlocks, allInterrupts, includeTransit, includeInspection, pbMode, hiddenRooms, roomSource, shiftStartLines, plannerCheck, shiftCheckpoints, areaLine, customOnlyAreas, windowPlans, laneByEmpCrew, shiftWindows, laneRoster, maxCrewSize, planHorizonMins, handoverMins, tailFillMins, reforecastFrom, ganttStartDate, ganttStartHour, shiftRotation, focusK, overrunTo, removedGanttTasks, skippedTasks, shiftStartCompletions, cleanResets, roomPlan];
     const engineDepsRef = useRef(null);
     if (engineOn || engineDepsRef.current === null) engineDepsRef.current = engineDepsNow;
     // PBED: false while the plan on hand was made with other inputs than the ones on screen now (an input changed on a tab that does not
@@ -9200,7 +9995,7 @@ export default function App(props) {
             if (rPri < vRoom.priority) vRoom.priority = rPri;
 
             const ssDone = isDoneInShiftStart(rawT, area);
-            const t = new Equipment(rawT, roomAllergen[area] || false, pbMode);
+            const t = new Equipment(rawT, roomAllergenOn(area), pbMode);
             t.isComplete = ssDone;
             if (ssDone) {
                 t.status = 'done';
@@ -9249,7 +10044,7 @@ export default function App(props) {
                 parent.keepIds = {};
                 (cyc.history.length ? cyc.history[cyc.history.length - 1] : []).concat(cyc.tail).forEach(function(b) { parent.keepIds[b.id] = true; });
                 if (cyc.lastDoneMs > 0) {
-                    parent.dueMs = nextCleanDueMs(rawT, cyc.lastDoneMs, prodLinesWide, lineIndex, roomProdLines);
+                    parent.dueMs = nextCleanDueMs(rawT, cyc.lastDoneMs, prodLinesWide, lineIndex, roomProdLines, planDueOf);
                 }
             }
             const inTail = {};
@@ -10870,6 +11665,14 @@ export default function App(props) {
                 const assetObj = assets.find(function(a) { return normGuid(a.id) === guid || String(a.id) === guid; });
                 const areaStr = String(task.originalArea || task.area || (assetObj && assetObj.area) || '');
                 const eqName = String((assetObj && assetObj.name) || task.baseName || task.name || 'Equipment');
+                // A Done taken back comes off the MSS log too (same shift date and kind as its save; the row is deactivated).
+                const recDone = taskStatus[task.id] && taskStatus[task.id].status === 'done' ? taskStatus[task.id]
+                    : Object.keys(taskStatus).map(function(k) { return taskStatus[k]; }).filter(function(r) { return r && r.status === 'done' && String(r.parentId) === pid; })[0];
+                if (recDone && hubIsGuid(guid)) {
+                    const f = doneLogFacts(areaStr, assetObj, recDone.doneAt || recDone.updatedAt);
+                    const api = mlwApiNow();
+                    if (api) mlwUndo(api, guid, hubShiftDate(f.slotStart), f.kind).then(function() { setMssLogNote(function(prev) { return Object.assign({}, prev, { queued: mlwQueueCount(), at: Date.now() }); }); });
+                }
                 gbRecordWork(props.dataApi, {
                     id: guid,
                     equipmentGuid: guid,
@@ -11059,23 +11862,13 @@ export default function App(props) {
                         if (lr && lr.name && item.laneKeys.indexOf(lr.key) > -1 && workerNames.indexOf(lr.name) === -1) workerNames.push(lr.name);
                     });
                 }
-                const cleanedBy = workerNames.length ? workerNames.join(' / ') : (effectiveSupervisorInfo && effectiveSupervisorInfo.name ? effectiveSupervisorInfo.name : 'Crew');
-                // Infer clean frequency for 'auto- xxx'
-                const rTypes = roomCleanTypes(areaStr);
-                const flags = (rTypes && rTypes.length) ? rTypes : (assetObj && Array.isArray(assetObj.flags) ? assetObj.flags : []);
-                let freqLabel = 'daily';
-                if (flags.some(function(c) { return /annual/i.test(c); })) freqLabel = 'annual';
-                else if (flags.some(function(c) { return /6month|semiannual/i.test(c); })) freqLabel = '6month';
-                else if (flags.some(function(c) { return /4month/i.test(c); })) freqLabel = '4month';
-                else if (flags.some(function(c) { return /quarter/i.test(c); })) freqLabel = 'quarterly';
-                else if (flags.some(function(c) { return /2month|bimonth/i.test(c); })) freqLabel = '2month';
-                else if (flags.some(function(c) { return /month/i.test(c); })) freqLabel = 'monthly';
-                else if (flags.some(function(c) { return /biweekly|2week/i.test(c); })) freqLabel = 'biweekly';
-                else if (flags.some(function(c) { return /week/i.test(c) && !/mid/i.test(c); })) freqLabel = 'weekly';
-                else if (flags.some(function(c) { return /midweek/i.test(c); })) freqLabel = 'midweek';
-                const hoursWorked = Math.max(0.08, Math.round(((item.durationMins * item.heads) / 60) * 100) / 100);
-                // Immediately update in-memory odMap so overdue clears without waiting for a reload
-                const rk = odSapRank('auto- ' + freqLabel) || 1;
+                // Who cleaned it: the people on its lanes, never "Crew" or the supervisor's name in their place.
+                const cleanedBy = workerNames.length ? workerNames.join(' / ') : '';
+                const facts = doneLogFacts(areaStr, assetObj, item.doneAt);
+                const kindNow = facts.kind;
+                // Clear overdue in this browser at once (the log read confirms it later); the letters follow the kind's flags.
+                const fl = mlwFlags(kindNow);
+                const rk = fl.craa5_monthly ? 3 : fl.craa5_weekly ? 2 : 1;
                 setOdMap(function(prevOd) {
                     const cur = (prevOd && prevOd[guid]) ? prevOd[guid].slice() : [0, 0, 0];
                     for (let k = 1; k <= 3; k++) if (rk >= k && todayDayNo > cur[k - 1]) cur[k - 1] = todayDayNo;
@@ -11083,21 +11876,34 @@ export default function App(props) {
                     try { localStorage.setItem(OD_CACHE_KEY, JSON.stringify({ v: 1, readDay: todayYmd, builtAt: Date.now(), logs: updated })); } catch (e) {}
                     return updated;
                 });
-                writeAutoLogToMss(props.dataApi, {
+                const empGuids = [];
+                (item.assignedLanes || []).forEach(function(l) { const lr = laneRoster[l]; if (lr && !lr.isPlaceholder && hubIsGuid(lr.empId)) empGuids.push(lr.empId); });
+                if (!empGuids.length && item.laneKeys && item.laneKeys.length) (laneRoster || []).forEach(function(lr) { if (lr && !lr.isPlaceholder && item.laneKeys.indexOf(lr.key) > -1 && hubIsGuid(lr.empId)) empGuids.push(lr.empId); });
+                mlwWrite(mlwApiNow(), {
                     equipmentGuid: guid,
                     equipment: eqName,
                     room: roomStr,
                     area: areaStr,
-                    freqLabel: freqLabel,
-                    cleanedBy: cleanedBy,
-                    hoursWorked: hoursWorked,
-                    dateYmd: todayYmd
-                });
+                    workArea: (assetObj && assetObj.workArea) || '',
+                    kind: kindNow,
+                    slotStart: facts.slotStart,
+                    crew: facts.crew,
+                    cleanedBy: workerNames,
+                    employeeGuids: empGuids,
+                    markedBy: (detectedMsUser && detectedMsUser.userName) || (effectiveSupervisorInfo && effectiveSupervisorInfo.name) || '',
+                    durationMins: item.durationMins,
+                    heads: item.heads,
+                    doneAt: item.doneAt || Date.now(),
+                    planKey: facts.planKey,
+                    lineKey: facts.lineKey,
+                    pathogen: false,
+                    source: 'Ganttly'
+                }).then(function(res) { noteMssLog(res, eqName, areaStr); }, function() { setMssLogNote(function(prev) { return Object.assign({}, prev, { queued: mlwQueueCount(), at: Date.now() }); }); });
                 // The live Shift Start board (craa5_shiftboard) gets the equipment, who did it and the start / done times
                 const boardWorkers = [];
                 (item.assignedLanes || []).forEach(function(l) { const lr = laneRoster[l]; if (lr && !lr.isPlaceholder && (lr.empId || lr.name) && !boardWorkers.some(function(x) { return x.name === lr.name; })) boardWorkers.push({ name: lr.name || '', empId: lr.empId || '' }); });
                 if (!boardWorkers.length && item.laneKeys && item.laneKeys.length) (laneRoster || []).forEach(function(lr) { if (lr && !lr.isPlaceholder && item.laneKeys.indexOf(lr.key) > -1 && !boardWorkers.some(function(x) { return x.name === lr.name; })) boardWorkers.push({ name: lr.name || '', empId: lr.empId || '' }); });
-                gbRecordWork(props.dataApi, { id: guid, equipmentGuid: guid, name: eqName, equipment: eqName, area: areaStr, by: cleanedBy, status: 'done', startedAt: item.startedAt ? new Date(item.startedAt).toISOString() : null, doneAt: new Date(item.doneAt || Date.now()).toISOString(), workers: boardWorkers });
+                gbRecordWork(props.dataApi, { id: guid, equipmentGuid: guid, name: eqName, equipment: eqName, area: areaStr, by: cleanedBy || ((effectiveSupervisorInfo && effectiveSupervisorInfo.name) || 'Supervisor'), status: 'done', startedAt: item.startedAt ? new Date(item.startedAt).toISOString() : null, doneAt: new Date(item.doneAt || Date.now()).toISOString(), workers: boardWorkers });
             });
         }
     };
@@ -12873,6 +13679,18 @@ export default function App(props) {
         // ---- Needs Attention (worst first; rooms, crews and leads, never a person) ----
         const attention = [];
         if (planOnly) attention.push({ tone: 'grey', key: 'trust', title: ckShared ? 'No Start / Done check-offs this shift' : 'No Start / Done check-offs on this computer this shift', sub: ckShared ? 'Finish times assume nothing has been done yet. Nobody has pressed Start or Done in Ganttly on any computer.' : 'Finish times assume nothing has been done yet. Check-offs are not being saved to Dataverse right now, so ones made on another computer do not show here.' });
+        // The Production Scheduler's clean plan: not readable, week not published, and its alerts (over 72 h, Highspeed + Custard, no EOW).
+        const cpNote = cleanPlanNote();
+        if (cpNote) attention.push({ tone: 'grey', key: 'cplan', title: cpNote.title, sub: cpNote.sub });
+        planAlerts.forEach(function(al) {
+            const t = cplAlertText(al);
+            attention.push({ tone: al.status === 'approved' ? 'grey' : 'yellow', key: 'cpa-' + al.key, title: t.title, sub: t.sub });
+        });
+        // MSS log saves waiting or refused (red: a failed save, data contract 10).
+        if (mssLogNote.queued) attention.push({ tone: 'red', key: 'mlw-q', title: tr(mssLogNote.queued + ' clean' + (mssLogNote.queued === 1 ? '' : 's') + ' not in the MSS log yet', mssLogNote.queued + ' limpieza' + (mssLogNote.queued === 1 ? '' : 's') + ' aun sin el registro MSS'), sub: tr('They wait on this computer and are tried again. Use Retry on the Gantt strip, or keep this page open.', 'Esperan en esta computadora y se intentan de nuevo. Use Reintentar en la barra del Gantt, o deje esta pagina abierta.') });
+        mssLogNote.invalid.slice(-3).forEach(function(x) {
+            attention.push({ tone: 'red', key: 'mlw-i-' + x.key, room: x.area, title: tr('Not saved to the MSS log: ', 'No se guardo en el registro MSS: ') + x.name + ' (' + x.area + ')', sub: x.codes.map(function(c) { return mlwSay(c, _ACTIVE_LANG); }).join(' ') });
+        });
         if (prodState.status === 'failed') attention.push({ tone: 'grey', key: 'sched', title: 'Production schedule could not be read', sub: prodState.readAt ? 'Startup times are from the read at ' + clockMs(prodState.readAt) + ' and from down lines.' : 'Startup times come from down lines only.' });
         const covered = {};
         rows.filter(function(x) { return x.status === 'LATE'; }).forEach(function(x) {
@@ -19108,6 +19926,35 @@ export default function App(props) {
                             {ganttStrip.length > GANTT_STRIP_MAX && <button data-strip-more onClick={function() { goTab('startup'); }} className="no-pan text-[11px] font-black text-[#0072CE] hover:underline whitespace-nowrap flex-shrink-0">+{ganttStrip.length - GANTT_STRIP_MAX} more {'->'} Startup</button>}
                         </div>
                     )}
+                    {/* Ganttly: the clean plan (Production Scheduler) and the MSS log saves, one line each, only when something needs a look */}
+                    {IS_CURRENT && (function() {
+                        const cp = cleanPlanNote();
+                        const open = planAlerts.filter(function(al) { return al.status === 'open'; });
+                        if (!cp && !open.length && !mssLogNote.queued && !mssLogNote.invalid.length) return null;
+                        return (
+                            <div data-plan-feed className="bg-white border-b border-slate-200 px-5 py-1.5 text-[11px] font-bold flex flex-wrap items-center gap-x-3 gap-y-1 flex-shrink-0">
+                                {cp && <span data-cplan-note={cleanPlanRead.status} className="rounded-full border border-slate-300 bg-slate-50 text-slate-600 px-2 py-0.5" title={cp.sub}>{cp.title}</span>}
+                                {open.slice(0, 3).map(function(al) {
+                                    const t = cplAlertText(al);
+                                    return <span key={al.key} data-cplan-alert={al.kind} className="rounded-full border border-[#D97706] bg-[#FFF4D6] text-[#8A5A00] px-2 py-0.5" title={t.sub}>{t.title}</span>;
+                                })}
+                                {open.length > 3 && <span className="text-slate-500">+{open.length - 3}</span>}
+                                {mssLogNote.queued > 0 && (
+                                    <button data-mlw-retry onClick={retryMssLog} className="rounded-full border border-[#E4002B] bg-[#FDE6EA] text-[#B00020] px-2 py-0.5" title={tr('Done, but the save to the MSS log failed. They wait on this computer. Click to try again now.', 'Hechas, pero no se guardaron en el registro MSS. Esperan en esta computadora. Haga clic para intentar de nuevo.')}>
+                                        {tr(mssLogNote.queued + ' not in the MSS log yet - Retry', mssLogNote.queued + ' sin registro MSS - Reintentar')}
+                                    </button>
+                                )}
+                                {mssLogNote.invalid.slice(-2).map(function(x) {
+                                    return (
+                                        <span key={x.key} data-mlw-invalid className="rounded-full border border-[#E4002B] bg-[#FDE6EA] text-[#B00020] px-2 py-0.5 flex items-center gap-1" title={x.codes.map(function(c) { return mlwSay(c, _ACTIVE_LANG); }).join(' ')}>
+                                            {tr('Not in MSS log: ', 'Sin registro MSS: ') + x.name + ' - ' + x.codes.map(function(c) { return mlwSay(c, _ACTIVE_LANG); }).join(' ')}
+                                            <button onClick={function() { setMssLogNote(function(prev) { return Object.assign({}, prev, { invalid: prev.invalid.filter(function(y) { return y.key !== x.key; }) }); }); }} className="ml-1 font-black" aria-label="Dismiss">x</button>
+                                        </span>
+                                    );
+                                })}
+                            </div>
+                        );
+                    })()}
                     {!IS_CURRENT && odWanted && (odState.status === 'idle' || odState.status === 'loading') && (
                         <div data-od-banner="loading" className="bg-[#E6F1FB] border-b border-[#B3D4F2] px-5 py-1.5 text-[11px] font-bold text-[#00468B] flex items-center gap-2 flex-shrink-0">
                             <Loader2 className="w-3.5 h-3.5 animate-spin flex-shrink-0" />
