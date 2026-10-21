@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.17, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.18, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -349,6 +349,8 @@ Apps look a table up by its prefixed name first and its plain name second, as Ma
 **Shared settings** in `craa5__0_hubconfig` (one row per `craa5_configkey`, JSON in `craa5_configjson`, each key written by one app):
 `hub_people_thresholds` (Manager hub), `ganttly_settings` (Ganttly), `mss_view_rules` (MSS Log Input), `scheduler_shared` (Production Scheduler; today its `config` row in the Clean Plan, which may stay there), `training_settings` (Training page: minimum shifts, refresher days), `mss_completion_exclusions` and `mss_line_downtime` (MSS Calendar; downtime only for lines the Scheduler does not plan). Plus one `manifest|<appId>` row per app, written by that app (12.1).
 
+**Keys in use today** (older names, listed so the monitor does not flag them): `MSS_CALENDAR_VIEW_CONFIG` and `MSS_SKIPPED_ENTRIES_LOG` (MSS Calendar), `MSS_LOG_VIEW_CONFIG` (MSS Log Input; becomes `mss_view_rules`), `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG` (written by both MSS apps today, against the one-writer rule: the two MSS threads pick one owner), `PBED_WEEKEND_PLAN` (old PBED, unused). The full list with owners is `configKeys` in `contract.json`.
+
 ### 12.1 App manifests (self-check)
 
 Each app says in its own code which tables and columns it uses, and saves that list to Dataverse when it opens. The Dataverse monitor then checks every app at once against what really exists, with nothing pasted by hand. Smallest version: no new table.
@@ -407,6 +409,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.18 (2026-10-21)** `contract.json` gains `configKeys` (every hubconfig key, its owner app and status) for the monitor's hubconfig check. Section 12 lists the keys in use today; `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG` have two writers (open).
 - **1.0.17 (2026-10-21)** 12.1 App manifests: each app saves the tables and columns it uses to hubconfig `manifest|<appId>`; the Dataverse monitor checks them. `hub-shared.js` v1.1 adds `hubManifest`, `hubManifestKey`, `hubSaveManifest` (77 checks). `contract.json` gains a `manifests` block.
 - **1.0.16 (2026-10-21)** Section 7: `Weekend clean` time loss rows are time lost during the weekend clean (PBED's Add time loss form), not planned work. Still left out of Time lost totals (manager hub v6.9, PR #41).
 - **1.0.15 (2026-10-21)** 6.5: an open stop (`|last`, `details.open` set) has no restart; readers must not use its `craa5_end` as one (found by PBED).
