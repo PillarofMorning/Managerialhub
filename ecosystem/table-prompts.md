@@ -1,5 +1,7 @@
 # Tables and columns for data contract 1.0
 
+**You do not create the data contract itself.** `data-contract.md` is the rulebook the apps follow; it is not a table. This file is the only part you build in Dataverse.
+
 These are the Dataverse changes from `data-contract.md` section 13 that this thread owns. Most are a few columns added to tables you already have. There is one small new table. No lookups. Every column is optional, so nothing breaks while they are missing. Apps check for each column and use it once it is there.
 
 Order: part 1 matters most (it fixes double logging and night shifts landing on the wrong day). The rest can wait. Copilot cannot edit an existing table, so parts 1, 3 and 5 are done by hand.
@@ -65,3 +67,11 @@ For the Map submission tool. It writes them only once they exist.
 |---|---|---|
 | Equipment guids | `craa5_equipmentguids` | Multiple lines of text, max 4000 |
 | MSS area guid | `craa5_mssareaguid` | Single line of text, max 100 |
+
+## Part 6. Shared settings (`craa5__0_hubconfig`): one setting, no new columns
+
+Apps now save a short list of the tables and columns they use here, so the Dataverse monitor can check every app by itself (contract section 12.1). The lists are up to about 8 KB, so the Config json column must be big enough.
+
+1. Tables > hubconfig > Columns > **Config json**.
+2. If **Maximum character count** is under 100,000, set it to 100000. Save.
+3. Security roles: every hub role needs **Organization** Read on hubconfig. Give **Organization** Write too, so a newer app version can update a list that someone else saved.
