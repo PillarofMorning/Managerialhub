@@ -2,7 +2,7 @@
 
 These are the Dataverse changes from `data-contract.md` section 13 that this thread owns. Most are a few columns added to tables you already have. There is one small new table. No lookups. Every column is optional, so nothing breaks while they are missing. Apps check for each column and use it once it is there.
 
-Order: part 1 matters most (it fixes double logging and night shifts landing on the wrong day). Parts 2-4 can wait.
+Order: part 1 matters most (it fixes double logging and night shifts landing on the wrong day). The rest can wait. Copilot cannot edit an existing table, so parts 1, 3 and 5 are done by hand.
 
 How to add a column by hand: Power Apps maker > **Tables** > the table > **New** > **Column**. Type the **Display name** exactly as written. Dataverse makes the schema name from it (shown in brackets: check it before saving). Leave **Required** = Optional. Save. When all are in, open the Dataverse monitor and run its check.
 
@@ -28,15 +28,9 @@ Optional extra, worth doing once the apps fill Completion key: table > **Keys** 
 
 Security: `_log_` is User-owned. Every hub role needs **Organization** level Read (and Create/Write for roles that log). Otherwise each person sees only their own rows.
 
-## Part 2. Equipment (`craa5_aa_assets`): 1 column, only if missing
+## Part 2. Equipment (`craa5_aa_assets`): nothing to add
 
-Open the table's columns and search for "Midweek". If it is not there:
-
-| Display name | Schema name | Type |
-|---|---|---|
-| Midweek | `craa5_midweek` | Yes/No, default No |
-
-Then set it to **Yes** on every IBL4 piece that is in the midweek clean (everything except caseout / dry-clean items and the freezer). The MSS Calendar's frequency matrix can set it in bulk once the Calendar thread adds the column there.
+The Midweek column (`craa5_midweek`) already exists. Set it to **Yes** on every IBL4 piece in the midweek clean (everything except caseout / dry-clean items and the freezer). The MSS Calendar's frequency matrix can do it in bulk.
 
 ## Part 3. Clean check-off (`craa5_cleancheckoff`): 4 columns
 
@@ -51,23 +45,15 @@ If the table itself does not exist yet, ask the Ganttly thread for its full prom
 
 ## Part 4. New table: _e_ Labor rate (`craa5__e_laborrate`)
 
-Power Apps > **Tables** > **New table** > **Start with Copilot**. Paste the prompt, check the names in the draft, then **Save and exit**. Choose **Organization** ownership if it asks (or under Advanced options).
-
-(866 characters)
+Copilot makes one table per prompt and does best with short ones. Power Apps > **Tables** > **New table** > **Start with Copilot**, paste, check the names, **Save and exit**. Choose **Organization** ownership if it asks.
 
 ```text
-Create one new Dataverse table. Do not add sample data and do not add columns I do not list.
-Display name: _e_ Labor rate. Plural name: _e_ Labor rates. Schema name: craa5__e_laborrate. Record ownership: Organization.
-Primary column: Name (craa5_name), single line of text, maximum 100 characters.
-Description: Hourly labor rates used for sanitation cost recaps. One row per role per date the rate starts.
-No lookup, choice, relationship, autonumber or formula columns: use only the types given. A column's display name without spaces, in lower case, must equal the part after craa5_.
-Columns, all optional:
-Role (craa5_role) single line of text, maximum 50 characters
-Hourly rate (craa5_hourlyrate) currency
-Effective from (craa5_effectivefrom) date only
-Notes (craa5_notes) multiple lines of text, maximum 2000 characters
-Keep the column names exactly as written.
+Create table "_e_ Labor rate", schema name craa5__e_laborrate, Organization owned, no sample data, no lookups.
+Primary column: Name (text).
+Columns: Role (text, 50), Hourly rate (currency), Effective from (date only), Notes (multiline text).
 ```
+
+If a column comes out with another name, rename its display name or add it by hand (New > Column).
 
 What goes in it: one row per role, e.g. Name "Sanitor 2026", Role `Sanitor`, Hourly rate, Effective from `2026-01-01`. Use Role `All` for a single plant-wide rate. When a rate changes, add a new row with the new date. Do not edit the old one, so past weeks keep their cost. Apps use the newest row whose Effective from is on or before the shift date.
 

@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.12, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.13, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -55,6 +55,8 @@ Renaming an area or room breaks every text key that uses it. Treat a rename as a
 ## 3. Who writes what
 
 Status: **live** = in use; **proposed** = in this contract, not created yet; **legacy** = still read, being replaced; **abandoned** = no app may use it.
+**Primary name columns:** some tables were made with a primary name column other than the one their app first planned (for example `craa5__c_chemical` uses `craa5__c_chemical_name`). Gerald keeps them as they are. Apps read the table's `PrimaryNameAttribute` from metadata, or use the name in contract.json, and never require a renamed primary column.
+
 Ownership: User-owned tables need **Organization-level Read** on every hub security role, or people see only their own rows and the screen looks empty with no error.
 
 ### 3.1 Reference data (set up once, edited rarely)
@@ -62,7 +64,7 @@ Ownership: User-owned tables need **Organization-level Read** on every hub secur
 | Table | Status | Writes it | Reads it | Notes |
 |---|---|---|---|---|
 | `craa5_aa_mss_area` Areas | live | Admin in the model-driven form. Shift Start writes only `craa5_clipboard` ("include in update"). | All floor apps, Scheduler, Manager hub, PBED | Key `craa5_area`. Room `craa5_parentroom`. Line setup (`craa5_numberoflines`, `craa5_supportingpart`, `craa5_supportingoffset`, `craa5_cleanoffsetmins`, `craa5_textadditions`) is read by the Scheduler and Ganttly. Map tool and BOLO should read it too, so their areas match. |
-| `craa5_aa_assets` Equipment | live | Admin form. **MSS Calendar** owns the frequency flags (`craa5_dailyclean`, `craa5_midweek`, `craa5_weeklyclean`, `craa5_monthlyclean`, `craa5_month`, `craa5_quarterly`, `craa5_annually`). **Map tool** owns `craa5_maplocation` and the pictures. | Everyone | Key = GUID. `craa5_hoursrequired` = **standard labor minutes** (section 7). `craa5_heads` = people the piece needs. `craa5_subcategory` = clean step order ("1 - pic", "5 Staging"). `craa5_midweek` is not in the April export, so it may need adding (table-prompts.md, part 2). |
+| `craa5_aa_assets` Equipment | live | Admin form. **MSS Calendar** owns the frequency flags (`craa5_dailyclean`, `craa5_midweek`, `craa5_weeklyclean`, `craa5_monthlyclean`, `craa5_month`, `craa5_quarterly`, `craa5_annually`). **Map tool** owns `craa5_maplocation` and the pictures. | Everyone | Key = GUID. `craa5_hoursrequired` = **standard labor minutes** (section 7). `craa5_heads` = people the piece needs. `craa5_subcategory` = clean step order ("1 - pic", "5 Staging"). `craa5_midweek` exists (Dataverse monitor, 2026-10-21). |
 | `craa5_aa_ms_assets` MSS SAP catalog | live | Admin / MSS Log Input | MSS Log Input, MSS Calendar, Scheduler | SAP code `craa5_title`. `craa5_hourstoclean` is read as minutes (open question Q3). |
 | `craa5__aa_employee` Employees | live | Manager hub (People page) and admin. **Ganttly** writes only `craa5_remarks` / `craa5_remarkcategory` (high fives). | Everyone | Leavers: `statecode` = inactive, never a browser list. Role `craa5_role`: 256000000 Sanitor, 256000001 Lead, 256000002 Supervisor. |
 | `craa5__aa_leadershipteam` | live | Admin | Shift Start | Lead/supervisor team names |
@@ -87,8 +89,8 @@ Ownership: User-owned tables need **Organization-level Read** on every hub secur
 | 2f. Roster rows (old) | `craa5_taskassignment` | legacy | Shift Start | Ganttly, Manager hub (move to the board, then retire) |
 | 3. Who cleans what + live progress | `craa5_cleancheckoff` | live | **Ganttly** only | Ganttly on every device, Manager hub, PBED (Execute) |
 | 4. A clean finished (record of truth) | `craa5__log_` MSS log | live | **Ganttly** (piece marked Done), **MSS Log Input** (paper, SAP, by hand), **MSS Calendar** (quick log). All three use the one shared "MSS LOG WRITE" block (section 6.3). **Shift Start does not write here.** | MSS Calendar, MSS Log Input, Manager hub, PBED, Ganttly People, metrics |
-| 4b. Skip codes | `craa5_mss_skipcode` | live | MSS Log Input | MSS Calendar |
-| 5. Time lost / call-outs | `craa5__m_timelosslog` | live | Manager hub, PBED (Kind = `Weekend clean`) | Manager hub, PBED |
+| 4b. Skip codes | `craa5_mss_skipcode` | **missing** (not in Dataverse, 2026-10-21; apps treat it as optional) | MSS Log Input | MSS Calendar |
+| 5. Time lost / call-outs | `craa5__m_timelosslog` | proposed (not made yet) | Manager hub, PBED (Kind = `Weekend clean`) | Manager hub, PBED |
 
 Time loss log keeps the column names it was created with: `craa5_assetguid` holds the equipment key, `craa5_responsibleguid` the employee key and `craa5_crew` the crew letter. The contract names (`craa5_equipmentguid`, `craa5_employeeguid`, `craa5_shiftcode`) are for new tables. A reader of this table uses its own names.
 | 6. Weekend plan | `craa5__p_plan`, `_p_milestone`, `_p_workorder`, `_p_flocmap` | live | PBED | PBED, Manager hub |
@@ -108,10 +110,12 @@ Time loss log keeps the column names it was created with: `craa5_assetguid` hold
 | `craa5_dailyproduction` | live | (import) | Chemical hub, cost per pound |
 | `craa5__0_hubconfig` Shared settings | live | Each app writes only its own `craa5_configkey` rows | The same app; shared keys in section 12 |
 | `craa5__sani_schedule_` | live | MSS Calendar | MSS Calendar |
-| `craa5_mss_useraccesslog`, `craa5_useraccesslog` | live | MSS apps, Shift Start | Dataverse monitor |
+| `craa5_mss_useraccesslog`, `craa5_useraccesslog` | **missing** (not in Dataverse; logging is optional) | MSS apps, Shift Start | Dataverse monitor |
 | `craa5__t_skill` (one row per skill; key `craa5_skillkey` = exact area name or `SYS-xxx`), `craa5__t_skilllevel` (one row per person per skill; key `craa5_levelkey` = `employeeguid|skillkey`, row id `hubIdFromKey`; level 0-3), `craa5__t_trainingevent` (append-only history) | **proposed** (Training matrix thread) | Training page only | Manager hub, Ganttly People, Shift Start Assign |
 | `craa5__0_*` (asset, employee, mssarea, prodweek, saporder, shiftarchive, shiftboard, shiftlog, shiftplan) | **abandoned** | nobody | nobody (`craa5__0_hubconfig` is the one exception and stays) |
-| `craa5_sanitationshiftreport`, `craa5_mss_shift_capacity`, `craa5_mss_quality_verifications`, `craa5_mss_downtime_events`, `craa5_mss_cost_model`, `craa5_mss_capex_lifecycle`, `craa5_pathogen_bolo_sample`, `craa5_pathogen_bolo_harborage`, `craa5_quickload_assets` | **unknown** | Named in code; not confirmed to exist | The Dataverse monitor reports whether each exists. No new feature should depend on them before this contract lists them as live. |
+| `craa5_sanitationshiftreport` | legacy (exists, 0 rows) | nobody new | Ganttly (old read) |
+| `craa5_mss_shift_capacity`, `craa5_mss_quality_verifications`, `craa5_mss_downtime_events`, `craa5_mss_cost_model`, `craa5_mss_capex_lifecycle`, `craa5_pathogen_bolo_sample`, `craa5_pathogen_bolo_harborage`, `craa5_quickload_assets` | **absent** (not in Dataverse, 2026-10-21) | nobody | Remove the code that reads them |
+| 47 other craa5 tables found in Dataverse (old chemical set, old MSS tables, `craa5_table1` and others; full list in contract.json, group `unlisted`) | abandoned (3 legacy: `craa5_cart`, `craa5_distributor`, `craa5_log`, read only by old pages) | nobody | Used by no current app. Delete only when Gerald chooses. |
 
 ---
 
@@ -352,7 +356,7 @@ Prompts and click-steps: `table-prompts.md`.
 | What | Why | Who creates it |
 |---|---|---|
 | 11 optional columns on `craa5__log_` (completion key, shift date, shift code, clean kind, labor minutes, employee ids, marked by, source, done at, plan key, line key) | One honest completion record with dedup, shift date, people and minutes | Gerald, part 1 |
-| `craa5_midweek` (Yes/No) on `craa5_aa_assets`, only if the data check says it is missing | IBL4 midweek list | Gerald, part 2 |
+| `craa5_midweek` on `craa5_aa_assets` | Already exists. Gerald only sets it to Yes on IBL4 midweek pieces. | Gerald, part 2 |
 | 4 optional columns on `craa5_cleancheckoff` (shift date, clean kind, completion key, employee guids) | Join live progress to the log and record who is on each piece | Gerald, part 3 |
 | `_e_ Labor rate` table | The one labor rate for cost recap | Gerald, part 4 |
 | `craa5_cleanoverride` text on `craa5__aa_prd_schd` | IBL4 72 h override (Scheduler thread) | Scheduler thread's prompt |
@@ -374,7 +378,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 14. Open questions for Gerald
 
-- **Q1.** Is `craa5_cleancheckoff` created in Dataverse, and is `craa5_midweek` on Equipment? The Dataverse monitor can answer both.
+- **Q1.** Answered 2026-10-21 by the Dataverse monitor: `craa5_cleancheckoff` and `craa5_midweek` both exist.
 - **Q2.** Who may mark a piece Done: leads and supervisors only, or members too? (Also asked in the Ganttly plan.)
 - **Q3.** `craa5_aa_ms_assets.craa5_hourstoclean` (values like 15, 21, 1245): minutes, like Equipment?
 - **Q4.** What does `craa5_month` on Equipment mean (it is set on "2nd week of month" pieces)? Is it different from `craa5_monthlyclean`?
@@ -387,6 +391,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.13 (2026-10-21)** Dataverse monitor results: check-off table and Midweek column exist; skip code and access log tables missing; time loss log and quick task not made yet; 8 named tables absent; 47 unlisted tables marked abandoned (3 legacy); primary name columns kept as made. Labor rate prompt shortened (Copilot makes one table per short prompt).
 - **1.0.12 (2026-10-21)** MSS Calendar config keys `mss_completion_exclusions` and `mss_line_downtime`. Line downtime comes from the Clean Plan; hand-entered ranges only for lines the Scheduler does not plan.
 - **1.0.11 (2026-10-21)** Section 6.2: old frequency spellings mapped (MSS LOG WRITE v1.0, PR #40). 6.3: fill `craa5_uid` (primary name) with the SAP code. Q8: `craa5_allergenclean` type.
 - **1.0.10 (2026-10-21)** BOLO v2.2: `craa5__b_swabresult` columns and keys, and four new text columns on the swab catalog.
