@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.3, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.4, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -104,7 +104,7 @@ Time loss log keeps the column names it was created with: `craa5_assetguid` hold
 | `craa5__supervisor_todo` | live | Manager hub | Manager hub |
 | `craa5__m_formtemplate`, `craa5__m_quicktask` (both User-owned; quick tasks are a personal list on purpose) | live | Manager hub | Manager hub |
 | `craa5__m_employeenote` Manager notes on people | live | Manager hub | Manager hub, manager role only. Sensitive: User-owned, never shown to peers, never in exports or the repo. Key `craa5_employeeguid`. |
-| `craa5__c_*` chemical tables (13) | live | Chemical hub | Chemical hub; Manager hub for cost |
+| `craa5__c_*` chemical tables (14, listed in contract.json; columns in chemical-ordering/table-spec.md) | live | Chemical hub | Chemical hub; Manager hub for cost |
 | `craa5_dailyproduction` | live | (import) | Chemical hub, cost per pound |
 | `craa5__0_hubconfig` Shared settings | live | Each app writes only its own `craa5_configkey` rows | The same app; shared keys in section 12 |
 | `craa5__sani_schedule_` | live | MSS Calendar | MSS Calendar |
@@ -345,6 +345,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.4 (2026-10-21)** contract.json lists the 14 `_c_` chemical tables.
 - **1.0.3 (2026-10-21)** Manager hub review: time loss log keeps its column names (listed), Weekend clean left out of Time lost, quick task User-owned, `craa5__m_employeenote` added. Map: equipment id lists may follow a paired names column's order. table-prompts.md part 5 (observation columns).
 - **1.0.2 (2026-10-21)** Training matrix tables added (sections 3.3, 12, 13; contract.json).
 - **1.0.1 (2026-10-21)** Section 6.3: Shift Start's interim area logging (switch `SHIFT_START_LOGS_MSS`) allowed until Ganttly logs per piece, using the same completion keys.
