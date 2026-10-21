@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.2, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -106,7 +106,7 @@ Ownership: User-owned tables need **Organization-level Read** on every hub secur
 | `craa5__0_hubconfig` Shared settings | live | Each app writes only its own `craa5_configkey` rows | The same app; shared keys in section 12 |
 | `craa5__sani_schedule_` | live | MSS Calendar | MSS Calendar |
 | `craa5_mss_useraccesslog`, `craa5_useraccesslog` | live | MSS apps, Shift Start | Dataverse monitor |
-| `_t_` training tables | **proposed** (Training matrix thread) | Training matrix app | Manager hub, Ganttly People, Shift Start Assign |
+| `craa5__t_skill` (one row per skill; key `craa5_skillkey` = exact area name or `SYS-xxx`), `craa5__t_skilllevel` (one row per person per skill; key `craa5_levelkey` = `employeeguid|skillkey`, row id `hubIdFromKey`; level 0-3), `craa5__t_trainingevent` (append-only history) | **proposed** (Training matrix thread) | Training page only | Manager hub, Ganttly People, Shift Start Assign |
 | `craa5__0_*` (asset, employee, mssarea, prodweek, saporder, shiftarchive, shiftboard, shiftlog, shiftplan) | **abandoned** | nobody | nobody (`craa5__0_hubconfig` is the one exception and stays) |
 | `craa5_sanitationshiftreport`, `craa5_mss_shift_capacity`, `craa5_mss_quality_verifications`, `craa5_mss_downtime_events`, `craa5_mss_cost_model`, `craa5_mss_capex_lifecycle`, `craa5_pathogen_bolo_sample`, `craa5_pathogen_bolo_harborage`, `craa5_quickload_assets` | **unknown** | Named in code; not confirmed to exist | The Dataverse monitor reports whether each exists. No new feature should depend on them before this contract lists them as live. |
 
@@ -297,7 +297,7 @@ New tables are named `_<letter>_ Name`, so the schema name is `craa5__<letter>_n
 Apps look a table up by its prefixed name first and its plain name second, as Manager hub v6.8 does, because Gerald may create either.
 
 **Shared settings** in `craa5__0_hubconfig` (one row per `craa5_configkey`, JSON in `craa5_configjson`, each key written by one app):
-`hub_people_thresholds` (Manager hub), `ganttly_settings` (Ganttly), `mss_view_rules` (MSS Log Input), `scheduler_shared` (Production Scheduler; today its `config` row in the Clean Plan, which may stay there).
+`hub_people_thresholds` (Manager hub), `ganttly_settings` (Ganttly), `mss_view_rules` (MSS Log Input), `scheduler_shared` (Production Scheduler; today its `config` row in the Clean Plan, which may stay there), `training_settings` (Training page: minimum shifts, refresher days).
 
 ---
 
@@ -313,7 +313,7 @@ Prompts and click-steps: `table-prompts.md`.
 | `_e_ Labor rate` table | The one labor rate for cost recap | Gerald, part 4 |
 | `craa5_cleanoverride` text on `craa5__aa_prd_schd` | IBL4 72 h override (Scheduler thread) | Scheduler thread's prompt |
 | `_b_ Swab result` | Swab results as rows (BOLO thread) | BOLO thread's prompt, keys per section 2 |
-| `_t_` training tables | Training matrix (its thread) | Training thread's prompt, keys per section 2 |
+| `_t_ Skill`, `_t_ Skill level`, `_t_ Training event` | Training matrix (floor sessions are inferred from MSS log `craa5_employeeguids`) | Training thread's prompt, keys per section 2 |
 
 Rules for other threads' new tables: area = `craa5_area` (exact area name), equipment = `craa5_equipmentguid(s)`, employee = `craa5_employeeguid(s)` plus a name column for people, dates as in section 5, Organization-owned.
 
@@ -342,5 +342,6 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.2 (2026-10-21)** Training matrix tables added (sections 3.3, 12, 13; contract.json).
 - **1.0.1 (2026-10-21)** Section 6.3: Shift Start's interim area logging (switch `SHIFT_START_LOGS_MSS`) allowed until Ganttly logs per piece, using the same completion keys.
 - **1.0 (2026-10-21)** First version. Keys, owners, dates, clean kinds, MSS log write rule, number definitions, status words, language, theme, browser storage moves, prefixes, new columns and the labor rate table. The Ganttly plan's new Completion table is replaced by the existing check-off table plus new MSS log columns.
