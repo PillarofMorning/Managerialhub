@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.21, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.22, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -411,6 +411,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.22 (2026-10-21)** contract.json rebuilt from c-tables.json: `_c_ Chemical standard` live (read by Chemical hub and Manager hub, kept by Admin form); Chemical price per unit = current price of one container.
 - **1.0.21 (2026-10-21)** Section 7: Projected clean cost (manager hub v7.0 Line clean cost tab, PR #42). Q9: wage or loaded labor rate.
 - **1.0.20 (2026-10-21)** 12.1: Config json's length cannot be changed, so manifests go in a new optional hubconfig column Manifest json (`craa5_manifestjson`) when present; `hubSaveManifest` falls back to Config json (82 checks). hubconfig is not recreated.
 - **1.0.19 (2026-10-21)** One writer per hubconfig key again: MSS Log Input owns `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG`; the Calendar writes its own `MSS_CALENDAR_ACCESS_LOG` (Calendar PR #38).
