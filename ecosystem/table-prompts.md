@@ -38,15 +38,16 @@ Open the table's columns and search for "Midweek". If it is not there:
 
 Then set it to **Yes** on every IBL4 piece that is in the midweek clean (everything except caseout / dry-clean items and the freezer). The MSS Calendar's frequency matrix can set it in bulk once the Calendar thread adds the column there.
 
-## Part 3. Clean check-off (`craa5_cleancheckoff`): 3 columns
+## Part 3. Clean check-off (`craa5_cleancheckoff`): 4 columns
 
 | Display name | Schema name | Type |
 |---|---|---|
 | Shift date | `craa5_shiftdate` | Single line of text, max 10 |
 | Clean kind | `craa5_cleankind` | Single line of text, max 20 |
 | Completion key | `craa5_completionkey` | Single line of text, max 200 |
+| Employee guids | `craa5_employeeguids` | Multiple lines of text, max 4000 |
 
-If the table itself does not exist yet, ask the Ganttly thread for its full prompt. These three columns will be in it.
+If the table itself does not exist yet, ask the Ganttly thread for its full prompt. These four columns will be in it.
 
 ## Part 4. New table: _e_ Labor rate (`craa5__e_laborrate`)
 

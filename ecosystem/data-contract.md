@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.5, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.6, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -185,7 +185,23 @@ Undo of a Done within the same shift sets the check-off back and **deactivates**
 
 ### 6.4 Live progress (`craa5_cleancheckoff`)
 
-Ganttly's check-off table stays the live record of Start / Done / Undo during the shift. Every device reads it every 2 minutes. It holds progress. The MSS log holds the finished record. Its `craa5_status` words are in section 8.1. New check-offs should also fill `craa5_shiftdate`, `craa5_cleankind` and `craa5_completionkey` (optional columns, table-prompts.md part 3), so the Manager hub can join a check-off to its log row without reading the details JSON.
+Ganttly's check-off table stays the live record of Start / Done / Undo during the shift. There is one row per check-off, updated in place, and every device reads it every 2 minutes. It holds progress; the MSS log holds the finished record. Only Ganttly writes it.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `craa5_checkoffkey` | text (primary) | The check-off's key: Ganttly block id + `~` + first press time (base 36 seconds). Row id = `hubIdFromKey(key)`. If a table was made with another primary column, Ganttly writes the key into `craa5_cleancheckoff1` or `craa5_name`. Readers try those in that order. |
+| `craa5_status` | text | Stored values: `started`, `done`, `undone`. "Planned" means no row yet. "Overdue" is a display state (section 8.1). |
+| `craa5_startedat` | date-time (UTC) | When Start was pressed. Blank if Done was pressed without Start. |
+| `craa5_doneat` | date-time (UTC) | When Done was pressed. |
+| `craa5_keepuntil` | date-time (UTC) | Until when the check-off still counts on screen (a monthly clean: a month). |
+| `craa5_equipmentguid` | text | Asset GUID |
+| `craa5_equipment` | text | Equipment name, for people |
+| `craa5_area` | text | The MSS area name. Rows written before 1.0.6 may hold the room. A reader that gets no area match falls back to the asset's area. |
+| `craa5_details` | multiple lines (JSON) | `{status, parentId, name, startMs, durationMins, laneKeys, workMins, heads, updatedAt, startedAt, doneAt, noStart, syncAt}`. Times are epoch ms. `workMins` = person-minutes worked. `heads` = people on it. `laneKeys` are Ganttly lanes, **not** employee ids. |
+| `craa5_shiftdate`, `craa5_cleankind`, `craa5_completionkey`, `craa5_employeeguids` | text | **Proposed** (table-prompts.md part 3). The shift date, kind, completion key and the people on the piece (`hubGuidList`). Until they exist, people come from the board's `craa5_updatesjson.work[].workers[].empId`. |
+| `modifiedon` | system | Last change. Use it only to order rows and to read "changed since"; never as Start or Done time. |
+
+`craa5_shiftboard.craa5_updatesjson` (written by Ganttly): `remarks` (high fives) stays. `work` (pieces cleaned, with workers) stays for now as the board's display copy, so Shift Start and the archive show who cleaned what. It is never a source for metrics or the MSS log. It goes when the check-off people column exists and Ganttly and Shift Start merge (Ganttly Phase 5). PBED's Execute and the Manager hub read progress from the check-off table and finished pieces from the MSS log.
 
 This replaces the "new Completion table" in the Ganttly overhaul plan: the check-off table already exists, and the MSS log, with the columns in part 1 of table-prompts.md, is the completion record. That is one fewer table to make and only one place a finished clean is counted.
 
@@ -221,7 +237,7 @@ People thresholds (coaching below 75 % pace for 14 days, high performer list) ar
 
 Stored as lower-case English codes. Shown with the label in the language chosen. Colors are in section 10.
 
-1. **Piece / check-off** (`craa5_cleancheckoff.craa5_status`): `planned`, `started`, `done`, `skipped` (with a skip code), `undone` (a Done taken back). A piece past its window end and not done is shown as **Overdue**. That is a display state, never stored.
+1. **Piece / check-off** (`craa5_cleancheckoff.craa5_status`): stored `started`, `done`, `undone` (a Done taken back). Shown also: **Planned** (no row yet), **Skipped** (an MSS skip code from `craa5_mss_skipcode`), and **Overdue** (past its window end and not done). These three are display states, never stored in the check-off.
 2. **Clean window** (Clean Plan `craa5_status`, Scheduler's words): `ok`, `tight`, `short`, `overlap`, `nocrew`, `none`. Shown as On track, Tight, Short of people, Overlaps a run, No crew, Nothing to do.
 3. **Board** (`craa5_shiftboard.craa5_status`): `planned`, `live`, `archived`, `used`, `cancelled`.
 4. **Attendance** (on a board row): `present`, `late`, `sick`, `pto`, `left_early`, `no_call`, `loaned`, `training`. Shift Start's current PTO / Sick / Late / Left Early map to these. The badge reader will later write the same words.
@@ -237,7 +253,7 @@ Stored as lower-case English codes. Shown with the label in the language chosen.
 - **One switch for all apps:** browser key `hub_lang` (`en` or `es`), read with `hubGetLang()`. On first use it picks up the old per-app keys. Every app header has the same EN / ES toggle.
 - **es-MX.** Every visible word goes through the app's translate function, keyed by the English text, as in PBED's `pbT`. Each app's build check fails when a string has no Spanish.
 - **ASCII only:** Spanish is written with % codes (`%a` = á, `%n` = ñ, `%?` = ¿; full list in `hub-shared.js`) and decoded at run time.
-- **Shared words:** the `HUB_ES` list in `hub-shared.js`. Status words, clean kinds, attendance, roles, load states and core nouns. An app may add words but never gives a shared word another Spanish. Examples: Done = Terminado, Started = En proceso, Overdue = Atrasado, Late (attendance) = Llegó tarde, Area = Área, Line = Línea, Crew = Cuadrilla, Team = Grupo (not "Equipo", which is Equipment), Swab = Hisopo, EOW = FDS (Fin de semana). **Gerald: please have a Spanish-speaking lead check these words once (Q6).**
+- **Shared words:** the `HUB_ES` list in `hub-shared.js`. Status words, clean kinds, attendance, roles, load states and core nouns. An app may add words but never gives a shared word another Spanish, and never reuses a shared English key with a different meaning (for example "Late" is attendance only; a late piece is "Overdue"). An app whose own list uses a shared key differently renames its key. Examples: Done = Terminado, Started = En proceso, Overdue = Atrasado, Late (attendance) = Llegó tarde, Area = Área, Line = Línea, Crew = Cuadrilla, Team = Grupo (not "Equipo", which is Equipment), Swab = Hisopo, EOW = FDS (Fin de semana). **Gerald: please have a Spanish-speaking lead check these words once (Q6).**
 - **Manuals:** every screen has a `?` button that opens a one-page picture guide in the current language. It can be printed for training. At most 7 short steps, one action each ("Tap the piece. Check your name. Tap Done."), a screenshot per step, and the same layout in every app. Each app keeps its guide text in its own word list, so the Spanish check covers it.
 
 ---
@@ -345,6 +361,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.6 (2026-10-21)** Section 6.4 lists the check-off columns exactly; `updatesjson.work` is a display copy only; check-off stored statuses are started/done/undone; section 9: no reuse of a shared key with another meaning; table-prompts part 3 adds Employee guids.
 - **1.0.5 (2026-10-21)** Chemical hub review: `chGuidFrom` id exception to rule 6, draft chemical cost for cost per pound, cart label "Draft (not in SAP yet)", `_c_` ownership note.
 - **1.0.4 (2026-10-21)** contract.json lists the 14 `_c_` chemical tables.
 - **1.0.3 (2026-10-21)** Manager hub review: time loss log keeps its column names (listed), Weekend clean left out of Time lost, quick task User-owned, `craa5__m_employeenote` added. Map: equipment id lists may follow a paired names column's order. table-prompts.md part 5 (observation columns).
