@@ -2,7 +2,8 @@
  * [PERSISTENT MEMORY & APP REGISTRATION BLOCK]
  * APP NAME:        Shift Start & Roster Allocation Hub
  * PHASE ID:        P2.1 (Ref: _00 - list of apps - defined how to integrate - link to masterplan)
- * CURRENT VERSION: v0.0001
+ * CURRENT VERSION: v0.0002 (2026-10-21: MSS auto-log logs only the pieces of the area's clean, local date, retried on failure;
+ *                  a clean type picked by hand lasts one shift)
  * FOLDER STATUS:   backups - testing
  * REPO SOURCE:     P2.1 - shift start 0.0001
  * 
@@ -458,16 +459,29 @@ function nextCleanType(current?: string): string {
     const idx = CLEAN_TYPE_OPTIONS.findIndex(o => o.label.toLowerCase() === t || o.esLabel.toLowerCase() === t || o.short.toLowerCase() === t || o.esShort.toLowerCase() === t);
     return CLEAN_TYPE_OPTIONS[(idx + 1) % CLEAN_TYPE_OPTIONS.length].label;
 }
+// A clean type picked by hand lasts for the shift it was picked on (16 hours), never for every later day on this device.
+// The map keeps its old shape (area id -> clean type) because Ganttly reads it; when each entry was picked is kept beside it.
+const CLEAN_TYPE_AT_LS_KEY = "ss_area_cleantypes_at_v1";
+const CLEAN_TYPE_KEEP_MS = 16 * 3600000;
 function readSavedCleanTypes(): Record<string, string> {
     try {
         const raw = typeof window !== 'undefined' && window.localStorage ? window.localStorage.getItem(CLEAN_TYPE_LS_KEY) : null;
-        return raw ? (JSON.parse(raw) || {}) : {};
+        const map = raw ? (JSON.parse(raw) || {}) : {};
+        const at = JSON.parse(window.localStorage.getItem(CLEAN_TYPE_AT_LS_KEY) || '{}') || {};
+        const out: Record<string, string> = {};
+        Object.keys(map).forEach(k => { if (Number(at[k]) > Date.now() - CLEAN_TYPE_KEEP_MS) out[k] = map[k]; });
+        return out;
     } catch (e) { return {}; }
 }
 function writeSavedCleanTypes(map: Record<string, string>) {
     try {
         if (typeof window !== 'undefined' && window.localStorage) {
+            const before = JSON.parse(window.localStorage.getItem(CLEAN_TYPE_LS_KEY) || '{}') || {};
+            const at = JSON.parse(window.localStorage.getItem(CLEAN_TYPE_AT_LS_KEY) || '{}') || {};
+            const kept: Record<string, number> = {};
+            Object.keys(map).forEach(k => { kept[k] = before[k] === map[k] && Number(at[k]) > Date.now() - CLEAN_TYPE_KEEP_MS ? Number(at[k]) : Date.now(); });
             window.localStorage.setItem(CLEAN_TYPE_LS_KEY, JSON.stringify(map));
+            window.localStorage.setItem(CLEAN_TYPE_AT_LS_KEY, JSON.stringify(kept));
         }
     } catch (e) {}
 }
@@ -2784,6 +2798,103 @@ function diffBoardRows(prev: any[], next: any[], prevAtt?: any[], nextAtt?: any[
     Object.keys(ap).forEach(k => { if (!an[k] && !OUT_AREA_RE.test(String(ap[k].craa5_area))) out.push(`Removed area ${ap[k].craa5_area}`); });
     if (!prev || !prev.length) out.unshift(`First save: ${Object.keys(pn).length} people in ${Object.keys(an).length} areas`);
     return out.slice(0, 200);
+}
+
+// ---- MSS log (craa5__log_): what an area marked finished tells the MSS calendar ----
+// Interim, until Ganttly logs each piece as it is done: only the equipment that belongs to the area's clean is logged.
+//   Daily / Everyday / Allergen / Dry clean: pieces marked Daily.  Midweek: Daily or Midweek.  EOW: Daily, Midweek or Weekly.
+//   Monthly, quarterly and annual pieces are never logged from here, and a changeover logs nothing.
+// The row says which clean was done (EOW = daily + weekly, never monthly). A row without those flags would count for every
+// frequency in the MSS calendar, so a row is never sent without them. The date is the plant's local date (night shift stays on
+// its own day). A piece counts as sent only once Dataverse accepted it; anything that failed is tried again on the next save.
+// SHIFT_START_LOGS_MSS = false switches it off (Ganttly's Done screen takes over).
+const SHIFT_START_LOGS_MSS = true;
+const MSS_LOG_TABLE = 'craa5__log_';
+const MSS_SENT_LS_PREFIX = 'itp_autolog_v1_';
+type MssAreaJob = { areaId: string; areaName: string; cleanType: string; assets: any[]; cleanedBy: string; totalAreaHrs: number };
+const localYmd = (ms: number) => { const d = new Date(ms); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+function mssCleanScope(cleanType: string): { pieceFlags: string[]; logFlags: { craa5_daily: boolean; craa5_weekly: boolean; craa5_monthly: boolean }; code: string } | null {
+    const raw = String(getCleanTypeMeta(cleanType).rawLabel || '').toLowerCase();
+    if (raw.indexOf('change') >= 0) return null;
+    if (raw.indexOf('eow') >= 0) return { pieceFlags: ['craa5_dailyclean', 'craa5_midweek', 'craa5_weeklyclean'], logFlags: { craa5_daily: true, craa5_weekly: true, craa5_monthly: false }, code: 'eow' };
+    if (raw.indexOf('midweek') >= 0) return { pieceFlags: ['craa5_dailyclean', 'craa5_midweek'], logFlags: { craa5_daily: true, craa5_weekly: false, craa5_monthly: false }, code: 'midweek' };
+    return { pieceFlags: ['craa5_dailyclean'], logFlags: { craa5_daily: true, craa5_weekly: false, craa5_monthly: false }, code: 'daily' };
+}
+const assetFlag = (a: any, col: string) => isBoolTrue(a?.[col] ?? getField(a, col));
+const assetGuidOf = (a: any) => String(a?.craa5_aa_assetsid || a?.craa5_equipmentguid || getField(a, 'craa5_aa_assetsid') || '').replace(/[{}]/g, '').trim().toLowerCase();
+// The pieces of one area that belong to its clean: the area must match exactly (by id or by name), never "IBL5" inside "IBL5 Packaging".
+function mssPiecesFor(job: MssAreaJob): any[] {
+    const scope = mssCleanScope(job.cleanType);
+    if (!scope) return [];
+    const areaKey = normText(job.areaName), areaGuid = String(job.areaId || '').toLowerCase();
+    return (job.assets || []).filter((a: any) => {
+        if (!assetGuidOf(a)) return false;
+        const g = String(a.craa5_mssareaguid || a._craa5_mssareaguid_value || getField(a, 'craa5_mssareaguid') || getField(a, '_craa5_mssareaguid_value') || '').toLowerCase().trim();
+        const n = normText(a.craa5_area || a.craa5_areaname || a.craa5_line || a.craa5_roomname || getField(a, 'craa5_area') || getField(a, 'craa5_areaname') || getField(a, 'craa5_roomname'));
+        if (!((g && areaGuid && g === areaGuid) || (n && n === areaKey))) return false;
+        return scope.pieceFlags.some(c => assetFlag(a, c));
+    });
+}
+// Equipment already logged on that day (from any device), so a second device does not log the same piece again. Empty when it cannot be read.
+async function mssLoggedOn(props: any, ymd: string): Promise<Set<string>> {
+    const out = new Set<string>();
+    const filters = [`craa5_lastcleaned eq ${ymd}`, `craa5_lastcleaned ge ${ymd}T00:00:00Z and craa5_lastcleaned le ${ymd}T23:59:59Z`];
+    for (const f of filters) {
+        try {
+            const rows = await tableQuery(props, MSS_LOG_TABLE, f, ['craa5_equipmentguid'], 5000, 'createdon desc');
+            rows.forEach((r: any) => { const g = String(getField(r, 'craa5_equipmentguid') || '').replace(/[{}]/g, '').trim().toLowerCase(); if (g) out.add(g); });
+            return out;
+        } catch (e) { /* try the next date style */ }
+    }
+    return out;
+}
+async function writeMssLogs(props: any, jobs: MssAreaJob[], doneAtMs: number): Promise<{ written: number; skipped: number; failed: number; error: string }> {
+    const res = { written: 0, skipped: 0, failed: 0, error: '' };
+    const wApi = getWriteApi(props);
+    if (!SHIFT_START_LOGS_MSS || !wApi || !jobs.length) return res;
+    const ymd = localYmd(doneAtMs), dedupKey = MSS_SENT_LS_PREFIX + ymd;
+    let sentMap: Record<string, number> = {};
+    try { sentMap = JSON.parse(window.localStorage.getItem(dedupKey) || '{}') || {}; } catch (e) { sentMap = {}; }
+    const already = await mssLoggedOn(props, ymd);
+    const pending: any[] = [];
+    jobs.forEach(job => {
+        const scope = mssCleanScope(job.cleanType);
+        const pieces = mssPiecesFor(job);
+        if (!scope || !pieces.length) return;
+        const perPieceHrs = Math.max(0.08, (job.totalAreaHrs || 2) / Math.max(1, pieces.length));
+        pieces.forEach((a: any) => {
+            const guid = assetGuidOf(a);
+            if (sentMap[guid] || already.has(guid)) { res.skipped++; return; }
+            const rawHrs = parseFloat(String(a.craa5_hoursrequired ?? getField(a, 'craa5_hoursrequired') ?? '0'));
+            const pieceHrs = (!isNaN(rawHrs) && rawHrs > 0 && rawHrs <= 16) ? rawHrs : perPieceHrs;
+            pending.push({
+                guid,
+                row: {
+                    craa5_sap: 'auto- ' + scope.code,
+                    craa5_room: String(a.craa5_room || a.craa5_roomname || getField(a, 'craa5_room') || getField(a, 'craa5_roomname') || job.areaName).trim(),
+                    craa5_area: String(a.craa5_area || a.craa5_areaname || getField(a, 'craa5_area') || getField(a, 'craa5_areaname') || job.areaName).trim(),
+                    craa5_equipment: String(a.craa5_ValidationName || a.craa5_validationname || a.craa5_equipment || a.craa5_equipmentidentifier || a.craa5_name || getField(a, 'craa5_validationname') || getField(a, 'craa5_equipment') || getField(a, 'craa5_equipmentidentifier') || 'Equipment').trim(),
+                    craa5_equipmentguid: guid,
+                    craa5_lastcleaned: ymd + 'T00:00:00Z',
+                    craa5_lastcleanedby: job.cleanedBy,
+                    craa5_hoursworked: Math.max(1, Math.round(pieceHrs)),   // whole number column
+                    ...scope.logFlags,
+                },
+            });
+        });
+    });
+    // Without craa5_sap / craa5_hoursworked / craa5_room if the table refuses them; the clean flags always stay.
+    const lean = (r: any) => { const o = { ...r }; delete o.craa5_sap; delete o.craa5_hoursworked; delete o.craa5_room; return o; };
+    for (let i = 0; i < pending.length; i += 4) {
+        const batch = pending.slice(i, i + 4);
+        await Promise.all(batch.map((p: any) => wApi.create(MSS_LOG_TABLE, p.row)
+            .catch(() => wApi.create(MSS_LOG_TABLE, lean(p.row)))
+            .then(() => { sentMap[p.guid] = Date.now(); res.written++; })
+            .catch((e: any) => { res.failed++; res.error = res.error || extractDvError(e); })));
+    }
+    try { window.localStorage.setItem(dedupKey, JSON.stringify(sentMap)); } catch (e) { /* the read above still stops repeats */ }
+    if (res.failed) logError(`MSS log: ${res.failed} piece(s) not saved`, res.error);
+    return res;
 }
 
 // ---- Who can edit a board (from the Microsoft sign-in, matched to the employee table) ----
@@ -8646,6 +8757,7 @@ const handleSubmission = async (): Promise<boolean> => {
         const updatedSubcatProgress = { ...subcatProgress };
         let progressChanged = false;
         const activeRoomsMap: Record<string, any> = {};
+        const mssJobs: MssAreaJob[] = [];
 
         for (const areaId of Object.keys(areaAssignments)) {
             const lead = employeeMap.get(areaAssignments[areaId]) || supervisor;
@@ -8751,72 +8863,9 @@ const handleSubmission = async (): Promise<boolean> => {
                     taskPayloads.push({ ...base, empName: name, craa5_id: name, empEmail, craa5_email: empEmail, Email: empEmail, empGuid, craa5__aaemp_guid: empGuid, badgeNumber: empBadge, craa5_badgenumber: empBadge, badgenumber: empBadge, startTime: est, craa5_starttime: est });
                 }
                 if (finished) {
+                    // Logged to the MSS calendar after the board is saved (writeMssLogs: only the pieces of this area's clean)
                     const areaLookup = assetLookupByArea.get(areaId);
-                    const matchedAssets = areaLookup?.matchedAssets || [];
-                    if (matchedAssets.length > 0) {
-                        const ymd = new Date().toISOString().slice(0, 10);
-                        const dedupKey = 'itp_autolog_v1_' + ymd;
-                        let sentMap: Record<string, number> = {};
-                        try { sentMap = JSON.parse(localStorage.getItem(dedupKey) || '{}'); } catch (e) {}
-                        const cleanedByStr = areaWorkerNames.length > 0 ? areaWorkerNames.join(' / ') : (leadNameStr || supNameRaw || 'Crew');
-                        const totalAreaHrs = areaLookup?.totalCleanHours || (isProductionArea(areaMap.get(areaId)) ? 4.5 : 2.0);
-                        const perPieceFallbackHrs = Math.max(0.08, Math.round((totalAreaHrs / Math.max(1, matchedAssets.length)) * 100) / 100);
-                        const wApi = getWriteApi(propsRef.current);
-                        if (wApi) {
-                            const pendingLogs: Array<{ full: any; fallback: any }> = [];
-                            matchedAssets.forEach((asset: any) => {
-                                const rawGuid = String(asset.craa5_aa_assetsid || asset.craa5_equipmentguid || getField(asset, 'craa5_aa_assetsid') || '').replace(/[{}]/g, '').trim().toLowerCase();
-                                if (!rawGuid || sentMap[rawGuid]) return;
-                                sentMap[rawGuid] = Date.now();
-                                const eqName = String(asset.craa5_ValidationName || asset.craa5_validationname || asset.craa5_equipment || asset.craa5_name || getField(asset, 'craa5_validationname') || getField(asset, 'craa5_equipment') || 'Equipment').trim();
-                                const rmName = String(asset.craa5_room || asset.craa5_roomname || getField(asset, 'craa5_room') || areaNameStr).trim();
-                                const arName = String(asset.craa5_area || asset.craa5_areaname || getField(asset, 'craa5_area') || areaNameStr).trim();
-                                const rawHrs = parseFloat(String(asset.craa5_hoursrequired ?? getField(asset, 'craa5_hoursrequired') ?? '0'));
-                                const pieceHrs = (!isNaN(rawHrs) && rawHrs > 0 && rawHrs <= 16) ? Math.round(rawHrs * 100) / 100 : perPieceFallbackHrs;
-                                let freq = 'daily';
-                                if (isBoolTrue(asset.craa5_annually ?? getField(asset, 'craa5_annually'))) freq = 'annual';
-                                else if (isBoolTrue(asset.craa5_quarterly ?? getField(asset, 'craa5_quarterly'))) freq = 'quarterly';
-                                else if (isBoolTrue(asset.craa5_monthlyclean ?? asset.craa5_month ?? getField(asset, 'craa5_monthlyclean'))) freq = 'monthly';
-                                else if (isBoolTrue(asset.craa5_weeklyclean ?? getField(asset, 'craa5_weeklyclean')) && !isBoolTrue(asset.craa5_dailyclean ?? getField(asset, 'craa5_dailyclean'))) freq = 'weekly';
-                                else if (isBoolTrue(asset.craa5_midweek ?? getField(asset, 'craa5_midweek')) && !isBoolTrue(asset.craa5_dailyclean ?? getField(asset, 'craa5_dailyclean'))) freq = 'midweek';
-                                const decHours = Math.max(0.08, Math.round((pieceHrs || 0.25) * 100) / 100);
-                                const intHours = Math.max(1, Math.round(pieceHrs || 1));
-                                const baseLog = {
-                                    craa5_sap: 'auto- ' + freq,
-                                    craa5_room: rmName || areaNameStr,
-                                    craa5_area: arName || areaNameStr,
-                                    craa5_equipment: eqName,
-                                    craa5_equipmentguid: rawGuid,
-                                    craa5_lastcleaned: ymd + 'T00:00:00Z',
-                                    craa5_lastcleanedby: cleanedByStr,
-                                    craa5_hoursworked: decHours
-                                };
-                                const rank = freq === 'monthly' || freq === 'quarterly' || freq === 'annual' ? 3 : freq === 'weekly' ? 2 : 1;
-                                pendingLogs.push({
-                                    full: {
-                                        ...baseLog,
-                                        craa5_daily: true,
-                                        craa5_weekly: rank >= 2,
-                                        craa5_monthly: rank >= 3
-                                    },
-                                    fallback: { ...baseLog, craa5_hoursworked: intHours }
-                                });
-                            });
-                            try { localStorage.setItem(dedupKey, JSON.stringify(sentMap)); } catch (e) {}
-                            if (pendingLogs.length > 0) {
-                                setTimeout(async () => {
-                                    for (let i = 0; i < pendingLogs.length; i += 4) {
-                                        const batch = pendingLogs.slice(i, i + 4);
-                                        await Promise.all(batch.map(item =>
-                                            wApi.create('craa5__log_', item.full)
-                                                .catch(() => wApi.create('craa5__log_', { ...item.fallback, craa5_hoursworked: item.full.craa5_hoursworked }))
-                                                .catch(() => wApi.create('craa5__log_', item.fallback).catch(() => {}))
-                                        ));
-                                    }
-                                }, 250);
-                            }
-                        }
-                    }
+                    mssJobs.push({ areaId, areaName: areaNameStr, cleanType: sc.cleanType || getAreaCleanType(areaId), assets: areaLookup?.matchedAssets || [], cleanedBy: areaWorkerNames.length > 0 ? areaWorkerNames.join(' / ') : (leadNameStr || supNameRaw || 'Crew'), totalAreaHrs: areaLookup?.totalCleanHours || (isProductionArea(areaMap.get(areaId)) ? 4.5 : 2.0) });
                 }
             }
         }
@@ -8929,6 +8978,13 @@ const handleSubmission = async (): Promise<boolean> => {
             }
         }
         logActivity(propsRef.current, { action: reactivate ? 'saved (reopened)' : 'saved', user: me, email: myEmail, role: access.role, board: boardName(savedBoard), boardId: savedBoard.recordId, crew: savedBoard.crew, team: savedBoard.team, changes });
+        // Finished areas go to the MSS calendar only now that the board is saved (in the background; a failure is shown and retried on the next save)
+        if (mssJobs.length) {
+            const doneAt = Date.now();
+            writeMssLogs(propsRef.current, mssJobs, doneAt).then(r => {
+                if (r.failed) setSaveWarning(prev => `${prev ? prev + ' ' : ''}${tx(`MSS calendar: ${r.failed} piece${r.failed === 1 ? '' : 's'} not logged (${r.error.slice(0, 120)}); saving again retries them.`, `Calendario MSS: ${r.failed} pieza${r.failed === 1 ? '' : 's'} sin registrar (${r.error.slice(0, 120)}); guardar de nuevo lo reintenta.`)}`);
+            }).catch((e: any) => logError('MSS log failed', e?.message || e));
+        }
         // A plan loaded for this exact shift has now become this board: it is marked used and deactivated, so it is never offered again
         const lp = loadedPlanRef.current;
         if (lp && lp.recordId && Math.abs(lp.slotStart - savedBoard.slotStart) < 2 * 3600000) {
