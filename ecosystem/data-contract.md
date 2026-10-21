@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.6, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.7, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -104,7 +104,7 @@ Time loss log keeps the column names it was created with: `craa5_assetguid` hold
 | `craa5__supervisor_todo` | live | Manager hub | Manager hub |
 | `craa5__m_formtemplate`, `craa5__m_quicktask` (both User-owned; quick tasks are a personal list on purpose) | live | Manager hub | Manager hub |
 | `craa5__m_employeenote` Manager notes on people | live | Manager hub | Manager hub, manager role only. Sensitive: User-owned, never shown to peers, never in exports or the repo. Key `craa5_employeeguid`. |
-| `craa5__c_*` chemical tables (listed in contract.json; columns in chemical-ordering/table-spec.md) | live | Chemical hub | Chemical hub; Manager hub for cost. User/team-owned with Organization-level Read. The old chem log's employee, shift and equipment columns stay as text as written. |
+| `craa5__c_*` chemical tables (14 in contract.json, taken from the chemical hub's own spec file chemical-ordering/contract/c-tables.json, with full columns; 11 live, Chemical alias and Sanitation budget proposed, Chemical standard unknown) | live | Chemical hub | Chemical hub; Manager hub for cost. User/team-owned with Organization-level Read. The old chem log's employee, shift and equipment columns stay as text as written. |
 | `craa5_dailyproduction` | live | (import) | Chemical hub, cost per pound |
 | `craa5__0_hubconfig` Shared settings | live | Each app writes only its own `craa5_configkey` rows | The same app; shared keys in section 12 |
 | `craa5__sani_schedule_` | live | MSS Calendar | MSS Calendar |
@@ -126,7 +126,7 @@ The **Production Scheduler** writes runs and publishes the clean plan. It is the
 - **Plant clock:** America/Chicago, with daylight saving (`HUB_TZ`). Every "day" in any app is a plant day, `hubPlantDay(ms)`.
 - **Shift date:** the plant day the shift **started**, taken from the board's `craa5_slotstart` (`hubShiftDate`). Everything done on a night shift that starts Tuesday 18:00 belongs to Tuesday, including work after midnight. Never date work by the clock time it was marked.
 - **Date-only values in Dataverse** (MSS log `craa5_lastcleaned`) hold midnight UTC of the shift date: `2026-10-20T00:00:00Z` (`hubDateOnlyUtc`). Readers take the first 10 characters (`hubDayFromDateOnly`) and never convert the time zone.
-- **Text date keys** (`craa5_shiftdate`, `craa5_day`, `craa5_weekkey`) are `YYYY-MM-DD`.
+- **Text date keys** (`craa5_shiftdate`, `craa5_day`, `craa5_weekkey`) are `YYYY-MM-DD`. One existing exception: `_c_ Clerk checklist.craa5_shiftdate` is a date-only column. It stays; readers take its first 10 characters.
 - **Timestamps** (started, done, saved) are stored as UTC date-times and shown on the plant clock.
 - **Week:** Monday to Sunday by shift date. The week key is that Monday (`hubWeekKey`). Production usually ends Saturday or Sunday, so the EOW clean falls in the week it ends.
 - **Teams status times:** 09:00, 12:00 and 15:00 plant time (Shift Start setting).
@@ -361,6 +361,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.7 (2026-10-21)** contract.json takes the 14 `_c_` entries from the chemical hub's c-tables.json (columns, keys, statuses). Clerk checklist date-only shift date noted as an exception.
 - **1.0.6 (2026-10-21)** Section 6.4 lists the check-off columns exactly; `updatesjson.work` is a display copy only; check-off stored statuses are started/done/undone; section 9: no reuse of a shared key with another meaning; table-prompts part 3 adds Employee guids.
 - **1.0.5 (2026-10-21)** Chemical hub review: `chGuidFrom` id exception to rule 6, draft chemical cost for cost per pound, cart label "Draft (not in SAP yet)", `_c_` ownership note.
 - **1.0.4 (2026-10-21)** contract.json lists the 14 `_c_` chemical tables.
