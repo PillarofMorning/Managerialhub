@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.11, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.12, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -314,6 +314,8 @@ Stored as lower-case English codes. Shown with the label in the language chosen.
 | `ss_deactivated_employees_v1` | People who left | `craa5__aa_employee.statecode` |
 | Ganttly `itp_*` keys (check-off fallback, removed / skipped tasks, obstacles, handovers, personnel notes, settings) | Floor work | Check-offs to `craa5_cleancheckoff`. Settings to `craa5__0_hubconfig` key `ganttly_settings`. Notes / handovers: Ganttly thread decides with Gerald which stay (Q7). |
 | `itp_settings_v10` `avgHourlyRate` ($21) | Labor rate | `_e_ Labor rate` |
+| `mss_completion_excluded_v1` | Rooms, areas and equipment left out of MSS percentages | `craa5__0_hubconfig` key `mss_completion_exclusions` (MSS Calendar) |
+| `mss_line_downtime_v1` | Lines off schedule (date ranges), lines added by hand | When a line is off comes from the Clean Plan `day` rows (`craa5_status` idle / unplanned, `craa5_cleankind` none / covered). Only lines the Scheduler does not plan keep hand-entered ranges, in `craa5__0_hubconfig` key `mss_line_downtime` (MSS Calendar) |
 | `mss_log_input_view_module_v1` | Log Input view rules for the Calendar | `craa5__0_hubconfig` key `mss_view_rules` |
 | BOLO IndexedDB swab results + `PATHOGEN_BOLO_MANAGERS_HUB_GRAPHS` blob | Swab results | `_b_ Swab result` |
 | `itp_lang_v1`, `ss_lang_v1`, `prodsched_lang_v1`, `stillwell_*_lang_v1` | Language | `hub_lang` (stays in the browser, one key) |
@@ -339,7 +341,7 @@ New tables are named `_<letter>_ Name`, so the schema name is `craa5__<letter>_n
 Apps look a table up by its prefixed name first and its plain name second, as Manager hub v6.8 does, because Gerald may create either.
 
 **Shared settings** in `craa5__0_hubconfig` (one row per `craa5_configkey`, JSON in `craa5_configjson`, each key written by one app):
-`hub_people_thresholds` (Manager hub), `ganttly_settings` (Ganttly), `mss_view_rules` (MSS Log Input), `scheduler_shared` (Production Scheduler; today its `config` row in the Clean Plan, which may stay there), `training_settings` (Training page: minimum shifts, refresher days).
+`hub_people_thresholds` (Manager hub), `ganttly_settings` (Ganttly), `mss_view_rules` (MSS Log Input), `scheduler_shared` (Production Scheduler; today its `config` row in the Clean Plan, which may stay there), `training_settings` (Training page: minimum shifts, refresher days), `mss_completion_exclusions` and `mss_line_downtime` (MSS Calendar; downtime only for lines the Scheduler does not plan).
 
 ---
 
@@ -385,6 +387,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.12 (2026-10-21)** MSS Calendar config keys `mss_completion_exclusions` and `mss_line_downtime`. Line downtime comes from the Clean Plan; hand-entered ranges only for lines the Scheduler does not plan.
 - **1.0.11 (2026-10-21)** Section 6.2: old frequency spellings mapped (MSS LOG WRITE v1.0, PR #40). 6.3: fill `craa5_uid` (primary name) with the SAP code. Q8: `craa5_allergenclean` type.
 - **1.0.10 (2026-10-21)** BOLO v2.2: `craa5__b_swabresult` columns and keys, and four new text columns on the swab catalog.
 - **1.0.9 (2026-10-21)** Section 6.5 points to the Scheduler's reader guide; adds scope and alert rows and window details v2. `craa5_cleanoverride` ("midweek|who|why" or "skip|who|why") is for the Scheduler only.
