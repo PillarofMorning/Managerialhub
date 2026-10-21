@@ -170,7 +170,7 @@ var HUB_BRAND_RED = '#E4002B';            // the logo only, never a status
 //         config: ['ganttly_settings'] }
 //   names = table names the app tries, in order (default [t]); opt = columns the app works without (shown as "not yet").
 var HUB_APP_IDS = ['ganttly', 'shiftstart', 'prodsched', 'msscalendar', 'msslog', 'pbed', 'bolo', 'managerhub', 'chemicals', 'mapsubmit', 'monitor', 'training'];
-var HUB_CONFIG_TABLE = 'craa5__0_hubconfig';
+var HUB_MANIFEST_TABLE = 'craa5__0_hubconfig';   // own name: some pages already declare HUB_CONFIG_TABLE
 function hubNameList(a) {
     var out = [], seen = {};
     (a || []).forEach(function (x) { var v = String(x === undefined || x === null ? '' : x).trim().toLowerCase(); if (v && !seen[v]) { seen[v] = 1; out.push(v); } });
@@ -196,7 +196,7 @@ function hubManifestKey(appId) { return 'manifest|' + hubCanon(appId); }
 var HUB_MANIFEST_COL = 'craa5_manifestjson';
 function hubSaveManifest(io, m) {
     try {
-        var man = hubManifest(m), key = hubManifestKey(man.appId), table = HUB_CONFIG_TABLE, idCol = table + 'id';
+        var man = hubManifest(m), key = hubManifestKey(man.appId), table = HUB_MANIFEST_TABLE, idCol = table + 'id';
         if (!man.appId) return Promise.resolve('failed: no appId');
         var fail = function (e) { return 'failed: ' + String(e && e.message || e); };
         var read = function (cols) {

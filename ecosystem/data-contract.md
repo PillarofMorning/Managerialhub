@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.25, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.26, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -417,6 +417,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.26 (2026-10-21)** `hub-shared.js`: the manifest table constant is now `HUB_MANIFEST_TABLE` (was `HUB_CONFIG_TABLE`, which MSS Calendar and MSS Log Input already declare). `contract.json`: Equipment `optionalCols` lists the egg / pecan columns and `craa5_minalrg`.
 - **1.0.25 (2026-10-21)** Q7 tables from the Ganttly thread: `_g_ Obstacle`, `_g_ Handover`, `_g_ Personnel note` (sections 3.3 and 13, contract.json). Ganttly stops writing notes into the Employee `craa5_remarks` JSON.
 - **1.0.24 (2026-10-21)** Section 2: egg / pecan minutes are labor person-minutes like `craa5_minalrg`; blank or 0 falls back to it.
 - **1.0.23 (2026-10-21)** Gerald's answers Q2-Q8: anyone may mark Done; `craa5_hourstoclean` minutes; `craa5_month` = 6-month flag; labor rate by role; Spanish checked once; Ganttly obstacles / handovers / personnel notes kept and move to tables; allergen split into `egg` and `pecan` clean kinds (hub-shared.js, 85 checks) with 4 Equipment columns (`table-prompts.md` part 7).
