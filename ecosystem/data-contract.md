@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.13, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.14, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -391,6 +391,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.14 (2026-10-21)** contract.json rebuilt from the chemical thread's updated c-tables.json: the four kept `_c_` primary name columns (Chemical `craa5__c_chemical_name`, Cart line `craa5_cartlinename`, Chemical count `craa5_chemicalname`, Clerk checklist `craa5__c_clerkchecklist1`). Apps read the primary column from the table definition.
 - **1.0.13 (2026-10-21)** Dataverse monitor results: check-off table and Midweek column exist; skip code and access log tables missing; time loss log and quick task not made yet; 8 named tables absent; 47 unlisted tables marked abandoned (3 legacy); primary name columns kept as made. Labor rate prompt shortened (Copilot makes one table per short prompt).
 - **1.0.12 (2026-10-21)** MSS Calendar config keys `mss_completion_exclusions` and `mss_line_downtime`. Line downtime comes from the Clean Plan; hand-entered ranges only for lines the Scheduler does not plan.
 - **1.0.11 (2026-10-21)** Section 6.2: old frequency spellings mapped (MSS LOG WRITE v1.0, PR #40). 6.3: fill `craa5_uid` (primary name) with the SAP code. Q8: `craa5_allergenclean` type.
