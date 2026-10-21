@@ -1,4 +1,4 @@
-/* ============================== START MSS LOG WRITE v1.0 ============================== */
+/* ============================== START MSS LOG WRITE v1.1 ============================== */
 // The one place in the ecosystem that builds and saves a finished clean in the MSS log (craa5__log_), by the rule in the data
 // contract, section 6.3. Paste it unchanged into every app that logs a clean (Ganttly, MSS Log Input, MSS Calendar), right after
 // the HUB SHARED block, which it needs (hubGuid, hubShiftDate, hubCompletionKey, hubLogIdOf, hubCleanKind, hubCrew, ...).
@@ -20,7 +20,7 @@
 // The host passes an api with query(table, { select, filter, top }) -> rows, create(table, body) and update(table, id, body);
 // mlwApi(xrm, dataApi) builds one from Xrm.WebApi or the page's dataApi.
 
-var MLW_VERSION = '1.0';
+var MLW_VERSION = '1.1';
 var MLW_TABLE = 'craa5__log_';
 var MLW_ID = 'craa5__log_id';
 var MLW_QUEUE_KEY = 'mss_log_write_queue_v1';
@@ -144,7 +144,8 @@ function mlwBuildRow(entry, now) {
         craa5_doneat: e.doneAt ? new Date(e.doneAt).toISOString() : new Date(now || Date.now()).toISOString(),
         craa5_plankey: String(e.planKey || '').trim(),
         craa5_linekey: String(e.lineKey || '').trim(),
-        craa5_sapw: String(e.workArea || '').trim()
+        craa5_sapw: String(e.workArea || '').trim(),
+        craa5_uid: String(e.workArea || '').trim().slice(0, 100)   // primary name: the SAP code, same as craa5_sapw (contract 6.3)
     };
     var f = mlwFlags(kind);
     row.craa5_daily = f.craa5_daily; row.craa5_weekly = f.craa5_weekly; row.craa5_monthly = f.craa5_monthly;
@@ -321,4 +322,4 @@ function mlwApi(xrm, dataApi) {
     };
     return null;
 }
-/* ============================== END MSS LOG WRITE v1.0 ============================== */
+/* ============================== END MSS LOG WRITE v1.1 ============================== */

@@ -83,7 +83,7 @@ test('row: every column by contract 6.3', () => {
     assert.strictEqual(r.craa5_plankey, 'w|x|y');
     assert.strictEqual(r.craa5_linekey, 'ibl5');
     assert.strictEqual(r.craa5_sapw, 'SSANIBL5W');
-    assert.strictEqual(r.craa5_uid, undefined, 'craa5_uid keeps its old meaning and is not written');
+    assert.strictEqual(r.craa5_uid, 'SSANIBL5W', 'craa5_uid (primary name) = the SAP code, same as craa5_sapw');
 });
 
 test('night shift: the shift date comes from the board start on the plant clock, not the time Done was pressed', () => {
