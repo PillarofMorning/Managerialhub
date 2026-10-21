@@ -49,7 +49,7 @@ ok(m1.hash, m2.hash); ok(m1.hash === H.hubManifest({ appId: 'ganttly', app: 'Gan
 ok(H.hubManifestKey('Ganttly'), 'manifest|ganttly'); ok(/[^\x00-\x7F]/.test(JSON.stringify(m1)), false);
 var db = [], calls = [];
 var io = {
-    query: function (t, q) { calls.push('q'); var key = /'([^']+)'/.exec(q.filter)[1]; return Promise.resolve({ rows: db.filter(function (r) { return r.craa5_configkey === key; }) }); },
+    query: function (t, q) { calls.push('q'); if (!io.hasCol && q.select.indexOf('craa5_manifestjson') >= 0) return Promise.reject(new Error('Could not find a property named craa5_manifestjson')); var key = /'([^']+)'/.exec(q.filter)[1]; return Promise.resolve({ rows: db.filter(function (r) { return r.craa5_configkey === key; }) }); },
     create: function (t, b) { calls.push('c'); db.push(b); return Promise.resolve(b[t + 'id']); },
     update: function (t, id, b) { calls.push('u'); db.forEach(function (r) { if (r.craa5__0_hubconfigid === id) { for (var k in b) r[k] = b[k]; } }); return Promise.resolve(); }
 };
@@ -58,7 +58,7 @@ H.hubSaveManifest(io, man).then(function (r1) {
     ok(r1, 'saved'); ok(db.length, 1); ok(db[0].craa5__0_hubconfigid, H.hubIdFromKey('hubconfig|manifest|ganttly')); ok(JSON.parse(db[0].craa5_configjson).version, '2.0.0');
     return H.hubSaveManifest(io, man);
 }).then(function (r2) {
-    ok(r2, 'same'); ok(calls.join(''), 'qcq');
+    ok(r2, 'same'); ok(calls.join(''), 'qqcqq');
     return H.hubSaveManifest(io, { appId: 'ganttly', app: 'Ganttly', version: '2.0.1', tables: man.tables });
 }).then(function (r3) {
     ok(r3, 'saved'); ok(db.length, 1); ok(JSON.parse(db[0].craa5_configjson).version, '2.0.1');
@@ -68,5 +68,13 @@ H.hubSaveManifest(io, man).then(function (r1) {
     return H.hubSaveManifest(io, { app: 'x' });
 }).then(function (r5) {
     ok(r5, 'failed: no appId');
+    // hubconfig gains craa5_manifestjson: the list moves there, configjson keeps a stub
+    io.hasCol = true;
+    return H.hubSaveManifest(io, man);
+}).then(function (r6) {
+    ok(r6, 'saved'); ok(db.length, 1); ok(JSON.parse(db[0].craa5_manifestjson).version, '2.0.0'); ok(JSON.parse(db[0].craa5_configjson).in, 'craa5_manifestjson');
+    return H.hubSaveManifest(io, man);
+}).then(function (r7) {
+    ok(r7, 'same');
     console.log('hub-shared: ' + n + ' checks passed');
 }).catch(function (e) { console.error(e); process.exit(1); });

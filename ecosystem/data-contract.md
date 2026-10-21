@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.19, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.20, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -355,14 +355,14 @@ Apps look a table up by its prefixed name first and its plain name second, as Ma
 
 Each app says in its own code which tables and columns it uses, and saves that list to Dataverse when it opens. The Dataverse monitor then checks every app at once against what really exists, with nothing pasted by hand. Smallest version: no new table.
 
-- **Where:** `craa5__0_hubconfig`, `craa5_configkey` = `manifest|<appId>`, JSON in `craa5_configjson`, name "<App> manifest". One row per app, fixed row id `hubIdFromKey('hubconfig|manifest|<appId>')`.
+- **Where:** `craa5__0_hubconfig`, `craa5_configkey` = `manifest|<appId>`, name "<App> manifest". The JSON goes in the optional column `craa5_manifestjson` (Manifest json, max 100,000) when it exists; `craa5_configjson` then holds a short stub `{ m, appId, version, hash, savedAt, in }`. Without that column the JSON goes in `craa5_configjson`. One row per app, fixed row id `hubIdFromKey('hubconfig|manifest|<appId>')`.
 - **appIds:** `ganttly`, `shiftstart`, `prodsched`, `msscalendar`, `msslog`, `pbed`, `bolo`, `managerhub`, `chemicals`, `mapsubmit`, `monitor`, `training`.
 - **What the app writes:** `{ appId, app, version, tables: [{ t, names, read, write, opt }], config }`. `t` is the table's logical name, `names` the names the app tries in order (prefixed first), `read`/`write` the columns, `opt` the columns it works without (the monitor shows them as "not yet", not "missing"), `config` the hubconfig keys it writes. Logical names only, never data or people.
 - **What gets stored:** `hubManifest()` adds `m: 1`, the pasted block's `contract` version, a `hash` and `savedAt`, and sorts every list.
 - **When:** call `hubSaveManifest(io, manifest)` once after the app loads. It reads the row (one small read), writes only when the hash changed, never blocks the app and never shows an error. `io` is the app's own query / create / update (Ganttly: `swQuery` + `swWriter`).
 - **Who reads it:** the Dataverse monitor. It reports "Ganttly 2.0.0 (saved <date>) needs X, missing Y", and builds the one-table Copilot prompts and click-steps for what is missing.
 - **How it relates to `contract.json`:** `contract.json` is the plan: which tables should exist, keys, statuses, owners. Manifests are what each app build really uses. The monitor checks manifests against Dataverse (does it exist?) and against `contract.json` (is the app writing a table it does not own, or reading an abandoned one?). When a manifest and the contract disagree, the contract thread fixes one of them.
-- **Dataverse setup (Gerald, once):** `craa5_configjson` must hold the larger manifests (up to about 8 KB). If its maximum length is under 100,000, raise it (Tables > hubconfig > Columns > Config json > Maximum character count). Roles need Organization Read on hubconfig. With User ownership, only the person who first saved a manifest can update it unless roles also have Organization Write. Without that, a manifest stays at the older version until that person opens the newer app.
+- **Dataverse setup (Gerald, once):** Config json's maximum length cannot be changed, and the table is not recreated (seven apps keep settings in it). If Config json holds under 10,000 characters, add the column Manifest json (`craa5_manifestjson`, Multiple lines of text, max 100,000) to hubconfig (`table-prompts.md` part 6). Roles need Organization Read on hubconfig. With User ownership, only the person who first saved a manifest can update it unless roles also have Organization Write. Without that, a manifest stays at the older version until that person opens the newer app.
 - **First app:** Ganttly, in its Phase 2. The others add theirs when they next change.
 
 ---
@@ -409,6 +409,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.20 (2026-10-21)** 12.1: Config json's length cannot be changed, so manifests go in a new optional hubconfig column Manifest json (`craa5_manifestjson`) when present; `hubSaveManifest` falls back to Config json (82 checks). hubconfig is not recreated.
 - **1.0.19 (2026-10-21)** One writer per hubconfig key again: MSS Log Input owns `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG`; the Calendar writes its own `MSS_CALENDAR_ACCESS_LOG` (Calendar PR #38).
 - **1.0.18 (2026-10-21)** `contract.json` gains `configKeys` (every hubconfig key, its owner app and status) for the monitor's hubconfig check. Section 12 lists the keys in use today; `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG` have two writers (open).
 - **1.0.17 (2026-10-21)** 12.1 App manifests: each app saves the tables and columns it uses to hubconfig `manifest|<appId>`; the Dataverse monitor checks them. `hub-shared.js` v1.1 adds `hubManifest`, `hubManifestKey`, `hubSaveManifest` (77 checks). `contract.json` gains a `manifests` block.

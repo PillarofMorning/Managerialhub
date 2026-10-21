@@ -68,10 +68,17 @@ For the Map submission tool. It writes them only once they exist.
 | Equipment guids | `craa5_equipmentguids` | Multiple lines of text, max 4000 |
 | MSS area guid | `craa5_mssareaguid` | Single line of text, max 100 |
 
-## Part 6. Shared settings (`craa5__0_hubconfig`): one setting, no new columns
+## Part 6. Shared settings (`craa5__0_hubconfig`): maybe one column
 
-Apps now save a short list of the tables and columns they use here, so the Dataverse monitor can check every app by itself (contract section 12.1). The lists are up to about 8 KB, so the Config json column must be big enough.
+Apps now save a short list of the tables and columns they use here, so the Dataverse monitor can check every app by itself (contract section 12.1). The lists are up to about 8 KB. Do **not** recreate this table: seven apps keep their settings in it. Its Config json column cannot be resized or deleted (the "dependencies" are just the form and views that show it), and that is fine.
 
-1. Tables > hubconfig > Columns > **Config json**.
-2. If **Maximum character count** is under 100,000, set it to 100000. Save.
-3. Security roles: every hub role needs **Organization** Read on hubconfig. Give **Organization** Write too, so a newer app version can update a list that someone else saved.
+1. Tables > hubconfig > Columns > **Config json** > Advanced options: read **Maximum character count**. If it is 10,000 or more, stop here.
+2. Otherwise add one column to hubconfig (New > Column):
+
+| Display name | Schema name | Type |
+|---|---|---|
+| Manifest json | `craa5_manifestjson` | Multiple lines of text, Maximum character count **100000** (set it while creating) |
+
+3. Security roles: every hub role needs **Organization** Read on hubconfig, and **Organization** Write too, so a newer app version can update a list someone else saved.
+
+Apps use Manifest json when it is there and Config json when it is not, so nothing breaks either way.
