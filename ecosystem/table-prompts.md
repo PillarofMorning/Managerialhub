@@ -96,7 +96,7 @@ Egg and pecan cleans cover different pieces and take different times, so each ge
 | Pecan clean | `craa5_pecanclean` | Yes/No |
 | Pecan clean minutes | `craa5_pecanminutes` | Whole number |
 
-Until these are filled, apps keep using the old combined allergen minutes.
+Minutes are labor minutes (people x minutes), the same way as the Allergen clean mins column. Leave one blank and apps use the old combined Allergen clean mins for it.
 
 Optional: on the same table, rename the display name of the **Month** column (`craa5_month`) to "6 month". Only the display name changes; the schema name stays and nothing breaks.
 

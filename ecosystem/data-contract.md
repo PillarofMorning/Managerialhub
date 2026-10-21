@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.23, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.24, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -64,7 +64,7 @@ Ownership: User-owned tables need **Organization-level Read** on every hub secur
 | Table | Status | Writes it | Reads it | Notes |
 |---|---|---|---|---|
 | `craa5_aa_mss_area` Areas | live | Admin in the model-driven form. Shift Start writes only `craa5_clipboard` ("include in update"). | All floor apps, Scheduler, Manager hub, PBED | Key `craa5_area`. Room `craa5_parentroom`. Line setup (`craa5_numberoflines`, `craa5_supportingpart`, `craa5_supportingoffset`, `craa5_cleanoffsetmins`, `craa5_textadditions`) is read by the Scheduler and Ganttly. Map tool and BOLO should read it too, so their areas match. |
-| `craa5_aa_assets` Equipment | live | Admin form. **MSS Calendar** owns the frequency flags (`craa5_dailyclean`, `craa5_midweek`, `craa5_weeklyclean`, `craa5_monthlyclean`, `craa5_month`, `craa5_quarterly`, `craa5_annually`, and the new egg / pecan allergen columns). **Map tool** owns `craa5_maplocation` and the pictures. | Everyone | Key = GUID. `craa5_hoursrequired` = **standard labor minutes** (section 7). `craa5_heads` = people the piece needs. `craa5_subcategory` = clean step order ("1 - pic", "5 Staging"). `craa5_midweek` exists (Dataverse monitor, 2026-10-21). `craa5_month` is the **6-month (semiannual)** flag: it was meant to be `craa5_6month` and the 6 was lost when it was made (Gerald, Q4); its display name can be changed to "6 month", the schema name stays. Allergen cleans are split by allergen (Q8): `craa5_eggclean` / `craa5_eggminutes` and `craa5_pecanclean` / `craa5_pecanminutes` (`table-prompts.md` part 7); `craa5_minalrg` is the old combined allergen minutes, used only until the split columns are filled. |
+| `craa5_aa_assets` Equipment | live | Admin form. **MSS Calendar** owns the frequency flags (`craa5_dailyclean`, `craa5_midweek`, `craa5_weeklyclean`, `craa5_monthlyclean`, `craa5_month`, `craa5_quarterly`, `craa5_annually`, and the new egg / pecan allergen columns). **Map tool** owns `craa5_maplocation` and the pictures. | Everyone | Key = GUID. `craa5_hoursrequired` = **standard labor minutes** (section 7). `craa5_heads` = people the piece needs. `craa5_subcategory` = clean step order ("1 - pic", "5 Staging"). `craa5_midweek` exists (Dataverse monitor, 2026-10-21). `craa5_month` is the **6-month (semiannual)** flag: it was meant to be `craa5_6month` and the 6 was lost when it was made (Gerald, Q4); its display name can be changed to "6 month", the schema name stays. Allergen cleans are split by allergen (Q8): `craa5_eggclean` / `craa5_eggminutes` and `craa5_pecanclean` / `craa5_pecanminutes` (`table-prompts.md` part 7); `craa5_minalrg` is the old combined allergen minutes. Egg / pecan minutes mean the same as `craa5_minalrg` (labor person-minutes, like `craa5_hoursrequired`), for that allergen only; a blank or 0 means use `craa5_minalrg`. |
 | `craa5_aa_ms_assets` MSS SAP catalog | live | Admin / MSS Log Input | MSS Log Input, MSS Calendar, Scheduler | SAP code `craa5_title`. `craa5_hourstoclean` is **minutes** (Gerald, Q3: the original data was hours; it is minutes now). |
 | `craa5__aa_employee` Employees | live | Manager hub (People page) and admin. **Ganttly** writes only `craa5_remarks` / `craa5_remarkcategory` (high fives). | Everyone | Leavers: `statecode` = inactive, never a browser list. Role `craa5_role`: 256000000 Sanitor, 256000001 Lead, 256000002 Supervisor. |
 | `craa5__aa_leadershipteam` | live | Admin | Shift Start | Lead/supervisor team names |
@@ -414,6 +414,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.24 (2026-10-21)** Section 2: egg / pecan minutes are labor person-minutes like `craa5_minalrg`; blank or 0 falls back to it.
 - **1.0.23 (2026-10-21)** Gerald's answers Q2-Q8: anyone may mark Done; `craa5_hourstoclean` minutes; `craa5_month` = 6-month flag; labor rate by role; Spanish checked once; Ganttly obstacles / handovers / personnel notes kept and move to tables; allergen split into `egg` and `pecan` clean kinds (hub-shared.js, 85 checks) with 4 Equipment columns (`table-prompts.md` part 7).
 - **1.0.22 (2026-10-21)** contract.json rebuilt from c-tables.json: `_c_ Chemical standard` live (read by Chemical hub and Manager hub, kept by Admin form); Chemical price per unit = current price of one container.
 - **1.0.21 (2026-10-21)** Section 7: Projected clean cost (manager hub v7.0 Line clean cost tab, PR #42). Q9: wage or loaded labor rate.
