@@ -14,7 +14,7 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 
 const LOGO_URL = "";
 const BRAND = { blue: '#0072CE', blueDark: '#00468B', blueSoft: '#E6F1FB', yellow: '#FFB81C', yellowSoft: '#FFF6E0', red: '#E4002B', redSoft: '#FDE8EC' };
-const MONITOR_VERSION = 'v2.2';
+const MONITOR_VERSION = 'v2.3';
 
 const ORG_LANG_KEY = 'stillwell_org_lang_v1';
 const ORG_THEME_KEY = 'stillwell_org_dark_v1';
@@ -1273,8 +1273,9 @@ function dvParseManifest(row) {
   return out;
 }
 
-// Reads every manifest row. Resolves { state: 'ok'|'missing'|'denied'|'unknown', table, rows, err }.
-async function dvReadManifestRows(conn) {
+// Reads Hub config rows (only the manifest rows when prefix is given). Resolves { state: 'ok'|'missing'|'denied'|'unknown', table, rows, err }.
+function dvReadManifestRows(conn) { return dvReadHubConfigRows(conn, MANIFEST_PREFIX); }
+async function dvReadHubConfigRows(conn, prefix) {
   const select = ['craa5_configkey', 'craa5_configname', 'craa5_configjson', 'modifiedon'];
   let lastErr = '';
   let lastKind = '';
@@ -1282,14 +1283,14 @@ async function dvReadManifestRows(conn) {
     const t = HUBCONFIG_NAMES[i];
     if (conn.web) {
       try {
-        const q = '?$select=' + select.join(',') + "&$filter=startswith(craa5_configkey,'" + MANIFEST_PREFIX + "')&$top=200";
+        const q = '?$select=' + select.join(',') + (prefix ? "&$filter=startswith(craa5_configkey,'" + prefix + "')" : '') + '&$top=500';
         const res = await dvTimeout(() => conn.web.retrieveMultipleRecords(t, q), 'Xrm.WebApi ' + t);
         return { state: 'ok', table: t, rows: (res && res.entities) || [] };
       } catch (e) { lastErr = dvErrText(e); lastKind = dvClassify(lastErr); }
     }
     if (conn.dataApi) {
       try {
-        const page = await dvTimeout(() => conn.dataApi.queryTable(t, { select, filter: "startswith(craa5_configkey,'" + MANIFEST_PREFIX + "')", pageSize: 200 }), 'dataApi ' + t);
+        const page = await dvTimeout(() => conn.dataApi.queryTable(t, prefix ? { select, filter: "startswith(craa5_configkey,'" + prefix + "')", pageSize: 500 } : { select, pageSize: 500 }), 'dataApi ' + t);
         if (page && Array.isArray(page.rows)) return { state: 'ok', table: t, rows: page.rows };
       } catch (e) { const m = dvErrText(e); if (!lastErr || dvClassify(m) === 'denied') { lastErr = m; lastKind = dvClassify(m); } }
     }
@@ -1344,6 +1345,60 @@ async function dvCheckManifest(conn, man, metaCache, contractTables) {
   const problems = tables.filter(t => t.state !== 'found' || t.missingRead.length || t.missingWrite.length || t.contractNotes.length).length;
   const unsure = tables.filter(t => t.state === 'unknown' || t.unchecked.length).length;
   return { tables, problems, unsure };
+}
+
+// The shared settings keys the contract names (section 12), each written by one app. Manifests add manifest|<appId> per app.
+const HUB_CONFIG_KEYS = [
+  { key: 'hub_people_thresholds', app: 'managerhub' },
+  { key: 'ganttly_settings', app: 'ganttly' },
+  { key: 'mss_view_rules', app: 'msslog' },
+  { key: 'scheduler_shared', app: 'prodsched', note: 'may stay in the Clean Plan config row' },
+  { key: 'training_settings', app: 'training' },
+  { key: 'mss_completion_exclusions', app: 'msscalendar' },
+  { key: 'mss_line_downtime', app: 'msscalendar' }
+];
+
+// Checks every Hub config row the way the tables are checked: is it what the contract expects, and is it healthy.
+// Looks at keys, text length and whether the text is valid JSON. Never keeps or shows the values.
+function dvCheckHubConfig(rows, maxLen, apps) {
+  const keyCount = {};
+  const list = (rows || []).map(r => {
+    const key = String(r && r.craa5_configkey || '').trim();
+    const text = r && r.craa5_configjson != null ? String(r.craa5_configjson) : '';
+    keyCount[key] = (keyCount[key] || 0) + 1;
+    let json = 'empty';
+    let jsonAppId = '';
+    if (text.trim()) {
+      try { const j = JSON.parse(text); json = 'ok'; if (j && typeof j === 'object' && j.appId) jsonAppId = String(j.appId); } catch (e) { json = 'bad'; }
+    }
+    const isManifest = key.indexOf(MANIFEST_PREFIX) === 0;
+    const setting = HUB_CONFIG_KEYS.find(k => k.key === key);
+    const appId = isManifest ? key.slice(MANIFEST_PREFIX.length) : (setting ? setting.app : '');
+    return { key, name: String(r && r.craa5_configname || ''), len: text.length, json, jsonAppId, kind: isManifest ? 'manifest' : (setting ? 'setting' : 'unlisted'), appId, modifiedOn: r && r.modifiedon ? String(r.modifiedon) : '', issues: [] };
+  });
+  list.forEach(x => {
+    if (!x.key) x.issues.push('blankkey');
+    else if (keyCount[x.key] > 1) x.issues.push('dupkey');
+    if (x.json === 'bad') x.issues.push(maxLen && x.len >= maxLen ? 'cutoff' : 'badjson');
+    if (x.json === 'empty') x.issues.push('emptyjson');
+    if (maxLen && x.json !== 'bad' && x.len >= maxLen * 0.9) x.issues.push('nearlimit');
+    if (x.kind === 'manifest' && !APP_WRITER_NAMES[x.appId]) x.issues.push('unknownapp');
+    if (x.kind === 'manifest' && x.jsonAppId && x.jsonAppId !== x.appId) x.issues.push('appmismatch');
+  });
+  const have = new Set(list.map(x => x.key));
+  const expected = HUB_CONFIG_KEYS.map(k => ({ key: k.key, app: k.app, note: k.note || '', kind: 'setting' }))
+    .concat(Object.keys(APP_WRITER_NAMES).map(a => ({ key: MANIFEST_PREFIX + a, app: a, note: '', kind: 'manifest' })))
+    .map(e => { const row = list.find(x => x.key === e.key); return Object.assign(e, { state: !have.has(e.key) ? 'notyet' : (row.issues.length ? 'problem' : 'saved') }); });
+  // Keys a manifest says the app writes: must be on the contract's list and belong to that app.
+  const claims = [];
+  (apps || []).forEach(a => (a.config || []).forEach(k => {
+    const owner = HUB_CONFIG_KEYS.find(x => x.key === k);
+    if (k.indexOf(MANIFEST_PREFIX) === 0) return;
+    if (!owner) claims.push({ appId: a.appId, key: k, issue: 'notincontract' });
+    else if (owner.app !== a.appId) claims.push({ appId: a.appId, key: k, issue: 'otherapp', owner: owner.app });
+  }));
+  const problems = list.filter(x => x.issues.length).length + claims.length;
+  return { rows: list, expected, claims, unlisted: list.filter(x => x.kind === 'unlisted' && x.key).map(x => x.key), problems };
 }
 
 // How long the config text column may be (so a manifest is known to fit). null = could not tell.
@@ -1544,11 +1599,12 @@ export default function DataverseOrganizerApp(props) {
     if (scanRef.current !== myScan) return;
     setDiscovered(list);
     // App manifests: what each app says it needs, saved by the app itself in Hub config.
-    const read = await dvReadManifestRows(conn);
+    const read = await dvReadHubConfigRows(conn, '');
+    const manRows = read.rows.filter(r => String(r.craa5_configkey || '').indexOf(MANIFEST_PREFIX) === 0);
     const cache = {};
     const apps = [];
-    for (let i = 0; i < read.rows.length; i++) {
-      const man = dvParseManifest(read.rows[i]);
+    for (let i = 0; i < manRows.length; i++) {
+      const man = dvParseManifest(manRows[i]);
       man.check = man.error ? null : await dvCheckManifest(conn, man, cache, ECOSYSTEM_TABLES);
       apps.push(man);
     }
@@ -1558,7 +1614,8 @@ export default function DataverseOrganizerApp(props) {
     const hubSpec = ECOSYSTEM_TABLES.find(t => t.logicalName === read.table);
     const hubRes = read.table ? await dvReadMeta(conn, read.table, []) : null;
     if (scanRef.current !== myScan) return;
-    setManifests({ state: read.state, table: read.table || '', err: read.err || '', apps, maxLen, ownership: hubRes && hubRes.meta ? hubRes.meta.OwnershipType : '', expectedOwnership: hubSpec ? hubSpec.expectedOwnership : '' });
+    const hub = read.state === 'ok' ? dvCheckHubConfig(read.rows, maxLen, apps) : null;
+    setManifests({ state: read.state, table: read.table || '', err: read.err || '', apps, maxLen, hub, ownership: hubRes && hubRes.meta ? hubRes.meta.OwnershipType : '', expectedOwnership: hubSpec ? hubSpec.expectedOwnership : '' });
     setLastScanTime(new Date().toISOString());
     setScanning(false);
   }, [conn, online]);
@@ -1635,6 +1692,15 @@ export default function DataverseOrganizerApp(props) {
       summary: VERDICT_ORDER.filter(c => summary[c] > 0).map(c => summaryLabel(c, 'en') + ': ' + summary[c]),
       tables: printoutMode === 'full' ? rows : rows.filter(x => NOT_PROBLEMS.indexOf(verdicts[x.table].code) === -1 || x.filledValues),
       notConfirmedTables: ECOSYSTEM_TABLES.filter(t => t.status === 'unknown').map(t => t.logicalName + ': ' + verdictText(verdicts[t.logicalName], 'en')),
+      hubConfig: !manifests ? 'not read' : (manifests.state !== 'ok' || !manifests.hub ? manifests.state + (manifests.err ? ': ' + manifests.err : '') : {
+        rows: manifests.hub.rows.length,
+        configJsonMaxLength: manifests.maxLen,
+        ownership: manifests.ownership || 'unknown',
+        problems: manifests.hub.rows.filter(x => x.issues.length).map(x => (x.key || '(blank key)') + ': ' + x.issues.join(',') + ' (' + x.len + ' chars)').concat(manifests.hub.claims.map(c => c.appId + ' writes ' + c.key + ': ' + (c.issue === 'otherapp' ? 'belongs to ' + c.owner : 'not in contract'))),
+        notSavedYet: manifests.hub.expected.filter(e => e.state === 'notyet').map(e => e.key),
+        notInContract: manifests.hub.unlisted,
+        largest: manifests.hub.rows.slice().sort((a, b) => b.len - a.len).slice(0, 3).map(x => x.key + ' ' + x.len)
+      }),
       appManifests: !manifests ? 'not read' : (manifests.state !== 'ok' ? manifests.state + (manifests.err ? ': ' + manifests.err : '') : {
         configJsonMaxLength: manifests.maxLen,
         hubConfigOwnership: manifests.ownership || 'unknown',
@@ -1811,7 +1877,7 @@ export default function DataverseOrganizerApp(props) {
           { id: 'printout', label: L('Printout', 'Reporte') },
           { id: 'bridges', label: L('Browser storage', 'Almacenamiento del navegador') + ' (' + STORAGE_BRIDGES.length + ')' },
           { id: 'apps', label: L('Apps', 'Apps') + ' (' + ECOSYSTEM_APPS.length + ')' },
-          { id: 'manifests', label: L('App manifests', 'Manifiestos de apps') + (manifests && manifests.apps ? ' (' + manifests.apps.length + ')' : '') },
+          { id: 'manifests', label: L('Hub config', 'Hub config') + (manifests && manifests.hub ? ' (' + manifests.hub.rows.length + (manifests.hub.problems ? ', ' + manifests.hub.problems + L(' to fix', ' por corregir') : '') + ')' : '') },
           { id: 'prompts', label: L('Table maker prompt', 'Prompt para crear tablas') }
         ].map(tab => (
           <button key={tab.id} type="button" onClick={() => setActiveTab(tab.id)} style={{ padding: '9px 16px', borderRadius: '6px', border: '1px solid ' + (activeTab === tab.id ? '#3b82f6' : borderCol), background: activeTab === tab.id ? '#1d4ed8' : bgCard, color: activeTab === tab.id ? '#ffffff' : textMain, fontWeight: 600, fontSize: '13px', cursor: 'pointer' }}>
@@ -2087,7 +2153,52 @@ export default function DataverseOrganizerApp(props) {
       {/* APP MANIFESTS: what each app says it needs */}
       {activeTab === 'manifests' && (
         <div style={{ background: bgCard, borderRadius: '8px', padding: '18px', border: '1px solid ' + borderCol }}>
-          <h2 style={{ margin: 0, fontSize: '18px' }}>{L('What each app says it needs', 'Lo que cada app dice que necesita')}</h2>
+          <h2 style={{ margin: 0, fontSize: '18px' }}>{L('Hub config (shared settings)', 'Hub config (configuracion compartida)')}</h2>
+          <div style={{ fontSize: '13px', color: textSub, marginTop: '4px', marginBottom: '14px' }}>
+            {L('Every row in craa5__0_hubconfig is checked: its key is on the contract list and written by the right app, it is there only once, its text is valid JSON, and it fits the column. Values are never shown or copied. The table itself (columns, row count) is checked in the Tables tab like every other table.', 'Se revisa cada fila de craa5__0_hubconfig: su clave esta en la lista del contrato y la escribe la app correcta, esta una sola vez, su texto es JSON valido y cabe en la columna. Los valores nunca se muestran ni se copian. La tabla misma (columnas, filas) se revisa en la pestana Tablas como las demas.')}
+          </div>
+          {manifests && manifests.hub && (() => {
+            const hub = manifests.hub;
+            const issueText = i => ({ blankkey: L('blank key', 'clave vacia'), dupkey: L('key saved more than once (apps may read the wrong one)', 'clave guardada mas de una vez (las apps pueden leer la equivocada)'), badjson: L('text is not valid JSON (the app cannot read it)', 'el texto no es JSON valido (la app no lo puede leer)'), cutoff: L('text was cut off at the column limit; raise the maximum length', 'el texto se corto en el limite de la columna; suba la longitud maxima'), emptyjson: L('no text saved', 'sin texto guardado'), nearlimit: L('within 10% of the column limit', 'a menos del 10% del limite de la columna'), unknownapp: L('manifest for an app the contract does not know', 'manifiesto de una app que el contrato no conoce'), appmismatch: L('appId inside does not match the key', 'el appId de adentro no coincide con la clave') }[i] || i);
+            const appName = a => APP_WRITER_NAMES[a] || a;
+            const stateTone = { saved: 'green', notyet: 'gray', problem: 'red' };
+            const stateWord = { saved: L('saved', 'guardada'), notyet: L('not saved yet', 'aun no guardada'), problem: L('needs a fix', 'por corregir') };
+            return (
+              <div style={{ marginBottom: '18px' }}>
+                <div style={{ fontSize: '14px', fontWeight: 700, marginBottom: '6px' }}>{L('Keys the apps need', 'Claves que necesitan las apps')}</div>
+                <div style={{ fontSize: '12px', color: textSub, marginBottom: '6px' }}>{L('"Not saved yet" is normal until that app saves its settings or manifest the first time.', '"Aun no guardada" es normal hasta que esa app guarde su configuracion o manifiesto la primera vez.')}</div>
+                <div style={{ display: 'grid', gap: '4px' }}>
+                  {hub.expected.map(e => (
+                    <div key={e.key} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px', flexWrap: 'wrap', fontSize: '12px' }}>
+                      <span style={{ fontFamily: 'Consolas, monospace', wordBreak: 'break-word', minWidth: 0 }}>{e.key} <span style={{ color: textSub, fontFamily: 'inherit' }}>{'- ' + appName(e.app) + (e.note ? ' (' + e.note + ')' : '')}</span></span>
+                      <span style={pill(stateTone[e.state])}>{stateWord[e.state]}</span>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ fontSize: '14px', fontWeight: 700, margin: '14px 0 6px' }}>{L('Every row', 'Todas las filas') + ' (' + hub.rows.length + ')'}</div>
+                {hub.rows.length === 0 && <div style={{ fontSize: '13px', color: textSub }}>{L('Hub config has no rows yet.', 'Hub config aun no tiene filas.')}</div>}
+                <div style={{ display: 'grid', gap: '4px' }}>
+                  {hub.rows.map((x, i) => (
+                    <div key={x.key + '-' + i} style={{ fontSize: '12px', fontFamily: 'Consolas, monospace', wordBreak: 'break-word', color: x.issues.length ? textMain : textSub }}>
+                      {(x.key || L('(blank key)', '(clave vacia)')) + ' - ' + x.len.toLocaleString() + L(' chars', ' caracteres') + (x.json === 'ok' ? ' - JSON ok' : '')}
+                      {x.kind === 'unlisted' && x.key && <span style={{ color: TONES.amber.fg }}>{L(' - not on the contract list (tell the contract thread)', ' - no esta en la lista del contrato (avise al hilo del contrato)')}</span>}
+                      {x.issues.length > 0 && <span style={{ color: TONES.red.fg }}>{' - ' + x.issues.map(issueText).join('; ')}</span>}
+                    </div>
+                  ))}
+                </div>
+                {hub.claims.length > 0 && (
+                  <div style={{ marginTop: '10px' }}>
+                    {hub.claims.map(c => (
+                      <div key={c.appId + c.key} style={{ fontSize: '12px', color: TONES.red.fg }}>
+                        {appName(c.appId) + L(' says it writes ', ' dice que escribe ') + c.key + ': ' + (c.issue === 'otherapp' ? L('that key belongs to ', 'esa clave es de ') + appName(c.owner) : L('the contract does not list that key', 'el contrato no lista esa clave'))}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+          <div style={{ fontSize: '14px', fontWeight: 700, marginBottom: '4px' }}>{L('App manifests: what each app says it needs', 'Manifiestos: lo que cada app dice que necesita')}</div>
           <div style={{ fontSize: '13px', color: textSub, marginTop: '4px', marginBottom: '14px' }}>
             {L('Each app saves a short list of the tables and columns it reads and writes (its manifest) in Hub config when its version changes. This tab checks every list against Dataverse, so a new app version is checked without changing this page.', 'Cada app guarda una lista corta de las tablas y columnas que lee y escribe (su manifiesto) en Hub config cuando cambia de version. Esta pestana revisa cada lista contra Dataverse, asi una version nueva se revisa sin cambiar esta pagina.')}
           </div>
