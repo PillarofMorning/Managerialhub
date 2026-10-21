@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.4, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.5, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -20,7 +20,7 @@ Changes go through this thread. An app thread that needs a new key, column, stat
 3. **Plain keys, no lookups.** Tables point at each other with text keys, set out in section 2. Lookup columns that already exist stay, but no app depends on them for a join.
 4. **Exact column names.** An app reads the column names in this contract. It does not guess from 22 possible names. A missing column is shown as missing (section 8.6) and is never filled in from another column.
 5. **Empty means empty.** When a read fails or comes back empty, the screen says so. It never shows sample, seed or remembered data as if it were real.
-6. **A save is done when Dataverse says so.** Nothing is marked sent, saved or logged before the write succeeds. A failed write stays queued and is retried. Repeated writes use a fixed row id built from the row's key (`hubIdFromKey`), so a retry or a second device updates the same row and never adds a second one.
+6. **A save is done when Dataverse says so.** Nothing is marked sent, saved or logged before the write succeeds. A failed write stays queued and is retried. Repeated writes use a fixed row id built from the row's key (`hubIdFromKey`), so a retry or a second device updates the same row and never adds a second one. Exception: the chemical hub's `_c_` tables build their fixed ids with its own `chGuidFrom` (13,519 usage rows already carry them). Only the chemical hub writes those tables, so the two id builders never meet on the same row.
 7. **Plant time.** Every day, shift and week is read on the America/Chicago clock (section 5). Never use the UTC day.
 8. **Every word in English and Spanish (es-MX)**, with the shared words in section 9. Apps stay 7-bit ASCII (GEMINI.md), so Spanish accents are written as % codes.
 
@@ -104,7 +104,7 @@ Time loss log keeps the column names it was created with: `craa5_assetguid` hold
 | `craa5__supervisor_todo` | live | Manager hub | Manager hub |
 | `craa5__m_formtemplate`, `craa5__m_quicktask` (both User-owned; quick tasks are a personal list on purpose) | live | Manager hub | Manager hub |
 | `craa5__m_employeenote` Manager notes on people | live | Manager hub | Manager hub, manager role only. Sensitive: User-owned, never shown to peers, never in exports or the repo. Key `craa5_employeeguid`. |
-| `craa5__c_*` chemical tables (14, listed in contract.json; columns in chemical-ordering/table-spec.md) | live | Chemical hub | Chemical hub; Manager hub for cost |
+| `craa5__c_*` chemical tables (listed in contract.json; columns in chemical-ordering/table-spec.md) | live | Chemical hub | Chemical hub; Manager hub for cost. User/team-owned with Organization-level Read. The old chem log's employee, shift and equipment columns stay as text as written. |
 | `craa5_dailyproduction` | live | (import) | Chemical hub, cost per pound |
 | `craa5__0_hubconfig` Shared settings | live | Each app writes only its own `craa5_configkey` rows | The same app; shared keys in section 12 |
 | `craa5__sani_schedule_` | live | MSS Calendar | MSS Calendar |
@@ -210,7 +210,7 @@ Every app computes these the same way, from the same table, with the `hub-shared
 | **Headcount planned / present** | Board rows assigned / board rows with attendance `present`, `late` or `loaned` | Shift board | |
 | **Labor cost** | Labor minutes / 60 x the hourly rate for the person's role on the shift date (`_e_ Labor rate`). No default rate. With no rate, cost shows "no rate set". | MSS log + labor rate | `hubLaborCost` |
 | **Weekly cost recap** | Labor cost summed by week key, line key and clean kind | MSS log | `hubWeekKey` |
-| **Sanitation cost per pound** | (Labor cost + chemical cost for the week) / `craa5_dailyproduction.craa5_pounds` for the week | MSS log, chemical hub, daily production | |
+| **Sanitation cost per pound** | (Labor cost + chemical cost for the week) / `craa5_dailyproduction.craa5_pounds` for the week. Chemical cost for the week = (drop in counts + received) between the two Sunday counts around the Monday-Sunday week, x unit price. If a count is missing, received spend is used and the number is marked so. **Draft, for Gerald to confirm.** | MSS log, chemical hub, daily production | |
 | **Time lost** | Minutes in `craa5__m_timelosslog` by kind. Kind `Weekend clean` (written by PBED) is planned weekend work: shown on its own and left out of Time lost totals. | Manager hub | |
 
 People thresholds (coaching below 75 % pace for 14 days, high performer list) are settings in `craa5__0_hubconfig` key `hub_people_thresholds`, not constants in an app. The coaching list is for supervisors and managers only, never shown to peers.
@@ -228,7 +228,7 @@ Stored as lower-case English codes. Shown with the label in the language chosen.
 5. **Role** (`craa5__aa_employee.craa5_role`): Sanitor 256000000, Lead 256000001, Supervisor 256000002. Manager and Admin come from the Dataverse security role.
 6. **Loading a table** (every app, same words): Loading, Ready, Nothing here yet (read worked, no rows), Table missing, No access (privilege), Could not load (network or other). An app shows one of these per table it reads. It never shows sample data instead.
 7. **Swab result** (BOLO): `positive`, `negative`, `pending`. In the MSS log, `craa5_pathogen` is `Yes` / `No`.
-8. **Order / cart** (chemical hub): Draft, Submitted, Approved, Ordered, Partially received, Received, Cancelled.
+8. **Order / cart** (chemical hub): Draft (not in SAP yet), Submitted, Approved, Ordered, Partially received, Received, Cancelled.
 
 ---
 
@@ -345,6 +345,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.5 (2026-10-21)** Chemical hub review: `chGuidFrom` id exception to rule 6, draft chemical cost for cost per pound, cart label "Draft (not in SAP yet)", `_c_` ownership note.
 - **1.0.4 (2026-10-21)** contract.json lists the 14 `_c_` chemical tables.
 - **1.0.3 (2026-10-21)** Manager hub review: time loss log keeps its column names (listed), Weekend clean left out of Time lost, quick task User-owned, `craa5__m_employeenote` added. Map: equipment id lists may follow a paired names column's order. table-prompts.md part 5 (observation columns).
 - **1.0.2 (2026-10-21)** Training matrix tables added (sections 3.3, 12, 13; contract.json).
