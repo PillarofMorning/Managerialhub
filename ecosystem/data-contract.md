@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.24, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.25, 2026-10-21. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -106,6 +106,8 @@ Time loss log keeps the column names it was created with: `craa5_assetguid` hold
 | `craa5__supervisor_todo` | live | Manager hub | Manager hub |
 | `craa5__m_formtemplate`, `craa5__m_quicktask` (both User-owned; quick tasks are a personal list on purpose) | live | Manager hub | Manager hub |
 | `craa5__m_employeenote` Manager notes on people | live | Manager hub | Manager hub, manager role only. Sensitive: User-owned, never shown to peers, never in exports or the repo. Key `craa5_employeeguid`. |
+| `craa5__g_obstacle`, `craa5__g_handover` Floor obstacles and crew handovers | proposed | Ganttly | Ganttly | Organization-owned. Keys `craa5_obstaclekey` / `craa5_handoverkey`; area, equipment and shift date as in section 2. Prompts: `/mnt/project-files/ganttly-overhaul/g-tables-prompts.md`. |
+| `craa5__g_personnelnote` Floor notes on people (high fives, incidents, coaching) | proposed | Ganttly | Ganttly (writer's own notes), Manager hub (managers read all) | **Sensitive**: User-owned; floor users Create + User-level Read/Write, managers Organization Read. Never shown to peers, exported or in the repo. Separate from `craa5__m_employeenote`. Replaces the `craa5_remarks` JSON on the Employee row. Key `craa5_employeeguid`. |
 | `craa5__c_*` chemical tables (14 in contract.json, taken from the chemical hub's own spec file chemical-ordering/contract/c-tables.json, with full columns; 11 live, Chemical alias and Sanitation budget proposed, Chemical standard unknown) | live | Chemical hub | Chemical hub; Manager hub for cost. User/team-owned with Organization-level Read. The old chem log's employee, shift and equipment columns stay as text as written. |
 | `craa5_dailyproduction` | live | (import) | Chemical hub, cost per pound |
 | `craa5__0_hubconfig` Shared settings | live | Each app writes only its own `craa5_configkey` rows | The same app; shared keys in section 12 |
@@ -383,6 +385,7 @@ Prompts and click-steps: `table-prompts.md`.
 | 4 columns on `craa5_aa_assets`: Egg clean, Egg clean minutes, Pecan clean, Pecan clean minutes | Egg and pecan allergen cleans have different pieces and times (Q8) | Gerald, part 7 |
 | `craa5_cleanoverride` text on `craa5__aa_prd_schd` | IBL4 72 h override (Scheduler thread) | Scheduler thread's prompt |
 | `_b_ Swab result` | Swab results as rows (BOLO thread) | BOLO thread's prompt, keys per section 2 |
+| `_g_ Obstacle`, `_g_ Handover`, `_g_ Personnel note` | Ganttly obstacles, handovers and personnel notes leave browser memory (Q7) | Ganttly thread's prompts, `/mnt/project-files/ganttly-overhaul/g-tables-prompts.md` |
 | `_t_ Skill`, `_t_ Skill level`, `_t_ Training event` | Training matrix (floor sessions are inferred from MSS log `craa5_employeeguids`) | Training thread's prompt, keys per section 2 |
 
 Rules for other threads' new tables: area = `craa5_area` (exact area name), equipment = `craa5_equipmentguid(s)`, employee = `craa5_employeeguid(s)` plus a name column for people, dates as in section 5, Organization-owned.
@@ -414,6 +417,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.25 (2026-10-21)** Q7 tables from the Ganttly thread: `_g_ Obstacle`, `_g_ Handover`, `_g_ Personnel note` (sections 3.3 and 13, contract.json). Ganttly stops writing notes into the Employee `craa5_remarks` JSON.
 - **1.0.24 (2026-10-21)** Section 2: egg / pecan minutes are labor person-minutes like `craa5_minalrg`; blank or 0 falls back to it.
 - **1.0.23 (2026-10-21)** Gerald's answers Q2-Q8: anyone may mark Done; `craa5_hourstoclean` minutes; `craa5_month` = 6-month flag; labor rate by role; Spanish checked once; Ganttly obstacles / handovers / personnel notes kept and move to tables; allergen split into `egg` and `pecan` clean kinds (hub-shared.js, 85 checks) with 4 Equipment columns (`table-prompts.md` part 7).
 - **1.0.22 (2026-10-21)** contract.json rebuilt from c-tables.json: `_c_ Chemical standard` live (read by Chemical hub and Manager hub, kept by Admin form); Chemical price per unit = current price of one container.
