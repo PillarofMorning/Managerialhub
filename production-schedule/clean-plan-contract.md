@@ -1,6 +1,6 @@
 # Clean Plan reader guide (craa5_cleanplan)
 
-Written by the Production Scheduler ("hub - production schedule" v4.1). No other app writes this table. Ganttly, Shift Start, the MSS Calendar, PBED and the Manager hub only read it. This guide wins over section 6.5 of the data contract on any detail.
+Written by the Production Scheduler ("hub - production schedule" v4.2). No other app writes this table. Ganttly, Shift Start, the MSS Calendar, PBED and the Manager hub only read it. This guide wins over section 6.5 of the data contract on any detail.
 
 All date-times are UTC. Read only active rows (`statecode eq 0`). The line key in `craa5_linekey` is the Scheduler's `canonLine(area, line)`, which is the same as `hubLineKey`: lowercase letters and digits only, for example `ibl4`, `highspeed1`.
 
@@ -14,6 +14,7 @@ All date-times are UTC. Read only active rows (`statecode eq 0`). The line key i
 | `alert` | `a|over72|<line>|<run id>`, `a|noeow|<line>|<Monday>`, `a|apart|<run id>|<run id>` | thing scheduling must look at | see section 4 |
 | `scope` | `s|<line>|<kind>|<part>` | clean kind of a line (split in parts) | both `2000-01-01T00:00:00Z` (outside every week) |
 | `config` | `config` | (one row) | `2000-01-01T00:00:00Z` |
+| `configpart` | `c|1` ... `c|n` | part of the shared settings when they are too long for one row | `2000-01-01T00:00:00Z` |
 
 **When a week is safe to read.** Every week has a `k|Monday` row. Use the week's windows, days and alerts only when that row's `craa5_status` is `done`. While it says `writing`, a publish is still in progress. If no week row exists, the week has not been published yet, so fall back to your own rule and say so on screen.
 
@@ -91,7 +92,7 @@ Readers do not need this column. Its effect is already in the windows and alerts
 
 ## 6. Day rows and the config row
 
-These have not changed from v4.0. Day rows: `craa5_cleankind` is `due`, `stretch`, `covered`, `none` or `unplanned`, and `craa5_status` is `ran`, `idle` or `unplanned`. Their details are `{v, prod, len, kind, weekOn, planned, job, lines, areaId}`. The config row holds the shared cleaning settings, which now include the skip words per area (`skipMidweek`, `skipDaily`).
+These have not changed from v4.0. Day rows: `craa5_cleankind` is `due`, `stretch`, `covered`, `none` or `unplanned`, and `craa5_status` is `ran`, `idle` or `unplanned`. Their details are `{v, prod, len, kind, weekOn, planned, job, lines, areaId}`. The config row holds the shared cleaning settings, which now include the skip words per area (`skipMidweek`, `skipDaily`). When the settings are longer than 1,900 characters, the config row's details are only `{v: 2, tz, at, parts, hash}`, and the settings JSON is split across the `configpart` rows `c|1` to `c|<parts>` (raw text, joined in order). Only the Scheduler reads these rows; other apps can skip both.
 
 ## 7. Clean rules this plan follows (v4.1, rules stamp `...|mw72last|scope1`)
 
