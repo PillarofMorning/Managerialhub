@@ -13,7 +13,7 @@ function load() {
     const ctx = { console, Intl, Date, JSON, Math, Object, Array, String, Number, isNaN, isFinite, parseInt, RegExp };
     ctx.window = { localStorage: { getItem: () => null, setItem: () => {} } };
     vm.createContext(ctx);
-    vm.runInContext(HUB + '\n' + SRC + '\n;globalThis.__x = { mpPlantMs, mpParseSlots, mpShifts, mpScopes, mpWindow, mpPieceLoads, mpPeak, mpBuild, hubWeekKey };', ctx);
+    vm.runInContext(HUB + '\n' + SRC + '\n;globalThis.__x = { mpPlantMs, mpParseSlots, mpShifts, mpScopes, mpWindow, mpPieceLoads, mpPeak, mpBuild, mpPosts, mpPostOn, hubWeekKey };', ctx);
     return ctx.__x;
 }
 const eq = (x, y, msg) => assert.deepStrictEqual(JSON.parse(JSON.stringify(x)), y, msg);
@@ -155,4 +155,68 @@ test('twelve months: published weeks as they are, other days as the average publ
 test('no shift rows: hours are still worked out, heads are not', () => {
     const r = m.mpBuild({ today: '2026-10-22', slots: [], weeks: [weekRow(WEEK, 'done')], windows: [win('full', '2026-10-21', '2026-10-21T13:00:00Z', '2026-10-21T15:00:00Z', 120)] });
     eq([r.heads, r.weeks[0].hours, r.crews.length, r.planHeads], [false, 2, 0, 0]);
+});
+
+// Fixed posts (made-up heads): supervisor and 2 leads on every shift, trash room on day shifts, steam pits on weekday nights,
+// one weekday admin outside the crews, and a post with no heads yet.
+const POSTS = [
+    { name: 'Supervisor', heads: 1, covers: 'all', days: 'all' }, { name: 'Leads', heads: 2, covers: 'all' }, { name: 'Trash room', heads: '1', covers: 'day' },
+    { name: 'Steam pits', heads: 1, covers: 'night', days: 'weekdays' }, { name: 'Admin', heads: 1, covers: 'office', hoursWeek: 40 }, { name: 'Sanitor helper', heads: '' }, { name: '', heads: '' },
+];
+
+test('fixed posts: which shifts need them; bad input is cleaned up', () => {
+    const p = m.mpPosts(POSTS);
+    eq(p.map(x => x.name + ':' + x.heads + ':' + x.covers + ':' + x.days), ['Supervisor:1:all:all', 'Leads:2:all:all', 'Trash room:1:day:all', 'Steam pits:1:night:weekdays', 'Admin:1:office:all', 'Sanitor helper:0:all:all']);
+    eq(m.mpPosts([{ name: 'x', heads: 2.6, covers: 'weird', days: 'nope' }])[0], { name: 'x', heads: 3, covers: 'all', days: 'all', hoursWeek: 0 });
+    const steam = p[3];
+    eq([m.mpPostOn(steam, 1, 18), m.mpPostOn(steam, 0, 18), m.mpPostOn(steam, 4, 0), m.mpPostOn(steam, 1, 6)], [true, false, true, false], 'weekday nights only; a shift starting at midnight is a night shift');
+    eq([m.mpPostOn(p[2], 3, 12), m.mpPostOn(p[2], 3, 16), m.mpPostOn(p[4], 1, 8)], [true, false, false], 'a noon start is a day shift; 4 PM is night; office posts are never on a crew shift');
+});
+
+test('fixed posts add to each crew that works those shifts, with hours; office posts count once; posts without heads are listed', () => {
+    const r = m.mpBuild({ today: '2026-10-22', slots: m.mpParseSlots(SHIFT_ROWS), weeks: [weekRow(WEEK, 'done')], vacation: 2, basis: 'busiest', posts: POSTS,
+        windows: [win('full', '2026-10-24', '2026-10-24T21:00:00Z', '2026-10-25T01:00:00Z', 960)] });
+    const c = {};
+    r.crews.forEach(x => { c[x.crew] = x; });
+    eq([c.B.cleaners, c.B.fixed, c.B.vacation, c.B.plan], [1, 4, 2, 7], 'B: 1 cleaner (480 of 720 min) + supervisor, 2 leads, trash room + 2 vacation');
+    eq(c.B.posts.map(x => x.name), ['Supervisor', 'Leads', 'Trash room']);
+    eq([c.D.cleaners, c.D.fixed, c.D.plan], [1, 4, 7], 'D works weekday nights, so it carries the steam pits');
+    eq([c.A.cleaners, c.A.fixed, c.A.plan], [0, 4, 6], 'A has no clean work but still needs its fixed posts and vacation cover');
+    eq([c.C.fixed, c.C.plan], [4, 6]);
+    eq([r.officeHeads, r.planHeads], [1, 27], 'all crews plus the weekday admin');
+    eq(r.notes.postsNoHeads, ['Sanitor helper']);
+    eq(r.weeks[0].fixedHours, 648 + 40, 'crew shifts: Sun 84, Mon 96, Tue 96, Wed 72, Thu 120, Fri 96, Sat 84 post-hours; plus 40 admin hours');
+    const nov = r.months[1];
+    eq(nov.fixedHours, mpR(5 * 84 + 5 * 96 + 4 * 96 + 4 * 72 + 4 * 120 + 4 * 96 + 4 * 84 + 40 * 30 / 7), 'November: 5 Sundays and Mondays, 4 of the other days');
+    eq(nov.crews.filter(x => x.crew === 'A')[0].plan, 6);
+    eq(nov.hours, r.months[1].hours, 'fixed posts do not change the cleaning hours');
+});
+
+test('shift layout: hours where overlapping cleans need more than the cleaners, and a quiet start', () => {
+    // Sat Oct 24, B on 6 AM to 6 PM. Two cleans 2 PM to 6 PM (19:00Z-23:00Z), 960 person-minutes each: 8 people at once for 4 hours.
+    const two = [win('full', '2026-10-24', '2026-10-24T19:00:00Z', '2026-10-24T23:00:00Z', 960), win('weekly', '2026-10-24', '2026-10-24T19:00:00Z', '2026-10-24T23:00:00Z', 960)];
+    const r = m.mpBuild({ today: '2026-10-22', slots: m.mpParseSlots(SHIFT_ROWS), weeks: [weekRow(WEEK, 'done')], vacation: 2, basis: 'busiest', windows: two });
+    const b = r.layout.filter(x => x.crew === 'B')[0];
+    eq([b.cleaners, b.plan, b.shifts.map(x => x.startHour + '/' + x.lengthHours + '/' + x.perWeek)], [3, 5, ['6/12/3', '12/6/1']], '1920 / 720 = 2.7, so 3 cleaners');
+    const day = b.shifts[0];
+    eq(day.hours.map(x => x.heads), [0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8]);
+    eq([day.hours[0].hour, day.hours[11].hour, day.upTo], [6, 17, 8]);
+    eq(day.over, [{ from: 14, to: 18, peak: 8, extra: 5 }], '2 PM to 6 PM needs 8, 5 more than the 3 cleaners');
+    eq(day.lead, { hours: 8, spare: 3, at: 14 }, 'nothing before 2 PM: the 3 could start later');
+    eq(day.trail, null);
+    eq([b.shifts[1].upTo, b.shifts[1].lead, b.shifts[1].over], [0, null, []], 'the Wednesday half shift has no clean work');
+    const avg = m.mpBuild({ today: '2026-10-22', slots: m.mpParseSlots(SHIFT_ROWS), weeks: [weekRow(WEEK, 'done')], basis: 'average', windows: two });
+    const ad = avg.layout.filter(x => x.crew === 'B')[0];
+    eq([ad.cleaners, ad.shifts[0].hours[8].heads, ad.shifts[0].over], [1, 2.7, [{ from: 14, to: 18, peak: 2.7, extra: 2 }]], 'average: 8 people over 3 Thu-Sat shifts');
+    const half = m.mpBuild({ today: '2026-10-22', slots: m.mpParseSlots(SHIFT_ROWS), weeks: [weekRow(WEEK, 'done')], share: 0.5, windows: two });
+    eq(half.layout.filter(x => x.crew === 'B')[0].shifts[0].upTo, 16, 'half a shift spent cleaning doubles the heads each hour');
+});
+
+test('shift layout with spread work: every hour gets its share; no shift rows = no layout', () => {
+    const r = m.mpBuild({ today: '2026-10-22', slots: m.mpParseSlots(SHIFT_ROWS), weeks: [weekRow(WEEK, 'done')], windows: [], assets: [{ craa5_aa_assetsid: G(2), craa5_hoursrequired: 1440, craa5_dailyclean: true }] });
+    const a = r.layout.filter(x => x.crew === 'A')[0];
+    eq(a.shifts[0].hours.map(x => x.heads), [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], '1,440 minutes a day over 24 shift hours = 1 person every hour');
+    eq([a.cleaners, a.shifts[1].lengthHours, a.shifts[1].hours[0].heads], [2, 6, 1.3], 'Wednesday has 18 shift hours (6 AM to midnight), so 80 minutes an hour: A is sized for that');
+    eq([a.shifts[0].over, a.shifts[0].lead], [[], null], 'a whole shift under the cleaners is not a staggered start');
+    eq(m.mpBuild({ today: '2026-10-22', slots: [], weeks: [weekRow(WEEK, 'done')], windows: [], posts: POSTS }).layout, []);
 });
