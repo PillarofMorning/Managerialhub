@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.32, 2026-10-22. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.33, 2026-10-22. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -107,6 +107,7 @@ Time loss log keeps the column names it was created with: `craa5_assetguid` hold
 | `craa5__supervisor_todo` | live | Manager hub | Manager hub |
 | `craa5__m_formtemplate`, `craa5__m_quicktask` (both User-owned; quick tasks are a personal list on purpose) | live | Manager hub | Manager hub |
 | `craa5__m_employeenote` Manager notes on people | live | Manager hub | Manager hub, manager role only. Sensitive: User-owned, never shown to peers, never in exports or the repo. Key `craa5_employeeguid`. |
+| `craa5__g_assignment` Equipment to people, per shift | proposed (Gerald made it 2026-10-22; name to confirm) | **Shift Start** and **Ganttly**, both (pinned beats auto; higher `craa5_rev` wins between pinned saves) | Shift Start, Ganttly, Manager hub | Organization-owned. Key `<shift date>|<crew>|<equipment guid>|<kind>`, row id `hubIdFromKey('asg|' + key)`. Spec: `/mnt/project-files/ganttly-overhaul/shared-assignment.md`. |
 | `craa5__g_obstacle`, `craa5__g_handover` Floor obstacles and crew handovers | proposed | Ganttly | Ganttly | Organization-owned. Keys `craa5_obstaclekey` / `craa5_handoverkey`; area, equipment and shift date as in section 2. Prompts: `/mnt/project-files/ganttly-overhaul/g-tables-prompts.md`. |
 | `craa5__g_personnelnote` Floor notes on people (high fives, incidents, coaching) | proposed | Ganttly | Ganttly (writer's own notes), Manager hub (managers read all) | **Sensitive**: User-owned; floor users Create + User-level Read/Write, managers Organization Read. Never shown to peers, exported or in the repo. Separate from `craa5__m_employeenote`. Replaces the `craa5_remarks` JSON on the Employee row. Key `craa5_employeeguid`. |
 | `craa5__c_*` chemical tables (14 in contract.json, taken from the chemical hub's own spec file chemical-ordering/contract/c-tables.json, with full columns; 11 live, Chemical alias and Sanitation budget proposed, Chemical standard unknown) | live | Chemical hub | Chemical hub; Manager hub for cost. User/team-owned with Organization-level Read. The old chem log's employee, shift and equipment columns stay as text as written. |
@@ -124,7 +125,7 @@ Time loss log keeps the column names it was created with: `craa5_assetguid` hold
 
 ## 4. The daily flow in one paragraph
 
-The **Production Scheduler** writes runs and publishes the clean plan. It is the only place the clean rules live, so it decides which clean happens when. **Shift Start** builds the crew board: leads, teams, who is out. The supervisor posts its status to Teams at 9, 12 and 3. **Ganttly** reads the board and the clean plan, fills in who cleans which piece, and records Start and Done per piece in the check-off table. When a piece is marked Done, Ganttly writes one MSS log row. The **MSS Calendar** shows compliance from those rows. The **Manager hub**, **PBED** and the director views compute every metric from the same rows with the definitions in section 7. Ganttly and Shift Start will later merge, and because they already share these tables, the merge is a move, not a rebuild.
+The **Production Scheduler** writes runs and publishes the clean plan. It is the only place the clean rules live, so it decides which clean happens when. **Shift Start** builds the crew board: leads, teams, who is out. The supervisor posts its status to Teams at 9, 12 and 3. **Ganttly** reads the board and the clean plan and fills in who cleans which piece in the shared assignment table `craa5__g_assignment`, which a lead can also change from Shift Start (pinned pieces stay where a person put them). Ganttly records Start and Done per piece in the check-off table. When a piece is marked Done, Ganttly writes one MSS log row. The **MSS Calendar** shows compliance from those rows. The **Manager hub**, **PBED** and the director views compute every metric from the same rows with the definitions in section 7. Ganttly and Shift Start will later merge, and because they already share these tables, the merge is a move, not a rebuild.
 
 ---
 
@@ -388,6 +389,7 @@ Prompts and click-steps: `table-prompts.md`.
 | 4 columns on `craa5_aa_assets`: Egg clean, Egg clean minutes, Pecan clean, Pecan clean minutes | Egg and pecan allergen cleans have different pieces and times (Q8) | Gerald, part 7 |
 | `craa5_cleanoverride` text on `craa5__aa_prd_schd` | IBL4 72 h override (Scheduler thread) | Scheduler thread's prompt |
 | `_b_ Swab result` | Swab results as rows (BOLO thread) | BOLO thread's prompt, keys per section 2 |
+| `_g_ Assignment` | Equipment to people, shared by Shift Start and Ganttly | Ganttly thread's prompt, `/mnt/project-files/ganttly-overhaul/shared-assignment.md` (made 2026-10-22) |
 | `_g_ Obstacle`, `_g_ Handover`, `_g_ Personnel note` | Ganttly obstacles, handovers and personnel notes leave browser memory (Q7) | Ganttly thread's prompts, `/mnt/project-files/ganttly-overhaul/g-tables-prompts.md` |
 | `_t_ Skill`, `_t_ Skill level`, `_t_ Training event` | Training matrix (floor sessions are inferred from MSS log `craa5_employeeguids`) | Training thread's prompt, keys per section 2 |
 
@@ -420,6 +422,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.33 (2026-10-22)** `_g_ Assignment` (`craa5__g_assignment`): equipment to people per shift, written by both Shift Start and Ganttly with pinned / source / rev rules (sections 3, 4, 13; contract.json with name candidates).
 - **1.0.32 (2026-10-22)** BOLO v2.3: swab result rows keyed by sample + description + test; results add `count` and `replaced`; readers add `statecode eq 0`, skip replaced, keep count out of rates.
 - **1.0.31 (2026-10-22)** Ground rule 9: no pop-ups (Power Apps blocks confirm / alert / prompt). Empty Hub config JSON = no settings yet. The Dataverse monitor is English only.
 - **1.0.30 (2026-10-22)** Hub config moves to a new table `craa5__e_hubconfig` (agreed with the Dataverse monitor; Gerald asked for it): Organization-owned, same column names, big `craa5_configjson`. Apps probe it first, the old `craa5__0_hubconfig` second. `hub-shared.js`: `HUB_CONFIG_TABLES`, `hubSaveManifest` tries the new table first (92 checks). `table-prompts.md` part 8.
