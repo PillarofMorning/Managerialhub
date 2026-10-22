@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.28, 2026-10-22. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.29, 2026-10-22. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -354,7 +354,7 @@ Apps look a table up by its prefixed name first and its plain name second, as Ma
 **Shared settings** in `craa5__0_hubconfig` (one row per `craa5_configkey`, each key written by one app). **The JSON goes in `craa5_manifestjson`** (display name Manifest json, up to 1,048,576 characters). `craa5_configjson` holds only **100 characters** in this Dataverse (monitor, 2026-10-22), so apps never write to it; longer values are refused. Readers use `hubConfigJsonOf(row)` (Manifest json first, then Config json for old rows) and match `craa5_configkey` first, `craa5_configname` second for old rows that have a blank key. Keys:
 `hub_people_thresholds` (Manager hub), `ganttly_settings` (Ganttly), `mss_view_rules` (MSS Log Input), `scheduler_shared` (Production Scheduler; today its `config` row in the Clean Plan, which may stay there), `training_settings` (Training page: minimum shifts, refresher days), `mss_completion_exclusions` and `mss_line_downtime` (MSS Calendar; downtime only for lines the Scheduler does not plan). Plus one `manifest|<appId>` row per app, written by that app (12.1).
 
-**Keys in use today** (older names, listed so the monitor does not flag them): `MSS_CALENDAR_VIEW_CONFIG` and `MSS_SKIPPED_ENTRIES_LOG` (MSS Calendar), `MSS_LOG_VIEW_CONFIG` (MSS Log Input; becomes `mss_view_rules`), `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG` (MSS Log Input; the Calendar only reads skip codes), `MSS_CALENDAR_ACCESS_LOG` (MSS Calendar's own access log), `PBED_WEEKEND_PLAN` (old PBED, unused). The full list with owners is `configKeys` in `contract.json`.
+**Keys in use today** (older names, listed so the monitor does not flag them): `MSS_CALENDAR_VIEW_CONFIG` and `MSS_SKIPPED_ENTRIES_LOG` (MSS Calendar), `MSS_LOG_SKIPPED_ENTRIES` (MSS Log Input), `MSS_LOG_VIEW_CONFIG` (MSS Log Input; becomes `mss_view_rules`), `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG` (MSS Log Input; the Calendar only reads skip codes), `MSS_CALENDAR_ACCESS_LOG` (MSS Calendar's own access log), `PBED_WEEKEND_PLAN` (old PBED, unused). The full list with owners is `configKeys` in `contract.json`.
 
 ### 12.1 App manifests (self-check)
 
@@ -419,6 +419,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.29 (2026-10-22)** MSS Log Input writes its skipped entries to its own key `MSS_LOG_SKIPPED_ENTRIES`; `MSS_SKIPPED_ENTRIES_LOG` is the Calendar's alone.
 - **1.0.28 (2026-10-22)** 12.1: monitor code scans saved as hubconfig `scan|<appId>` (in `configKeys`); one-time allergen flag copy run by Gerald.
 - **1.0.27 (2026-10-22)** Monitor run: `craa5_configjson` holds only 100 characters, so **every** hubconfig JSON value now goes in `craa5_manifestjson`; the manifest helper no longer writes a stub there; new `hubConfigJsonOf` (86 checks). Equipment allergen flags are `craa5_eggallergen` and `craa5_pecanallergen` (as Gerald made them); the minutes columns are still to make. Training: `craa5__t_skilllevel1` accepted as the skill level table name. hubconfig key `CHANGEOVER_RULES` found, owner unknown (not the Scheduler).
 - **1.0.26 (2026-10-21)** `hub-shared.js`: the manifest table constant is now `HUB_MANIFEST_TABLE` (was `HUB_CONFIG_TABLE`, which MSS Calendar and MSS Log Input already declare). `contract.json`: Equipment `optionalCols` lists the egg / pecan columns and `craa5_minalrg`.
