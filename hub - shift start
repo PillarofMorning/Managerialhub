@@ -2,7 +2,9 @@
  * [PERSISTENT MEMORY & APP REGISTRATION BLOCK]
  * APP NAME:        Shift Start & Roster Allocation Hub
  * PHASE ID:        P2.1 (Ref: _00 - list of apps - defined how to integrate - link to masterplan)
- * CURRENT VERSION: v0.0003 (2026-10-22: archived shifts only in the developer console; a lead sees only their own crew;
+ * CURRENT VERSION: v0.0004 (2026-10-22: Equipment section on the last tab, shared with Ganttly through craa5__g_assignment;
+ *                  drag or tap a piece to a person and Save; Ganttly's auto placements and Done shown, re-read every minute)
+ *                  v0.0003 (2026-10-22: archived shifts only in the developer console; a lead sees only their own crew;
  *                  room completion, passoff and handoff moved to a last tab 'Finish Shift')
  *                  v0.0002 (2026-10-21: MSS auto-log logs only the pieces of the area's clean, local date, retried on failure;
  *                  a clean type picked by hand lasts one shift; HUB SHARED v1.0 pasted in; MSS rows keyed per data contract 1.0.1;
@@ -3063,6 +3065,280 @@ async function writeMssLogs(props: any, jobs: MssAreaJob[], slotStartMs: number)
     }
     if (res.failed) logError(`MSS log: ${res.failed} piece(s) not saved`, res.error);
     return res;
+}
+
+// ---- Equipment to people, shared with Ganttly (craa5__g_assignment) ----
+// Spec: /mnt/project-files/ganttly-overhaul/shared-assignment.md. One row per piece per shift, updated in place.
+// Ganttly's engine places the pieces (source 'auto'); Shift Start never splits pieces itself. A piece a person places, here or in Ganttly, is pinned,
+// and Ganttly plans everything else around it. Shift Start reads the rows every 60 s and when the tab gets focus; Done comes from Ganttly's check-offs.
+const ASG_TABLE = 'craa5__g_assignment', ASG_ID = 'craa5__g_assignmentid', CHECKOFF_TABLE = 'craa5_cleancheckoff';
+const ASG_COLS = [ASG_ID, 'craa5_assignmentkey', 'craa5_equipmentguid', 'craa5_equipment', 'craa5_area', 'craa5_room', 'craa5_boardid', 'craa5_shiftdate', 'craa5_crew', 'craa5_team', 'craa5_cleankind', 'craa5_employeeguids', 'craa5_employees', 'craa5_plannedstart', 'craa5_plannedminutes', 'craa5_order', 'craa5_pinned', 'craa5_source', 'craa5_updatedby', 'craa5_rev'];
+const ASG_REFRESH_MS = 60000;
+type AsgRow = { id: string; key: string; guid: string; equipment: string; area: string; room: string; boardId: string; shiftDate: string; crew: string; team: string; kind: string; people: string[]; names: string; plannedStart: string; minutes: number | null; order: number; pinned: boolean; source: string; updatedBy: string; rev: number };
+type AsgRead = { state: 'ok' | 'missing' | 'error'; rows: AsgRow[]; error: string; at: number };
+const asgKeyOf = (shiftDate: string, crew: string, guid: string, kind: string) => `${shiftDate}|${hubCrew(crew)}|${hubGuid(guid)}|${hubCleanKind(kind)}`;
+const asgIdOf = (key: string) => hubIdFromKey('asg|' + key);
+function asgParse(r: any): AsgRow {
+    const s = (c: string) => String(getField(r, c) ?? '').trim();
+    const mins = Number(getField(r, 'craa5_plannedminutes'));
+    return {
+        id: hubGuid(getField(r, ASG_ID)), key: s('craa5_assignmentkey'), guid: hubGuid(getField(r, 'craa5_equipmentguid')), equipment: s('craa5_equipment'),
+        area: s('craa5_area'), room: s('craa5_room'), boardId: s('craa5_boardid'), shiftDate: s('craa5_shiftdate'), crew: hubCrew(s('craa5_crew')), team: hubGuid(getField(r, 'craa5_team')),
+        kind: hubCleanKind(s('craa5_cleankind')), people: hubSplitGuids(s('craa5_employeeguids')), names: s('craa5_employees'), plannedStart: s('craa5_plannedstart'),
+        minutes: isFinite(mins) && mins > 0 ? mins : null, order: Number(getField(r, 'craa5_order')) || 0, pinned: isBoolTrue(getField(r, 'craa5_pinned')),
+        source: s('craa5_source').toLowerCase(), updatedBy: s('craa5_updatedby'), rev: Number(getField(r, 'craa5_rev')) || 0,
+    };
+}
+async function readAssignments(props: any, shiftDate: string, crew: string): Promise<AsgRead> {
+    try {
+        const rows = await tableQuery(props, ASG_TABLE, `craa5_shiftdate eq '${shiftDate}' and craa5_crew eq '${hubCrew(crew)}'`, ASG_COLS, 3000, 'craa5_order asc');
+        return { state: 'ok', rows: rows.map(asgParse).filter(r => r.guid), error: '', at: Date.now() };
+    } catch (e: any) {
+        const msg = extractDvError(e);
+        return { state: TABLE_STATE[ASG_TABLE] === 'missing' || looksMissing(msg) ? 'missing' : 'error', rows: [], error: msg, at: Date.now() };
+    }
+}
+// Equipment guids marked Done in Ganttly since the shift started (newest row per piece wins). Empty when the table cannot be read.
+async function readDoneSince(props: any, fromMs: number): Promise<Set<string>> {
+    const out = new Set<string>(), seen = new Set<string>();
+    try {
+        const rows = await tableQuery(props, CHECKOFF_TABLE, `modifiedon ge ${odataDate(fromMs)}`, ['craa5_equipmentguid', 'craa5_status', 'modifiedon'], 5000, 'modifiedon desc');
+        rows.forEach((r: any) => {
+            const g = hubGuid(getField(r, 'craa5_equipmentguid'));
+            if (!g || seen.has(g)) return;
+            seen.add(g);
+            if (String(getField(r, 'craa5_status') || '').toLowerCase() === 'done') out.add(g);
+        });
+    } catch (e) { /* progress is only shown, never needed */ }
+    return out;
+}
+// Saves one row with its fixed id: update when it is there, create when it is not (a create that finds it already made becomes an update).
+async function writeAssignment(props: any, row: any, exists: boolean): Promise<string> {
+    const api = getWriteApi(props), id = row[ASG_ID];
+    if (!api) return 'no way to write to Dataverse from here';
+    const data = { ...row }; delete data[ASG_ID];
+    try {
+        if (exists) await asyncRace(api.update(ASG_TABLE, id, data), API_TIMEOUT_MS, 'equipment save');
+        else {
+            try { await asyncRace(api.create(ASG_TABLE, row), API_TIMEOUT_MS, 'equipment save'); }
+            catch (e: any) { if (!isDuplicateError(extractDvError(e))) throw e; await asyncRace(api.update(ASG_TABLE, id, data), API_TIMEOUT_MS, 'equipment save'); }
+        }
+        return '';
+    } catch (e: any) { return extractDvError(e) || 'not saved'; }
+}
+
+type AsgPerson = { id: string; name: string };
+type AsgRoom = { areaId: string; name: string; cleanType: string; leadId: string; people: AsgPerson[] };
+type AsgPiece = { key: string; guid: string; name: string; room: string; area: string; areaId: string; kind: string; minutes: number | null; row: AsgRow | null };
+type AsgEdit = { people: string[]; pinned: boolean };
+type EquipmentAssignProps = {
+    hostProps: any; rooms: AsgRoom[]; assets: any[]; shiftDate: string; crew: string; slotStartMs: number; boardId: string;
+    canEdit: boolean; onlyTeam: string; me: string; nameOf: (id: string) => string;
+};
+function EquipmentAssignPanel({ hostProps, rooms, assets, shiftDate, crew, slotStartMs, boardId, canEdit, onlyTeam, me, nameOf }: EquipmentAssignProps) {
+    const [read, setRead] = useState<AsgRead | null>(null);
+    const [done, setDone] = useState<Set<string>>(new Set());
+    const [edits, setEdits] = useState<Record<string, AsgEdit>>({});
+    const [picked, setPicked] = useState('');
+    const [saving, setSaving] = useState(false);
+    const [note, setNote] = useState<{ tone: 'ok' | 'warn'; text: string } | null>(null);
+    const [open, setOpen] = useState(true);
+    const busy = useRef(false);
+
+    const load = useCallback(async () => {
+        if (busy.current || !shiftDate || !crew) return;
+        busy.current = true;
+        try {
+            const [r, d] = await Promise.all([readAssignments(hostProps, shiftDate, crew), readDoneSince(hostProps, slotStartMs - 3600000)]);
+            setRead(r); setDone(d);
+        } finally { busy.current = false; }
+    }, [hostProps, shiftDate, crew, slotStartMs]);
+    useEffect(() => {
+        load();
+        const t = window.setInterval(load, ASG_REFRESH_MS);
+        const onFocus = () => { if (!document.hidden) load(); };
+        window.addEventListener('focus', onFocus); document.addEventListener('visibilitychange', onFocus);
+        return () => { window.clearInterval(t); window.removeEventListener('focus', onFocus); document.removeEventListener('visibilitychange', onFocus); };
+    }, [load]);
+    useEffect(() => { setEdits({}); setPicked(''); }, [shiftDate, crew]);
+
+    const shown = onlyTeam ? rooms.filter(r => r.leadId === onlyTeam) : rooms;
+    // Tonight's pieces per room: the room's clean from the equipment list, plus any piece Ganttly placed in that area. One piece is one row, whatever kind it was saved under.
+    const piecesByRoom = useMemo(() => {
+        const rows = read?.rows || [], byGuid = new Map<string, AsgRow>();
+        rows.forEach(r => { if (!byGuid.has(r.guid) || r.rev > (byGuid.get(r.guid) as AsgRow).rev) byGuid.set(r.guid, r); });
+        const used = new Set<string>(), out: Record<string, AsgPiece[]> = {};
+        shown.forEach(room => {
+            const scope = mssCleanScope(room.cleanType), list: AsgPiece[] = [];
+            if (scope) mssPiecesFor({ areaId: room.areaId, areaName: room.name, cleanType: room.cleanType, assets, cleanedBy: '', totalAreaHrs: 0 }).forEach((a: any) => {
+                const guid = assetGuidOf(a);
+                if (!guid || used.has(guid)) return;
+                used.add(guid);
+                const row = byGuid.get(guid) || null;
+                list.push({
+                    key: row?.key || asgKeyOf(shiftDate, crew, guid, scope.code), guid, row, areaId: room.areaId, area: room.name, kind: row?.kind || hubCleanKind(scope.code),
+                    name: String(a.craa5_equipmentidentifier || a.craa5_ValidationName || a.craa5_validationname || a.craa5_equipment || a.craa5_name || getField(a, 'craa5_equipmentidentifier') || getField(a, 'craa5_equipment') || 'Equipment').trim(),
+                    room: String(a.craa5_roomname || a.craa5_room || getField(a, 'craa5_roomname') || room.name).trim(),
+                    minutes: row?.minutes ?? hubStdMinutes(a.craa5_hoursrequired ?? getField(a, 'craa5_hoursrequired')),
+                });
+            });
+            rows.forEach(r => {
+                if (used.has(r.guid) || byGuid.get(r.guid) !== r || !hubSameName(r.area, room.name)) return;
+                used.add(r.guid);
+                list.push({ key: r.key, guid: r.guid, row: r, areaId: room.areaId, area: room.name, kind: r.kind, name: r.equipment || 'Equipment', room: r.room || room.name, minutes: r.minutes });
+            });
+            out[room.areaId] = list;
+        });
+        return out;
+    }, [read, shown, assets, shiftDate, crew]);
+
+    const peopleOf = (p: AsgPiece) => edits[p.key] ? edits[p.key].people : (p.row ? p.row.people : []);
+    const pinnedOf = (p: AsgPiece) => edits[p.key] ? edits[p.key].pinned : !!p.row?.pinned;
+    const tableOk = read?.state === 'ok';
+    const editable = canEdit && tableOk && !saving;
+    const allPieces = shown.reduce((acc, r) => acc.concat(piecesByRoom[r.areaId] || []), [] as AsgPiece[]);
+    const findPiece = (key: string) => allPieces.find(p => p.key === key);
+    const moveTo = (key: string, personId: string) => {
+        const p = findPiece(key);
+        if (!p || !editable) return;
+        // Not assigned hands the piece back to Ganttly's auto plan
+        setEdits(prev => ({ ...prev, [key]: personId ? { people: [hubGuid(personId)], pinned: true } : { people: [], pinned: false } }));
+        setPicked('');
+    };
+    const backToAuto = (key: string) => { const p = findPiece(key); if (!p || !editable) return; setEdits(prev => ({ ...prev, [key]: { people: peopleOf(p), pinned: false } })); setPicked(''); };
+    const pending = Object.keys(edits).length;
+
+    const save = async () => {
+        if (!pending || saving) return;
+        setSaving(true); setNote(null);
+        try {
+            const fresh = await readAssignments(hostProps, shiftDate, crew);
+            if (fresh.state !== 'ok') { setNote({ tone: 'warn', text: tx(`Not saved: the equipment table could not be read (${fresh.error})`, `No se guardo: no se pudo leer la tabla de equipo (${fresh.error})`) }); return; }
+            const freshById = new Map<string, AsgRow>(); fresh.rows.forEach(r => freshById.set(r.id, r));
+            let saved = 0, lost = 0, failed = 0, err = '';
+            const keep: Record<string, AsgEdit> = {};
+            for (const key of Object.keys(edits)) {
+                const p = findPiece(key), e = edits[key];
+                if (!p) continue;
+                const id = asgIdOf(key), now = freshById.get(id) || null, readRev = p.row ? p.row.rev : 0;
+                // Someone placed it by hand on another device after this screen read it: theirs stays, this change is dropped
+                if (now && now.rev > readRev && now.pinned && now.source !== 'auto') { lost++; continue; }
+                const room = shown.find(r => r.areaId === p.areaId);
+                const names = e.people.map(nameOf).filter(Boolean).join(' / ');
+                const row: any = {
+                    [ASG_ID]: id, craa5_assignmentkey: key, craa5_equipmentguid: p.guid, craa5_equipment: p.name.slice(0, 200), craa5_area: p.area.slice(0, 100), craa5_room: p.room.slice(0, 100),
+                    craa5_boardid: boardId, craa5_shiftdate: shiftDate, craa5_crew: hubCrew(crew), craa5_team: hubGuid(room?.leadId || ''), craa5_cleankind: p.kind,
+                    craa5_employeeguids: hubGuidList(e.people), craa5_employees: names.slice(0, 400), craa5_pinned: e.pinned, craa5_source: 'shiftstart',
+                    craa5_updatedby: me.slice(0, 200), craa5_rev: (now ? now.rev : readRev) + 1,
+                };
+                if (p.minutes && !now?.minutes) row.craa5_plannedminutes = Math.round(p.minutes);
+                const m = await writeAssignment(hostProps, row, !!now);
+                if (m) { failed++; err = err || m; keep[key] = e; } else saved++;
+            }
+            setEdits(keep);
+            const parts: string[] = [];
+            if (saved) parts.push(tx(`${saved} saved, Ganttly follows on its next read`, `${saved} guardados, Ganttly los toma en su siguiente lectura`));
+            if (lost) parts.push(tx(`${lost} changed on another device first, so theirs stays`, `${lost} cambiados antes en otro equipo, se queda ese cambio`));
+            if (failed) parts.push(tx(`${failed} not saved (${err})`, `${failed} sin guardar (${err})`));
+            setNote({ tone: failed || lost ? 'warn' : 'ok', text: parts.join('. ') });
+            if (failed) logError(`Equipment: ${failed} piece(s) not saved`, err);
+        } finally {
+            setSaving(false);
+            load();
+        }
+    };
+
+    const total = allPieces.length, doneCount = allPieces.filter(p => done.has(p.guid)).length;
+    const autoCount = allPieces.filter(p => p.row && !pinnedOf(p) && peopleOf(p).length).length, handCount = allPieces.filter(p => pinnedOf(p)).length;
+    const chip = (p: AsgPiece) => {
+        const isDone = done.has(p.guid), pin = pinnedOf(p), sel = picked === p.key, changed = !!edits[p.key];
+        return (
+            <div key={p.key} draggable={editable} onDragStart={ev => { try { ev.dataTransfer.setData('text/plain', p.key); } catch (e) {} setPicked(p.key); }}
+                onClick={() => setPicked(sel ? '' : p.key)}
+                className="flex items-center gap-1 px-1.5 py-1 rounded-md border text-[11px] font-semibold cursor-pointer select-none"
+                style={{ background: isDone ? '#E7F6EC' : sel ? BRAND.blueSoft : '#fff', borderColor: sel ? BRAND.blue : changed ? BRAND.yellow : '#E2E8F0', color: '#1E293B' }}
+                title={`${p.name} (${p.room})${p.minutes ? `, ${p.minutes} min` : ''}`}>
+                <span className="truncate flex-1 min-w-0">{p.name}</span>
+                {p.minutes ? <span className="text-slate-500 font-medium shrink-0">{p.minutes}m</span> : null}
+                {isDone ? <Badge size="small" appearance="filled" color="success">{tx('Done', 'Listo')}</Badge>
+                    : pin ? <Badge size="small" appearance="tint" color="warning">{tx('Set', 'Fijo')}</Badge>
+                    : p.row && p.row.people.length ? <Badge size="small" appearance="tint" color="informative">{tx('Auto', 'Auto')}</Badge> : null}
+            </div>
+        );
+    };
+    const lane = (room: AsgRoom, personId: string, label: string, list: AsgPiece[]) => {
+        const mins = list.reduce((s, p) => s + (p.minutes || 0), 0);
+        return (
+            <div key={room.areaId + '|' + (personId || 'none')} className="flex flex-col gap-1 p-1.5 rounded-lg border border-dashed min-w-[150px] flex-1"
+                style={{ borderColor: picked && editable ? BRAND.blue : '#CBD5E1', background: personId ? '#F8FAFC' : '#FFFBEB' }}
+                onDragOver={ev => { if (editable) ev.preventDefault(); }}
+                onDrop={ev => { ev.preventDefault(); let k = ''; try { k = ev.dataTransfer.getData('text/plain'); } catch (e) {} moveTo(k || picked, personId); }}>
+                <div className="flex items-center justify-between gap-1">
+                    <span className="text-[11px] font-black uppercase tracking-wide truncate" style={{ color: BRAND.blueDark }}>{label}</span>
+                    <span className="text-[10px] text-slate-500 shrink-0">{list.length}{mins ? `, ${mins}m` : ''}</span>
+                </div>
+                {picked && editable && (
+                    <Button size="small" appearance="secondary" onClick={() => moveTo(picked, personId)}>{personId ? tx('Move here', 'Mover aqui') : tx('Back to auto', 'Regresar a auto')}</Button>
+                )}
+                {list.map(chip)}
+            </div>
+        );
+    };
+    const pickedPiece = picked ? findPiece(picked) : undefined;
+
+    return (
+        <div className="bg-white border border-slate-200 rounded-xl p-2.5 shadow-2xs flex flex-col gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+                <button type="button" onClick={() => setOpen(o => !o)} className="flex items-center gap-2 bg-transparent border-0 p-0 cursor-pointer">
+                    <span className="text-sm font-black uppercase tracking-wider" style={{ color: BRAND.blueDark }}>{open ? '-' : '+'} {tx('Equipment', 'Equipo')}</span>
+                    <Badge appearance="filled" color={total && doneCount === total ? 'success' : 'brand'} size="small">{doneCount} / {total} {tx('Done', 'Listos')}</Badge>
+                </button>
+                <div className="flex items-center gap-1.5">
+                    {pending > 0 && <Button size="small" appearance="subtle" disabled={saving} onClick={() => { setEdits({}); setPicked(''); }}>{tx('Undo changes', 'Deshacer cambios')}</Button>}
+                    <Button size="small" appearance="primary" disabled={!pending || !editable} onClick={save}>
+                        {saving ? tx('Saving...', 'Guardando...') : pending ? tx(`Save equipment (${pending})`, `Guardar equipo (${pending})`) : tx('Save equipment', 'Guardar equipo')}
+                    </Button>
+                </div>
+            </div>
+            <Text size={200} className="text-slate-600">
+                {!read ? tx('Reading the shared equipment list...', 'Leyendo la lista de equipo compartida...')
+                    : read.state === 'missing' ? tx('The shared equipment table (_g_ Assignment) is not set up yet, so this list is view only. Ganttly still assigns equipment as before.', 'La tabla compartida de equipo (_g_ Assignment) aun no existe, asi que esta lista es solo para ver. Ganttly sigue asignando equipo como antes.')
+                    : read.state === 'error' ? tx(`The shared equipment list could not be read (${read.error}). It is tried again every minute.`, `No se pudo leer la lista de equipo (${read.error}). Se intenta de nuevo cada minuto.`)
+                    : tx(`Shared with Ganttly, read ${clockTime(read.at)}. ${autoCount} placed by Ganttly, ${handCount} set by a person. Drag a piece to a person, or tap it and then Move here. A piece you set stays put; Ganttly plans the rest around it.`,
+                        `Compartido con Ganttly, leido ${clockTime(read.at)}. ${autoCount} puestos por Ganttly, ${handCount} fijados por una persona. Arrastra una pieza a una persona, o tocala y luego Mover aqui. Una pieza fijada se queda; Ganttly planea lo demas alrededor.`)}
+            </Text>
+            {!canEdit && read?.state === 'ok' && <Text size={200} className="text-slate-500">{tx('View only: you cannot edit this board.', 'Solo ver: no puedes editar este tablero.')}</Text>}
+            {note && <div className="px-2 py-1 rounded-md border text-xs font-semibold" style={note.tone === 'ok' ? { background: '#E7F6EC', color: '#1B5E20', borderColor: '#A5D6A7' } : { background: BRAND.yellowSoft, color: '#8A5A00', borderColor: BRAND.yellow }}>{note.text}</div>}
+            {pickedPiece && pinnedOf(pickedPiece) && editable && (
+                <div className="flex items-center gap-2 text-xs">
+                    <span className="font-semibold">{pickedPiece.name}</span>
+                    <Button size="small" appearance="secondary" onClick={() => backToAuto(pickedPiece.key)}>{tx('Let Ganttly place it', 'Que Ganttly lo acomode')}</Button>
+                </div>
+            )}
+            {open && (shown.length === 0 ? (
+                <Text size={200} className="text-slate-500">{onlyTeam ? tx('No rooms on your team yet.', 'Aun no hay cuartos en tu equipo.') : tx('No rooms on this board yet.', 'Aun no hay cuartos en este tablero.')}</Text>
+            ) : shown.map(room => {
+                const list = piecesByRoom[room.areaId] || [];
+                const ids = room.people.map(p => hubGuid(p.id));
+                const of = (pid: string) => list.filter(p => peopleOf(p).indexOf(pid) >= 0);
+                const none = list.filter(p => !peopleOf(p).some(g => ids.indexOf(g) >= 0));
+                return (
+                    <div key={room.areaId} className="flex flex-col gap-1.5 pt-1.5 border-t border-slate-100">
+                        <div className="flex items-center gap-2">
+                            <span className="text-xs font-black" style={{ color: BRAND.blueDark }}>{room.name}</span>
+                            <span className="text-[10px] text-slate-500">{getCleanTypeMeta(room.cleanType).label || room.cleanType} - {list.filter(p => done.has(p.guid)).length}/{list.length} {tx('done', 'listos')}</span>
+                        </div>
+                        {list.length === 0 ? <Text size={200} className="text-slate-500">{tx('No equipment for this clean (a changeover, or no pieces marked for it).', 'Sin equipo para esta limpieza (cambio de producto, o ninguna pieza marcada).')}</Text> : (
+                            <div className="flex flex-wrap gap-1.5 items-start">
+                                {room.people.map(p => lane(room, hubGuid(p.id), p.name, of(hubGuid(p.id))))}
+                                {lane(room, '', tx('Not assigned', 'Sin asignar'), none)}
+                            </div>
+                        )}
+                    </div>
+                );
+            }))}
+        </div>
+    );
 }
 
 // ---- Who can edit a board (from the Microsoft sign-in, matched to the employee table) ----
@@ -7401,7 +7677,7 @@ export function MainComponent(props: any) {
     const [boardNote, setBoardNote] = useState<{ tone: 'ok' | 'none'; text: string } | null>(null);   // how the board got its contents
 
     // [clockCrew, upNextCrew, and allKnownEmps lifted to top]
-    const steps = [tx("Leads", "Lideres"), tx("Areas", "Cuartos"), tx("Assign Areas", "Asignar Cuartos"), tx("Assign Employees", "Asignar Personal"), tx("Update Teams", "Actualizar Turno"), tx("Finish Shift", "Cerrar Turno")];
+    const steps = [tx("Leads", "Lideres"), tx("Areas", "Cuartos"), tx("Assign Areas", "Asignar Cuartos"), tx("Assign Employees", "Asignar Personal"), tx("Update Teams", "Actualizar Turno"), tx("Equipment & Finish", "Equipo y Cierre")];
 
     // Writes the area "include in update" flag (Xrm.WebApi, or the generative page's dataApi).
     const updateAreaRecord = useCallback((areaId: string, data: any) => {
@@ -9713,8 +9989,8 @@ else if (currentStep === 4) {
                     <div className="flex flex-col gap-4 mt-2.5">
                         {/* Room completion and the Shift Handoff are on the last tab, Finish Shift */}
                         <div className="bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5 flex items-center justify-between gap-2 flex-wrap text-[11px] font-semibold text-slate-600">
-                            <span>{tx(`${doneRoomIds.length} of ${nonStatusIds.length} rooms done. Mark rooms done and hand off the shift on the last tab.`, `${doneRoomIds.length} de ${nonStatusIds.length} cuartos listos. Marca cuartos terminados y entrega el turno en la ultima pestana.`)}</span>
-                            <Button size="small" appearance="secondary" onClick={() => setCurrentStep(5)}>{tx("Finish Shift", "Cerrar Turno")}</Button>
+                            <span>{tx(`${doneRoomIds.length} of ${nonStatusIds.length} rooms done. Assign equipment, mark rooms done and hand off the shift on the last tab.`, `${doneRoomIds.length} de ${nonStatusIds.length} cuartos listos. Asigna equipo, marca cuartos terminados y entrega el turno en la ultima pestana.`)}</span>
+                            <Button size="small" appearance="secondary" onClick={() => setCurrentStep(5)}>{tx("Equipment & Finish", "Equipo y Cierre")}</Button>
                         </div>
 
                         {/* 1. PRODUCTION AREAS - COMPACT MULTI-COLUMN DESKTOP GRID */}
@@ -10057,16 +10333,30 @@ else {
     const unaddedContinuing = priorContinuing.filter(r => !areaAssignments[r.areaId]);
     const doneRoomIds = nonStatusIds.filter(id => isAreaFinished(id));
     const inProgRoomIds = nonStatusIds.filter(id => !isAreaFinished(id));
+    // Equipment to people, shared with Ganttly. A lead who is not running the board sees only their own team's rooms (a double shift).
+    const asgLive = boardMode === 'next' ? null : ownLiveBoard(activeSupervisorObj);
+    const asgSlot = boardMode === 'next' && nextSlot ? nextSlot.startMs : (asgLive?.slotStart || boardSlotNow().start);
+    const asgMe = currentUser ? hubGuid(empIdOf(currentUser)) : '';
+    const asgOnlyTeam = !fullAccess && !!currentUser && String(currentUser.calculatedRole || roleOf(currentUser)) === 'lead' && asgMe !== hubGuid(selectedSupervisorId) ? asgMe : '';
+    const asgNameOf = (id: string) => { const e = employeeMap.get(id) || allKnownEmps.find(x => hubGuid(empIdOf(x)) === hubGuid(id)); return e ? renderSafe(getField(e, 'craa5_name')) : ''; };
+    const asgRooms: AsgRoom[] = nonStatusIds.map(aid => {
+        const leadId = String(areaAssignments[aid] || ''), ids = [leadId].concat(assignments[aid] || []).filter((x, i, a) => !!x && a.indexOf(x) === i);
+        return { areaId: aid, name: renderSafe(getField(areaMap.get(aid), 'craa5_area')), cleanType: getAreaCleanType(aid), leadId: hubGuid(leadId), people: ids.map(id => ({ id, name: asgNameOf(id) || tx('Unknown', 'Desconocido') })) };
+    });
     SC = (
         <div className="flex flex-col h-full min-h-0 max-h-full p-3 md:p-4 overflow-y-auto flex-1 box-border gap-3">
             {saveWarning && <div className="px-3 py-2 rounded-lg border text-xs font-semibold" style={{ background: BRAND.yellowSoft, color: '#8A5A00', borderColor: BRAND.yellow }}>{tx("Warning:", "Aviso:")} {saveWarning}</div>}
             {submissionError && <div className="px-3 py-2 rounded-lg border text-xs font-semibold" style={{ background: BRAND.redSoft, color: BRAND.red, borderColor: BRAND.red }}>{tx("Submission Failed:", "Error al Guardar:")} {submissionError}</div>}
             <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-200">
-                <h2 className="text-base font-black uppercase tracking-wider m-0" style={{ color: BRAND.blueDark }}>{tx("Finish Shift", "Cerrar Turno")}</h2>
+                <h2 className="text-base font-black uppercase tracking-wider m-0" style={{ color: BRAND.blueDark }}>{tx("Equipment & Finish", "Equipo y Cierre")}</h2>
                 <Button appearance="primary" size="small" disabled={!access.can} onClick={() => { handleSubmission(); }} title={tx("Save personnel assignments and room progress to Dataverse", "Guardar asignaciones de personal y avance de cuartos en Dataverse")}>
                     {boardMode === 'next' ? tx('Save Setup', 'Guardar Plan') : tx('Save Progress', 'Guardar Avance')}
                 </Button>
             </div>
+            {nonStatusIds.length > 0 && (
+                <EquipmentAssignPanel hostProps={propsRef.current} rooms={asgRooms} assets={assets} shiftDate={hubShiftDate(asgSlot)} crew={boardCrewLetter} slotStartMs={asgSlot}
+                    boardId={asgLive?.recordId || ''} canEdit={access.can} onlyTeam={asgOnlyTeam} me={myName} nameOf={asgNameOf} />
+            )}
             {nonStatusIds.length === 0 ? (
                 <Text className="text-slate-500 font-medium">{tx("No rooms on this board yet. Assign areas in Steps 2 to 4 first.", "Aun no hay cuartos en este tablero. Asigna cuartos en los Pasos 2 a 4 primero.")}</Text>
             ) : (
