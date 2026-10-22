@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.30, 2026-10-22. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.31, 2026-10-22. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -22,7 +22,8 @@ Changes go through this thread. An app thread that needs a new key, column, stat
 5. **Empty means empty.** When a read fails or comes back empty, the screen says so. It never shows sample, seed or remembered data as if it were real.
 6. **A save is done when Dataverse says so.** Nothing is marked sent, saved or logged before the write succeeds. A failed write stays queued and is retried. Repeated writes use a fixed row id built from the row's key (`hubIdFromKey`), so a retry or a second device updates the same row and never adds a second one. Exception: the chemical hub's `_c_` tables build their fixed ids with its own `chGuidFrom` (13,519 usage rows already carry them). Only the chemical hub writes those tables, so the two id builders never meet on the same row.
 7. **Plant time.** Every day, shift and week is read on the America/Chicago clock (section 5). Never use the UTC day.
-8. **Every word in English and Spanish (es-MX)**, with the shared words in section 9. Apps stay 7-bit ASCII (GEMINI.md), so Spanish accents are written as % codes.
+8. **Every word in English and Spanish (es-MX)**, with the shared words in section 9. Apps stay 7-bit ASCII (GEMINI.md), so Spanish accents are written as % codes. One exception: the Dataverse monitor, an admin tool, is English only (Gerald, 2026-10-22).
+9. **No pop-ups.** Power Apps pages silently block `window.confirm`, `alert` and `prompt`, so a button that relies on one does nothing. Ask for confirmation on the page itself (for example a second "Yes, do it" button) and show messages on the page.
 
 ---
 
@@ -351,7 +352,7 @@ New tables are named `_<letter>_ Name`, so the schema name is `craa5__<letter>_n
 
 Apps look a table up by its prefixed name first and its plain name second, as Manager hub v6.8 does, because Gerald may create either.
 
-**Shared settings** live in **Hub config**: the new `craa5__e_hubconfig` ("_e_ Hub config", Organization-owned; columns `craa5_configname` primary, `craa5_configkey`, `craa5_configjson` Multiple lines max 1,048,576; prompt in `table-prompts.md` part 8). One row per `craa5_configkey`, each key written by one app, and the key is always filled. Apps look for `craa5__e_hubconfig` first and the old `craa5__0_hubconfig` second (`HUB_CONFIG_TABLES`). On the old table the JSON goes in `craa5_manifestjson`, because its `craa5_configjson` holds only 100 characters; on the new table it goes in `craa5_configjson`. Readers use `hubConfigJsonOf(row)` and match `craa5_configkey` first, `craa5_configname` second for old rows with a blank key. Gerald adds the keys to the new table once it exists; the old one stays until every app has switched. Keys:
+**Shared settings** live in **Hub config**: the new `craa5__e_hubconfig` ("_e_ Hub config", Organization-owned; columns `craa5_configname` primary, `craa5_configkey`, `craa5_configjson` Multiple lines max 1,048,576; prompt in `table-prompts.md` part 8). One row per `craa5_configkey`, each key written by one app, and the key is always filled. Apps look for `craa5__e_hubconfig` first and the old `craa5__0_hubconfig` second (`HUB_CONFIG_TABLES`). On the old table the JSON goes in `craa5_manifestjson`, because its `craa5_configjson` holds only 100 characters; on the new table it goes in `craa5_configjson`. A row with empty JSON means "no settings yet" (the monitor can pre-create rows with only the key and name): readers treat an empty string as no settings and use their defaults, and the owning app fills it on its first save. Readers use `hubConfigJsonOf(row)` and match `craa5_configkey` first, `craa5_configname` second for old rows with a blank key. Gerald adds the keys to the new table once it exists; the old one stays until every app has switched. Keys:
 `hub_people_thresholds` (Manager hub), `ganttly_settings` (Ganttly), `mss_view_rules` (MSS Log Input), `scheduler_shared` (Production Scheduler; today its `config` row in the Clean Plan, which may stay there), `training_settings` (Training page: minimum shifts, refresher days), `mss_completion_exclusions` and `mss_line_downtime` (MSS Calendar; downtime only for lines the Scheduler does not plan). Plus one `manifest|<appId>` row per app, written by that app (12.1).
 
 **Keys in use today** (older names, listed so the monitor does not flag them): `MSS_CALENDAR_VIEW_CONFIG` and `MSS_SKIPPED_ENTRIES_LOG` (MSS Calendar), `MSS_LOG_SKIPPED_ENTRIES` (MSS Log Input), `MSS_LOG_VIEW_CONFIG` (MSS Log Input; becomes `mss_view_rules`), `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG` (MSS Log Input; the Calendar only reads skip codes), `MSS_CALENDAR_ACCESS_LOG` (MSS Calendar's own access log), `PBED_WEEKEND_PLAN` (old PBED, unused). The full list with owners is `configKeys` in `contract.json`.
@@ -419,6 +420,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.31 (2026-10-22)** Ground rule 9: no pop-ups (Power Apps blocks confirm / alert / prompt). Empty Hub config JSON = no settings yet. The Dataverse monitor is English only.
 - **1.0.30 (2026-10-22)** Hub config moves to a new table `craa5__e_hubconfig` (agreed with the Dataverse monitor; Gerald asked for it): Organization-owned, same column names, big `craa5_configjson`. Apps probe it first, the old `craa5__0_hubconfig` second. `hub-shared.js`: `HUB_CONFIG_TABLES`, `hubSaveManifest` tries the new table first (92 checks). `table-prompts.md` part 8.
 - **1.0.29 (2026-10-22)** MSS Log Input writes its skipped entries to its own key `MSS_LOG_SKIPPED_ENTRIES`; `MSS_SKIPPED_ENTRIES_LOG` is the Calendar's alone.
 - **1.0.28 (2026-10-22)** 12.1: monitor code scans saved as hubconfig `scan|<appId>` (in `configKeys`); one-time allergen flag copy run by Gerald.
