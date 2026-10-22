@@ -180,6 +180,52 @@ function tr(enText, esText) {
   return _ACTIVE_LANG === 'es' ? (esText !== undefined ? esText : enText) : enText;
 }
 
+// --- IN-PAGE CONFIRM ---
+// Contract ground rule 9: Power Apps blocks window.confirm / alert / prompt without telling anyone,
+// so a question never shows and the answer comes back as "no". askConfirm(text) shows the question in
+// the page instead and resolves true (Yes) or false (Cancel / closed). One question at a time; the
+// ConfirmHost mounted inside the FluentProvider draws it.
+let confirmShow = null;
+const confirmQueue = [];
+function askConfirm(text, okLabel) {
+  return new Promise((resolve) => {
+    confirmQueue.push({ text: text, okLabel: okLabel, resolve: resolve });
+    if (confirmShow) confirmShow();
+  });
+}
+function ConfirmHost() {
+  const [, bump] = useState(0);
+  useEffect(() => {
+    confirmShow = () => bump(n => n + 1);
+    if (confirmQueue.length) bump(n => n + 1);
+    return () => { confirmShow = null; };
+  }, []);
+  const cur = confirmQueue[0];
+  if (!cur) return null;
+  const done = (ok) => {
+    if (confirmQueue[0] !== cur) return;
+    confirmQueue.shift();
+    cur.resolve(ok);
+    bump(n => n + 1);
+  };
+  return (
+    <Dialog open modalType="alert" onOpenChange={(e, d) => { if (!d.open) done(false); }}>
+      <DialogSurface style={{ width: '520px', maxWidth: '94vw' }} aria-label={tr('Please confirm', 'Confirme por favor')}>
+        <DialogBody>
+          <DialogTitle>{tr('Please confirm', 'Confirme por favor')}</DialogTitle>
+          <DialogContent>
+            <Text block style={{ whiteSpace: 'pre-wrap' }}>{cur.text}</Text>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={() => done(false)}>{tr('Cancel', 'Cancelar')}</Button>
+            <Button appearance="primary" data-confirm-yes="1" onClick={() => done(true)}>{cur.okLabel || tr('Yes, go ahead', 'Si, continuar')}</Button>
+          </DialogActions>
+        </DialogBody>
+      </DialogSurface>
+    </Dialog>
+  );
+}
+
 const ES_MX_EXACT = {
   "MSS Log Input": "MSS Log Input",
   "Add Log Entries": "Agregar Registros",
@@ -536,7 +582,10 @@ var HUB_BRAND_RED = '#E4002B';            // the logo only, never a status
 //         config: ['ganttly_settings'] }
 //   names = table names the app tries, in order (default [t]); opt = columns the app works without (shown as "not yet").
 var HUB_APP_IDS = ['ganttly', 'shiftstart', 'prodsched', 'msscalendar', 'msslog', 'pbed', 'bolo', 'managerhub', 'chemicals', 'mapsubmit', 'monitor', 'training'];
-var HUB_MANIFEST_TABLE = 'craa5__0_hubconfig';   // own name: some pages already declare HUB_CONFIG_TABLE
+// Shared settings table: the new _e_ Hub config first (Organization-owned, big craa5_configjson), the old _0_ one second.
+// Own names: some pages already declare HUB_CONFIG_TABLE.
+var HUB_CONFIG_TABLES = ['craa5__e_hubconfig', 'craa5__0_hubconfig'];
+var HUB_MANIFEST_TABLE = HUB_CONFIG_TABLES[0];
 function hubNameList(a) {
     var out = [], seen = {};
     (a || []).forEach(function (x) { var v = String(x === undefined || x === null ? '' : x).trim().toLowerCase(); if (v && !seen[v]) { seen[v] = 1; out.push(v); } });
@@ -557,36 +606,38 @@ function hubManifest(m, nowIso) {
 function hubManifestKey(appId) { return 'manifest|' + hubCanon(appId); }
 // io = { query(table, { select, filter, top }) -> Promise of rows (or { rows }), create(table, body), update(table, id, body) }
 // (Ganttly: swQuery + swWriter). Never rejects and never blocks the app: resolves 'same', 'saved' or 'failed: why'.
-// The list goes in craa5_manifestjson when hubconfig has that column; otherwise in craa5_configjson.
-// craa5_configjson holds only 100 characters in this Dataverse, so with the new column it is left alone.
+// Where it goes, first that reads: _e_ Hub config craa5_configjson; old _0_ hubconfig craa5_manifestjson (its
+// craa5_configjson holds only 100 characters); old _0_ hubconfig craa5_configjson.
 var HUB_MANIFEST_COL = 'craa5_manifestjson';
-// Every hubconfig JSON value (settings too, not only manifests) is written to craa5_manifestjson and read from it first.
+// Every hubconfig JSON value: read Manifest json first (old table), then Config json.
 function hubConfigJsonOf(row) { return row ? String(row[HUB_MANIFEST_COL] || row.craa5_configjson || '') : ''; }
 function hubSaveManifest(io, m) {
     try {
-        var man = hubManifest(m), key = hubManifestKey(man.appId), table = HUB_MANIFEST_TABLE, idCol = table + 'id';
+        var man = hubManifest(m), key = hubManifestKey(man.appId);
         if (!man.appId) return Promise.resolve('failed: no appId');
         var fail = function (e) { return 'failed: ' + String(e && e.message || e); };
-        var read = function (cols) {
-            return Promise.resolve(io.query(table, { select: [idCol].concat(cols), filter: "craa5_configkey eq '" + key + "' and statecode eq 0", top: 5 })).then(function (res) {
+        var spots = [[HUB_CONFIG_TABLES[0], 'craa5_configjson', []], [HUB_CONFIG_TABLES[1], HUB_MANIFEST_COL, ['craa5_configjson']], [HUB_CONFIG_TABLES[1], 'craa5_configjson', []]];
+        var read = function (i) {
+            if (i >= spots.length) return Promise.reject(new Error('no hub config table'));
+            var sp = spots[i], idCol = sp[0] + 'id';
+            return Promise.resolve(io.query(sp[0], { select: [idCol, sp[1]].concat(sp[2]), filter: "craa5_configkey eq '" + key + "' and statecode eq 0", top: 5 })).then(function (res) {
                 var rows = res && res.rows !== undefined ? res.rows : res;
                 if (!rows) throw new Error(res && res.err || 'read failed');
-                return rows;
-            });
+                return { rows: rows, table: sp[0], col: sp[1], idCol: idCol };
+            }).then(null, function (e) { return i + 1 < spots.length ? read(i + 1) : Promise.reject(e); });
         };
-        return read([HUB_MANIFEST_COL, 'craa5_configjson']).then(function (rows) { return { rows: rows, col: HUB_MANIFEST_COL }; },
-            function () { return read(['craa5_configjson']).then(function (rows) { return { rows: rows, col: 'craa5_configjson' }; }); }).then(function (r) {
+        return read(0).then(function (r) {
             var body = { craa5_configkey: key, craa5_configname: (man.app || man.appId) + ' manifest' };
             body[r.col] = JSON.stringify(man);
             var row = r.rows[0];
             if (row) {
                 var old = {}; try { old = JSON.parse(row[r.col] || '{}'); } catch (e) {}
                 if (old && old.hash === man.hash) return 'same';
-                return Promise.resolve(io.update(table, hubGuid(row[idCol]), body)).then(function () { return 'saved'; }, fail);
+                return Promise.resolve(io.update(r.table, hubGuid(row[r.idCol]), body)).then(function () { return 'saved'; }, fail);
             }
             var create = {}; for (var k in body) create[k] = body[k];
-            create[idCol] = hubIdFromKey('hubconfig|' + key);      // fixed id: two people opening at once still make one row
-            return Promise.resolve(io.create(table, create)).then(function () { return 'saved'; }, fail);
+            create[r.idCol] = hubIdFromKey('hubconfig|' + key);      // fixed id: two people opening at once still make one row
+            return Promise.resolve(io.create(r.table, create)).then(function () { return 'saved'; }, fail);
         }, fail);
     } catch (e) { return Promise.resolve('failed: ' + String(e && e.message || e)); }
 }
@@ -606,15 +657,58 @@ const HUB_CONFIG_TABLE = 'craa5__0_hubconfig';
 // Keys this app owns in hubconfig (contract 12). Skipped entries use their own key: MSS_SKIPPED_ENTRIES_LOG is MSS Calendar's.
 const HUB_CONFIG_SKIP_CODES_KEY = 'MSS_SKIP_CODES';
 const HUB_CONFIG_SKIPPED_LOG_KEY = 'MSS_LOG_SKIPPED_ENTRIES';
-// The hubconfig row of a key (contract 12): craa5_configkey first, then craa5_configname; [] when there is none. Values are written to
-// craa5_manifestjson (craa5_configjson holds only 100 characters) and read with hubConfigJsonOf(row), which falls back to the old column.
-const HUB_CONFIG_SELECT = ['craa5__0_hubconfigid', 'craa5_configkey', 'craa5_configname', 'craa5_configjson', HUB_MANIFEST_COL];
-async function cfgFindRows(api, key) {
+// Shared settings (contract 12): the new _e_ Hub config (HUB_CONFIG_TABLES[0], Organization-owned, JSON in craa5_configjson) first;
+// the old _0_ hubconfig (JSON in craa5_manifestjson, its craa5_configjson holds only 100 characters) when the new table cannot be read.
+const HUB_CFG_NEW = HUB_CONFIG_TABLES[0], HUB_CFG_OLD = HUB_CONFIG_TABLES[1];
+let cfgNewOk = null;   // can the new table be read? null until the first read
+const cfgTableName = () => (cfgNewOk === false ? HUB_CFG_OLD : HUB_CFG_NEW);
+const cfgGone = (e) => MISSING_TABLE.test(errText(e)) || MISSING_COLUMN.test(errText(e)) || mlwIsMissingCol(errText(e)) || mlwIsDenied(e);
+async function cfgFindIn(api, table, cols, key) {
   for (const col of ['craa5_configkey', 'craa5_configname']) {
-    const rows = await api.query(HUB_CONFIG_TABLE, { select: HUB_CONFIG_SELECT, filter: `${col} eq '${key}' and statecode eq 0`, top: 1 });
-    if (rows && rows[0]) return [rows[0]];
+    const rows = await api.query(table, { select: [table + 'id', 'craa5_configkey', 'craa5_configname'].concat(cols), filter: `${col} eq '${key}' and statecode eq 0`, top: 1 });
+    if (rows && rows[0]) return rows[0];
   }
-  return [];
+  return null;
+}
+// The settings row of a key, found by craa5_configkey first, then craa5_configname: [{ craa5_configjson: the JSON, _cfg: { table, col, id } }],
+// or [] when there is none. Read the JSON with hubConfigJsonOf(row); '' = no settings yet (the monitor may make rows with only key and
+// name). When the new table has no JSON for the key yet, the old table's JSON is read, and the next save goes to the new table.
+async function cfgFindRows(api, key) {
+  let fresh = null;
+  if (cfgNewOk !== false) {
+    try { fresh = await cfgFindIn(api, HUB_CFG_NEW, ['craa5_configjson'], key); cfgNewOk = true; }
+    catch (e) { if (!cfgGone(e)) throw e; cfgNewOk = false; }
+  }
+  const freshId = fresh ? cleanGuid(fresh[HUB_CFG_NEW + 'id']) : '';
+  if (fresh && safeString(fresh.craa5_configjson)) return [{ craa5_configjson: fresh.craa5_configjson, _cfg: { table: HUB_CFG_NEW, col: 'craa5_configjson', id: freshId } }];
+  let old = null;
+  try { old = await cfgFindIn(api, HUB_CFG_OLD, [HUB_MANIFEST_COL, 'craa5_configjson'], key); }
+  catch (e) {
+    if (!cfgGone(e)) { if (!cfgNewOk) throw e; }
+    else { try { old = await cfgFindIn(api, HUB_CFG_OLD, ['craa5_configjson'], key); } catch (e2) { if (!cfgNewOk) throw e2; } }
+  }
+  const json = old ? hubConfigJsonOf(old) : '';
+  if (cfgNewOk) return fresh || json ? [{ craa5_configjson: json, _cfg: { table: HUB_CFG_NEW, col: 'craa5_configjson', id: freshId } }] : [];
+  return old ? [{ craa5_configjson: json, _cfg: { table: HUB_CFG_OLD, col: HUB_MANIFEST_COL, id: cleanGuid(old[HUB_CFG_OLD + 'id']) } }] : [];
+}
+// Saves a key's JSON where cfgFindRows put it (rows from it; [] = the table it read). A new row gets a fixed id, so two people saving at
+// once still make one row; key and name are always written.
+// Scope, category and updated-by are extras: when the table lacks one of them the save is made again without them.
+async function cfgPut(api, rows, key, json, createExtra, updateExtra) {
+  const at = (rows && rows[0] && rows[0]._cfg) || (cfgNewOk === false ? { table: HUB_CFG_OLD, col: HUB_MANIFEST_COL, id: '' } : { table: HUB_CFG_NEW, col: 'craa5_configjson', id: '' });
+  const body = { craa5_configkey: key, craa5_configname: key, [at.col]: json };
+  const lean = (e) => MISSING_COLUMN.test(errText(e)) || mlwIsMissingCol(errText(e));
+  const upd = async (id) => {
+    try { return await api.update(at.table, id, { ...body, ...(updateExtra || {}) }); }
+    catch (e) { if (lean(e) && Object.keys(updateExtra || {}).length) return api.update(at.table, id, body); throw e; }
+  };
+  if (at.id) return upd(at.id);
+  const id = hubIdFromKey('hubconfig|' + key);
+  const make = (extra) => api.create(at.table, { ...body, ...extra, [at.table + 'id']: id });
+  try {
+    try { return await make(createExtra || {}); }
+    catch (e) { if (lean(e) && Object.keys(createExtra || {}).length) return await make({}); throw e; }
+  } catch (e) { if (mlwIsDuplicate(errText(e))) return upd(id); throw e; }
 }
 const HUB_CONFIG_SET = 'craa5__0_hubconfigs';
 const ACCESS_LOG_TABLE = 'craa5_mss_useraccesslog';
@@ -631,6 +725,7 @@ const ID_COL = {
   [USER_TABLE]: 'systemuserid',
   [SKIP_TABLE]: 'craa5_mss_skipcodeid',
   [HUB_CONFIG_TABLE]: 'craa5__0_hubconfigid',
+  [HUB_CONFIG_TABLES[0]]: 'craa5__e_hubconfigid',
   [ACCESS_LOG_TABLE]: 'craa5_mss_useraccesslogid',
   [SHIFT_LOG_TABLE]: 'craa5_shiftlogid',
   [EMP_TABLE]: 'craa5__aa_employeeid',
@@ -642,6 +737,7 @@ const ENTITY_SET = {
   [USER_TABLE]: USER_SET,
   [SKIP_TABLE]: SKIP_SET,
   [HUB_CONFIG_TABLE]: HUB_CONFIG_SET,
+  [HUB_CONFIG_TABLES[0]]: 'craa5__e_hubconfigs',
   [ACCESS_LOG_TABLE]: ACCESS_LOG_SET,
   [SHIFT_LOG_TABLE]: SHIFT_LOG_SET,
   [EMP_TABLE]: EMP_SET,
@@ -2745,7 +2841,7 @@ const makeStore = (api) => {
     dropOrders() { ['orderSearch', 'orderPending', 'orderRows', 'orders', 'prev', 'evidence'].forEach(k => cache[k].clear()); },
     invalidateAssets() { ['assetSearch', 'names', 'field'].forEach(k => cache[k].clear()); },
 
-    // --- SKIP / NOT-DONE CODES MANAGEMENT (Synced via Dataverse craa5__0_hubconfig key 'MSS_SKIP_CODES') ---
+    // --- SKIP / NOT-DONE CODES MANAGEMENT (Synced via Dataverse Hub config key 'MSS_SKIP_CODES': craa5__e_hubconfig, else craa5__0_hubconfig) ---
     getSkipCodes() {
       return skipCodes.slice().sort((a, b) => (Number(a.sortOrder) || 100) - (Number(b.sortOrder) || 100) || safeString(a.code).localeCompare(safeString(b.code)));
     },
@@ -2756,7 +2852,7 @@ const makeStore = (api) => {
       return skipTableState === 'connected';
     },
     skipTableStatus() {
-      return { state: skipTableState, error: skipTableError, lastSync: skipLastSync, table: HUB_CONFIG_TABLE, entitySet: HUB_CONFIG_SET };
+      return { state: skipTableState, error: skipTableError, lastSync: skipLastSync, table: cfgTableName(), entitySet: ENTITY_SET[cfgTableName()] };
     },
     async syncSkipCodesFromDataverse(force = false) {
       if (skipTableState === 'missing' && !force) {
@@ -2773,7 +2869,7 @@ const makeStore = (api) => {
           const list = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.codes) ? parsed.codes : []);
           const fromDv = list.map((r, idx) => ({
             id: safeString(r.id || r.code || `dv-${idx}`),
-            dvId: cleanGuid(cfgRow.craa5__0_hubconfigid) || null,
+            dvId: (cfgRow._cfg && cfgRow._cfg.id) || null,
             code: normCode(r.code || r.craa5_code),
             label: safeString(r.label || r.craa5_label) || normCode(r.code || r.craa5_code),
             category: safeString(r.category || r.craa5_category) || 'General',
@@ -2792,7 +2888,7 @@ const makeStore = (api) => {
         const msg = errText(e);
         if (MISSING_TABLE.test(msg) || MISSING_COLUMN.test(msg)) {
           skipTableState = 'missing';
-          skipTableError = `Hub config table ${HUB_CONFIG_TABLE} not reachable (using in-app storage).`;
+          skipTableError = `Hub config table ${cfgTableName()} not reachable (using in-app storage).`;
         } else {
           skipTableState = 'error';
           skipTableError = msg;
@@ -2830,22 +2926,7 @@ const makeStore = (api) => {
           const allCodes = store.getSkipCodes();
           const jsonStr = JSON.stringify(allCodes);
           const rows = await cfgFindRows(api, HUB_CONFIG_SKIP_CODES_KEY);
-          if (rows && rows[0] && rows[0].craa5__0_hubconfigid) {
-            await api.update(HUB_CONFIG_TABLE, rows[0].craa5__0_hubconfigid, {
-              craa5_configkey: HUB_CONFIG_SKIP_CODES_KEY,
-              craa5_configname: HUB_CONFIG_SKIP_CODES_KEY,
-              [HUB_MANIFEST_COL]: jsonStr,
-              craa5_scope: 'MSS_LOG_INPUT',
-            });
-          } else {
-            await api.create(HUB_CONFIG_TABLE, {
-              craa5_configkey: HUB_CONFIG_SKIP_CODES_KEY,
-              craa5_configname: HUB_CONFIG_SKIP_CODES_KEY,
-              craa5_category: 'SkipCodes',
-              craa5_scope: 'MSS_LOG_INPUT',
-              [HUB_MANIFEST_COL]: jsonStr,
-            });
-          }
+          await cfgPut(api, rows, HUB_CONFIG_SKIP_CODES_KEY, jsonStr, { craa5_category: 'SkipCodes', craa5_scope: 'MSS_LOG_INPUT' }, { craa5_scope: 'MSS_LOG_INPUT' });
           entry.source = 'dataverse';
           saveLocalSkipCodes(skipCodes);
           skipTableState = 'connected';
@@ -2865,13 +2946,7 @@ const makeStore = (api) => {
         try {
           const jsonStr = JSON.stringify(store.getSkipCodes());
           const rows = await cfgFindRows(api, HUB_CONFIG_SKIP_CODES_KEY);
-          if (rows && rows[0] && rows[0].craa5__0_hubconfigid) {
-            await api.update(HUB_CONFIG_TABLE, rows[0].craa5__0_hubconfigid, {
-              craa5_configkey: HUB_CONFIG_SKIP_CODES_KEY,
-              craa5_configname: HUB_CONFIG_SKIP_CODES_KEY,
-              [HUB_MANIFEST_COL]: jsonStr,
-            });
-          }
+          await cfgPut(api, rows, HUB_CONFIG_SKIP_CODES_KEY, jsonStr, {}, {});
         } catch (_) {}
       }
       return store.getSkipCodes();
@@ -2886,22 +2961,7 @@ const makeStore = (api) => {
         const allCodes = store.getSkipCodes();
         const jsonStr = JSON.stringify(allCodes);
         const rows = await cfgFindRows(api, HUB_CONFIG_SKIP_CODES_KEY);
-        if (rows && rows[0] && rows[0].craa5__0_hubconfigid) {
-          await api.update(HUB_CONFIG_TABLE, rows[0].craa5__0_hubconfigid, {
-            craa5_configkey: HUB_CONFIG_SKIP_CODES_KEY,
-            craa5_configname: HUB_CONFIG_SKIP_CODES_KEY,
-            [HUB_MANIFEST_COL]: jsonStr,
-            craa5_scope: 'MSS_LOG_INPUT',
-          });
-        } else {
-          await api.create(HUB_CONFIG_TABLE, {
-            craa5_configkey: HUB_CONFIG_SKIP_CODES_KEY,
-            craa5_configname: HUB_CONFIG_SKIP_CODES_KEY,
-            craa5_category: 'SkipCodes',
-            craa5_scope: 'MSS_LOG_INPUT',
-            [HUB_MANIFEST_COL]: jsonStr,
-          });
-        }
+        await cfgPut(api, rows, HUB_CONFIG_SKIP_CODES_KEY, jsonStr, { craa5_category: 'SkipCodes', craa5_scope: 'MSS_LOG_INPUT' }, { craa5_scope: 'MSS_LOG_INPUT' });
         skipCodes = skipCodes.map(sc => ({ ...sc, source: 'dataverse' }));
         saveLocalSkipCodes(skipCodes);
         skipTableState = 'connected';
@@ -2911,7 +2971,7 @@ const makeStore = (api) => {
         return {
           ok: false,
           pushed: 0,
-          error: `Could not sync skip codes to ${HUB_CONFIG_TABLE}: ${errText(e)}`,
+          error: `Could not sync skip codes to ${cfgTableName()}: ${errText(e)}`,
         };
       }
     },
@@ -2935,22 +2995,7 @@ const makeStore = (api) => {
               } catch (_) {}
             }
             const jsonStr = JSON.stringify(merged);
-            if (rows && rows[0] && rows[0].craa5__0_hubconfigid) {
-              await api.update(HUB_CONFIG_TABLE, rows[0].craa5__0_hubconfigid, {
-                craa5_configkey: HUB_CONFIG_SKIPPED_LOG_KEY,
-                craa5_configname: HUB_CONFIG_SKIPPED_LOG_KEY,
-                [HUB_MANIFEST_COL]: jsonStr,
-                craa5_scope: 'MSS_LOG_INPUT',
-              });
-            } else {
-              await api.create(HUB_CONFIG_TABLE, {
-                craa5_configkey: HUB_CONFIG_SKIPPED_LOG_KEY,
-                craa5_configname: HUB_CONFIG_SKIPPED_LOG_KEY,
-                craa5_category: 'SkippedEntries',
-                craa5_scope: 'MSS_LOG_INPUT',
-                [HUB_MANIFEST_COL]: jsonStr,
-              });
-            }
+            await cfgPut(api, rows, HUB_CONFIG_SKIPPED_LOG_KEY, jsonStr, { craa5_category: 'SkippedEntries', craa5_scope: 'MSS_LOG_INPUT' }, { craa5_scope: 'MSS_LOG_INPUT' });
           } catch (_) {}
         })();
       }
@@ -6267,9 +6312,9 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
       if (!stale()) setSheet(s => ({ ...s, status: e && e.reader ? 'unavailable' : 'error', msg: lowerFirst(errText(e)) }));
     } finally { if (ocrLog === mine) ocrLog = null; }
   };
-  const pickFromSheet = (kind, value) => {
+  const pickFromSheet = async (kind, value) => {
     if (kind === 'code') {
-      if (normalizedCode && normalizedCode !== value && !window.confirm(`Replace ${normalizedCode} with ${value}? Changes made to its lines will be cleared.`)) return;
+      if (normalizedCode && normalizedCode !== value && !(await askConfirm(tr(`Replace ${normalizedCode} with ${value}? Changes made to its lines will be cleared.`, `Cambiar ${normalizedCode} por ${value}? Se borraran los cambios hechos a sus lineas.`)))) return;
       if (normalizedCode !== value) selectCode(value);
     } else if (kind === 'date') { dateTouched.current = true; setDateStr(value); }
     else if (kind === 'hours') setTotalHours(String(value));
@@ -6333,7 +6378,7 @@ const EntryRow = forwardRef(function EntryRow({ ctx, index, initialDate, initial
       }
       return false;
     }
-    if (row && existing && !window.confirm(`${asset.name} (${placeText(asset)}) already has ${existing} as its ${freqLabel(targetCol)} code. Replace it with ${normalizedCode}?`)) {
+    if (row && existing && !(await askConfirm(tr(`${asset.name} (${placeText(asset)}) already has ${existing} as its ${freqLabel(targetCol)} code. Replace it with ${normalizedCode}?`, `${asset.name} (${placeText(asset)}) ya tiene ${existing} como su codigo ${freqLabel(targetCol)}. Cambiarlo por ${normalizedCode}?`)))) {
       notes.push(`${asset.name}: kept ${existing}; ${normalizedCode} was not stored on it.`);
       return false;
     }
@@ -8501,7 +8546,7 @@ const LogTableTab = ({ ctx }) => {
 
   const batchDelete = async () => {
     if (!selected.size) return;
-    if (!window.confirm(`Are you sure you want to permanently delete ${plural(selected.size, 'record', 'records')} from Dataverse?`)) return;
+    if (!(await askConfirm(tr(`Are you sure you want to permanently delete ${plural(selected.size, 'record', 'records')} from Dataverse?`, `Seguro que quiere borrar para siempre ${plural(selected.size, 'registro', 'registros')} de Dataverse?`), tr('Delete', 'Borrar')))) return;
     const res = await pool(Array.from(selected), 8, (id) => api.remove(LOG_TABLE, id));
     const failed = res.filter(r => !r.ok);
     setMessage(failed.length ? { kind: 'error', text: `${failed.length} deletes failed: ${errText(failed[0].error)}` } : { kind: 'ok', text: `Deleted ${plural(res.length, 'entry', 'entries')}.` });
@@ -8727,10 +8772,10 @@ const CheckTab = ({ ctx }) => {
     if (optCols.current.indexOf('craa5_cleankind') >= 0) body.craa5_cleankind = k;
     return api.update(LOG_TABLE, r.id, body);
   }, 'Clean kind filled in from the SAP order', 'Tipo de limpieza tomado de la orden SAP');
-  const removeRepeats = () => {
+  const removeRepeats = async () => {
     const list = rows.filter(r => r.problems.indexOf('duplicate') >= 0);
     if (!list.length) return;
-    if (!window.confirm(tr(`Turn off ${list.length} repeated automatic entries? The first entry of each clean is kept. The repeats are deactivated, not deleted.`, `Desactivar ${list.length} registros automaticos repetidos? Se conserva el primer registro de cada limpieza. Los repetidos se desactivan, no se borran.`))) return;
+    if (!(await askConfirm(tr(`Turn off ${list.length} repeated automatic entries? The first entry of each clean is kept. The repeats are deactivated, not deleted.`, `Desactivar ${list.length} registros automaticos repetidos? Se conserva el primer registro de cada limpieza. Los repetidos se desactivan, no se borran.`)))) return;
     applyAll(list, (r) => api.update(LOG_TABLE, r.id, { statecode: 1, statuscode: 2 }), 'Repeated entries turned off', 'Registros repetidos desactivados');
   };
   const moveBack = (r) => applyAll([r], (x) => api.update(LOG_TABLE, x.id, { craa5_lastcleaned: toLogDate(dayBefore(x.date)) }), 'Moved to the day before', 'Movido al dia anterior');
@@ -9298,7 +9343,7 @@ const SkipCodesTab = ({ ctx }) => {
   };
 
   const handleDelete = async (item) => {
-    if (!window.confirm(`Delete skip code "${item.code} - ${item.label}"?`)) return;
+    if (!(await askConfirm(tr(`Delete skip code "${item.code} - ${item.label}"?`, `Borrar el codigo de omision "${item.code} - ${item.label}"?`), tr('Delete', 'Borrar')))) return;
     setBusy(true);
     setMsg(null);
     try {
@@ -9315,7 +9360,7 @@ const SkipCodesTab = ({ ctx }) => {
   };
 
   const handleResetDefaults = async () => {
-    if (!window.confirm('Reset the skip code list to the default plant codes? Any custom codes stored only in browser storage will be replaced.')) return;
+    if (!(await askConfirm(tr('Reset the skip code list to the default plant codes? Any custom codes stored only in browser storage will be replaced.', 'Restablecer la lista de codigos de omision a los codigos de planta predeterminados? Los codigos propios guardados solo en este navegador se reemplazaran.')))) return;
     store.resetSkipCodes();
     refreshLocal();
     dataChanged();
@@ -10117,21 +10162,38 @@ const MSS_DATAVERSE_TABLE_BLUEPRINTS = [
   },
   {
     key: 'hubconfig',
+    table: HUB_CONFIG_TABLES[0],
+    entitySet: 'craa5__e_hubconfigs',
+    primaryId: 'craa5__e_hubconfigid',
+    primaryName: 'craa5_configname',
+    displayName: 'Hub Configuration & Shared State (craa5__e_hubconfig)',
+    role: 'Central JSON Key-Value Store (Organization-owned, data contract 12) - Syncs View Module per-user permissions (MSS_LOG_VIEW_CONFIG), Skip Codes (MSS_SKIP_CODES), User Access Audit Logs (MSS_LOG_ACCESS_LOG) and skipped entries (MSS_LOG_SKIPPED_ENTRIES) across devices. Read first; the old craa5__0_hubconfig is used only while this table is missing.',
+    probeSelect: ['craa5__e_hubconfigid', 'craa5_configkey', 'craa5_configname', 'craa5_configjson'],
+    columns: [
+      { logicalName: 'craa5__e_hubconfigid', displayName: 'Config Record GUID', type: 'Uniqueidentifier (Primary Key)', tier: 'Current Core', required: true, notes: 'Primary key GUID. A new row gets a fixed id made from its key, so two people saving at once still make one row.' },
+      { logicalName: 'craa5_configname', displayName: 'Configuration Name (Primary Name)', type: 'Single Line of Text (120)', tier: 'Current Core', required: true, notes: 'Primary Name column on craa5__e_hubconfig. Written with the key.' },
+      { logicalName: 'craa5_configkey', displayName: 'Configuration Key', type: 'Single Line of Text (120)', tier: 'Current Core', required: true, notes: 'Key identifier (e.g. MSS_LOG_VIEW_CONFIG, MSS_LOG_ACCESS_LOG, MSS_SKIP_CODES).' },
+      { logicalName: 'craa5_configjson', displayName: 'Configuration JSON', type: 'Multiple Lines of Text (1048576)', tier: 'Current Core', required: true, notes: 'Every JSON value this app saves. Empty = no settings yet (rows can be made with only key and name).' },
+      { logicalName: 'craa5_scope', displayName: 'App / Scope Name', type: 'Single Line of Text (100)', tier: 'Current Extended', required: false, notes: 'Module scope (e.g. MSS_LOG_INPUT).' },
+      { logicalName: 'craa5_category', displayName: 'Category', type: 'Single Line of Text (100)', tier: 'Current Extended', required: false, notes: 'SkipCodes, AccessAudit, ViewConfig.' },
+      { logicalName: 'craa5_updatedby', displayName: 'Updated By', type: 'Single Line of Text (120)', tier: 'Current Extended', required: false, notes: 'Microsoft ID / user name who last saved the config.' },
+    ],
+  },
+  {
+    key: 'hubconfigold',
     table: HUB_CONFIG_TABLE,
     entitySet: HUB_CONFIG_SET,
     primaryId: 'craa5__0_hubconfigid',
     primaryName: 'craa5_configname',
-    displayName: 'Hub Configuration & Shared State (craa5__0_hubconfig)',
-    role: 'Central JSON Key-Value Store - Syncs View Module per-user permissions (MSS_LOG_VIEW_CONFIG), Skip Codes (MSS_SKIP_CODES), and User Access Audit Logs (MSS_LOG_ACCESS_LOG) across devices.',
-    probeSelect: ['craa5__0_hubconfigid', 'craa5_configkey', 'craa5_configname', 'craa5_manifestjson', 'craa5_updatedby'],
+    displayName: 'Old Hub Configuration (craa5__0_hubconfig) - fallback only',
+    role: 'Old User-owned settings table. Read when craa5__e_hubconfig has nothing for a key; written only while craa5__e_hubconfig cannot be read. Can go once every app reads the new table.',
+    probeSelect: ['craa5__0_hubconfigid', 'craa5_configkey', 'craa5_configname', 'craa5_manifestjson'],
     columns: [
       { logicalName: 'craa5__0_hubconfigid', displayName: 'Config Record GUID', type: 'Uniqueidentifier (Primary Key)', tier: 'Current Core', required: true, notes: 'Primary key GUID.' },
       { logicalName: 'craa5_configname', displayName: 'Configuration Name (Primary Name)', type: 'Single Line of Text (120)', tier: 'Current Core', required: true, notes: 'Primary Name column on craa5__0_hubconfig.' },
-      { logicalName: 'craa5_configkey', displayName: 'Configuration Key', type: 'Single Line of Text (120)', tier: 'Current Core', required: true, notes: 'Key identifier (e.g. MSS_LOG_VIEW_CONFIG, MSS_LOG_ACCESS_LOG, MSS_SKIP_CODES).' },
-      { logicalName: 'craa5_scope', displayName: 'App / Scope Name', type: 'Single Line of Text (100)', tier: 'Current Extended', required: false, notes: 'Module scope (e.g. MSS_LOG_INPUT).' },
-      { logicalName: 'craa5_manifestjson', displayName: 'Manifest json', type: 'Multiple Lines of Text (Max / 1048576)', tier: 'Current Core', required: true, notes: 'Every JSON value this app saves (View Module assignments, Skip Codes, Access Audit history, skipped entries). Data contract 12.' },
-      { logicalName: 'craa5_configjson', displayName: 'Configuration JSON', type: 'Multiple Lines of Text (100 today)', tier: 'Current Core', required: false, notes: 'Old column, only 100 characters: read as a fallback for old rows, never written.' },
-      { logicalName: 'craa5_updatedby', displayName: 'Updated By', type: 'Single Line of Text (120)', tier: 'Current Extended', required: false, notes: 'Microsoft ID / user name who last saved the config.' },
+      { logicalName: 'craa5_configkey', displayName: 'Configuration Key', type: 'Single Line of Text (120)', tier: 'Current Core', required: true, notes: 'Key identifier.' },
+      { logicalName: 'craa5_manifestjson', displayName: 'Manifest json', type: 'Multiple Lines of Text (Max / 1048576)', tier: 'Current Core', required: false, notes: 'Where JSON went on this table (data contract 12) before the new table.' },
+      { logicalName: 'craa5_configjson', displayName: 'Configuration JSON', type: 'Multiple Lines of Text (100 today)', tier: 'Current Core', required: false, notes: 'Only 100 characters: read as a fallback for old rows, never written.' },
     ],
   },
   {
@@ -10249,7 +10311,7 @@ const buildMasterAllTablesPowerversePrompt = (probeMap) => {
   });
   lines.push(
     `Please generate:`,
-    `1. A prioritized migration checklist separating (A) Existing Tables that only need missing Current Extended / Future Feature columns added vs. (B) Brand-New Optional Tables (${SKIP_TABLE}, ${HUB_CONFIG_TABLE}, ${ACCESS_LOG_TABLE}) to create from scratch.`,
+    `1. A prioritized migration checklist separating (A) Existing Tables that only need missing Current Extended / Future Feature columns added vs. (B) Brand-New Optional Tables (${SKIP_TABLE}, ${HUB_CONFIG_TABLES[0]}, ${ACCESS_LOG_TABLE}) to create from scratch.`,
     `2. Exact Data Types, Max Lengths, and Schema Names so zero OData 400 "Could not find a property named..." errors occur.`,
     `3. Recommended Dataverse indexes on craa5_lastcleaned, craa5_sap, craa5_equipmentguid, and craa5_configkey.`
   );
@@ -10406,8 +10468,8 @@ const ViewModuleTab = ({
     setMsg({ kind: 'ok', text: `Saved view assignment for "${record.displayName}" (${record.matchKey}) - ${record.lockedByAdmin ? 'Locked by Admin' : 'Unlocked default'}.` });
   };
 
-  const deleteUserAssignment = (a) => {
-    if (!window.confirm(`Remove custom view assignment for "${a.displayName} (${a.matchKey})"?`)) return;
+  const deleteUserAssignment = async (a) => {
+    if (!(await askConfirm(tr(`Remove custom view assignment for "${a.displayName} (${a.matchKey})"?`, `Quitar la vista asignada a "${a.displayName} (${a.matchKey})"?`), tr('Remove', 'Quitar')))) return;
     const nextCfg = {
       ...viewConfig,
       userAssignments: (viewConfig.userAssignments || []).filter(x => x.id !== a.id),
@@ -10858,7 +10920,7 @@ const MANUAL_SCREEN_GUIDES = [
     title: 'Live Dataverse Column Checkers, ChatGPT Powerverse Prompts & User Access Audit Log',
     subtitle: 'Probe every Dataverse table and column, generate ready-to-paste ChatGPT/Copilot prompts for current & future features, and audit every user access.',
     callouts: [
-      { num: '1', title: 'Live Dataverse Table & Column Prober', desc: 'Tests all 6 MSS tables (craa5__log_, craa5_aa_assets, craa5_aa_ms_assets, craa5_mss_skipcode, craa5__0_hubconfig, craa5_mss_useraccesslog) and badges every column as FOUND or MISSING.' },
+      { num: '1', title: 'Live Dataverse Table & Column Prober', desc: 'Tests all 7 MSS tables (craa5__log_, craa5_aa_assets, craa5_aa_ms_assets, craa5_mss_skipcode, craa5__e_hubconfig, the old craa5__0_hubconfig, craa5_mss_useraccesslog) and badges every column as FOUND or MISSING.' },
       { num: '2', title: 'Existing Table vs New Table Powerverse Prompt Generator', desc: 'Generates copyable ChatGPT / Power Apps Copilot prompts tailored for either adding missing Current & Future columns to an EXISTING table or creating a NEW table from scratch.' },
       { num: '3', title: 'Who Has Accessed the App & When Audit Log', desc: 'Logs every user session with Microsoft ID, Full Name, Email, Timestamp, Active View Profile, and Tabs Visited, with CSV export and Dataverse sync.' },
       { num: '4', title: '10-Point Proactive Health Scanner', desc: 'Runs automated diagnostics across OData connectivity, Asset Catalog integrity, SAP order linkage, Skip Code sync, and View Module configuration.' },
@@ -11106,7 +11168,7 @@ const renderManualScreenSvg = (screenId) => {
         {/* Preview & Sync */}
         <rect x="14" y="236" width="652" height="90" rx="8" fill="#FFFFFF" stroke="#CBD5E1" />
         <text x="48" y="262" fill="#002B5C" fontSize="11" fontWeight="800" fontFamily="Segoe UI, sans-serif">Assigned User Directory & Live Preview</text>
-        <text x="48" y="282" fill="#475569" fontSize="10" fontFamily="Segoe UI, sans-serif">U1010051 (Full Admin) - U1023456 (Operator - Locked) - Synced to craa5__0_hubconfigs</text>
+        <text x="48" y="282" fill="#475569" fontSize="10" fontFamily="Segoe UI, sans-serif">U1010051 (Full Admin) - U1023456 (Operator - Locked) - Synced to craa5__e_hubconfigs</text>
         <rect x="490" y="254" width="156" height="28" rx="6" fill="#0072CE" />
         <text x="568" y="272" textAnchor="middle" fill="#FFFFFF" fontSize="10" fontWeight="800" fontFamily="Segoe UI, sans-serif">Preview As User</text>
         {badgeCircle(28, 268, '4')}
@@ -11774,7 +11836,7 @@ const DevConsoleTab = ({
       { num: 5, name: 'Duplicate Equipment Name Disambiguation', ok: typeof store.assetsByName === 'function' && typeof store.allCatalogAssets === 'function', status: 'Active (Room + Area + GUID)', detail: 'Ensures equipment sharing the same name in different rooms never collide.' },
       { num: 6, name: 'Skip / Not-Done Codes Engine', ok: store.getSkipCodes().length > 0, status: `${store.getSkipCodes().length} Codes (${skipSt === true ? 'Dataverse Synced' : 'In-App Storage Ready'})`, detail: 'Supports mandatory skip notes and Dataverse craa5_mss_skipcode synchronization.' },
       { num: 7, name: 'Verification Photo Compression & Upload Pipeline', ok: true, status: 'Ready (Canvas JPEG Compression + Dataverse File Upload)', detail: 'Compresses high-res mobile photos before uploading to craa5_pictureorfileofpaperwork.' },
-      { num: 8, name: 'View Module Role & Per-User Lock Engine', ok: !!viewConfig, status: `${(viewConfig && viewConfig.userAssignments && viewConfig.userAssignments.length) || 0} Per-User Assignments Configured`, detail: 'Persists in localStorage and syncs to craa5__0_hubconfigs (MSS_LOG_VIEW_CONFIG).' },
+      { num: 8, name: 'View Module Role & Per-User Lock Engine', ok: !!viewConfig, status: `${(viewConfig && viewConfig.userAssignments && viewConfig.userAssignments.length) || 0} Per-User Assignments Configured`, detail: `Persists in localStorage and syncs to ${cfgTableName()} (MSS_LOG_VIEW_CONFIG).` },
       { num: 9, name: 'User Access Audit Logger', ok: (accessLogs || []).length > 0, status: `${(accessLogs || []).length} Access Sessions Logged (${userAccessSummary.length} Unique Users)`, detail: 'Records Microsoft ID, User Name, Timestamp, View Profile, and Tabs Visited on every session.' },
       { num: 10, name: 'OData $skiptoken Pagination Resilience', ok: true, status: 'Verified (No Conflicting maxPageSize Header)', detail: 'Prevents Power Apps WebApi pagination failures when loading >500 assets or log rows.' },
     ];
@@ -12017,7 +12079,7 @@ const DevConsoleTab = ({
                   Active User Identity & Access Audit Controls
                 </Text>
                 <Text className={styles.hint} block>
-                  Every time a user opens MSS Log Input, their Microsoft ID, Name, Email, View Profile, and Tabs Visited are automatically logged locally and synced to Dataverse (<code>{HUB_CONFIG_TABLE}</code> key <code>{HUB_CONFIG_ACCESS_KEY}</code> and optional table <code>{ACCESS_LOG_TABLE}</code>).
+                  Every time a user opens MSS Log Input, their Microsoft ID, Name, Email, View Profile, and Tabs Visited are automatically logged locally and synced to Dataverse (<code>{cfgTableName()}</code> key <code>{HUB_CONFIG_ACCESS_KEY}</code> and optional table <code>{ACCESS_LOG_TABLE}</code>).
                 </Text>
               </div>
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -12295,7 +12357,7 @@ export default function GeneratedComponent(props) {
       if (!live) return;
       setCurrentUser(detected);
 
-      // Pull shared View Module config from Dataverse craa5__0_hubconfig using live schema columns first
+      // Pull shared View Module config from the Dataverse Hub config (new _e_ table first, then the old _0_ one)
       let latestViewCfg = loadViewModuleConfig();
       if (api.mode === 'dataverse' || api.mode === 'live') {
         try {
@@ -12334,7 +12396,7 @@ export default function GeneratedComponent(props) {
       const updatedLogs = saveAccessAuditLogsLocal([sessionEntry, ...existingLogs.filter(x => x.id !== sessionEntry.id)]);
       if (live) setAccessLogs(updatedLogs);
 
-      // Sync access log to live Dataverse craa5__0_hubconfig (MSS_LOG_ACCESS_LOG) and craa5_shiftlog
+      // Sync access log to the live Dataverse Hub config (MSS_LOG_ACCESS_LOG) and craa5_shiftlog
       if (api.mode === 'dataverse' || api.mode === 'live') {
         try {
           const accRows = await cfgFindRows(api, HUB_CONFIG_ACCESS_KEY);
@@ -12356,23 +12418,7 @@ export default function GeneratedComponent(props) {
           }
           const accJson = JSON.stringify(mergedAcc);
           const updatedByStr = `${detected.userName} (${detected.microsoftId})`;
-          if (accRow && accRow.craa5__0_hubconfigid) {
-            await api.update(HUB_CONFIG_TABLE, accRow.craa5__0_hubconfigid, {
-              craa5_configkey: HUB_CONFIG_ACCESS_KEY,
-              craa5_configname: HUB_CONFIG_ACCESS_KEY,
-              [HUB_MANIFEST_COL]: accJson,
-              craa5_updatedby: updatedByStr,
-            });
-          } else {
-            await api.create(HUB_CONFIG_TABLE, {
-              craa5_configkey: HUB_CONFIG_ACCESS_KEY,
-              craa5_configname: HUB_CONFIG_ACCESS_KEY,
-              craa5_category: 'AccessAudit',
-              craa5_scope: 'MSS_LOG_INPUT',
-              [HUB_MANIFEST_COL]: accJson,
-              craa5_updatedby: updatedByStr,
-            });
-          }
+          await cfgPut(api, accRows, HUB_CONFIG_ACCESS_KEY, accJson, { craa5_category: 'AccessAudit', craa5_scope: 'MSS_LOG_INPUT', craa5_updatedby: updatedByStr }, { craa5_updatedby: updatedByStr });
         } catch (_) { /* ignore hubconfig error */ }
       }
     };
@@ -12417,27 +12463,10 @@ export default function GeneratedComponent(props) {
       const payload = JSON.stringify(viewConfig);
       const updatedBy = `${currentUser.userName} (${currentUser.microsoftId})`;
       const existing = await cfgFindRows(api, HUB_CONFIG_VIEW_KEY);
-      if (existing && existing[0] && existing[0].craa5__0_hubconfigid) {
-        await api.update(HUB_CONFIG_TABLE, existing[0].craa5__0_hubconfigid, {
-          craa5_configkey: HUB_CONFIG_VIEW_KEY,
-          craa5_configname: HUB_CONFIG_VIEW_KEY,
-          [HUB_MANIFEST_COL]: payload,
-          craa5_scope: 'MSS_LOG_INPUT',
-          craa5_updatedby: updatedBy,
-        });
-      } else {
-        await api.create(HUB_CONFIG_TABLE, {
-          craa5_configkey: HUB_CONFIG_VIEW_KEY,
-          craa5_configname: HUB_CONFIG_VIEW_KEY,
-          craa5_category: 'ViewModule',
-          craa5_scope: 'MSS_LOG_INPUT',
-          [HUB_MANIFEST_COL]: payload,
-          craa5_updatedby: updatedBy,
-        });
-      }
-      setViewSyncStatus(`Synced View Module configuration to Dataverse table ${HUB_CONFIG_TABLE} (${HUB_CONFIG_VIEW_KEY}).`);
+      await cfgPut(api, existing, HUB_CONFIG_VIEW_KEY, payload, { craa5_category: 'ViewModule', craa5_scope: 'MSS_LOG_INPUT', craa5_updatedby: updatedBy }, { craa5_scope: 'MSS_LOG_INPUT', craa5_updatedby: updatedBy });
+      setViewSyncStatus(`Synced View Module configuration to Dataverse table ${cfgTableName()} (${HUB_CONFIG_VIEW_KEY}).`);
     } catch (e) {
-      setViewSyncStatus(`Saved locally. Dataverse table ${HUB_CONFIG_TABLE} note: ${errText(e)}`);
+      setViewSyncStatus(`Saved locally. Dataverse table ${cfgTableName()} note: ${errText(e)}`);
     } finally {
       setSyncingViewConfig(false);
     }
@@ -12471,25 +12500,8 @@ export default function GeneratedComponent(props) {
       }
       const payload = JSON.stringify(merged);
       const updatedBy = `${currentUser.userName} (${currentUser.microsoftId})`;
-      if (existingRow && existingRow.craa5__0_hubconfigid) {
-        await api.update(HUB_CONFIG_TABLE, existingRow.craa5__0_hubconfigid, {
-          craa5_configkey: HUB_CONFIG_ACCESS_KEY,
-          craa5_configname: HUB_CONFIG_ACCESS_KEY,
-          [HUB_MANIFEST_COL]: payload,
-          craa5_scope: 'MSS_LOG_INPUT',
-          craa5_updatedby: updatedBy,
-        });
-      } else {
-        await api.create(HUB_CONFIG_TABLE, {
-          craa5_configkey: HUB_CONFIG_ACCESS_KEY,
-          craa5_configname: HUB_CONFIG_ACCESS_KEY,
-          craa5_category: 'AccessAudit',
-          craa5_scope: 'MSS_LOG_INPUT',
-          [HUB_MANIFEST_COL]: payload,
-          craa5_updatedby: updatedBy,
-        });
-      }
-      setAccessSyncStatus(`Synced ${merged.length} User Access Audit sessions with Dataverse (${HUB_CONFIG_TABLE}).`);
+      await cfgPut(api, existing, HUB_CONFIG_ACCESS_KEY, payload, { craa5_category: 'AccessAudit', craa5_scope: 'MSS_LOG_INPUT', craa5_updatedby: updatedBy }, { craa5_scope: 'MSS_LOG_INPUT', craa5_updatedby: updatedBy });
+      setAccessSyncStatus(`Synced ${merged.length} User Access Audit sessions with Dataverse (${cfgTableName()}).`);
     } catch (e) {
       setAccessSyncStatus(`Access logs stored locally. Dataverse sync note: ${errText(e)}`);
     } finally {
@@ -12753,6 +12765,7 @@ export default function GeneratedComponent(props) {
 
   return (
     <FluentProvider theme={isDark ? DARK_THEME : THEME} style={{ background: isDark ? '#0B1120' : 'transparent', minHeight: '100%' }}>
+      <ConfirmHost />
       {isDark && (
         <style>{`
           .mss-dark-root { background-color: #0B1120 !important; color: #F1F5F9 !important; }
