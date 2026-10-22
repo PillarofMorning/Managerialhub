@@ -3,7 +3,7 @@
  * APP NAME:        Shift Start & Roster Allocation Hub
  * PHASE ID:        P2.1 (Ref: _00 - list of apps - defined how to integrate - link to masterplan)
  * CURRENT VERSION: v0.0004 (2026-10-22: Equipment section on the last tab, shared with Ganttly through craa5__g_assignment;
- *                  drag or tap a piece to a person and Save; Ganttly's auto placements and Done shown, re-read every minute)
+ *                  drag or tap a piece to a person and Save; Ganttly's auto placements, Started (check-offs) and Done (MSS log row) shown, re-read every minute)
  *                  v0.0003 (2026-10-22: archived shifts only in the developer console; a lead sees only their own crew;
  *                  room completion, passoff and handoff moved to a last tab 'Finish Shift')
  *                  v0.0002 (2026-10-21: MSS auto-log logs only the pieces of the area's clean, local date, retried on failure;
@@ -3070,7 +3070,7 @@ async function writeMssLogs(props: any, jobs: MssAreaJob[], slotStartMs: number)
 // ---- Equipment to people, shared with Ganttly (craa5__g_assignment) ----
 // Spec: /mnt/project-files/ganttly-overhaul/shared-assignment.md. One row per piece per shift, updated in place.
 // Ganttly's engine places the pieces (source 'auto'); Shift Start never splits pieces itself. A piece a person places, here or in Ganttly, is pinned,
-// and Ganttly plans everything else around it. Shift Start reads the rows every 60 s and when the tab gets focus; Done comes from Ganttly's check-offs.
+// and Ganttly plans everything else around it. Shift Start reads the rows every 60 s and when the tab gets focus; Done comes from the MSS log row Ganttly writes when a piece is finished.
 const ASG_TABLE = 'craa5__g_assignment', ASG_ID = 'craa5__g_assignmentid', CHECKOFF_TABLE = 'craa5_cleancheckoff';
 const ASG_COLS = [ASG_ID, 'craa5_assignmentkey', 'craa5_equipmentguid', 'craa5_equipment', 'craa5_area', 'craa5_room', 'craa5_boardid', 'craa5_shiftdate', 'craa5_crew', 'craa5_team', 'craa5_cleankind', 'craa5_employeeguids', 'craa5_employees', 'craa5_plannedstart', 'craa5_plannedminutes', 'craa5_order', 'craa5_pinned', 'craa5_source', 'craa5_updatedby', 'craa5_rev'];
 const ASG_REFRESH_MS = 60000;
@@ -3098,17 +3098,21 @@ async function readAssignments(props: any, shiftDate: string, crew: string): Pro
         return { state: TABLE_STATE[ASG_TABLE] === 'missing' || looksMissing(msg) ? 'missing' : 'error', rows: [], error: msg, at: Date.now() };
     }
 }
-// Equipment guids marked Done in Ganttly since the shift started (newest row per piece wins). Empty when the table cannot be read.
-async function readDoneSince(props: any, fromMs: number): Promise<Set<string>> {
-    const out = new Set<string>(), seen = new Set<string>();
+// Progress, read only. Done = the piece's MSS log row (id hubLogIdOf(completion key)) is there and active: Ganttly writes it only when the whole
+// piece is done, and an Undo deactivates it. Started = a check-off row of the piece (Ganttly splits long or shared pieces into parts) says 'started'.
+type AsgProgress = { logIds: Set<string>; started: Set<string> };
+async function readProgress(props: any, shiftDate: string, fromMs: number): Promise<AsgProgress> {
+    const out: AsgProgress = { logIds: new Set<string>(), started: new Set<string>() };
+    for (const f of [`statecode eq 0 and craa5_lastcleaned eq ${shiftDate}`, `statecode eq 0 and craa5_lastcleaned ge ${shiftDate}T00:00:00Z and craa5_lastcleaned le ${shiftDate}T23:59:59Z`]) {
+        try {
+            const rows = await tableQuery(props, MSS_LOG_TABLE, f, [MSS_LOG_ID], 5000, 'createdon desc');
+            rows.forEach((r: any) => { const id = hubGuid(getField(r, MSS_LOG_ID)); if (id) out.logIds.add(id); });
+            break;
+        } catch (e) { /* try the next date style */ }
+    }
     try {
-        const rows = await tableQuery(props, CHECKOFF_TABLE, `modifiedon ge ${odataDate(fromMs)}`, ['craa5_equipmentguid', 'craa5_status', 'modifiedon'], 5000, 'modifiedon desc');
-        rows.forEach((r: any) => {
-            const g = hubGuid(getField(r, 'craa5_equipmentguid'));
-            if (!g || seen.has(g)) return;
-            seen.add(g);
-            if (String(getField(r, 'craa5_status') || '').toLowerCase() === 'done') out.add(g);
-        });
+        const rows = await tableQuery(props, CHECKOFF_TABLE, `modifiedon ge ${odataDate(fromMs)}`, ['craa5_equipmentguid', 'craa5_status'], 5000, 'modifiedon desc');
+        rows.forEach((r: any) => { const g = hubGuid(getField(r, 'craa5_equipmentguid')); if (g && String(getField(r, 'craa5_status') || '').toLowerCase() === 'started') out.started.add(g); });
     } catch (e) { /* progress is only shown, never needed */ }
     return out;
 }
@@ -3137,7 +3141,7 @@ type EquipmentAssignProps = {
 };
 function EquipmentAssignPanel({ hostProps, rooms, assets, shiftDate, crew, slotStartMs, boardId, canEdit, onlyTeam, me, nameOf }: EquipmentAssignProps) {
     const [read, setRead] = useState<AsgRead | null>(null);
-    const [done, setDone] = useState<Set<string>>(new Set());
+    const [prog, setProg] = useState<AsgProgress>({ logIds: new Set<string>(), started: new Set<string>() });
     const [edits, setEdits] = useState<Record<string, AsgEdit>>({});
     const [picked, setPicked] = useState('');
     const [saving, setSaving] = useState(false);
@@ -3149,8 +3153,8 @@ function EquipmentAssignPanel({ hostProps, rooms, assets, shiftDate, crew, slotS
         if (busy.current || !shiftDate || !crew) return;
         busy.current = true;
         try {
-            const [r, d] = await Promise.all([readAssignments(hostProps, shiftDate, crew), readDoneSince(hostProps, slotStartMs - 3600000)]);
-            setRead(r); setDone(d);
+            const [r, d] = await Promise.all([readAssignments(hostProps, shiftDate, crew), readProgress(hostProps, shiftDate, slotStartMs - 3600000)]);
+            setRead(r); setProg(d);
         } finally { busy.current = false; }
     }, [hostProps, shiftDate, crew, slotStartMs]);
     useEffect(() => {
@@ -3248,19 +3252,21 @@ function EquipmentAssignPanel({ hostProps, rooms, assets, shiftDate, crew, slotS
         }
     };
 
-    const total = allPieces.length, doneCount = allPieces.filter(p => done.has(p.guid)).length;
+    const isDone = (p: AsgPiece) => prog.logIds.has(hubLogIdOf(hubCompletionKey(p.guid, shiftDate, p.kind)));
+    const total = allPieces.length, doneCount = allPieces.filter(isDone).length;
     const autoCount = allPieces.filter(p => p.row && !pinnedOf(p) && peopleOf(p).length).length, handCount = allPieces.filter(p => pinnedOf(p)).length;
     const chip = (p: AsgPiece) => {
-        const isDone = done.has(p.guid), pin = pinnedOf(p), sel = picked === p.key, changed = !!edits[p.key];
+        const pDone = isDone(p), pStarted = !pDone && prog.started.has(p.guid), pin = pinnedOf(p), sel = picked === p.key, changed = !!edits[p.key];
         return (
             <div key={p.key} draggable={editable} onDragStart={ev => { try { ev.dataTransfer.setData('text/plain', p.key); } catch (e) {} setPicked(p.key); }}
                 onClick={() => setPicked(sel ? '' : p.key)}
                 className="flex items-center gap-1 px-1.5 py-1 rounded-md border text-[11px] font-semibold cursor-pointer select-none"
-                style={{ background: isDone ? '#E7F6EC' : sel ? BRAND.blueSoft : '#fff', borderColor: sel ? BRAND.blue : changed ? BRAND.yellow : '#E2E8F0', color: '#1E293B' }}
+                style={{ background: pDone ? '#E7F6EC' : sel ? BRAND.blueSoft : '#fff', borderColor: sel ? BRAND.blue : changed ? BRAND.yellow : '#E2E8F0', color: '#1E293B' }}
                 title={`${p.name} (${p.room})${p.minutes ? `, ${p.minutes} min` : ''}`}>
                 <span className="truncate flex-1 min-w-0">{p.name}</span>
                 {p.minutes ? <span className="text-slate-500 font-medium shrink-0">{p.minutes}m</span> : null}
-                {isDone ? <Badge size="small" appearance="filled" color="success">{tx('Done', 'Listo')}</Badge>
+                {pDone ? <Badge size="small" appearance="filled" color="success">{tx('Done', 'Listo')}</Badge>
+                    : pStarted ? <Badge size="small" appearance="tint" color="brand">{tx('Started', 'Iniciado')}</Badge>
                     : pin ? <Badge size="small" appearance="tint" color="warning">{tx('Set', 'Fijo')}</Badge>
                     : p.row && p.row.people.length ? <Badge size="small" appearance="tint" color="informative">{tx('Auto', 'Auto')}</Badge> : null}
             </div>
@@ -3326,7 +3332,7 @@ function EquipmentAssignPanel({ hostProps, rooms, assets, shiftDate, crew, slotS
                     <div key={room.areaId} className="flex flex-col gap-1.5 pt-1.5 border-t border-slate-100">
                         <div className="flex items-center gap-2">
                             <span className="text-xs font-black" style={{ color: BRAND.blueDark }}>{room.name}</span>
-                            <span className="text-[10px] text-slate-500">{getCleanTypeMeta(room.cleanType).label || room.cleanType} - {list.filter(p => done.has(p.guid)).length}/{list.length} {tx('done', 'listos')}</span>
+                            <span className="text-[10px] text-slate-500">{getCleanTypeMeta(room.cleanType).label || room.cleanType} - {list.filter(isDone).length}/{list.length} {tx('done', 'listos')}</span>
                         </div>
                         {list.length === 0 ? <Text size={200} className="text-slate-500">{tx('No equipment for this clean (a changeover, or no pieces marked for it).', 'Sin equipo para esta limpieza (cambio de producto, o ninguna pieza marcada).')}</Text> : (
                             <div className="flex flex-wrap gap-1.5 items-start">
