@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.27, 2026-10-22. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.28, 2026-10-22. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -368,6 +368,8 @@ Each app says in its own code which tables and columns it uses, and saves that l
 - **Who reads it:** the Dataverse monitor. It reports "Ganttly 2.0.0 (saved <date>) needs X, missing Y", and builds the one-table Copilot prompts and click-steps for what is missing.
 - **How it relates to `contract.json`:** `contract.json` is the plan: which tables should exist, keys, statuses, owners. Manifests are what each app build really uses. The monitor checks manifests against Dataverse (does it exist?) and against `contract.json` (is the app writing a table it does not own, or reading an abandoned one?). When a manifest and the contract disagree, the contract thread fixes one of them.
 - **Dataverse setup:** done. Manifest json exists (2026-10-21). hubconfig is User-owned (monitor, 2026-10-22): roles need Organization Read, and Organization Write so a newer app version can replace a manifest or setting another person saved.
+- **Code scans:** until an app carries its own manifest, Gerald can paste its code into the Dataverse monitor, which saves the craa5 names it finds as `scan|<appId>` (same format, `source: 'scan'`). A real `manifest|<appId>` wins over a scan.
+- **One-time copy:** the monitor has a tab Gerald runs once to copy `craa5_allergenclean` into `craa5_eggallergen` and `craa5_pecanallergen`. After that the MSS Calendar owns those flags.
 - **First app:** Ganttly, in its Phase 2. The others add theirs when they next change.
 
 ---
@@ -417,6 +419,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.28 (2026-10-22)** 12.1: monitor code scans saved as hubconfig `scan|<appId>` (in `configKeys`); one-time allergen flag copy run by Gerald.
 - **1.0.27 (2026-10-22)** Monitor run: `craa5_configjson` holds only 100 characters, so **every** hubconfig JSON value now goes in `craa5_manifestjson`; the manifest helper no longer writes a stub there; new `hubConfigJsonOf` (86 checks). Equipment allergen flags are `craa5_eggallergen` and `craa5_pecanallergen` (as Gerald made them); the minutes columns are still to make. Training: `craa5__t_skilllevel1` accepted as the skill level table name. hubconfig key `CHANGEOVER_RULES` found, owner unknown (not the Scheduler).
 - **1.0.26 (2026-10-21)** `hub-shared.js`: the manifest table constant is now `HUB_MANIFEST_TABLE` (was `HUB_CONFIG_TABLE`, which MSS Calendar and MSS Log Input already declare). `contract.json`: Equipment `optionalCols` lists the egg / pecan columns and `craa5_minalrg`.
 - **1.0.25 (2026-10-21)** Q7 tables from the Ganttly thread: `_g_ Obstacle`, `_g_ Handover`, `_g_ Personnel note` (sections 3.3 and 13, contract.json). Ganttly stops writing notes into the Employee `craa5_remarks` JSON.
