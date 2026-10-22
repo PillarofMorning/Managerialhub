@@ -97,3 +97,22 @@ Egg and pecan cleans cover different pieces and take different times. **Done 202
 Minutes are labor minutes (people x minutes), the same way as the Allergen clean mins column. Leave one blank and apps use the old combined Allergen clean mins for it.
 
 Optional: on the same table, rename the display name of the **Month** column (`craa5_month`) to "6 month". Only the display name changes; the schema name stays and nothing breaks.
+
+## Part 8. New table: _e_ Hub config (`craa5__e_hubconfig`), replaces the old hubconfig
+
+The old hubconfig is User-owned and its Config json holds only 100 characters, so the apps' settings could not save. The new table keeps the **same column names**, so apps only change the table name. Power Apps > **Tables** > **New table** > **Start with Copilot**, paste:
+
+```text
+Create table "_e_ Hub config", schema name craa5__e_hubconfig, Organization owned, no sample data, no lookups.
+Primary column: Config name (text 200), schema craa5_configname.
+Columns: Config key (text 200, schema craa5_configkey), Config json (multiple lines of text, maximum 1048576 characters, schema craa5_configjson).
+```
+
+Then check before adding any rows:
+1. The three schema names are exactly `craa5_configname`, `craa5_configkey`, `craa5_configjson`.
+2. Config json > Advanced options > Maximum character count = **1048576**. If Copilot set less, delete that column (the new table has nothing depending on it yet) and add it again by hand with 1048576.
+3. Optional but good: **Keys** > New key "Config key" on Config key, so a key can never be saved twice.
+4. Security roles: every hub role gets **Organization** Read, Create and Write on _e_ Hub config.
+
+Leave the old hubconfig alone. Apps read the new table first and the old one second, so nothing breaks while both exist. Add the keys once the apps have been pasted with the new version, or let the apps create their own rows when they first save.
+

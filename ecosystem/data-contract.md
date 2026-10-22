@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.29, 2026-10-22. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.30, 2026-10-22. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -110,7 +110,7 @@ Time loss log keeps the column names it was created with: `craa5_assetguid` hold
 | `craa5__g_personnelnote` Floor notes on people (high fives, incidents, coaching) | proposed | Ganttly | Ganttly (writer's own notes), Manager hub (managers read all) | **Sensitive**: User-owned; floor users Create + User-level Read/Write, managers Organization Read. Never shown to peers, exported or in the repo. Separate from `craa5__m_employeenote`. Replaces the `craa5_remarks` JSON on the Employee row. Key `craa5_employeeguid`. |
 | `craa5__c_*` chemical tables (14 in contract.json, taken from the chemical hub's own spec file chemical-ordering/contract/c-tables.json, with full columns; 11 live, Chemical alias and Sanitation budget proposed, Chemical standard unknown) | live | Chemical hub | Chemical hub; Manager hub for cost. User/team-owned with Organization-level Read. The old chem log's employee, shift and equipment columns stay as text as written. |
 | `craa5_dailyproduction` | live | (import) | Chemical hub, cost per pound |
-| `craa5__0_hubconfig` Shared settings | live | Each app writes only its own `craa5_configkey` rows | The same app; shared keys in section 12 |
+| `craa5__e_hubconfig` Hub config (shared settings and app manifests) | proposed (Gerald making it 2026-10-22) | Each app writes only its own `craa5_configkey` rows | The same app; keys in section 12 | Organization-owned. Replaces `craa5__0_hubconfig` (User-owned, Config json only 100 characters), which apps read second until the new one exists. |
 | `craa5__sani_schedule_` | live | MSS Calendar | MSS Calendar |
 | `craa5_mss_useraccesslog`, `craa5_useraccesslog` | **missing** (not in Dataverse; logging is optional) | MSS apps, Shift Start | Dataverse monitor |
 | `craa5__t_skill` (one row per skill; key `craa5_skillkey` = exact area name or `SYS-xxx`), `craa5__t_skilllevel` (one row per person per skill; key `craa5_levelkey` = `employeeguid|skillkey`, row id `hubIdFromKey`; level 0-3), `craa5__t_trainingevent` (append-only history) | **proposed** (Training matrix thread) | Training page only | Manager hub, Ganttly People, Shift Start Assign |
@@ -263,7 +263,7 @@ Every app computes these the same way, from the same table, with the `hub-shared
 | **Sanitation cost per pound** | (Labor cost + chemical cost for the week) / `craa5_dailyproduction.craa5_pounds` for the week. Chemical cost for the week = (drop in counts + received) between the two Sunday counts around the Monday-Sunday week, x unit price. If a count is missing, received spend is used and the number is marked so. **Draft, for Gerald to confirm.** | MSS log, chemical hub, daily production | |
 | **Time lost** | Minutes in `craa5__m_timelosslog` by kind. Kind `Weekend clean` rows come from PBED's Add time loss form: time lost during the weekend clean (`craa5_minuteslost`, a delay reason such as Waiting on FSQ, a department, status Open). Shown on their own as "from PBED" and left out of Time lost totals. Whether they count anywhere else is Gerald's call (asked). | Manager hub | |
 
-People thresholds (coaching below 75 % pace for 14 days, high performer list) are settings in `craa5__0_hubconfig` key `hub_people_thresholds`, not constants in an app. The coaching list is for supervisors and managers only, never shown to peers.
+People thresholds (coaching below 75 % pace for 14 days, high performer list) are settings in Hub config key `hub_people_thresholds`, not constants in an app. The coaching list is for supervisors and managers only, never shown to peers.
 
 ---
 
@@ -323,11 +323,11 @@ Stored as lower-case English codes. Shown with the label in the language chosen.
 | `ss_live_boards_local_v1`, `SS_DATA_CACHE_V1/V2` | Live boards, cached tables | `craa5_shiftboard`. A cache may stay as a speed-up, never as the source. |
 | `ss_presets_v1` | Crew setups | `craa5_shiftpreset` |
 | `ss_deactivated_employees_v1` | People who left | `craa5__aa_employee.statecode` |
-| Ganttly `itp_*` keys (check-off fallback, removed / skipped tasks, obstacles, handovers, personnel notes, settings) | Floor work | Check-offs to `craa5_cleancheckoff`. Settings to `craa5__0_hubconfig` key `ganttly_settings`. Gerald keeps all three (Q7): obstacles, handovers and personnel notes move to tables (Ganttly thread designs them, `_g_` prefix, plain keys). Personnel notes must stay readable by managers after supervisors and leads lose access to the Manager hub; a later supervisor hub may show them too. |
+| Ganttly `itp_*` keys (check-off fallback, removed / skipped tasks, obstacles, handovers, personnel notes, settings) | Floor work | Check-offs to `craa5_cleancheckoff`. Settings to Hub config key `ganttly_settings`. Gerald keeps all three (Q7): obstacles, handovers and personnel notes move to tables (Ganttly thread designs them, `_g_` prefix, plain keys). Personnel notes must stay readable by managers after supervisors and leads lose access to the Manager hub; a later supervisor hub may show them too. |
 | `itp_settings_v10` `avgHourlyRate` ($21) | Labor rate | `_e_ Labor rate` |
-| `mss_completion_excluded_v1` | Rooms, areas and equipment left out of MSS percentages | `craa5__0_hubconfig` key `mss_completion_exclusions` (MSS Calendar) |
+| `mss_completion_excluded_v1` | Rooms, areas and equipment left out of MSS percentages | Hub config key `mss_completion_exclusions` (MSS Calendar) |
 | `mss_line_downtime_v1` | Lines off schedule (date ranges), lines added by hand | When a line is off comes from the Clean Plan `day` rows (`craa5_status` idle / unplanned, `craa5_cleankind` none / covered). Only lines the Scheduler does not plan keep hand-entered ranges, in `craa5__0_hubconfig` key `mss_line_downtime` (MSS Calendar) |
-| `mss_log_input_view_module_v1` | Log Input view rules for the Calendar | `craa5__0_hubconfig` key `mss_view_rules` |
+| `mss_log_input_view_module_v1` | Log Input view rules for the Calendar | Hub config key `mss_view_rules` |
 | BOLO IndexedDB swab results + `PATHOGEN_BOLO_MANAGERS_HUB_GRAPHS` blob | Swab results | `_b_ Swab result` |
 | `itp_lang_v1`, `ss_lang_v1`, `prodsched_lang_v1`, `stillwell_*_lang_v1` | Language | `hub_lang` (stays in the browser, one key) |
 | `itp_theme_v1`, `schwans_theme`, `stillwell_*_dark_v1` | Theme | `hub_theme` (stays in the browser, one key) |
@@ -347,11 +347,11 @@ New tables are named `_<letter>_ Name`, so the schema name is `craa5__<letter>_n
 | `_t_` | Training matrix | new |
 | `_g_` | Ganttly / Shift Start (merged floor app) | in use: obstacle, handover, personnel note (1.0.25) |
 | `_e_` | Shared by the whole ecosystem (owned by this contract) | new |
-| `_0_` | Abandoned set | do not use (except `craa5__0_hubconfig`) |
+| `_0_` | Abandoned set | do not use (`craa5__0_hubconfig` only until the apps move to `craa5__e_hubconfig`) |
 
 Apps look a table up by its prefixed name first and its plain name second, as Manager hub v6.8 does, because Gerald may create either.
 
-**Shared settings** in `craa5__0_hubconfig` (one row per `craa5_configkey`, each key written by one app). **The JSON goes in `craa5_manifestjson`** (display name Manifest json, up to 1,048,576 characters). `craa5_configjson` holds only **100 characters** in this Dataverse (monitor, 2026-10-22), so apps never write to it; longer values are refused. Readers use `hubConfigJsonOf(row)` (Manifest json first, then Config json for old rows) and match `craa5_configkey` first, `craa5_configname` second for old rows that have a blank key. Keys:
+**Shared settings** live in **Hub config**: the new `craa5__e_hubconfig` ("_e_ Hub config", Organization-owned; columns `craa5_configname` primary, `craa5_configkey`, `craa5_configjson` Multiple lines max 1,048,576; prompt in `table-prompts.md` part 8). One row per `craa5_configkey`, each key written by one app, and the key is always filled. Apps look for `craa5__e_hubconfig` first and the old `craa5__0_hubconfig` second (`HUB_CONFIG_TABLES`). On the old table the JSON goes in `craa5_manifestjson`, because its `craa5_configjson` holds only 100 characters; on the new table it goes in `craa5_configjson`. Readers use `hubConfigJsonOf(row)` and match `craa5_configkey` first, `craa5_configname` second for old rows with a blank key. Gerald adds the keys to the new table once it exists; the old one stays until every app has switched. Keys:
 `hub_people_thresholds` (Manager hub), `ganttly_settings` (Ganttly), `mss_view_rules` (MSS Log Input), `scheduler_shared` (Production Scheduler; today its `config` row in the Clean Plan, which may stay there), `training_settings` (Training page: minimum shifts, refresher days), `mss_completion_exclusions` and `mss_line_downtime` (MSS Calendar; downtime only for lines the Scheduler does not plan). Plus one `manifest|<appId>` row per app, written by that app (12.1).
 
 **Keys in use today** (older names, listed so the monitor does not flag them): `MSS_CALENDAR_VIEW_CONFIG` and `MSS_SKIPPED_ENTRIES_LOG` (MSS Calendar), `MSS_LOG_SKIPPED_ENTRIES` (MSS Log Input), `MSS_LOG_VIEW_CONFIG` (MSS Log Input; becomes `mss_view_rules`), `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG` (MSS Log Input; the Calendar only reads skip codes), `MSS_CALENDAR_ACCESS_LOG` (MSS Calendar's own access log), `PBED_WEEKEND_PLAN` (old PBED, unused). The full list with owners is `configKeys` in `contract.json`.
@@ -360,14 +360,14 @@ Apps look a table up by its prefixed name first and its plain name second, as Ma
 
 Each app says in its own code which tables and columns it uses, and saves that list to Dataverse when it opens. The Dataverse monitor then checks every app at once against what really exists, with nothing pasted by hand. Smallest version: no new table.
 
-- **Where:** `craa5__0_hubconfig`, `craa5_configkey` = `manifest|<appId>`, name "<App> manifest", JSON in `craa5_manifestjson` (made 2026-10-21, max 1,048,576). `craa5_configjson` is left alone (100 characters). Without Manifest json, the helper tries Config json and the save is refused if too long.
+- **Where:** Hub config (`craa5__e_hubconfig`, else the old `craa5__0_hubconfig`), `craa5_configkey` = `manifest|<appId>`, name "<App> manifest". JSON in the new table's `craa5_configjson`; on the old table in `craa5_manifestjson`. `hubSaveManifest` picks the first that reads.
 - **appIds:** `ganttly`, `shiftstart`, `prodsched`, `msscalendar`, `msslog`, `pbed`, `bolo`, `managerhub`, `chemicals`, `mapsubmit`, `monitor`, `training`.
 - **What the app writes:** `{ appId, app, version, tables: [{ t, names, read, write, opt }], config }`. `t` is the table's logical name, `names` the names the app tries in order (prefixed first), `read`/`write` the columns, `opt` the columns it works without (the monitor shows them as "not yet", not "missing"), `config` the hubconfig keys it writes. Logical names only, never data or people.
 - **What gets stored:** `hubManifest()` adds `m: 1`, the pasted block's `contract` version, a `hash` and `savedAt`, and sorts every list.
 - **When:** call `hubSaveManifest(io, manifest)` once after the app loads. It reads the row (one small read), writes only when the hash changed, never blocks the app and never shows an error. `io` is the app's own query / create / update (Ganttly: `swQuery` + `swWriter`).
 - **Who reads it:** the Dataverse monitor. It reports "Ganttly 2.0.0 (saved <date>) needs X, missing Y", and builds the one-table Copilot prompts and click-steps for what is missing.
 - **How it relates to `contract.json`:** `contract.json` is the plan: which tables should exist, keys, statuses, owners. Manifests are what each app build really uses. The monitor checks manifests against Dataverse (does it exist?) and against `contract.json` (is the app writing a table it does not own, or reading an abandoned one?). When a manifest and the contract disagree, the contract thread fixes one of them.
-- **Dataverse setup:** done. Manifest json exists (2026-10-21). hubconfig is User-owned (monitor, 2026-10-22): roles need Organization Read, and Organization Write so a newer app version can replace a manifest or setting another person saved.
+- **Dataverse setup:** the new Hub config table (`table-prompts.md` part 8). It is Organization-owned, so every hub role needs Organization Read and Write on it, and any app can update a manifest someone else saved.
 - **Code scans:** until an app carries its own manifest, Gerald can paste its code into the Dataverse monitor, which saves the craa5 names it finds as `scan|<appId>` (same format, `source: 'scan'`). A real `manifest|<appId>` wins over a scan.
 - **One-time copy:** the monitor has a tab Gerald runs once to copy `craa5_allergenclean` into `craa5_eggallergen` and `craa5_pecanallergen`. After that the MSS Calendar owns those flags.
 - **First app:** Ganttly, in its Phase 2. The others add theirs when they next change.
@@ -419,6 +419,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.30 (2026-10-22)** Hub config moves to a new table `craa5__e_hubconfig` (agreed with the Dataverse monitor; Gerald asked for it): Organization-owned, same column names, big `craa5_configjson`. Apps probe it first, the old `craa5__0_hubconfig` second. `hub-shared.js`: `HUB_CONFIG_TABLES`, `hubSaveManifest` tries the new table first (92 checks). `table-prompts.md` part 8.
 - **1.0.29 (2026-10-22)** MSS Log Input writes its skipped entries to its own key `MSS_LOG_SKIPPED_ENTRIES`; `MSS_SKIPPED_ENTRIES_LOG` is the Calendar's alone.
 - **1.0.28 (2026-10-22)** 12.1: monitor code scans saved as hubconfig `scan|<appId>` (in `configKeys`); one-time allergen flag copy run by Gerald.
 - **1.0.27 (2026-10-22)** Monitor run: `craa5_configjson` holds only 100 characters, so **every** hubconfig JSON value now goes in `craa5_manifestjson`; the manifest helper no longer writes a stub there; new `hubConfigJsonOf` (86 checks). Equipment allergen flags are `craa5_eggallergen` and `craa5_pecanallergen` (as Gerald made them); the minutes columns are still to make. Training: `craa5__t_skilllevel1` accepted as the skill level table name. hubconfig key `CHANGEOVER_RULES` found, owner unknown (not the Scheduler).

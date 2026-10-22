@@ -170,7 +170,10 @@ var HUB_BRAND_RED = '#E4002B';            // the logo only, never a status
 //         config: ['ganttly_settings'] }
 //   names = table names the app tries, in order (default [t]); opt = columns the app works without (shown as "not yet").
 var HUB_APP_IDS = ['ganttly', 'shiftstart', 'prodsched', 'msscalendar', 'msslog', 'pbed', 'bolo', 'managerhub', 'chemicals', 'mapsubmit', 'monitor', 'training'];
-var HUB_MANIFEST_TABLE = 'craa5__0_hubconfig';   // own name: some pages already declare HUB_CONFIG_TABLE
+// Shared settings table: the new _e_ Hub config first (Organization-owned, big craa5_configjson), the old _0_ one second.
+// Own names: some pages already declare HUB_CONFIG_TABLE.
+var HUB_CONFIG_TABLES = ['craa5__e_hubconfig', 'craa5__0_hubconfig'];
+var HUB_MANIFEST_TABLE = HUB_CONFIG_TABLES[0];
 function hubNameList(a) {
     var out = [], seen = {};
     (a || []).forEach(function (x) { var v = String(x === undefined || x === null ? '' : x).trim().toLowerCase(); if (v && !seen[v]) { seen[v] = 1; out.push(v); } });
@@ -191,36 +194,38 @@ function hubManifest(m, nowIso) {
 function hubManifestKey(appId) { return 'manifest|' + hubCanon(appId); }
 // io = { query(table, { select, filter, top }) -> Promise of rows (or { rows }), create(table, body), update(table, id, body) }
 // (Ganttly: swQuery + swWriter). Never rejects and never blocks the app: resolves 'same', 'saved' or 'failed: why'.
-// The list goes in craa5_manifestjson when hubconfig has that column; otherwise in craa5_configjson.
-// craa5_configjson holds only 100 characters in this Dataverse, so with the new column it is left alone.
+// Where it goes, first that reads: _e_ Hub config craa5_configjson; old _0_ hubconfig craa5_manifestjson (its
+// craa5_configjson holds only 100 characters); old _0_ hubconfig craa5_configjson.
 var HUB_MANIFEST_COL = 'craa5_manifestjson';
-// Every hubconfig JSON value (settings too, not only manifests) is written to craa5_manifestjson and read from it first.
+// Every hubconfig JSON value: read Manifest json first (old table), then Config json.
 function hubConfigJsonOf(row) { return row ? String(row[HUB_MANIFEST_COL] || row.craa5_configjson || '') : ''; }
 function hubSaveManifest(io, m) {
     try {
-        var man = hubManifest(m), key = hubManifestKey(man.appId), table = HUB_MANIFEST_TABLE, idCol = table + 'id';
+        var man = hubManifest(m), key = hubManifestKey(man.appId);
         if (!man.appId) return Promise.resolve('failed: no appId');
         var fail = function (e) { return 'failed: ' + String(e && e.message || e); };
-        var read = function (cols) {
-            return Promise.resolve(io.query(table, { select: [idCol].concat(cols), filter: "craa5_configkey eq '" + key + "' and statecode eq 0", top: 5 })).then(function (res) {
+        var spots = [[HUB_CONFIG_TABLES[0], 'craa5_configjson', []], [HUB_CONFIG_TABLES[1], HUB_MANIFEST_COL, ['craa5_configjson']], [HUB_CONFIG_TABLES[1], 'craa5_configjson', []]];
+        var read = function (i) {
+            if (i >= spots.length) return Promise.reject(new Error('no hub config table'));
+            var sp = spots[i], idCol = sp[0] + 'id';
+            return Promise.resolve(io.query(sp[0], { select: [idCol, sp[1]].concat(sp[2]), filter: "craa5_configkey eq '" + key + "' and statecode eq 0", top: 5 })).then(function (res) {
                 var rows = res && res.rows !== undefined ? res.rows : res;
                 if (!rows) throw new Error(res && res.err || 'read failed');
-                return rows;
-            });
+                return { rows: rows, table: sp[0], col: sp[1], idCol: idCol };
+            }).then(null, function (e) { return i + 1 < spots.length ? read(i + 1) : Promise.reject(e); });
         };
-        return read([HUB_MANIFEST_COL, 'craa5_configjson']).then(function (rows) { return { rows: rows, col: HUB_MANIFEST_COL }; },
-            function () { return read(['craa5_configjson']).then(function (rows) { return { rows: rows, col: 'craa5_configjson' }; }); }).then(function (r) {
+        return read(0).then(function (r) {
             var body = { craa5_configkey: key, craa5_configname: (man.app || man.appId) + ' manifest' };
             body[r.col] = JSON.stringify(man);
             var row = r.rows[0];
             if (row) {
                 var old = {}; try { old = JSON.parse(row[r.col] || '{}'); } catch (e) {}
                 if (old && old.hash === man.hash) return 'same';
-                return Promise.resolve(io.update(table, hubGuid(row[idCol]), body)).then(function () { return 'saved'; }, fail);
+                return Promise.resolve(io.update(r.table, hubGuid(row[r.idCol]), body)).then(function () { return 'saved'; }, fail);
             }
             var create = {}; for (var k in body) create[k] = body[k];
-            create[idCol] = hubIdFromKey('hubconfig|' + key);      // fixed id: two people opening at once still make one row
-            return Promise.resolve(io.create(table, create)).then(function () { return 'saved'; }, fail);
+            create[r.idCol] = hubIdFromKey('hubconfig|' + key);      // fixed id: two people opening at once still make one row
+            return Promise.resolve(io.create(r.table, create)).then(function () { return 'saved'; }, fail);
         }, fail);
     } catch (e) { return Promise.resolve('failed: ' + String(e && e.message || e)); }
 }
