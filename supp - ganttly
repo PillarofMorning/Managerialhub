@@ -2,7 +2,7 @@
  * [PERSISTENT MEMORY & APP REGISTRATION BLOCK]
  * APP NAME:        Floor Ganttly
  * PHASE ID:        P3.1 (Ref: _00 - list of apps - defined how to integrate - link to masterplan)
- * CURRENT VERSION: v1.3 (Phase 1: clean plan read from craa5_cleanplan, MSS LOG WRITE v1.1, HUB SHARED v1.0)
+ * CURRENT VERSION: v1.3.1 (Phase 1 + live test fixes: down lines vs schedule, room ids, Crew tab teams from Shift Start)
  * FOLDER STATUS:   Root Workspace
  * REPO SOURCE:     P3.1 - supp - ganttly
  * 
@@ -39,6 +39,9 @@ const APP_MODE = 'current';   // 'current' = Ganttly, the floor app (file "supp 
 // and hides the planning controls (Setup tab, plan window, rotation, headcount, role mapping, Metrics). PBED is the whole thing.
 // A fix made in one file is copied to the other (scratchpad split/check-files.sh asserts they differ only on line 2).
 const IS_CURRENT = APP_MODE === 'current';
+// The Crew tab's own team builder (drag rooms / people onto leads). Off: Shift Start's live board is where teams are built, so the
+// two apps never hold two different teams. On for testing only: localStorage 'ganttly_team_builder' = '1'.
+const CREW_TEAM_BUILDER = (function() { try { return typeof window !== 'undefined' && window.localStorage && window.localStorage.getItem('ganttly_team_builder') === '1'; } catch (e) { return false; } })();
 // [!] ARCHITECTURE NOTE: PBED tabs update when clicked. The planning engine (scheduleData) is the one heavy computation. Only the
 // Gantt, Focus and Metrics tabs show its result, so PBED holds its inputs still on every other tab (Setup, Crew, Dashboard) and
 // plans once when one of those three is opened (or Print is pressed). Ganttly (the floor app) keeps planning live. The clock tick
@@ -7741,6 +7744,13 @@ export default function App(props) {
     const overrunTo = IS_CURRENT && nowMin > 0 ? Math.min(Math.ceil(nowMin / 15) * 15, planHorizonMins) : 0;
 
     const lineIndex = useMemo(function() { return buildLineIndex(lineRows); }, [lineRows]);
+    // A room Shift Start kept as its MSS area id (craa5_aa_mss_areaid) -> the area's name; anything else as it is.
+    const areaNameOfId = function(v) {
+        const t = String(v === undefined || v === null ? '' : v);
+        if (!hubIsGuid(t)) return t;
+        const ln = lineIndex.find(function(l) { return hubGuid(l.id) === hubGuid(t); });
+        return ln ? ln.name : t;
+    };
     const prodLinesWide = useMemo(function() { return buildProdLines(prodRows); }, [prodRows]);
 
     // ---- Clean plan (see CLEAN PLAN): the Production Scheduler's windows, scope and alerts, read every 5 minutes ----
@@ -8685,7 +8695,7 @@ export default function App(props) {
             taskRows.forEach(function(r) {
                 const empId = r.craa5__aaemp_guid || r.craa5_id;
                 if (empId && r.craa5_area && OUT_AREA_NAMES.indexOf(normS(r.craa5_area)) === -1 && !basePersonRoom[empId]) {
-                    basePersonRoom[empId] = r.craa5_area;
+                    basePersonRoom[empId] = areaNameOfId(r.craa5_area);
                 }
             });
         }
@@ -8704,13 +8714,15 @@ export default function App(props) {
             const hasPassed = nowMin >= cpMinutes;
             if (savedCp && typeof savedCp === 'object') {
                 if (savedCp.personRoom) {
-                    runningPersonRoom = Object.assign({}, savedCp.personRoom);
+                    runningPersonRoom = {};
+                    Object.keys(savedCp.personRoom).forEach(function(k) { runningPersonRoom[k] = areaNameOfId(savedCp.personRoom[k]); });
                 }
                 if (savedCp.leadOf) {
                     runningLeadOf = Object.assign({}, savedCp.leadOf);
                 }
                 if (savedCp.leadRooms) {
                     runningLeadRooms = cloneLeadRoomsMap(savedCp.leadRooms);
+                    Object.keys(runningLeadRooms).forEach(function(k) { runningLeadRooms[k] = (runningLeadRooms[k] || []).map(areaNameOfId).filter(function(x, i, a) { return a.indexOf(x) === i; }); });
                 }
             }
             // Ensure any room assigned to a person at this checkpoint is present in their lead's room buckets
@@ -9141,7 +9153,9 @@ export default function App(props) {
                     });
                 }
             });
-            const roomOf = function(empId) {
+            // Shift Start may keep a room as its MSS area id: shown (and matched) by the area's name.
+            const roomOf = function(empId) { return areaNameOfId(roomOfRaw(empId)); };
+            const roomOfRaw = function(empId) {
                 for (let i = 0; i < crewWins.length; i++) {
                     const resolved = resolveShiftCheckpoints(crewWins[i]);
                     if (resolved && resolved.activeSetup && resolved.activeSetup.personRoom && resolved.activeSetup.personRoom[empId]) {
@@ -9232,7 +9246,7 @@ export default function App(props) {
             }
         });
         return lanes;
-    }, [shiftWindows, crewPeople, crewHeadcountOverrides, windowPlans, shiftCheckpoints, taskRows, rosterSource, roomSource, rosterInfo, handoffMs, globalStartMs, nowMin]);
+    }, [shiftWindows, crewPeople, crewHeadcountOverrides, windowPlans, shiftCheckpoints, taskRows, rosterSource, roomSource, rosterInfo, handoffMs, globalStartMs, nowMin, lineIndex]);
     // Lane of a person in a crew's shift (the same person can have a lane in more than one crew when pulled in on overtime).
     const laneByEmpCrew = useMemo(function() {
         const m = {};
@@ -13493,11 +13507,18 @@ export default function App(props) {
             const assocRm = assocLinesOfArea(r);
             const matchedRm = linesForRoom([r, lnRm ? lnRm.name : ''].concat(assocRm), prodLinesWide, roomProdLines[r]);
             const rawRunSpans = [];
+            let schedSaysRunning = false;
             (matchedRm.lines || []).forEach(function(L) {
                 (L.runs || []).forEach(function(run) {
                     if (!run || run.maint) return;
-                    const rs = toMin(run.s);
+                    let rs = toMin(run.s);
                     const re = toMin(run.e);
+                    // A line marked down on the floor is not running, whatever the schedule says, until its restart: those runs are no
+                    // overlap (the clock said 'Overlap 9h' on a line that was down for cleaning). The clash is noted on the card instead.
+                    if (down && re > S0) {
+                        if (R === null || !isFinite(R) || re <= R) { schedSaysRunning = true; return; }
+                        if (rs < R) { schedSaysRunning = true; rs = R; }
+                    }
                     if (re > dialWinStart && rs < dialWinEnd && re > rs) {
                         rawRunSpans.push({
                             s: Math.max(dialWinStart, rs),
@@ -13553,6 +13574,7 @@ export default function App(props) {
             if (!isNotScheduled && plannedWhileRunning && S > cleanStartMin && !overlapSpans.some(function(ov) { return ov.s < S; })) {
                 overlapSpans.push({ s: cleanStartMin, e: S });
             }
+            if (schedSaysRunning) reasons.push(tr('marked down, but the production schedule still has it running', 'marcada parada, pero el programa de produccion aun la tiene corriendo'));
 
             const nowDateObj = new Date(nowMs);
             const targetDateObj = new Date((R !== null && isFinite(R)) ? msOf(R) : nowMs);
@@ -18482,7 +18504,14 @@ export default function App(props) {
                             </div>
 
                             {/* 2B. SHIFT START DRAG-AND-DROP TEAM & ROOM ASSIGNMENT BOARD (DAY 0600/0900/1200/1500 & NIGHT 1800/2100/0000/0300) */}
-                            {win && resolvedCp && currentCpObj && (function() {
+                            {/* Teams are built in Shift Start (its live board); Ganttly only reads them. The old builder stays for testing only:
+                                run localStorage.setItem('ganttly_team_builder', '1') in the browser console and reload. */}
+                            {!CREW_TEAM_BUILDER && (
+                                <div data-crew-note className="bg-sky-50 border border-sky-200 rounded-xl px-4 py-3 text-xs font-bold text-[#00468B]">
+                                    {tr('Teams and rooms are set in Shift Start (Assign employees). Ganttly reads them and assigns the equipment. To move someone, change it in Shift Start and save.', 'Los equipos y las areas se asignan en Shift Start (Asignar empleados). Ganttly los lee y asigna el equipo. Para mover a alguien, cambielo en Shift Start y guarde.')}
+                                </div>
+                            )}
+                            {CREW_TEAM_BUILDER && win && resolvedCp && currentCpObj && (function() {
                                 const cpPersonRoom = currentCpObj.personRoom || {};
                                 const cpLeadOf = currentCpObj.leadOf || {};
                                 const cpLeadRooms = currentCpObj.leadRooms || {};
@@ -19153,8 +19182,8 @@ export default function App(props) {
                                 );
                             })()}
 
-                            {/* 3. AREA BREAKDOWN (COLLAPSIBLE & COMPACT BUTTONS) */}
-                            <div className="space-y-3">
+                            {/* 3. AREA BREAKDOWN (COLLAPSIBLE & COMPACT BUTTONS): with the team builder only */}
+                            <div className="space-y-3" style={CREW_TEAM_BUILDER ? undefined : { display: 'none' }}>
                                 <div className="flex items-center justify-between px-1">
                                     <h3 className="text-xs font-black uppercase tracking-wider text-slate-700 flex items-center gap-1.5">
                                         <span>Area Deployment &amp; Workload</span>
