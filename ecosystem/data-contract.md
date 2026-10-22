@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.31, 2026-10-22. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.32, 2026-10-22. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -103,7 +103,7 @@ Time loss log keeps the column names it was created with: `craa5_assetguid` hold
 | `craa5__facilityobservation` Map problems and pins | live | Map submission tool | Pathogen BOLO, Manager hub |
 | `craa5___maps` Floor maps | live | Map submission tool | Pathogen BOLO |
 | `craa5_pathogenboloswabcatalog0320` Swab sites | live | Pathogen BOLO | Pathogen BOLO, Ganttly, Map tool |
-| `craa5__b_swabresult` Swab results (columns in contract.json; open hit = `craa5_result` positive and `craa5_closedkey` blank) | **proposed** (BOLO v2.2, PR #37) | Pathogen BOLO | Manager hub, Ganttly, MSS Calendar |
+| `craa5__b_swabresult` Swab results (columns in contract.json; one row per sample, description and test; open hit = `craa5_result` positive, `craa5_closedkey` blank, `statecode` 0) | **proposed** (BOLO v2.3, PR #37) | Pathogen BOLO | Manager hub, Ganttly, MSS Calendar |
 | `craa5__supervisor_todo` | live | Manager hub | Manager hub |
 | `craa5__m_formtemplate`, `craa5__m_quicktask` (both User-owned; quick tasks are a personal list on purpose) | live | Manager hub | Manager hub |
 | `craa5__m_employeenote` Manager notes on people | live | Manager hub | Manager hub, manager role only. Sensitive: User-owned, never shown to peers, never in exports or the repo. Key `craa5_employeeguid`. |
@@ -278,7 +278,7 @@ Stored as lower-case English codes. Shown with the label in the language chosen.
 4. **Attendance** (on a board row): `present`, `late`, `sick`, `pto`, `left_early`, `no_call`, `loaned`, `training`. Shift Start's current PTO / Sick / Late / Left Early map to these. The badge reader will later write the same words.
 5. **Role** (`craa5__aa_employee.craa5_role`): Sanitor 256000000, Lead 256000001, Supervisor 256000002. Manager and Admin come from the Dataverse security role.
 6. **Loading a table** (every app, same words): Loading, Ready, Nothing here yet (read worked, no rows), Table missing, No access (privilege), Could not load (network or other). An app shows one of these per table it reads. It never shows sample data instead.
-7. **Swab result** (BOLO): `positive`, `negative`, `pending`. In the MSS log, `craa5_pathogen` is `Yes` / `No`.
+7. **Swab result** (BOLO): `positive`, `negative`, `pending`, `count` (a lab number with no pass or fail: never in pass rates), `replaced` (a superseded row, kept, never deleted: skip it everywhere). In the MSS log, `craa5_pathogen` is `Yes` / `No`.
 8. **Order / cart** (chemical hub): Draft (not in SAP yet), Submitted, Approved, Ordered, Partially received, Received, Cancelled.
 
 ---
@@ -420,6 +420,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.32 (2026-10-22)** BOLO v2.3: swab result rows keyed by sample + description + test; results add `count` and `replaced`; readers add `statecode eq 0`, skip replaced, keep count out of rates.
 - **1.0.31 (2026-10-22)** Ground rule 9: no pop-ups (Power Apps blocks confirm / alert / prompt). Empty Hub config JSON = no settings yet. The Dataverse monitor is English only.
 - **1.0.30 (2026-10-22)** Hub config moves to a new table `craa5__e_hubconfig` (agreed with the Dataverse monitor; Gerald asked for it): Organization-owned, same column names, big `craa5_configjson`. Apps probe it first, the old `craa5__0_hubconfig` second. `hub-shared.js`: `HUB_CONFIG_TABLES`, `hubSaveManifest` tries the new table first (92 checks). `table-prompts.md` part 8.
 - **1.0.29 (2026-10-22)** MSS Log Input writes its skipped entries to its own key `MSS_LOG_SKIPPED_ENTRIES`; `MSS_SKIPPED_ENTRIES_LOG` is the Calendar's alone.
