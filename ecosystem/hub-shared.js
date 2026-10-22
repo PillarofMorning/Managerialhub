@@ -191,9 +191,11 @@ function hubManifest(m, nowIso) {
 function hubManifestKey(appId) { return 'manifest|' + hubCanon(appId); }
 // io = { query(table, { select, filter, top }) -> Promise of rows (or { rows }), create(table, body), update(table, id, body) }
 // (Ganttly: swQuery + swWriter). Never rejects and never blocks the app: resolves 'same', 'saved' or 'failed: why'.
-// The list goes in craa5_manifestjson when hubconfig has that column (made with room for it); otherwise in craa5_configjson.
-// With the new column, craa5_configjson keeps only a short stub (app, version, hash, where the list is).
+// The list goes in craa5_manifestjson when hubconfig has that column; otherwise in craa5_configjson.
+// craa5_configjson holds only 100 characters in this Dataverse, so with the new column it is left alone.
 var HUB_MANIFEST_COL = 'craa5_manifestjson';
+// Every hubconfig JSON value (settings too, not only manifests) is written to craa5_manifestjson and read from it first.
+function hubConfigJsonOf(row) { return row ? String(row[HUB_MANIFEST_COL] || row.craa5_configjson || '') : ''; }
 function hubSaveManifest(io, m) {
     try {
         var man = hubManifest(m), key = hubManifestKey(man.appId), table = HUB_MANIFEST_TABLE, idCol = table + 'id';
@@ -210,11 +212,10 @@ function hubSaveManifest(io, m) {
             function () { return read(['craa5_configjson']).then(function (rows) { return { rows: rows, col: 'craa5_configjson' }; }); }).then(function (r) {
             var body = { craa5_configkey: key, craa5_configname: (man.app || man.appId) + ' manifest' };
             body[r.col] = JSON.stringify(man);
-            if (r.col === HUB_MANIFEST_COL) body.craa5_configjson = JSON.stringify({ m: 1, appId: man.appId, version: man.version, hash: man.hash, savedAt: man.savedAt, in: HUB_MANIFEST_COL });
             var row = r.rows[0];
             if (row) {
-                var old = {}; try { old = JSON.parse(row[r.col] || row.craa5_configjson || '{}'); } catch (e) {}
-                if (old && old.hash === man.hash && (r.col !== HUB_MANIFEST_COL || row[HUB_MANIFEST_COL])) return 'same';
+                var old = {}; try { old = JSON.parse(row[r.col] || '{}'); } catch (e) {}
+                if (old && old.hash === man.hash) return 'same';
                 return Promise.resolve(io.update(table, hubGuid(row[idCol]), body)).then(function () { return 'saved'; }, fail);
             }
             var create = {}; for (var k in body) create[k] = body[k];
