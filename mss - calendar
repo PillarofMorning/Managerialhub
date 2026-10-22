@@ -248,9 +248,11 @@ function hubManifest(m, nowIso) {
 function hubManifestKey(appId) { return 'manifest|' + hubCanon(appId); }
 // io = { query(table, { select, filter, top }) -> Promise of rows (or { rows }), create(table, body), update(table, id, body) }
 // (Ganttly: swQuery + swWriter). Never rejects and never blocks the app: resolves 'same', 'saved' or 'failed: why'.
-// The list goes in craa5_manifestjson when hubconfig has that column (made with room for it); otherwise in craa5_configjson.
-// With the new column, craa5_configjson keeps only a short stub (app, version, hash, where the list is).
+// The list goes in craa5_manifestjson when hubconfig has that column; otherwise in craa5_configjson.
+// craa5_configjson holds only 100 characters in this Dataverse, so with the new column it is left alone.
 var HUB_MANIFEST_COL = 'craa5_manifestjson';
+// Every hubconfig JSON value (settings too, not only manifests) is written to craa5_manifestjson and read from it first.
+function hubConfigJsonOf(row) { return row ? String(row[HUB_MANIFEST_COL] || row.craa5_configjson || '') : ''; }
 function hubSaveManifest(io, m) {
     try {
         var man = hubManifest(m), key = hubManifestKey(man.appId), table = HUB_MANIFEST_TABLE, idCol = table + 'id';
@@ -267,11 +269,10 @@ function hubSaveManifest(io, m) {
             function () { return read(['craa5_configjson']).then(function (rows) { return { rows: rows, col: 'craa5_configjson' }; }); }).then(function (r) {
             var body = { craa5_configkey: key, craa5_configname: (man.app || man.appId) + ' manifest' };
             body[r.col] = JSON.stringify(man);
-            if (r.col === HUB_MANIFEST_COL) body.craa5_configjson = JSON.stringify({ m: 1, appId: man.appId, version: man.version, hash: man.hash, savedAt: man.savedAt, in: HUB_MANIFEST_COL });
             var row = r.rows[0];
             if (row) {
-                var old = {}; try { old = JSON.parse(row[r.col] || row.craa5_configjson || '{}'); } catch (e) {}
-                if (old && old.hash === man.hash && (r.col !== HUB_MANIFEST_COL || row[HUB_MANIFEST_COL])) return 'same';
+                var old = {}; try { old = JSON.parse(row[r.col] || '{}'); } catch (e) {}
+                if (old && old.hash === man.hash) return 'same';
                 return Promise.resolve(io.update(table, hubGuid(row[idCol]), body)).then(function () { return 'saved'; }, fail);
             }
             var create = {}; for (var k in body) create[k] = body[k];
@@ -2870,7 +2871,8 @@ const GroupDays = React.memo(({ g, groupKey, timelineDays, dayColWidth, onEnter,
 }, (p, q) => p.groupKey === q.groupKey && p.timelineDays === q.timelineDays && p.dayColWidth === q.dayColWidth && p.onEnter === q.onEnter && p.onLeave === q.onLeave && sameDays(p.g, q.g));
 
 // ----------------------------------------------------------------------------
-// SHARED SETTINGS (data contract section 12): craa5__0_hubconfig, one row per craa5_configkey, JSON in craa5_configjson.
+// SHARED SETTINGS (data contract section 12): craa5__0_hubconfig, one row per craa5_configkey (craa5_configname as
+// fallback match), JSON written to craa5_manifestjson only (craa5_configjson holds 100 characters) and read with hubConfigJsonOf.
 // The calendar is the only writer of 'mss_completion_exclusions' and 'mss_line_downtime'. The browser copy stays as a fallback
 // (not connected, or Dataverse refused the save); the Dataverse row wins when the page opens.
 const HC_EXCLUSIONS_KEY = 'mss_completion_exclusions';
@@ -2878,19 +2880,22 @@ const HC_DOWNTIME_KEY = 'mss_line_downtime';
 const hcFind = async (key) => {
   const web = getXrmWebApi();
   if (!web) return null;
-  const res = await web.retrieveMultipleRecords(HUB_CONFIG_TABLE, `?$select=craa5__0_hubconfigid,craa5_configjson&$filter=craa5_configkey eq '${key}'&$top=1`);
+  const sel = `?$select=craa5__0_hubconfigid,craa5_configkey,${HUB_MANIFEST_COL},craa5_configjson&$top=1&$filter=`;
+  let res = await web.retrieveMultipleRecords(HUB_CONFIG_TABLE, sel + `craa5_configkey eq '${key}'`);
+  if (!(res && res.entities && res.entities[0])) res = await web.retrieveMultipleRecords(HUB_CONFIG_TABLE, sel + `craa5_configname eq '${key}'`);
   return (res && res.entities && res.entities[0]) || null;
 };
 const hcRead = async (key) => {
   const row = await hcFind(key);
   if (!row) return { found: false, value: null };
-  try { return { found: true, value: JSON.parse(row.craa5_configjson || 'null') }; } catch (e) { return { found: true, value: null }; }
+  try { return { found: true, value: JSON.parse(hubConfigJsonOf(row) || 'null') }; } catch (e) { return { found: true, value: null }; }
 };
-const hcWrite = async (key, value) => {
+const hcWrite = async (key, value, extra) => {
   const web = getXrmWebApi();
   if (!web) throw new Error('Not connected to Dataverse');
   const row = await hcFind(key);
-  const payload = { craa5_configkey: key, craa5_configname: key, craa5_configjson: JSON.stringify(value), craa5_scope: 'PlantWide' };
+  const payload = Object.assign({ craa5_configkey: key, craa5_configname: key, craa5_scope: 'PlantWide' }, extra || {});
+  payload[HUB_MANIFEST_COL] = JSON.stringify(value);
   if (row) await web.updateRecord(HUB_CONFIG_TABLE, row.craa5__0_hubconfigid, payload);
   else await web.createRecord(HUB_CONFIG_TABLE, payload);
 };
@@ -3766,22 +3771,7 @@ const saveSkippedEntry = (entry) => {
     if (webApi && typeof webApi.retrieveMultipleRecords === 'function') {
       (async () => {
         try {
-          const jsonStr = JSON.stringify(next.slice(0, 200));
-          let res = null;
-          try {
-            res = await webApi.retrieveMultipleRecords(HUB_CONFIG_TABLE, "?$select=craa5__0_hubconfigid&$filter=craa5_configkey eq 'MSS_SKIPPED_ENTRIES_LOG' or craa5_configname eq 'MSS_SKIPPED_ENTRIES_LOG'&$top=1");
-          } catch (_) {
-            res = await webApi.retrieveMultipleRecords(HUB_CONFIG_TABLE, "?$filter=craa5_configname eq 'MSS_SKIPPED_ENTRIES_LOG'&$top=1");
-          }
-          const existingId = res && res.entities && res.entities[0] ? res.entities[0].craa5__0_hubconfigid : null;
-          const payload = {
-            craa5_configkey: 'MSS_SKIPPED_ENTRIES_LOG',
-            craa5_configname: 'MSS_SKIPPED_ENTRIES_LOG',
-            craa5_configjson: jsonStr,
-            craa5_scope: 'PlantWide'
-          };
-          if (existingId) await webApi.updateRecord(HUB_CONFIG_TABLE, existingId, payload);
-          else await webApi.createRecord(HUB_CONFIG_TABLE, payload);
+          await hcWrite('MSS_SKIPPED_ENTRIES_LOG', next.slice(0, 200));
         } catch (_) { /* ignore optional hubconfig sync error */ }
       })();
     }
@@ -4378,23 +4368,7 @@ const recordAccessAudit = (identity, presetId, tabId) => {
     if (webApi && typeof webApi.retrieveMultipleRecords === 'function') {
       (async () => {
         try {
-          const jsonStr = JSON.stringify(next);
-          let res = null;
-          try {
-            res = await webApi.retrieveMultipleRecords(HUB_CONFIG_TABLE, "?$select=craa5__0_hubconfigid&$filter=craa5_configkey eq 'MSS_CALENDAR_ACCESS_LOG' or craa5_configname eq 'MSS_CALENDAR_ACCESS_LOG'&$top=1");
-          } catch (_) {
-            res = await webApi.retrieveMultipleRecords(HUB_CONFIG_TABLE, "?$filter=craa5_configname eq 'MSS_CALENDAR_ACCESS_LOG'&$top=1");
-          }
-          const existingId = res && res.entities && res.entities[0] ? res.entities[0].craa5__0_hubconfigid : null;
-          const payload = {
-            craa5_configkey: 'MSS_CALENDAR_ACCESS_LOG',
-            craa5_configname: 'MSS_CALENDAR_ACCESS_LOG',
-            craa5_configjson: jsonStr,
-            craa5_scope: 'PlantWide',
-            craa5_updatedby: safeString(identity.userName || identity.microsoftId || 'MSS Calendar')
-          };
-          if (existingId) await webApi.updateRecord(HUB_CONFIG_TABLE, existingId, payload);
-          else await webApi.createRecord(HUB_CONFIG_TABLE, payload);
+          await hcWrite('MSS_CALENDAR_ACCESS_LOG', next, { craa5_updatedby: safeString(identity.userName || identity.microsoftId || 'MSS Calendar') });
         } catch (_) { /* ignore optional hubconfig telemetry error */ }
       })();
     }
@@ -4534,7 +4508,8 @@ const MSS_CALENDAR_TABLE_BLUEPRINTS = [
       { name: 'craa5__0_hubconfigid', displayName: 'Config GUID (PK)', type: 'Uniqueidentifier', required: true, status: 'existing', notes: 'Primary key' },
       { name: 'craa5_configname', displayName: 'Config Name', type: 'String (100)', required: true, status: 'existing', notes: 'Primary Name column e.g. MSS_CALENDAR_VIEW_CONFIG' },
       { name: 'craa5_configkey', displayName: 'Config Key', type: 'String (200)', required: true, status: 'existing', notes: 'Key identifier e.g. MSS_CALENDAR_VIEW_CONFIG' },
-      { name: 'craa5_configjson', displayName: 'Config JSON', type: 'Multiline Text (Max)', required: true, status: 'existing', notes: 'Serialized JSON configuration' },
+      { name: 'craa5_manifestjson', displayName: 'Manifest JSON', type: 'Multiline Text (1,048,576)', required: true, status: 'existing', notes: 'Serialized JSON; every setting is written here (contract 12)' },
+      { name: 'craa5_configjson', displayName: 'Config JSON', type: 'Multiline Text (100)', required: false, status: 'existing', notes: 'Old column, 100 characters; read only as a fallback' },
       { name: 'craa5_scope', displayName: 'Scope', type: 'String (100)', required: false, status: 'existing', notes: 'PlantWide or User' },
       { name: 'craa5_updatedby', displayName: 'Updated By', type: 'String (100)', required: false, status: 'existing', notes: 'User who last updated the config' }
     ]
@@ -5220,39 +5195,7 @@ function CustomViewsTab({ viewConfig, setViewConfig, activePresetId, setActivePr
     }
     const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
     try {
-      let existingId = null;
-      try {
-        const res = await webApi.retrieveMultipleRecords(HUB_CONFIG_TABLE, "?$select=craa5__0_hubconfigid&$filter=craa5_configkey eq 'MSS_CALENDAR_VIEW_CONFIG' or craa5_configname eq 'MSS_CALENDAR_VIEW_CONFIG'&$top=1");
-        if (res && res.entities && res.entities.length > 0) existingId = res.entities[0].craa5__0_hubconfigid;
-      } catch (_) {
-        const res2 = await webApi.retrieveMultipleRecords(HUB_CONFIG_TABLE, "?$filter=craa5_configname eq 'MSS_CALENDAR_VIEW_CONFIG'&$top=1");
-        if (res2 && res2.entities && res2.entities.length > 0) existingId = res2.entities[0].craa5__0_hubconfigid;
-      }
-      const jsonStr = JSON.stringify(viewConfig);
-      const payload = {
-        craa5_configkey: 'MSS_CALENDAR_VIEW_CONFIG',
-        craa5_configname: 'MSS_CALENDAR_VIEW_CONFIG',
-        craa5_configjson: jsonStr,
-        craa5_scope: 'PlantWide',
-        craa5_updatedby: safeString(currentIdentity && (currentIdentity.userName || currentIdentity.microsoftId) || 'MSS Calendar')
-      };
-      try {
-        if (existingId) {
-          await webApi.updateRecord(HUB_CONFIG_TABLE, existingId, payload);
-        } else {
-          await webApi.createRecord(HUB_CONFIG_TABLE, payload);
-        }
-      } catch (_) {
-        const fallbackPayload = {
-          craa5_configname: 'MSS_CALENDAR_VIEW_CONFIG',
-          craa5_configjson: jsonStr
-        };
-        if (existingId) {
-          await webApi.updateRecord(HUB_CONFIG_TABLE, existingId, fallbackPayload);
-        } else {
-          await webApi.createRecord(HUB_CONFIG_TABLE, fallbackPayload);
-        }
-      }
+      await hcWrite('MSS_CALENDAR_VIEW_CONFIG', viewConfig, { craa5_updatedby: safeString(currentIdentity && (currentIdentity.userName || currentIdentity.microsoftId) || 'MSS Calendar') });
       pushDevLog('API-WRITE', HUB_CONFIG_TABLE, 'Saved MSS_CALENDAR_VIEW_CONFIG to Dataverse', 'OK', (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0, 1);
       setStatusMsg('Saved Custom Views configuration to Dataverse (craa5__0_hubconfig).');
     } catch (err) {
@@ -8120,14 +8063,8 @@ export default function App() {
         }
       } catch (_) { /* ignore */ }
       try {
-        let res = null;
-        try {
-          res = await webApi.retrieveMultipleRecords(HUB_CONFIG_TABLE, `?$select=craa5__0_hubconfigid,craa5_configname,craa5_configkey,craa5_configjson&$filter=craa5_configkey eq 'MSS_CALENDAR_VIEW_CONFIG' or craa5_configname eq 'MSS_CALENDAR_VIEW_CONFIG'&$top=1`);
-        } catch (_) {
-          res = await webApi.retrieveMultipleRecords(HUB_CONFIG_TABLE, `?$filter=craa5_configname eq 'MSS_CALENDAR_VIEW_CONFIG'&$top=1`);
-        }
-        const row = res && res.entities && res.entities[0] ? res.entities[0] : null;
-        const rawJson = row ? (row.craa5_configjson || row.craa5_payloadjson) : null;
+        const row = await hcFind('MSS_CALENDAR_VIEW_CONFIG');
+        const rawJson = row ? hubConfigJsonOf(row) : null;
         if (rawJson) {
           const parsed = JSON.parse(rawJson);
           if (parsed && Array.isArray(parsed.presets)) {
