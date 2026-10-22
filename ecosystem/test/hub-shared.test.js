@@ -47,7 +47,7 @@ var man = { appId: 'Ganttly', app: 'Ganttly', version: '2.0.0', config: ['ganttl
 var m1 = H.hubManifest(man, '2026-10-21T17:00:00Z'), m2 = H.hubManifest(JSON.parse(JSON.stringify(man)), '2026-10-22T09:00:00Z');
 ok(m1.appId, 'ganttly'); ok(m1.tables[0].t, 'craa5_aa_assets'); ok(m1.tables[1].read, ['craa5_assetguid', 'craa5_status']); ok(m1.tables[1].names, ['craa5_cleancheckoff']);
 ok(m1.hash, m2.hash); ok(m1.hash === H.hubManifest({ appId: 'ganttly', app: 'Ganttly', version: '2.0.1', tables: man.tables, config: man.config }).hash, false);
-ok(H.hubManifestKey('Ganttly'), 'manifest|ganttly'); ok(/[^\x00-\x7F]/.test(JSON.stringify(m1)), false);
+ok(H.hubManifestKey('Ganttly'), 'manifest|ganttly'); ok(H.hubManifest({ appId: 'bolo', config: ['PATHOGEN_BOLO_CONFIG', 'mss_x', 'PATHOGEN_BOLO_CONFIG'] }).config, ['PATHOGEN_BOLO_CONFIG', 'mss_x']); ok(/[^\x00-\x7F]/.test(JSON.stringify(m1)), false);
 var db = [], calls = [];
 var io = {
     query: function (t, q) { calls.push('q'); if (t === 'craa5__e_hubconfig' && !io.newTable) return Promise.reject(new Error('404')); if (!io.hasCol && q.select.indexOf('craa5_manifestjson') >= 0) return Promise.reject(new Error('Could not find a property named craa5_manifestjson')); var key = /'([^']+)'/.exec(q.filter)[1]; return Promise.resolve({ rows: db.filter(function (r) { return r.craa5_configkey === key && r.t === t; }) }); },

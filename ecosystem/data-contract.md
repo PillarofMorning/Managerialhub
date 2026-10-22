@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.33, 2026-10-22. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.34, 2026-10-22. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -356,7 +356,7 @@ Apps look a table up by its prefixed name first and its plain name second, as Ma
 **Shared settings** live in **Hub config**: the new `craa5__e_hubconfig` ("_e_ Hub config", Organization-owned; columns `craa5_configname` primary, `craa5_configkey`, `craa5_configjson` Multiple lines max 1,048,576; prompt in `table-prompts.md` part 8). One row per `craa5_configkey`, each key written by one app, and the key is always filled. Apps look for `craa5__e_hubconfig` first and the old `craa5__0_hubconfig` second (`HUB_CONFIG_TABLES`). On the old table the JSON goes in `craa5_manifestjson`, because its `craa5_configjson` holds only 100 characters; on the new table it goes in `craa5_configjson`. A row with empty JSON means "no settings yet" (the monitor can pre-create rows with only the key and name): readers treat an empty string as no settings and use their defaults, and the owning app fills it on its first save. Readers use `hubConfigJsonOf(row)` and match `craa5_configkey` first, `craa5_configname` second for old rows with a blank key. Gerald adds the keys to the new table once it exists; the old one stays until every app has switched. Keys:
 `hub_people_thresholds` (Manager hub), `ganttly_settings` (Ganttly), `mss_view_rules` (MSS Log Input), `scheduler_shared` (Production Scheduler; today its `config` row in the Clean Plan, which may stay there), `training_settings` (Training page: minimum shifts, refresher days), `mss_completion_exclusions` and `mss_line_downtime` (MSS Calendar; downtime only for lines the Scheduler does not plan). Plus one `manifest|<appId>` row per app, written by that app (12.1).
 
-**Keys in use today** (older names, listed so the monitor does not flag them): `MSS_CALENDAR_VIEW_CONFIG` and `MSS_SKIPPED_ENTRIES_LOG` (MSS Calendar), `MSS_LOG_SKIPPED_ENTRIES` (MSS Log Input), `MSS_LOG_VIEW_CONFIG` (MSS Log Input; becomes `mss_view_rules`), `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG` (MSS Log Input; the Calendar only reads skip codes), `MSS_CALENDAR_ACCESS_LOG` (MSS Calendar's own access log), `PBED_WEEKEND_PLAN` (old PBED, unused). The full list with owners is `configKeys` in `contract.json`.
+**Keys in use today** (older names, listed so the monitor does not flag them): `MSS_CALENDAR_VIEW_CONFIG` and `MSS_SKIPPED_ENTRIES_LOG` (MSS Calendar), `MSS_LOG_SKIPPED_ENTRIES` (MSS Log Input), `MSS_LOG_VIEW_CONFIG` (MSS Log Input; becomes `mss_view_rules`), `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG` (MSS Log Input; the Calendar only reads skip codes), `MSS_CALENDAR_ACCESS_LOG` (MSS Calendar's own access log), `PBED_WEEKEND_PLAN` (old PBED, unused), nine `PATHOGEN_BOLO_*` keys (Pathogen BOLO). Keys match exactly, case included. The full list with owners is `configKeys` in `contract.json`.
 
 ### 12.1 App manifests (self-check)
 
@@ -422,6 +422,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.34 (2026-10-22)** configKeys adds BOLO's nine `PATHOGEN_BOLO_*` keys. `hubManifest` keeps the case of config keys (93 checks); table and column names stay lower case.
 - **1.0.33 (2026-10-22)** `_g_ Assignment` (`craa5__g_assignment`): equipment to people per shift, written by both Shift Start and Ganttly with pinned / source / rev rules (sections 3, 4, 13; contract.json with name candidates).
 - **1.0.32 (2026-10-22)** BOLO v2.3: swab result rows keyed by sample + description + test; results add `count` and `replaced`; readers add `statecode eq 0`, skip replaced, keep count out of rates.
 - **1.0.31 (2026-10-22)** Ground rule 9: no pop-ups (Power Apps blocks confirm / alert / prompt). Empty Hub config JSON = no settings yet. The Dataverse monitor is English only.
