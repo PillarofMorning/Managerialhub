@@ -5,7 +5,7 @@ assert.strictEqual(/[^\x00-\x7F]/.test(src), false, 'hub-shared.js must be 7-bit
 assert.strictEqual(/\\u[0-9a-fA-F]{4}/.test(src), false, 'no \\u escapes');
 var store = {};
 global.window = { localStorage: { getItem: function (k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; }, setItem: function (k, v) { store[k] = String(v); } } };
-var H = new Function(src + '; return { hubCanon: hubCanon, hubLineKey: hubLineKey, hubSameName: hubSameName, hubGuid: hubGuid, hubGuidList: hubGuidList, hubSplitGuids: hubSplitGuids, hubCrew: hubCrew, hubIdFromKey: hubIdFromKey, hubPlantDay: hubPlantDay, hubShiftDate: hubShiftDate, hubShiftKey: hubShiftKey, hubDateOnlyUtc: hubDateOnlyUtc, hubDayFromDateOnly: hubDayFromDateOnly, hubWeekKey: hubWeekKey, hubCleanKind: hubCleanKind, hubCompletionKey: hubCompletionKey, hubLogIdOf: hubLogIdOf, hubStdMinutes: hubStdMinutes, hubPace: hubPace, hubShare: hubShare, hubLaborCost: hubLaborCost, hubGetLang: hubGetLang, hubSetLang: hubSetLang, hubT: hubT, hubDecodeEs: hubDecodeEs, hubManifest: hubManifest, hubManifestKey: hubManifestKey, hubSaveManifest: hubSaveManifest };')();
+var H = new Function(src + '; return { hubCanon: hubCanon, hubLineKey: hubLineKey, hubSameName: hubSameName, hubGuid: hubGuid, hubGuidList: hubGuidList, hubSplitGuids: hubSplitGuids, hubCrew: hubCrew, hubIdFromKey: hubIdFromKey, hubPlantDay: hubPlantDay, hubShiftDate: hubShiftDate, hubShiftKey: hubShiftKey, hubDateOnlyUtc: hubDateOnlyUtc, hubDayFromDateOnly: hubDayFromDateOnly, hubWeekKey: hubWeekKey, hubCleanKind: hubCleanKind, hubCompletionKey: hubCompletionKey, hubLogIdOf: hubLogIdOf, hubStdMinutes: hubStdMinutes, hubPace: hubPace, hubShare: hubShare, hubLaborCost: hubLaborCost, hubGetLang: hubGetLang, hubSetLang: hubSetLang, hubT: hubT, hubDecodeEs: hubDecodeEs, hubManifest: hubManifest, hubManifestKey: hubManifestKey, hubSaveManifest: hubSaveManifest, hubConfigJsonOf: hubConfigJsonOf };')();
 var n = 0; function ok(a, b, m) { assert.deepStrictEqual(a, b, m); n++; }
 ok(H.hubLineKey('IBL4', 1), 'ibl4'); ok(H.hubLineKey('IBL 4', 1), 'ibl4'); ok(H.hubLineKey('Breading', 2), 'breading2'); ok(H.hubLineKey('Highspeed', null), 'highspeed');
 ok(H.hubSameName(' Dough Room', 'dough-room'), true); ok(H.hubSameName('', ''), false);
@@ -73,7 +73,7 @@ H.hubSaveManifest(io, man).then(function (r1) {
     io.hasCol = true;
     return H.hubSaveManifest(io, man);
 }).then(function (r6) {
-    ok(r6, 'saved'); ok(db.length, 1); ok(JSON.parse(db[0].craa5_manifestjson).version, '2.0.0'); ok(JSON.parse(db[0].craa5_configjson).in, 'craa5_manifestjson');
+    ok(r6, 'saved'); ok(db.length, 1); ok(JSON.parse(db[0].craa5_manifestjson).version, '2.0.0'); ok(H.hubConfigJsonOf(db[0]), db[0].craa5_manifestjson); ok(H.hubConfigJsonOf({ craa5_configjson: '{"a":1}' }), '{"a":1}');
     return H.hubSaveManifest(io, man);
 }).then(function (r7) {
     ok(r7, 'same');

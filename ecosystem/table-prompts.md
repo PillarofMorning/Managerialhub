@@ -70,7 +70,7 @@ For the Map submission tool. It writes them only once they exist.
 
 ## Part 6. Shared settings (`craa5__0_hubconfig`): maybe one column
 
-**Done 2026-10-21:** Gerald added Manifest json (`craa5_manifestjson`). Only step 3 (roles) remains if not done yet.
+**Done 2026-10-21:** Gerald added Manifest json (`craa5_manifestjson`). Config json turned out to hold only 100 characters, so all apps now keep their settings in Manifest json too. Only step 3 (roles) remains if not done yet.
 
 Apps now save a short list of the tables and columns they use here, so the Dataverse monitor can check every app by itself (contract section 12.1). The lists are up to about 8 KB. Do **not** recreate this table: seven apps keep their settings in it. Its Config json column cannot be resized or deleted (the "dependencies" are just the form and views that show it), and that is fine.
 
@@ -85,18 +85,15 @@ Apps now save a short list of the tables and columns they use here, so the Datav
 
 Apps use Manifest json when it is there and Config json when it is not, so nothing breaks either way.
 
-## Part 7. Equipment (`craa5_aa_assets`): 4 columns for egg and pecan allergen cleans
+## Part 7. Equipment (`craa5_aa_assets`): 2 more columns for egg and pecan allergen cleans
 
-Egg and pecan cleans cover different pieces and take different times, so each gets its own flag and minutes. Add by hand (New > Column). Then tick the pieces and fill the minutes, like Daily clean and Hours required.
+Egg and pecan cleans cover different pieces and take different times. **Done 2026-10-21:** the flags Egg allergen (`craa5_eggallergen`) and Pecan allergen (`craa5_pecanallergen`). Still to add by hand (New > Column):
 
 | Display name | Schema name | Type |
 |---|---|---|
-| Egg clean | `craa5_eggclean` | Yes/No |
 | Egg clean minutes | `craa5_eggminutes` | Whole number |
-| Pecan clean | `craa5_pecanclean` | Yes/No |
 | Pecan clean minutes | `craa5_pecanminutes` | Whole number |
 
 Minutes are labor minutes (people x minutes), the same way as the Allergen clean mins column. Leave one blank and apps use the old combined Allergen clean mins for it.
 
 Optional: on the same table, rename the display name of the **Month** column (`craa5_month`) to "6 month". Only the display name changes; the schema name stays and nothing breaks.
-
