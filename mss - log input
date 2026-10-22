@@ -50,6 +50,10 @@ import {
     - Log Table, Dashboard and Calendar load one filtered, limited page each.
     - Fix Missing IDs scans the log page by page and looks up candidate
       equipment per group of entries, never the whole equipment table.
+    - Dashboard > Manpower plan reads only when its button is pressed: the
+      published clean plan weeks, the shift hours, Equipment (id, area,
+      minutes and frequency columns, at most 6,000 rows) and the log's labor
+      minutes for the same weeks (MSS MANPOWER block).
   Text searches ask for the usual casings (as typed, lower, UPPER, Title), so
   they find matches even where the data source compares text case-sensitively.
 
@@ -1390,6 +1394,297 @@ function mlwApi(xrm, dataApi) {
     return null;
 }
 /* ============================== END MSS LOG WRITE v1.2 ============================== */
+
+/* ============================== START MSS MANPOWER v1.0 ============================== */
+// Manpower plan (projected): the labor hours the clean goals need per day, week and month, and the heads each crew needs.
+// This is not a data contract section 7 number, so the screen says how it is computed. Everything here is read only:
+//   - craa5_cleanplan (Production Scheduler only writes it): the window rows of published weeks (k|Monday row status 'done')
+//     are the line cleans. Work = the scope rows' craa5_minutes for that line and kind (person-minutes of every piece in the
+//     clean), else details.need.work, else the clean's clock minutes x the crew it assumed. When = details.cleanStart/cleanEnd.
+//     Changeovers are done by the line crew and are left out.
+//   - craa5_aa_assets: pieces in no line's clean plan that are flagged daily, weekly or midweek, and every piece flagged monthly,
+//     6-month (craa5_month), quarterly or annual, at standard minutes (craa5_hoursrequired; a daily clean at craa5_dailymin
+//     when set). These have no planned time, so they are spread evenly over the shift hours. A piece without a standard is
+//     counted, never guessed.
+//   - craa5_workshift: which crew is on the clock when (the same reading rules as Ganttly and Shift Start).
+// Heads for a shift = its work / (its length x the share of a shift spent cleaning). Cleans that overlap are added up at every
+// moment of the shift ("at once"). A crew's plan = its busiest (or average) shift, rounded up, plus the vacation cover.
+// Weeks the Scheduler has not published repeat the average published week. Needs HUB SHARED (hubPlantParts, hubWeekKey, ...).
+var MP_VERSION = '1.0';
+var MP_LINE_KINDS = { full: 'daily', midweek: 'midweek', weekly: 'eow', allergen: 'allergen' };
+var MP_PER_YEAR = { monthly: 12, semiannual: 2, quarterly: 4, annual: 1 };
+var MP_FLAG_COLS = { daily: 'craa5_dailyclean', midweek: 'craa5_midweek', weekly: 'craa5_weeklyclean', monthly: 'craa5_monthlyclean',
+    semiannual: 'craa5_month', quarterly: 'craa5_quarterly', annual: 'craa5_annually' };
+var MP_HOUR = 3600000, MP_MIN = 60000, MP_WEEK_DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+function mpYes(v) { return v === true || v === 1 || /^(true|yes|si|y|1)$/i.test(String(v === undefined || v === null ? '' : v).trim()); }
+function mpNum(v) { var n = Number(v); return v === null || v === undefined || v === '' || !isFinite(n) ? null : n; }
+function mpJson(s) { if (s && typeof s === 'object') return s; try { var o = JSON.parse(s || ''); return o && typeof o === 'object' ? o : null; } catch (e) { return null; } }
+function mpMs(v) { if (v === null || v === undefined || v === '') return 0; var t = typeof v === 'number' ? v : Date.parse(v); return isFinite(t) ? t : 0; }
+function mpField(r, n) { var f = r ? r[n + '@OData.Community.Display.V1.FormattedValue'] : undefined; return f !== undefined ? f : (r ? r[n] : undefined); }
+function mpDow(day) { return new Date(Date.UTC(Number(day.slice(0, 4)), Number(day.slice(5, 7)) - 1, Number(day.slice(8, 10)))).getUTCDay(); }
+function mpRound1(n) { return Math.round((n || 0) * 10) / 10; }
+
+// A plant wall-clock time (a day, plus hours that may pass 24) as epoch ms, daylight saving included.
+function mpPlantMs(day, hours) {
+    var want = Date.UTC(Number(day.slice(0, 4)), Number(day.slice(5, 7)) - 1, Number(day.slice(8, 10))) + hours * MP_HOUR, t = want;
+    for (var i = 0; i < 4; i++) {
+        var p = hubPlantParts(t);
+        if (!p) return want;
+        var seen = Date.UTC(p.y, p.m - 1, p.d, p.h, p.min), next = t + (want - seen);
+        if (next === t) break;
+        t = next;
+    }
+    return t;
+}
+
+// craa5_workshift: one row per slot. craa5_shiftcode (A-D), craa5_dayname / craa5_daynumber (1 = Sun), craa5_shiftstarthour /
+// craa5_shiftendhour. Midnight is stored as 1, or every hour is stored +1 (1/7/13/19). A row that starts before 4 AM is the back
+// half of a night shift: it goes on the named day or the next one, whichever overlaps the other rows less.
+function mpParseSlots(rows) {
+    var raw = (rows || []).map(function (r) {
+        return { crew: hubCrew(mpField(r, 'craa5_shiftcode')), dayName: String(mpField(r, 'craa5_dayname') || ''), dayNum: parseInt(mpField(r, 'craa5_daynumber'), 10),
+            startH: parseInt(mpField(r, 'craa5_shiftstarthour'), 10), endH: parseInt(mpField(r, 'craa5_shiftendhour'), 10) };
+    });
+    var hours = [];
+    raw.forEach(function (x) { if (!isNaN(x.startH)) hours.push(x.startH); if (!isNaN(x.endH)) hours.push(x.endH); });
+    var plusOne = hours.length > 0 && hours.every(function (h) { return h >= 1 && (h - 1) % 6 === 0; });
+    var hasZeroDay = raw.some(function (x) { return x.dayNum === 0; });
+    var fixHour = function (h) { return plusOne ? (h - 1 + 24) % 24 : (h === 1 || h === 24) ? 0 : ((h % 24) + 24) % 24; };
+    var slots = [], pending = [];
+    raw.forEach(function (x) {
+        var m = x.dayName.toLowerCase().match(/sun|mon|tue|wed|thu|fri|sat/);
+        var day = m ? ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].indexOf(m[0]) : (isNaN(x.dayNum) ? -1 : (hasZeroDay ? x.dayNum : x.dayNum - 1));
+        if (!x.crew || day < 0 || isNaN(x.startH) || isNaN(x.endH)) return;
+        day = ((day % 7) + 7) % 7;
+        var sH = fixHour(x.startH), eH = fixHour(x.endH);
+        var slot = { crew: x.crew, day: day, startHour: sH, lengthHours: ((eH - sH + 24) % 24) || 24 };
+        (sH < 4 ? pending : slots).push(slot);
+    });
+    var hoursOf = function (s) { var out = []; for (var h = 0; h < s.lengthHours; h++) out.push((s.day * 24 + s.startHour + h) % 168); return out; };
+    pending.forEach(function (p) {
+        var taken = {};
+        slots.forEach(function (s) { hoursOf(s).forEach(function (h) { taken[h] = true; }); });
+        var next = { crew: p.crew, day: (p.day + 1) % 7, startHour: p.startHour, lengthHours: p.lengthHours };
+        var clash = function (s) { return hoursOf(s).filter(function (h) { return taken[h]; }).length; };
+        slots.push(clash(p) < clash(next) ? p : next);
+    });
+    return slots;
+}
+
+// The shifts that START on each plant day from..to (inclusive). With no shift rows, one 24 h stretch per day (hours only, no heads).
+function mpShifts(fromDay, toDay, slots) {
+    var out = [], list = slots && slots.length ? slots : null;
+    for (var d = fromDay; d <= toDay; d = hubAddDays(d, 1)) {
+        var dow = mpDow(d);
+        (list || [{ crew: '', day: dow, startHour: 0, lengthHours: 24 }]).forEach(function (s) {
+            if (s.day !== dow) return;
+            var start = mpPlantMs(d, s.startHour), end = mpPlantMs(d, s.startHour + s.lengthHours);
+            out.push({ crew: s.crew, day: d, week: hubWeekKey(d), dow: dow, startHour: s.startHour, lengthHours: s.lengthHours, start: start, end: end,
+                mins: (end - start) / MP_MIN, key: s.crew + '|' + dow + '|' + s.startHour, line: 0, spread: 0, segs: [] });
+        });
+    }
+    return out.sort(function (a, b) { return a.start - b.start; });
+}
+
+// Scope rows (s|line|kind|part): the person-minutes of each line's clean kind, and every Equipment id that is in a line's plan.
+function mpScopes(rows) {
+    var out = { byKey: {}, ids: {}, count: 0 };
+    (rows || []).forEach(function (r) {
+        var d = mpJson(r.craa5_details) || {};
+        var line = String(r.craa5_linekey || d.line || '').toLowerCase(), kind = String(r.craa5_cleankind || d.kind || '').toLowerCase();
+        if (!line || !kind) return;
+        var k = line + '|' + kind, s = out.byKey[k] || (out.byKey[k] = { mins: 0, pieces: 0 });
+        s.mins = Math.max(s.mins, mpNum(r.craa5_minutes) || 0);
+        (Array.isArray(d.pieces) ? d.pieces : []).forEach(function (p) {
+            var id = hubGuid(Array.isArray(p) ? p[0] : p && p.id);
+            if (hubIsGuid(id)) { if (!out.ids[id]) out.count++; out.ids[id] = true; s.pieces++; }
+        });
+    });
+    return out;
+}
+
+// One window row -> the clean it plans: kind, work (person-minutes) and the planned slot. null for changeovers and 'none'.
+function mpWindow(r, scopes) {
+    var d = mpJson(r.craa5_details) || {};
+    var plan = String(r.craa5_cleankind || '').toLowerCase(), kind = MP_LINE_KINDS[plan];
+    if (!kind) return null;
+    var line = String(r.craa5_linekey || '').toLowerCase();
+    var sk = d.scope && d.scope.key ? String(d.scope.key).toLowerCase() : line + '|' + plan;
+    var clock = mpNum(r.craa5_minutes) || 0, heads = d.crew ? mpNum(d.crew.heads) : null;
+    var work = 0, basis = 'none';
+    if (scopes && scopes.byKey[sk] && scopes.byKey[sk].mins > 0) { work = scopes.byKey[sk].mins; basis = 'scope'; }
+    else if (d.need && d.need.basis === 'equipment' && mpNum(d.need.work) > 0) { work = mpNum(d.need.work); basis = 'need'; }
+    else if (clock > 0 && heads > 0) { work = clock * heads; basis = 'clock'; }
+    var start = mpMs(d.cleanStart) || mpMs(r.craa5_start), end = mpMs(d.cleanEnd);
+    if (!(end > start)) end = clock > 0 && start ? start + clock * MP_MIN : 0;
+    var day = /^\d{4}-\d{2}-\d{2}$/.test(String(r.craa5_day || '')) ? String(r.craa5_day) : (start ? hubPlantDay(start) : '');
+    return { line: line, area: String(r.craa5_area || ''), plan: plan, kind: kind, day: day, week: day ? hubWeekKey(day) : '', start: start, end: end,
+        work: work, basis: basis, open: !!d.open, status: String(r.craa5_status || '') };
+}
+
+// Equipment that no line's clean plan covers, and the monthly-and-longer cleans: minutes per day and per week.
+function mpPieceLoads(assets, scopes, lineAreas) {
+    var out = { dailyMins: 0, weeklyMins: 0, periodicWeekMins: 0, daily: 0, weekly: 0, periodic: 0, noStd: 0, inPlan: 0 };
+    var useIds = scopes && scopes.count > 0;
+    (assets || []).forEach(function (a) {
+        var id = hubGuid(a.craa5_aa_assetsid), std = hubStdMinutes(a.craa5_hoursrequired), dmin = hubStdMinutes(a.craa5_dailymin) || std;
+        var f = {};
+        Object.keys(MP_FLAG_COLS).forEach(function (k) { f[k] = mpYes(a[MP_FLAG_COLS[k]]); });
+        var inPlan = useIds ? !!scopes.ids[id] : !!(lineAreas && lineAreas[hubCanon(a.craa5_areaname)]);
+        var missing = false;
+        if (inPlan) out.inPlan++;
+        else if (f.daily) { if (dmin) { out.dailyMins += dmin; out.daily++; } else missing = true; }
+        else if (f.weekly || f.midweek) { if (std) { out.weeklyMins += std; out.weekly++; } else missing = true; }
+        var per = 0;
+        Object.keys(MP_PER_YEAR).forEach(function (k) { if (f[k]) per += MP_PER_YEAR[k]; });
+        if (per) { if (std) { out.periodicWeekMins += std * per / 52; out.periodic++; } else missing = true; }
+        if (missing) out.noStd++;
+    });
+    return out;
+}
+
+// The most people working at the same moment inside a shift, from the cleans that overlap it.
+function mpPeak(inst) {
+    var pts = [inst.start, inst.end];
+    inst.segs.forEach(function (s) { if (s[0] > inst.start && s[0] < inst.end) pts.push(s[0]); if (s[1] > inst.start && s[1] < inst.end) pts.push(s[1]); });
+    pts.sort(function (a, b) { return a - b; });
+    var best = 0;
+    for (var i = 0; i + 1 < pts.length; i++) {
+        if (pts[i + 1] <= pts[i]) continue;
+        var mid = (pts[i] + pts[i + 1]) / 2, h = 0;
+        inst.segs.forEach(function (s) { if (s[0] <= mid && s[1] > mid) h += s[2]; });
+        if (h > best) best = h;
+    }
+    return best;
+}
+
+// in: { windows, weeks, scopes, assets (rows), slots (mpParseSlots), today 'YYYY-MM-DD', share (0-1 of a shift spent cleaning),
+//       vacation (heads per crew), basis 'busiest' | 'average', months (default 12), logged { Monday: { mins, rows, noMins } } }
+function mpBuild(input) {
+    var o = input || {}, share = o.share > 0 && o.share <= 1 ? o.share : 1, vac = Math.max(0, Math.round(mpNum(o.vacation) || 0));
+    var slots = o.slots || [], heads = slots.length > 0, today = o.today, thisWeek = hubWeekKey(today);
+    var notes = { changeover: 0, noWork: 0, basis: { scope: 0, need: 0, clock: 0 }, noTime: 0, writing: [], open: 0 };
+    var done = {};
+    (o.weeks || []).forEach(function (w) {
+        var mon = /^\d{4}-\d{2}-\d{2}$/.test(String(w.craa5_day || '')) ? String(w.craa5_day) : (mpMs(w.craa5_start) ? hubWeekKey(hubPlantDay(mpMs(w.craa5_start) + 6 * MP_HOUR)) : '');
+        if (!mon) return;
+        if (String(w.craa5_status || '').toLowerCase() === 'done') done[mon] = true; else if (notes.writing.indexOf(mon) < 0) notes.writing.push(mon);
+    });
+    var scopes = mpScopes(o.scopes);
+    var cleans = [], lineAreas = {};
+    (o.windows || []).forEach(function (r) {
+        var w = mpWindow(r, scopes);
+        if (!w) {
+            var cd = /^\d{4}-\d{2}-\d{2}$/.test(String(r.craa5_day || '')) ? String(r.craa5_day) : '';
+            if (String(r.craa5_cleankind || '').toLowerCase() === 'changeover' && cd && done[hubWeekKey(cd)]) notes.changeover++;
+            return;
+        }
+        if (!w.week || !done[w.week]) return;
+        lineAreas[hubCanon(w.area)] = true;
+        if (!w.work) { notes.noWork++; return; }
+        notes.basis[w.basis]++;
+        if (w.open) notes.open++;
+        cleans.push(w);
+    });
+    var planned = Object.keys(done).sort();
+    var weeks = planned.length ? planned : [thisWeek];
+    var loads = mpPieceLoads(o.assets, scopes, lineAreas);
+    var insts = mpShifts(hubAddDays(weeks[0], -1), hubAddDays(weeks[weeks.length - 1], 7), slots);
+    var isBasis = {};
+    weeks.forEach(function (w) { isBasis[w] = true; });
+    var outside = {};
+    weeks.forEach(function (w) { outside[w] = 0; });
+    cleans.forEach(function (c) {
+        var placed = 0;
+        if (c.end > c.start) {
+            var rate = c.work / ((c.end - c.start) / MP_MIN);
+            insts.forEach(function (s) {
+                var a = Math.max(s.start, c.start), b = Math.min(s.end, c.end);
+                if (b <= a) return;
+                var part = c.work * (b - a) / (c.end - c.start);
+                if (isBasis[s.week]) { s.line += part; s.segs.push([a, b, rate]); placed += part; }
+            });
+        } else {
+            notes.noTime++;
+            var home = insts.filter(function (s) { return s.start <= c.start && s.end > c.start && isBasis[s.week]; })[0];
+            if (home) { home.line += c.work; placed = c.work; }
+        }
+        outside[c.week] += c.work - placed;
+    });
+    // Spread: pieces outside every line plan (daily: that day's shifts; weekly: the week's) and monthly-and-longer cleans (the week's)
+    weeks.forEach(function (w) {
+        var wk = insts.filter(function (s) { return s.week === w; }), wkMins = wk.reduce(function (t, s) { return t + s.mins; }, 0);
+        for (var i = 0; i < 7; i++) {
+            var day = hubAddDays(w, i), on = wk.filter(function (s) { return s.day === day; }), m = on.reduce(function (t, s) { return t + s.mins; }, 0);
+            if (m > 0) on.forEach(function (s) { s.spread += loads.dailyMins * s.mins / m; }); else outside[w] += loads.dailyMins;
+        }
+        var weekly = loads.weeklyMins + loads.periodicWeekMins;
+        if (wkMins > 0) wk.forEach(function (s) { s.spread += weekly * s.mins / wkMins; }); else outside[w] += weekly;
+    });
+    var shifts = insts.filter(function (s) { return isBasis[s.week]; });
+    shifts.forEach(function (s) {
+        s.work = s.line + s.spread;
+        s.need = s.mins > 0 ? s.work / (s.mins * share) : 0;
+        s.atOnce = mpPeak(s);
+        delete s.segs;
+    });
+    // The average published week, slot by slot (crew | weekday | start hour), for the weeks not published
+    var typical = {}, outsideDow = [0, 0, 0, 0, 0, 0, 0];
+    shifts.forEach(function (s) {
+        var t = typical[s.key] || (typical[s.key] = { crew: s.crew, dow: s.dow, startHour: s.startHour, mins: s.mins, work: 0, line: 0, n: 0 });
+        t.work += s.work; t.line += s.line; t.n++;
+    });
+    Object.keys(typical).forEach(function (k) { var t = typical[k]; t.work /= t.n; t.line /= t.n; t.need = t.mins > 0 ? t.work / (t.mins * share) : 0; });
+    weeks.forEach(function (w) { for (var i = 0; i < 7; i++) outsideDow[i] += outside[w] / 7 / weeks.length; });
+    var crewPlan = function (list) {
+        var by = {};
+        list.forEach(function (s) {
+            if (!s.crew) return;
+            var c = by[s.crew] || (by[s.crew] = { crew: s.crew, shifts: 0, work: 0, needSum: 0, busiest: null, atOnce: 0 });
+            c.shifts++; c.work += s.work; c.needSum += s.need;
+            if (!c.busiest || s.need > c.busiest.need) c.busiest = s;
+            if ((s.atOnce || 0) > c.atOnce) c.atOnce = s.atOnce;
+        });
+        return Object.keys(by).sort().map(function (k) {
+            var c = by[k], avg = c.shifts ? c.needSum / c.shifts : 0, top = c.busiest ? c.busiest.need : 0, pick = o.basis === 'average' ? avg : top;
+            return { crew: c.crew, shifts: c.shifts, hours: mpRound1(c.work / 60), avgHeads: mpRound1(avg), busiestHeads: mpRound1(top),
+                busiest: c.busiest ? { day: c.busiest.day, startHour: c.busiest.startHour, dow: c.busiest.dow } : null, atOnce: mpRound1(c.atOnce),
+                plan: c.work > 0 ? Math.ceil(pick - 1e-9) + vac : 0 };
+        });
+    };
+    var weekRows = weeks.map(function (w) {
+        var wk = shifts.filter(function (s) { return s.week === w; });
+        var line = wk.reduce(function (t, s) { return t + s.line; }, 0), spread = wk.reduce(function (t, s) { return t + s.spread; }, 0);
+        var lg = o.logged && o.logged[w];
+        return { week: w, published: !!done[w], lineHours: mpRound1(line / 60), spreadHours: mpRound1(spread / 60), outsideHours: mpRound1(outside[w] / 60),
+            hours: mpRound1((line + spread + outside[w]) / 60), cleans: cleans.filter(function (c) { return c.week === w; }).length,
+            loggedHours: lg ? mpRound1(lg.mins / 60) : null, loggedRows: lg ? lg.rows : 0, loggedNoMins: lg ? lg.noMins : 0, crews: crewPlan(wk) };
+    });
+    // Month by month from this month: published weeks as they are, the other days as the average published week
+    var months = [], n = o.months > 0 ? o.months : 12, y = Number(today.slice(0, 4)), m0 = Number(today.slice(5, 7)) - 1;
+    for (var i = 0; i < n; i++) {
+        var yy = y + Math.floor((m0 + i) / 12), mm = (m0 + i) % 12, first = yy + '-' + hubPad2(mm + 1) + '-01';
+        var days = new Date(Date.UTC(yy, mm + 1, 0)).getUTCDate(), list = [], work = 0, fromPlan = 0;
+        for (var k = 0; k < days; k++) {
+            var day = hubAddDays(first, k), dow = mpDow(day), wk = hubWeekKey(day);
+            if (isBasis[wk] && planned.length) {
+                shifts.forEach(function (s) { if (s.day === day) { list.push(s); work += s.work; } });
+                work += outside[wk] / 7; fromPlan++;
+            } else {
+                Object.keys(typical).forEach(function (key) { var t = typical[key]; if (t.dow === dow) { list.push({ crew: t.crew, day: day, dow: dow, startHour: t.startHour, work: t.work, need: t.need, atOnce: 0 }); work += t.work; } });
+                work += outsideDow[dow];
+            }
+        }
+        months.push({ month: first.slice(0, 7), days: days, planDays: fromPlan, hours: mpRound1(work / 60), perDay: mpRound1(work / 60 / days), perWeek: mpRound1(work / 60 / days * 7), crews: crewPlan(list) });
+    }
+    var yearHours = months.reduce(function (t, x) { return t + x.hours; }, 0), yearDays = months.reduce(function (t, x) { return t + x.days; }, 0);
+    var crews = crewPlan(shifts);
+    return { version: MP_VERSION, heads: heads, planned: planned, weeks: weekRows, months: months, crews: crews, loads: loads, notes: notes,
+        cleans: cleans.length, perDay: mpRound1(yearHours / yearDays), perWeek: mpRound1(yearHours / yearDays * 7), perMonth: mpRound1(yearHours / months.length),
+        planHeads: crews.reduce(function (t, c) { return t + c.plan; }, 0) };
+}
+/* ============================== END MSS MANPOWER v1.0 ============================== */
 
 // The clean kind (data contract 6.2) of an entry: an "auto-" order names it, else the frequency column of the SAP order, else
 // the order's suffix (W, M, Q ...). strict: '' when the order says nothing (no weekly guess), for the Check tab's fixes.
@@ -8520,6 +8815,269 @@ const CheckTab = ({ ctx }) => {
   );
 };
 
+// --- MANPOWER PLAN (Dashboard): the hours the clean goals need and the heads each crew needs (MSS MANPOWER block) ---
+// Reads only when its button is pressed: the published clean plan weeks, the shift hours, Equipment (id, area, minutes and the
+// frequency columns, at most MP_CAP.assets rows) and the MSS log's labor minutes for the same weeks. Writes nothing.
+const CLEANPLAN_TABLE = 'craa5_cleanplan';
+const WORKSHIFT_TABLE = 'craa5_workshift';
+const MP_INPUTS_KEY = 'mss_manpower_inputs_v1';
+const MP_CAP = { windows: 3000, scopes: 600, assets: 6000, log: 6000, shifts: 300 };
+const MP_FLAGS = Object.keys(MP_FLAG_COLS).map(k => MP_FLAG_COLS[k]);
+const MP_STATE = {
+  idle: ['Not read yet', 'Sin leer'], loading: ['Loading', 'Cargando'], ready: ['Ready', 'Listo'], empty: ['Nothing here yet', 'Nada aqui todavia'],
+  missing: ['Table missing', 'Falta la tabla'], denied: ['No access', 'Sin acceso'], failed: ['Could not load', 'No se pudo cargar'],
+};
+const MP_DAYS_ES = ['Dom', 'Lun', 'Mar', 'Mie', 'Jue', 'Vie', 'Sab'];
+const MP_MONTHS = [['Jan', 'Ene'], ['Feb', 'Feb'], ['Mar', 'Mar'], ['Apr', 'Abr'], ['May', 'May'], ['Jun', 'Jun'], ['Jul', 'Jul'], ['Aug', 'Ago'], ['Sep', 'Sep'], ['Oct', 'Oct'], ['Nov', 'Nov'], ['Dec', 'Dic']];
+const mpIsoZ = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+const mpDayText = (day) => `${tr(MP_WEEK_DAYS[mpDow(day)], MP_DAYS_ES[mpDow(day)])} ${tr(MP_MONTHS[Number(day.slice(5, 7)) - 1][0], MP_MONTHS[Number(day.slice(5, 7)) - 1][1])} ${Number(day.slice(8, 10))}`;
+const mpMonthText = (ym) => `${tr(MP_MONTHS[Number(ym.slice(5, 7)) - 1][0], MP_MONTHS[Number(ym.slice(5, 7)) - 1][1])} ${ym.slice(0, 4)}`;
+const mpHourText = (h) => `${String(h).padStart(2, '0')}:00`;
+const mpStateOf = (e) => (MISSING_TABLE.test(errText(e)) ? 'missing' : mlwIsDenied(e) ? 'denied' : 'failed');
+const mpLoadInputs = () => {
+  try { const o = JSON.parse(window.localStorage.getItem(MP_INPUTS_KEY) || '{}'); return { vacation: o.vacation !== undefined ? String(o.vacation) : '2', pct: o.pct !== undefined ? String(o.pct) : '100', basis: o.basis === 'average' ? 'average' : 'busiest' }; }
+  catch (_) { return { vacation: '2', pct: '100', basis: 'busiest' }; }
+};
+
+// Reads up to `cap` rows, a page at a time. A column the table does not have (named in the error) is dropped and the read tried again.
+const mpRead = async (api, table, o, cap, optional) => {
+  let select = o.select.slice();
+  const dropped = [];
+  for (let tries = 0; tries < 16; tries++) {
+    try {
+      const rows = [];
+      let pg = await api.page(table, { ...o, select, top: Math.min(500, cap) });
+      while (pg) {
+        pg.rows.forEach(r => rows.push(r));
+        if (rows.length >= cap || !pg.next) break;
+        pg = await pg.next();
+      }
+      return { rows: rows.slice(0, cap), capped: rows.length >= cap, dropped };
+    } catch (e) {
+      const msg = errText(e).toLowerCase();
+      const named = (optional || []).filter(c => select.indexOf(c) >= 0 && msg.indexOf(c) >= 0);
+      if (!mlwIsMissingCol(errText(e)) || !named.length) throw e;
+      select = select.filter(c => named.indexOf(c) < 0);
+      named.forEach(c => dropped.push(c));
+    }
+  }
+  throw new Error('Too many missing columns');
+};
+
+const ManpowerPanel = ({ ctx }) => {
+  const styles = useStyles();
+  const { api } = ctx;
+  const [inputs, setInputs] = useState(mpLoadInputs);
+  const [data, setData] = useState(null);
+  const [state, setState] = useState({ plan: 'idle', shifts: 'idle', assets: 'idle', log: 'idle' });
+  const [info, setInfo] = useState({});
+  const [busy, setBusy] = useState(false);
+  const reqId = useRef(0);
+  const offline = api.mode !== 'dataverse' && api.mode !== 'live';
+
+  const setInput = (k, v) => setInputs(p => {
+    const next = { ...p, [k]: v };
+    try { window.localStorage.setItem(MP_INPUTS_KEY, JSON.stringify(next)); } catch (_) {}
+    return next;
+  });
+
+  const load = useCallback(async () => {
+    const id = ++reqId.current;
+    setBusy(true);
+    setState({ plan: 'loading', shifts: 'loading', assets: 'loading', log: 'loading' });
+    const today = hubPlantDay(Date.now()), mon = hubWeekKey(today);
+    const fromDay = hubAddDays(mon, -28), toDay = hubAddDays(mon, 42);
+    const range = `craa5_start ge ${mpIsoZ(mpPlantMs(fromDay, 0) - 86400000)} and craa5_start lt ${mpIsoZ(mpPlantMs(toDay, 0))}`;
+    const st = {}, nf = {}, out = { today, weeks: [], windows: [], scopes: [], assets: [], shiftRows: [], logged: {} };
+    const step = async (key, fn) => {
+      try { await fn(); } catch (e) { st[key] = mpStateOf(e); nf[key] = errText(e); }
+    };
+    await Promise.all([
+      step('plan', async () => {
+        const sel = ['craa5_cleanplanid', 'craa5_plankey', 'craa5_rowtype', 'craa5_linekey', 'craa5_area', 'craa5_start', 'craa5_end', 'craa5_day', 'craa5_cleankind', 'craa5_minutes', 'craa5_status', 'craa5_details'];
+        const wk = await mpRead(api, CLEANPLAN_TABLE, { select: ['craa5_cleanplanid', 'craa5_rowtype', 'craa5_day', 'craa5_start', 'craa5_status'], filter: `statecode eq 0 and craa5_rowtype eq 'week' and ${range}` }, 40);
+        const win = await mpRead(api, CLEANPLAN_TABLE, { select: sel, filter: `statecode eq 0 and craa5_rowtype eq 'window' and ${range}` }, MP_CAP.windows);
+        const sc = await mpRead(api, CLEANPLAN_TABLE, { select: ['craa5_cleanplanid', 'craa5_plankey', 'craa5_linekey', 'craa5_cleankind', 'craa5_minutes', 'craa5_details'], filter: `statecode eq 0 and craa5_rowtype eq 'scope'` }, MP_CAP.scopes);
+        out.weeks = wk.rows; out.windows = win.rows; out.scopes = sc.rows;
+        st.plan = wk.rows.length || win.rows.length || sc.rows.length ? 'ready' : 'empty';
+        nf.plan = win.capped ? tr(`Only the first ${MP_CAP.windows} clean windows were read.`, `Solo se leyeron las primeras ${MP_CAP.windows} ventanas de limpieza.`) : '';
+      }),
+      step('shifts', async () => {
+        const r = await mpRead(api, WORKSHIFT_TABLE, { select: ['craa5_workshiftid', 'craa5_shiftcode', 'craa5_dayname', 'craa5_daynumber', 'craa5_shiftstarthour', 'craa5_shiftendhour'] }, MP_CAP.shifts, ['craa5_dayname', 'craa5_daynumber']);
+        out.shiftRows = r.rows;
+        st.shifts = r.rows.length ? 'ready' : 'empty';
+      }),
+      step('assets', async () => {
+        const r = await mpRead(api, ASSET_TABLE, { select: ['craa5_aa_assetsid', 'craa5_areaname', 'craa5_hoursrequired', 'craa5_dailymin'].concat(MP_FLAGS), filter: 'statecode eq 0' }, MP_CAP.assets, ['craa5_dailymin'].concat(MP_FLAGS));
+        out.assets = r.rows;
+        st.assets = r.rows.length ? 'ready' : 'empty';
+        const notes = [];
+        if (r.capped) notes.push(tr(`Only the first ${MP_CAP.assets} pieces were read.`, `Solo se leyeron las primeras ${MP_CAP.assets} piezas.`));
+        if (r.dropped.length) notes.push(tr(`Columns not on Equipment yet (counted as not set): ${r.dropped.join(', ')}.`, `Columnas que aun no estan en Equipos (cuentan como no marcadas): ${r.dropped.join(', ')}.`));
+        nf.assets = notes.join(' ');
+      }),
+      step('log', async () => {
+        const r = await mpRead(api, LOG_TABLE, { select: ['craa5__log_id', 'craa5_lastcleaned', 'craa5_shiftdate', 'craa5_laborminutes'], filter: `statecode eq 0 and craa5_lastcleaned ge ${fromDay}T00:00:00Z and craa5_lastcleaned lt ${toDay}T00:00:00Z` }, MP_CAP.log, ['craa5_shiftdate', 'craa5_laborminutes']);
+        const noCol = r.dropped.indexOf('craa5_laborminutes') >= 0;
+        r.rows.forEach(x => {
+          const day = /^\d{4}-\d{2}-\d{2}$/.test(safeString(x.craa5_shiftdate)) ? safeString(x.craa5_shiftdate) : hubDayFromDateOnly(x.craa5_lastcleaned);
+          if (!day) return;
+          const w = hubWeekKey(day), g = out.logged[w] || (out.logged[w] = { mins: 0, rows: 0, noMins: 0 });
+          const n = mpNum(x.craa5_laborminutes);
+          g.rows++;
+          if (n !== null && n >= 0) g.mins += n; else g.noMins++;
+        });
+        st.log = r.rows.length ? 'ready' : 'empty';
+        nf.log = noCol ? tr('The log has no Labor minutes column yet, so logged hours are not shown.', 'El registro aun no tiene la columna Minutos de trabajo; no se muestran horas registradas.')
+          : r.capped ? tr(`Only the first ${MP_CAP.log} log entries were read.`, `Solo se leyeron los primeros ${MP_CAP.log} registros.`) : '';
+        if (noCol) out.logged = {};
+      }),
+    ]);
+    if (id !== reqId.current) return;
+    setState(st); setInfo(nf); setData(out); setBusy(false);
+  }, [api]);
+
+  const model = useMemo(() => {
+    if (!data) return null;
+    const pct = Math.min(100, Math.max(10, Number(inputs.pct) || 100));
+    return mpBuild({ today: data.today, windows: data.windows, weeks: data.weeks, scopes: data.scopes, assets: data.assets, slots: mpParseSlots(data.shiftRows),
+      share: pct / 100, vacation: Math.min(20, Math.max(0, Math.round(Number(inputs.vacation) || 0))), basis: inputs.basis, logged: data.logged, months: 12 });
+  }, [data, inputs]);
+
+  const th = { textAlign: 'left', padding: '6px 8px', borderBottom: `2px solid ${BRAND.line}`, fontSize: 12, whiteSpace: 'nowrap' };
+  const td = { padding: '6px 8px', borderBottom: `1px solid ${BRAND.line}`, textAlign: 'left', verticalAlign: 'top' };
+  const num = { ...td, textAlign: 'right', whiteSpace: 'nowrap' };
+  const crews = model ? model.crews.map(c => c.crew) : [];
+  const nWeeks = model ? Math.max(1, model.weeks.length) : 1;
+  const sourceText = (k, en, es) => `${tr(en, es)}: ${tr(MP_STATE[state[k]][0], MP_STATE[state[k]][1])}`;
+  const notes = [];
+  if (model) {
+    const n = model.notes, L = model.loads;
+    if (!model.planned.length) notes.push(tr('No published week in the clean plan, so line cleans are not counted. The hours come from the Equipment frequency flags alone.', 'No hay semana publicada en el plan de limpieza, asi que no se cuentan las limpiezas de linea. Las horas salen solo de las marcas de frecuencia de Equipos.'));
+    n.writing.forEach(w => notes.push(tr(`The week of ${mpDayText(w)} is still being written by the Production Scheduler and is not used yet.`, `La semana del ${mpDayText(w)} aun la esta escribiendo el Programador de Produccion y no se usa todavia.`)));
+    if (!model.heads) notes.push(tr('No shift hours (craa5_workshift), so hours are shown but heads per crew are not.', 'No hay horarios de turno (craa5_workshift): se muestran las horas, pero no las personas por cuadrilla.'));
+    if (n.changeover) notes.push(tr(`${n.changeover} changeovers are left out: the line crew does them.`, `${n.changeover} cambios de producto no se cuentan: los hace el personal de la linea.`));
+    if (n.noWork) notes.push(tr(`${n.noWork} planned cleans have no work estimate (no scope, work or crew) and are not counted.`, `${n.noWork} limpiezas planeadas no tienen estimado de trabajo y no se cuentan.`));
+    if (n.basis.need) notes.push(tr(`${n.basis.need} cleans use the Scheduler's work after the stop, because their scope rows were not found. Early starts (dough room, silo, sifter) are not in that number.`, `${n.basis.need} limpiezas usan el trabajo despues del paro del Programador, porque no se encontraron sus filas de alcance. Los inicios tempranos no estan en ese numero.`));
+    if (n.basis.clock) notes.push(tr(`${n.basis.clock} cleans use their clock time x the crew the Scheduler assumed.`, `${n.basis.clock} limpiezas usan su tiempo de reloj x la cuadrilla que supuso el Programador.`));
+    if (n.open) notes.push(tr(`${n.open} cleans are in stops with no restart planned yet; their planned slot is used.`, `${n.open} limpiezas estan en paros sin reinicio planeado; se usa su horario planeado.`));
+    notes.push(tr(`${L.inPlan} pieces are in a line's clean plan. Outside every plan: ${L.daily} daily and ${L.weekly} weekly pieces. ${L.periodic} pieces have monthly, 6-month, quarterly or annual cleans. These are spread evenly over the shift hours.`,
+      `${L.inPlan} piezas estan en el plan de limpieza de una linea. Fuera de todo plan: ${L.daily} piezas diarias y ${L.weekly} semanales. ${L.periodic} piezas tienen limpiezas mensuales, semestrales, trimestrales o anuales. Estas se reparten parejo en las horas de turno.`));
+    if (L.noStd) notes.push(tr(`${L.noStd} flagged pieces have no standard minutes (Hours required) and are not counted.`, `${L.noStd} piezas marcadas no tienen minutos estandar y no se cuentan.`));
+    const outside = model.weeks.reduce((t, w) => t + w.outsideHours, 0);
+    if (model.heads && outside > 0) notes.push(tr(`${mpRound1(outside)} h of planned cleaning falls when no crew is on the clock. It is in the hours, not in the heads.`, `${mpRound1(outside)} h de limpieza planeada caen cuando ninguna cuadrilla esta en turno. Estan en las horas, no en las personas.`));
+    ['plan', 'assets', 'log'].forEach(k => { if (info[k]) notes.push(info[k]); });
+  }
+
+  return (
+    <div className={styles.listCard}>
+      <Text size={500} weight="semibold" block>{tr('Manpower plan (projected)', 'Plan de personal (proyectado)')}</Text>
+      <Text className={styles.hint} block style={{ marginTop: 4 }}>
+        {tr('How it is worked out: the cleans the Production Scheduler published, at the work of every piece in them, placed in their planned time. Pieces outside every line plan and the monthly-and-longer cleans are added at their standard minutes, spread over the shift hours. Heads for a shift = its work / (its length x the time spent cleaning). Each crew is sized for its busiest (or average) shift, rounded up, plus the vacation cover. Weeks not published repeat the average published week.',
+          'Como se calcula: las limpiezas que publico el Programador de Produccion, con el trabajo de cada pieza, en su horario planeado. Las piezas fuera de todo plan y las limpiezas mensuales o mas largas se suman a sus minutos estandar, repartidas en las horas de turno. Personas por turno = su trabajo / (su duracion x el tiempo de limpieza). Cada cuadrilla se calcula para su turno mas pesado (o promedio), redondeado hacia arriba, mas la cobertura de vacaciones. Las semanas sin publicar repiten la semana publicada promedio.')}
+      </Text>
+      <div className={styles.actionBar} style={{ marginTop: 12, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          <Text className={styles.hint}>{tr('Vacation cover (heads per crew)', 'Cobertura de vacaciones (personas por cuadrilla)')}</Text>
+          <Input type="number" min={0} max={20} value={inputs.vacation} onChange={(e, d) => setInput('vacation', d.value)} style={{ width: 110 }} />
+        </label>
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          <Text className={styles.hint}>{tr('Time spent cleaning (% of a shift)', 'Tiempo limpiando (% del turno)')}</Text>
+          <Input type="number" min={10} max={100} value={inputs.pct} onChange={(e, d) => setInput('pct', d.value)} style={{ width: 110 }} />
+        </label>
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          <Text className={styles.hint}>{tr('Size each crew for', 'Calcular cada cuadrilla para')}</Text>
+          <Select value={inputs.basis} onChange={(e, d) => setInput('basis', d.value)}>
+            <option value="busiest">{tr('Its busiest shift', 'Su turno mas pesado')}</option>
+            <option value="average">{tr('Its average shift', 'Su turno promedio')}</option>
+          </Select>
+        </label>
+        <Button appearance="primary" disabled={busy || offline} onClick={load}>{busy ? tr('Reading...', 'Leyendo...') : data ? tr('Read again', 'Leer de nuevo') : tr('Work out the manpower plan', 'Calcular el plan de personal')}</Button>
+      </div>
+      {offline && <Text className={styles.warnText} block>{tr('Not connected to Dataverse, so there is nothing to work out.', 'Sin conexion a Dataverse, no hay nada que calcular.')}</Text>}
+      <Text className={styles.hint} block style={{ marginTop: 8 }} aria-live="polite">
+        {[sourceText('plan', 'Clean plan', 'Plan de limpieza') + (model ? tr(` (${model.planned.length} weeks published)`, ` (${model.planned.length} semanas publicadas)`) : ''),
+          sourceText('shifts', 'Shift hours', 'Horario de turnos'), sourceText('assets', 'Equipment', 'Equipos'), sourceText('log', 'MSS log', 'Registro MSS')].join(' | ')}
+      </Text>
+      {model && (
+        <div style={{ marginTop: 12 }}>
+          <div className={styles.dashboardGrid}>
+            {[[tr('Hours needed per day', 'Horas necesarias por dia'), model.perDay, BRAND.blue], [tr('Hours needed per week', 'Horas necesarias por semana'), model.perWeek, BRAND.logoBlue],
+              [tr('Hours needed per month', 'Horas necesarias por mes'), model.perMonth, BRAND.yellow], [tr('Heads, all crews (with vacation)', 'Personas, todas las cuadrillas (con vacaciones)'), model.heads ? model.planHeads : '-', BRAND.red]].map(([label, value, color]) => (
+              <div key={label} className={styles.metricCard} style={{ borderTop: `4px solid ${color}` }}>
+                <Text className={styles.metricLabel}>{label}</Text>
+                <Text className={styles.metricValue}>{value}</Text>
+              </div>
+            ))}
+          </div>
+
+          {model.heads && (
+            <div style={{ overflowX: 'auto', marginBottom: 16 }}>
+              <Text weight="semibold" block style={{ marginBottom: 6 }}>{tr('Heads per crew (published weeks)', 'Personas por cuadrilla (semanas publicadas)')}</Text>
+              <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: 13 }}>
+                <thead><tr>
+                  <th style={th}>{tr('Crew', 'Cuadrilla')}</th><th style={th}>{tr('Shifts a week', 'Turnos por semana')}</th><th style={th}>{tr('Hours a week', 'Horas por semana')}</th>
+                  <th style={th}>{tr('Average shift', 'Turno promedio')}</th><th style={th}>{tr('Busiest shift', 'Turno mas pesado')}</th><th style={th}>{tr('Most at once (cleans overlapping)', 'Mas a la vez (limpiezas encimadas)')}</th>
+                  <th style={th}>{tr('Plan, with vacation', 'Plan, con vacaciones')}</th>
+                </tr></thead>
+                <tbody>{model.crews.map(c => (
+                  <tr key={c.crew}>
+                    <td style={td}><strong>{c.crew}</strong></td>
+                    <td style={num}>{mpRound1(c.shifts / nWeeks)}</td>
+                    <td style={num}>{mpRound1(c.hours / nWeeks)}</td>
+                    <td style={num}>{c.avgHeads}</td>
+                    <td style={td}>{c.busiest ? `${c.busiestHeads} - ${mpDayText(c.busiest.day)} ${mpHourText(c.busiest.startHour)}` : '-'}</td>
+                    <td style={num}>{c.atOnce}{c.atOnce > c.plan ? <span className={mergeClasses(styles.tag, styles.tagWarn)} style={{ marginLeft: 6 }}>{tr('more than the plan', 'mas que el plan')}</span> : null}</td>
+                    <td style={num}><strong>{c.plan}</strong></td>
+                  </tr>))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          <div style={{ overflowX: 'auto', marginBottom: 16 }}>
+            <Text weight="semibold" block style={{ marginBottom: 6 }}>{tr('Next 12 months', 'Proximos 12 meses')}</Text>
+            <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: 13 }}>
+              <thead><tr>
+                <th style={th}>{tr('Month', 'Mes')}</th><th style={th}>{tr('Hours', 'Horas')}</th><th style={th}>{tr('Per day', 'Por dia')}</th><th style={th}>{tr('Per week', 'Por semana')}</th>
+                <th style={th}>{tr('Days from the published plan', 'Dias del plan publicado')}</th>
+                {model.heads && crews.map(c => <th key={c} style={th}>{tr(`Crew ${c}`, `Cuadrilla ${c}`)}</th>)}
+              </tr></thead>
+              <tbody>{model.months.map(mo => (
+                <tr key={mo.month}>
+                  <td style={td}>{mpMonthText(mo.month)}</td>
+                  <td style={num}>{mo.hours}</td><td style={num}>{mo.perDay}</td><td style={num}>{mo.perWeek}</td>
+                  <td style={num}>{mo.planDays} / {mo.days}</td>
+                  {model.heads && crews.map(c => { const x = mo.crews.filter(y => y.crew === c)[0]; return <td key={c} style={num}>{x ? x.plan : '-'}</td>; })}
+                </tr>))}
+              </tbody>
+            </table>
+          </div>
+
+          <div style={{ overflowX: 'auto', marginBottom: 16 }}>
+            <Text weight="semibold" block style={{ marginBottom: 6 }}>{tr('By week', 'Por semana')}</Text>
+            <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: 13 }}>
+              <thead><tr>
+                <th style={th}>{tr('Week of', 'Semana del')}</th><th style={th}>{tr('Line cleans (h)', 'Limpiezas de linea (h)')}</th><th style={th}>{tr('Other pieces and monthly+ (h)', 'Otras piezas y mensuales+ (h)')}</th>
+                <th style={th}>{tr('No crew on the clock (h)', 'Sin cuadrilla en turno (h)')}</th><th style={th}>{tr('Needed (h)', 'Necesarias (h)')}</th><th style={th}>{tr('Logged in the MSS log (h)', 'Registradas en el registro MSS (h)')}</th>
+              </tr></thead>
+              <tbody>{model.weeks.map(w => (
+                <tr key={w.week}>
+                  <td style={td}>{mpDayText(w.week)}{!w.published && <span className={mergeClasses(styles.tag, styles.tagWarn)} style={{ marginLeft: 6 }}>{tr('not published', 'sin publicar')}</span>}</td>
+                  <td style={num}>{w.lineHours}</td><td style={num}>{w.spreadHours}</td><td style={num}>{w.outsideHours}</td><td style={num}><strong>{w.hours}</strong></td>
+                  <td style={num}>{w.loggedHours === null ? '-' : w.loggedHours}{w.loggedNoMins ? <div className={styles.hint}>{tr(`${w.loggedNoMins} entries without labor minutes`, `${w.loggedNoMins} registros sin minutos de trabajo`)}</div> : null}</td>
+                </tr>))}
+              </tbody>
+            </table>
+          </div>
+
+          <ul style={{ margin: 0, paddingLeft: 18 }}>{notes.map((t, i) => <li key={i}><Text className={styles.hint}>{t}</Text></li>)}</ul>
+        </div>
+      )}
+    </div>
+  );
+};
+
 // --- DASHBOARD (one period, the newest entries up to a limit) ---
 const DashboardTab = ({ ctx }) => {
   const styles = useStyles();
@@ -8585,6 +9143,7 @@ const DashboardTab = ({ ctx }) => {
           )) : <Text>{loading ? 'Loading...' : error ? 'Not available.' : 'No entries in this period.'}</Text>}
         </div>
       </div>
+      <ManpowerPanel ctx={ctx} />
     </div>
   );
 };
