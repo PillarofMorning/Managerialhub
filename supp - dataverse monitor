@@ -14,7 +14,7 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 
 const LOGO_URL = ""; // the logo image is left out of the public repo; the copy in project files has it
 const BRAND = { blue: '#0072CE', blueDark: '#00468B', blueSoft: '#E6F1FB', yellow: '#FFB81C', yellowSoft: '#FFF6E0', red: '#E4002B', redSoft: '#FDE8EC' };
-const MONITOR_VERSION = 'v2.4.1';
+const MONITOR_VERSION = 'v2.5';
 
 const ORG_LANG_KEY = 'stillwell_org_lang_v1';
 const ORG_THEME_KEY = 'stillwell_org_dark_v1';
@@ -1276,7 +1276,7 @@ function appIdOf(name) { return String(name || '').toLowerCase().replace(/[^a-z0
 // Turns one saved row into a checked-shape manifest, or an error saying what is wrong with it.
 function dvParseManifest(row) {
   const key = String(row && row.craa5_configkey || '');
-  const out = { key, appId: key.slice(MANIFEST_PREFIX.length), app: String(row && row.craa5_configname || '').replace(/ manifest$/i, ''), version: '', savedAt: '', contract: '', hash: '', config: [], tables: [], error: '', modifiedOn: row && row.modifiedon ? String(row.modifiedon) : '' };
+  const out = { key, source: '', fromScan: key.indexOf('scan|') === 0, appId: key.slice(key.indexOf('|') + 1), app: String(row && row.craa5_configname || '').replace(/ manifest$/i, ''), version: '', savedAt: '', contract: '', hash: '', config: [], tables: [], error: '', modifiedOn: row && row.modifiedon ? String(row.modifiedon) : '' };
   // The full list lives in Manifest json when the table has that column; Config json then holds only a pointer.
   const mText = row && row.craa5_manifestjson != null ? String(row.craa5_manifestjson) : '';
   out.source = mText.trim() ? 'craa5_manifestjson' : 'craa5_configjson';
@@ -1413,12 +1413,13 @@ function dvCheckHubConfig(rows, maxLen, apps, mMaxLen) {
     let stub = false;
     if (json === 'ok') { try { const j = JSON.parse(text); stub = !!(j && typeof j === 'object' && j.in && !Array.isArray(j.tables)); } catch (e) { stub = false; } }
     const isManifest = key.indexOf(MANIFEST_PREFIX) === 0;
+    const isScan = key.indexOf('scan|') === 0;
     const setting = HUB_CONFIG_KEYS.find(k => k.key === key);
-    const appId = isManifest ? key.slice(MANIFEST_PREFIX.length) : (setting ? setting.app : '');
-    return { key, name: String(r && r.craa5_configname || ''), len: text.length, json, jsonAppId, kind: isManifest ? 'manifest' : (setting ? (setting.status === 'legacy' ? 'legacy' : 'setting') : 'unlisted'), appId, mLen: mText.length, mjson, stub, modifiedOn: r && r.modifiedon ? String(r.modifiedon) : '', issues: [], warnings: setting && setting.otherWriters && setting.otherWriters.length ? ['twowriters'] : [] };
+    const appId = isManifest || isScan ? key.slice(key.indexOf('|') + 1) : (setting ? setting.app : '');
+    return { key, name: String(r && r.craa5_configname || ''), len: text.length, json, jsonAppId, kind: isManifest ? 'manifest' : isScan ? 'scan' : (setting ? (setting.status === 'legacy' ? 'legacy' : 'setting') : 'unlisted'), appId, mLen: mText.length, mjson, stub, modifiedOn: r && r.modifiedon ? String(r.modifiedon) : '', issues: [], warnings: setting && setting.otherWriters && setting.otherWriters.length ? ['twowriters'] : [] };
   });
   list.forEach(x => {
-    if (!x.key) x.issues.push('blankkey');
+    if (!x.key) x.issues.push(HUB_CONFIG_KEYS.some(k => k.key === x.name) ? 'keyinname' : 'blankkey');
     else if (keyCount[x.key] > 1) x.issues.push('dupkey');
     if (x.json === 'bad') x.issues.push(maxLen && x.len >= maxLen ? 'cutoff' : 'badjson');
     if (x.json === 'empty') x.issues.push('emptyjson');
@@ -1457,6 +1458,154 @@ async function dvConfigJsonMaxLength(conn, hubTable, column) {
     if (r.ok && r.json && isFinite(Number(r.json.MaxLength))) return Number(r.json.MaxLength);
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// App code scanner: finds the craa5 tables and columns an app's code names,
+// checks them against Dataverse, and can save the result in Hub config
+// (key scan|<appId>) so every later check watches that app. Only names are
+// kept, never the code itself.
+// ---------------------------------------------------------------------------
+const SCAN_PREFIX = 'scan|';
+const SCAN_TABLE_CALL = /(retrieveMultipleRecords|retrieveRecord|createRecord|updateRecord|deleteRecord|queryTable|getEntityMetadata|LogicalName=)\W{0,6}$/;
+
+// known: { tables: Set of logical names, sets: { entitySetName: logical } }
+function dvScanCode(code, known) {
+  const text = String(code || '');
+  const tokens = [];
+  const re = /(_?)(craa5_[a-z0-9_]*[a-z0-9])/gi;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    let name = m[2].toLowerCase();
+    let lookup = false;
+    if (m[1] === '_' && /_value$/.test(name)) { name = name.replace(/_value$/, ''); lookup = true; }
+    if (name.replace(/^craa5_+/, '').replace(/_/g, '').length < 3) continue;   // prefix pieces like craa5__c
+    const before = text.slice(Math.max(0, m.index - 40), m.index);
+    tokens.push({ name, pos: m.index, lookup, call: SCAN_TABLE_CALL.test(before) });
+  }
+  const isTable = tok => known.tables.has(tok.name) || !!known.sets[tok.name] || (tok.call && !tok.lookup);
+  const tablePos = [];
+  const tableSet = {};
+  tokens.forEach(tok => {
+    if (!isTable(tok)) return;
+    const t = known.sets[tok.name] || tok.name;
+    tableSet[t] = true;
+    tablePos.push({ t, pos: tok.pos });
+  });
+  const colPos = {};
+  tokens.forEach(tok => {
+    if (isTable(tok) && !tok.lookup) return;
+    if (tableSet[tok.name.replace(/id$/, '')] && /id$/.test(tok.name)) return;   // a table's own id column
+    (colPos[tok.name] = colPos[tok.name] || []).push(tok.pos);
+  });
+  return { tables: Object.keys(tableSet).sort(), cols: Object.keys(colPos).sort(), tablePos, colPos };
+}
+
+// The table written closest before a column (else closest after): the best guess when no table has the column.
+function dvNearestTable(scan, col) {
+  let best = null;
+  (scan.colPos[col] || []).forEach(p => {
+    scan.tablePos.forEach(tp => {
+      const d = tp.pos <= p ? p - tp.pos : (tp.pos - p) * 4;   // before counts more than after
+      if (!best || d < best.d) best = { t: tp.t, d };
+    });
+  });
+  return best ? best.t : '';
+}
+
+// Checks the scanned names in Dataverse. Columns go to the table that has them; the rest to the nearest table (a guess).
+async function dvScanCheck(conn, scan) {
+  const metas = {};
+  await dvRunPool(scan.tables, t => dvReadMeta(conn, t, scan.cols), 4, (i, res) => { metas[scan.tables[i]] = res; });
+  const out = scan.tables.map(t => ({ t, state: metas[t] ? metas[t].state : 'unknown', checked: !!(metas[t] && metas[t].cols), have: [], missing: [], err: metas[t] ? metas[t].err || '' : '' }));
+  const byName = {};
+  out.forEach(r => { byName[r.t] = r; });
+  const loose = [];
+  scan.cols.forEach(c => {
+    const owners = out.filter(r => metas[r.t] && metas[r.t].cols && metas[r.t].cols.has(c));
+    if (owners.length) { owners.forEach(r => r.have.push(c)); return; }
+    const anyUnchecked = out.some(r => r.state === 'found' && !r.checked);
+    const guess = dvNearestTable(scan, c);
+    if (guess && byName[guess] && !anyUnchecked) byName[guess].missing.push(c);
+    else loose.push(c);
+  });
+  return { tables: out, loose };
+}
+
+// The list saved for a scanned app, in the manifest format, so the manifest checks run on it.
+function dvScanManifest(appId, app, result) {
+  return {
+    m: 1, appId, app, source: 'scan', savedAt: new Date().toISOString(),
+    tables: result.tables.map(r => ({ t: r.t, names: [r.t], read: r.have.concat(r.missing).sort(), write: [], opt: [] }))
+  };
+}
+
+// One create or update through Xrm.WebApi, else the Web API. Resolves { ok, id, err }.
+async function dvWriteRow(conn, logical, entitySet, id, body) {
+  try {
+    if (conn.web && typeof conn.web.createRecord === 'function') {
+      if (id) { await dvTimeout(() => conn.web.updateRecord(logical, id, body), 'save'); return { ok: true, id, err: '' }; }
+      const r = await dvTimeout(() => conn.web.createRecord(logical, body), 'save');
+      return { ok: true, id: r && r.id ? String(r.id) : '', err: '' };
+    }
+    if (conn.clientUrl && entitySet && typeof fetch === 'function') {
+      const url = conn.clientUrl + '/api/data/v9.2/' + entitySet + (id ? '(' + String(id).replace(/[{}]/g, '') + ')' : '');
+      const resp = await fetch(url, { method: id ? 'PATCH' : 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'OData-MaxVersion': '4.0', 'OData-Version': '4.0' }, body: JSON.stringify(body) });
+      if (resp.ok) return { ok: true, id: id || '', err: '' };
+      let t = ''; try { t = await resp.text(); } catch (e) {}
+      return { ok: false, id: '', err: 'HTTP ' + resp.status + ': ' + dvErrText(t) };
+    }
+    return { ok: false, id: '', err: 'This page has no way to save.' };
+  } catch (e) { return { ok: false, id: '', err: dvErrText(e) }; }
+}
+
+// Saves (or replaces) the scan|<appId> row. Config json gets only a short pointer: that column holds 100 characters.
+async function dvSaveScan(conn, hubTable, appId, app, result, rows) {
+  const key = SCAN_PREFIX + appId;
+  const old = (rows || []).find(r => String(r.craa5_configkey || '') === key);
+  const idCol = hubTable + 'id';
+  const body = { craa5_configkey: key, craa5_configname: app + ' scan', craa5_configjson: JSON.stringify({ m: 1, in: 'craa5_manifestjson' }), craa5_manifestjson: JSON.stringify(dvScanManifest(appId, app, result)) };
+  return dvWriteRow(conn, hubTable, hubTable + 's', old ? old[idCol] : '', body);
+}
+
+// Reads every row of a table, page by page (Xrm.WebApi). Resolves { ok, rows, err }.
+async function dvReadAllRows(conn, logical, select, limit) {
+  if (!conn.web) return { ok: false, rows: [], err: 'This page cannot read rows page by page.' };
+  const rows = [];
+  let options = '?$select=' + select.join(',');
+  try {
+    for (let guard = 0; guard < 200; guard++) {
+      const res = await dvTimeout(() => conn.web.retrieveMultipleRecords(logical, options, 500), 'read ' + logical);
+      (res && res.entities || []).forEach(e => rows.push(e));
+      if (rows.length >= (limit || 20000) || !res || !res.nextLink) break;
+      options = '?' + String(res.nextLink).split('?').slice(1).join('?');
+    }
+    return { ok: true, rows, err: '' };
+  } catch (e) { return { ok: false, rows, err: dvErrText(e) }; }
+}
+
+// Copy one column's value into other columns on the same rows. Plan first (no writes), then run.
+function dvPlanCopy(rows, idCol, from, to) {
+  const changes = [];
+  let skippedBlank = 0;
+  rows.forEach(r => {
+    const v = r[from];
+    if (v === null || v === undefined || v === '') { skippedBlank++; return; }
+    const body = {};
+    to.forEach(c => { if (r[c] !== v) body[c] = v; });
+    if (Object.keys(body).length) changes.push({ id: r[idCol], body });
+  });
+  return { total: rows.length, changes, skippedBlank };
+}
+async function dvRunCopy(conn, logical, plan, onProgress) {
+  let done = 0;
+  const failed = [];
+  await dvRunPool(plan.changes, ch => dvWriteRow(conn, logical, '', ch.id, ch.body), 4, (i, res) => {
+    done++;
+    if (!res.ok) failed.push(res.err);
+    if (onProgress) onProgress(done, failed.length);
+  });
+  return { done, failed };
 }
 
 
@@ -1611,6 +1760,18 @@ export default function DataverseOrganizerApp(props) {
   const [fillCounts, setFillCounts] = useState({});
   const [fillBusy, setFillBusy] = useState('');
   const [manifests, setManifests] = useState(null);
+  const [scanApp, setScanApp] = useState('');
+  const [scanOther, setScanOther] = useState('');
+  const [scanCode, setScanCode] = useState('');
+  const [scanBusy, setScanBusy] = useState(false);
+  const [scanResult, setScanResult] = useState(null);
+  const [scanSaved, setScanSaved] = useState('');
+  const [copyTable, setCopyTable] = useState('craa5_aa_assets');
+  const [copyFrom, setCopyFrom] = useState('craa5_allergenclean');
+  const [copyTo, setCopyTo] = useState('craa5_eggallergen, craa5_pecanallergen');
+  const [copyPlan, setCopyPlan] = useState(null);
+  const [copyBusy, setCopyBusy] = useState('');
+  const [copyDone, setCopyDone] = useState(null);
   const scanRef = useRef(0);
 
   const toggleTheme = useCallback(mode => {
@@ -1646,7 +1807,7 @@ export default function DataverseOrganizerApp(props) {
     setDiscovered(list);
     // App manifests: what each app says it needs, saved by the app itself in Hub config.
     const read = await dvReadHubConfigRows(conn, '');
-    const manRows = read.rows.filter(r => String(r.craa5_configkey || '').indexOf(MANIFEST_PREFIX) === 0);
+    const manRows = read.rows.filter(r => { const k = String(r.craa5_configkey || ''); return k.indexOf(MANIFEST_PREFIX) === 0 || k.indexOf(SCAN_PREFIX) === 0; });
     const cache = {};
     const apps = [];
     for (let i = 0; i < manRows.length; i++) {
@@ -1664,7 +1825,7 @@ export default function DataverseOrganizerApp(props) {
     const mMaxLen = manifestCol ? await dvConfigJsonMaxLength(conn, read.table, 'craa5_manifestjson') : null;
     if (scanRef.current !== myScan) return;
     const hub = read.state === 'ok' ? dvCheckHubConfig(read.rows, maxLen, apps, mMaxLen) : null;
-    setManifests({ state: read.state, table: read.table || '', err: read.err || '', apps, maxLen, hub, manifestCol, mMaxLen, ownership: hubRes && hubRes.meta ? hubRes.meta.OwnershipType : '', expectedOwnership: hubSpec ? hubSpec.expectedOwnership : '' });
+    setManifests({ state: read.state, table: read.table || '', err: read.err || '', rows: read.rows, apps, maxLen, hub, manifestCol, mMaxLen, ownership: hubRes && hubRes.meta ? hubRes.meta.OwnershipType : '', expectedOwnership: hubSpec ? hubSpec.expectedOwnership : '' });
     setLastScanTime(new Date().toISOString());
     setScanning(false);
   }, [conn, online]);
@@ -1750,10 +1911,10 @@ export default function DataverseOrganizerApp(props) {
         manifestJsonMaxLength: manifests.mMaxLen,
         ownership: manifests.ownership || 'unknown',
         warnings: manifests.hub.rows.filter(x => x.warnings.length && !x.issues.length).map(x => x.key + ': ' + x.warnings.join(',')),
-        problems: manifests.hub.rows.filter(x => x.issues.length).map(x => (x.key || '(blank key)') + ': ' + x.issues.join(',') + ' (' + x.len + ' chars' + (x.mLen ? ', manifestjson ' + x.mLen : '') + ')').concat(manifests.hub.claims.map(c => c.appId + ' writes ' + c.key + ': ' + (c.issue === 'otherapp' ? 'belongs to ' + c.owner : 'not in contract'))),
+        problems: manifests.hub.rows.filter(x => x.issues.length).map(x => (x.key || '(blank key, name "' + x.name + '")') + ': ' + x.issues.join(',') + ' (' + x.len + ' chars' + (x.mLen ? ', manifestjson ' + x.mLen : '') + ')').concat(manifests.hub.claims.map(c => c.appId + ' writes ' + c.key + ': ' + (c.issue === 'otherapp' ? 'belongs to ' + c.owner : 'not in contract'))),
         notSavedYet: manifests.hub.expected.filter(e => e.state === 'notyet').map(e => e.key),
         notInContract: manifests.hub.unlisted,
-        largest: manifests.hub.rows.slice().sort((a, b) => b.len - a.len).slice(0, 3).map(x => x.key + ' ' + x.len)
+        largest: manifests.hub.rows.slice().sort((a, b) => b.len - a.len).slice(0, 3).map(x => (x.key || 'name "' + x.name + '"') + ' ' + x.len)
       }),
       appManifests: !manifests ? 'not read' : (manifests.state !== 'ok' ? manifests.state + (manifests.err ? ': ' + manifests.err : '') : {
         configJsonMaxLength: manifests.maxLen,
@@ -1775,6 +1936,69 @@ export default function DataverseOrganizerApp(props) {
   // Work for the table maker, one card per table. Copilot does best with one short prompt per table and
   // cannot edit tables, so a missing table gets a short create prompt (required columns only) and missing
   // columns on an existing table are listed to add by hand. Lookup columns are never asked for.
+  // Code scanner: which names are tables. Ecosystem tables by name; any Dataverse table by its plural (entity set) name.
+  const scanKnown = useMemo(() => {
+    const tables = new Set();
+    const sets = {};
+    ECOSYSTEM_TABLES.forEach(t => { tables.add(t.logicalName); (t.candidates || []).forEach(c => tables.add(c)); if (t.entitySetName) sets[t.entitySetName] = t.logicalName; });
+    (Array.isArray(discovered) ? discovered : []).forEach(d => { if (d.entitySetName && d.entitySetName !== d.logicalName) sets[d.entitySetName.toLowerCase()] = d.logicalName; });
+    return { tables, sets };
+  }, [discovered]);
+  const scanAppId = scanApp === 'other' ? appIdOf(scanOther) : scanApp;
+  const scanAppName = scanApp === 'other' ? scanOther.trim() : (APP_WRITER_NAMES[scanApp] || scanApp);
+  const runCodeScan = useCallback(async () => {
+    setScanBusy(true); setScanSaved(''); setScanResult(null);
+    const sc = dvScanCode(scanCode, scanKnown);
+    const res = await dvScanCheck(conn, sc);
+    setScanResult(Object.assign(res, { tokenTables: sc.tables.length, tokenCols: sc.cols.length }));
+    setScanBusy(false);
+  }, [conn, scanCode, scanKnown]);
+  const saveCodeScan = useCallback(async () => {
+    if (!scanResult || !scanAppId || !manifests || !manifests.table) return;
+    setScanSaved(L('Saving...', 'Guardando...'));
+    const r = await dvSaveScan(conn, manifests.table, scanAppId, scanAppName || scanAppId, scanResult, manifests.rows || []);
+    setScanSaved(r.ok ? L('Saved. Every check now watches this app.', 'Guardado. Cada revision ahora vigila esta app.') : L('Could not save: ', 'No se pudo guardar: ') + r.err);
+    if (r.ok) runScan();
+  }, [conn, scanResult, scanAppId, scanAppName, manifests, L]);
+  const scanCards = useMemo(() => {
+    if (!scanResult) return [];
+    return scanResult.tables.map(r => {
+      const cols = r.missing.filter(c => !dvIsLookupCol(c));
+      const text = r.state === 'missing' ? 'Create one table. Display name: ' + colDisplay(r.t) + '. Primary column: name (text).'
+        + (cols.length ? ' Add only these columns: ' + cols.map(c => colDisplay(c) + ' (' + colTypeGuess(c) + ')').join(', ') + '.' : '')
+        + ' No lookup, choice or formula columns. Do not add any other columns.' : '';
+      return Object.assign({}, r, { text, cols });
+    });
+  }, [scanResult]);
+
+  // Copy column values: plan (read only), then copy on a second press.
+  const planCopy = useCallback(async () => {
+    const table = copyTable.trim().toLowerCase();
+    const from = copyFrom.trim().toLowerCase();
+    const to = copyTo.split(/[ ,]+/).map(x => x.trim().toLowerCase()).filter(Boolean);
+    setCopyPlan(null); setCopyDone(null);
+    if (!table || !from || !to.length) return;
+    setCopyBusy(L('Reading rows...', 'Leyendo filas...'));
+    const meta = await dvReadMeta(conn, table, [from].concat(to));
+    if (meta.state !== 'found') { setCopyPlan({ err: L('Table not found or no permission: ', 'Tabla no encontrada o sin permiso: ') + (meta.err || meta.state) }); setCopyBusy(''); return; }
+    const missingCols = meta.cols ? [from].concat(to).filter(c => !meta.cols.has(c)) : [];
+    if (missingCols.length) { setCopyPlan({ err: L('These columns are not on the table: ', 'Estas columnas no estan en la tabla: ') + missingCols.join(', ') }); setCopyBusy(''); return; }
+    const idCol = (meta.meta && meta.meta.PrimaryIdAttribute) || table + 'id';
+    const read = await dvReadAllRows(conn, table, [idCol, from].concat(to));
+    if (!read.ok) { setCopyPlan({ err: read.err }); setCopyBusy(''); return; }
+    setCopyPlan(Object.assign(dvPlanCopy(read.rows, idCol, from, to), { table, from, to }));
+    setCopyBusy('');
+  }, [conn, copyTable, copyFrom, copyTo, L]);
+  const runCopy = useCallback(async () => {
+    if (!copyPlan || !copyPlan.changes || !copyPlan.changes.length) return;
+    const ok = typeof window !== 'undefined' && window.confirm ? window.confirm(L('Change ' + copyPlan.changes.length + ' rows in ' + copyPlan.table + '?', 'Cambiar ' + copyPlan.changes.length + ' filas en ' + copyPlan.table + '?')) : true;
+    if (!ok) return;
+    const res = await dvRunCopy(conn, copyPlan.table, copyPlan, (d, f) => setCopyBusy(L('Copying ', 'Copiando ') + d + ' / ' + copyPlan.changes.length + (f ? L(', failed ', ', fallaron ') + f : '')));
+    setCopyBusy('');
+    setCopyDone(res);
+    setCopyPlan(null);
+  }, [conn, copyPlan, L]);
+
   const promptCards = useMemo(() => {
     const cards = [];
     ECOSYSTEM_TABLES.forEach(t => {
@@ -1934,7 +2158,9 @@ export default function DataverseOrganizerApp(props) {
           { id: 'bridges', label: L('Browser storage', 'Almacenamiento del navegador') + ' (' + STORAGE_BRIDGES.length + ')' },
           { id: 'apps', label: L('Apps', 'Apps') + ' (' + ECOSYSTEM_APPS.length + ')' },
           { id: 'manifests', label: L('Hub config', 'Hub config') + (manifests && manifests.hub ? ' (' + manifests.hub.rows.length + (manifests.hub.problems ? ', ' + manifests.hub.problems + L(' to fix', ' por corregir') : '') + ')' : '') },
-          { id: 'prompts', label: L('Table maker prompt', 'Prompt para crear tablas') }
+          { id: 'prompts', label: L('Table maker prompt', 'Prompt para crear tablas') },
+          { id: 'scancode', label: L('Scan app code', 'Escanear codigo') },
+          { id: 'copy', label: L('Copy column values', 'Copiar valores') }
         ].map(tab => (
           <button key={tab.id} type="button" onClick={() => setActiveTab(tab.id)} style={{ padding: '9px 16px', borderRadius: '6px', border: '1px solid ' + (activeTab === tab.id ? '#3b82f6' : borderCol), background: activeTab === tab.id ? '#1d4ed8' : bgCard, color: activeTab === tab.id ? '#ffffff' : textMain, fontWeight: 600, fontSize: '13px', cursor: 'pointer' }}>
             {tab.label}
@@ -2227,7 +2453,7 @@ export default function DataverseOrganizerApp(props) {
           )}
           {manifests && manifests.hub && (() => {
             const hub = manifests.hub;
-            const issueText = i => ({ blankkey: L('blank key', 'clave vacia'), dupkey: L('key saved more than once (apps may read the wrong one)', 'clave guardada mas de una vez (las apps pueden leer la equivocada)'), badjson: L('text is not valid JSON (the app cannot read it)', 'el texto no es JSON valido (la app no lo puede leer)'), cutoff: L('text was cut off at the column limit; raise the maximum length', 'el texto se corto en el limite de la columna; suba la longitud maxima'), emptyjson: L('no text saved', 'sin texto guardado'), nearlimit: L('within 10% of the column limit', 'a menos del 10% del limite de la columna'), unknownapp: L('manifest for an app the contract does not know', 'manifiesto de una app que el contrato no conoce'), appmismatch: L('appId inside does not match the key', 'el appId de adentro no coincide con la clave'), mbadjson: L('Manifest json is not valid JSON', 'Manifest json no es JSON valido'), mcutoff: L('Manifest json was cut off at its column limit', 'Manifest json se corto en el limite de su columna'), mnearlimit: L('Manifest json within 10% of its column limit', 'Manifest json a menos del 10% del limite de su columna') }[i] || i);
+            const issueText = i => ({ blankkey: L('blank key', 'clave vacia'), dupkey: L('key saved more than once (apps may read the wrong one)', 'clave guardada mas de una vez (las apps pueden leer la equivocada)'), badjson: L('text is not valid JSON (the app cannot read it)', 'el texto no es JSON valido (la app no lo puede leer)'), cutoff: L('text was cut off at the column limit; raise the maximum length', 'el texto se corto en el limite de la columna; suba la longitud maxima'), emptyjson: L('no text saved', 'sin texto guardado'), keyinname: L('the key is in the Name column, not in Config key (apps look for it in Config key)', 'la clave esta en la columna Nombre, no en Config key (las apps la buscan en Config key)'), nearlimit: L('within 10% of the column limit', 'a menos del 10% del limite de la columna'), unknownapp: L('manifest for an app the contract does not know', 'manifiesto de una app que el contrato no conoce'), appmismatch: L('appId inside does not match the key', 'el appId de adentro no coincide con la clave'), mbadjson: L('Manifest json is not valid JSON', 'Manifest json no es JSON valido'), mcutoff: L('Manifest json was cut off at its column limit', 'Manifest json se corto en el limite de su columna'), mnearlimit: L('Manifest json within 10% of its column limit', 'Manifest json a menos del 10% del limite de su columna') }[i] || i);
             const warnText = x => (x.warnings.indexOf('pointeronly') !== -1 ? L(' - holds only a pointer to Manifest json, which is empty or missing (add the column; the app saves the full list next time it opens)', ' - solo tiene un enlace a Manifest json, que esta vacia o no existe (agregue la columna; la app guarda la lista completa la proxima vez que abra)') : L(' - two apps write this key; the contract thread will pick one owner', ' - dos apps escriben esta clave; el hilo del contrato elegira un dueno'));
             const appName = a => APP_WRITER_NAMES[a] || a;
             const stateTone = { saved: 'green', notyet: 'gray', problem: 'red', warn: 'amber' };
@@ -2250,7 +2476,7 @@ export default function DataverseOrganizerApp(props) {
                 <div style={{ display: 'grid', gap: '4px' }}>
                   {hub.rows.map((x, i) => (
                     <div key={x.key + '-' + i} style={{ fontSize: '12px', fontFamily: 'Consolas, monospace', wordBreak: 'break-word', color: x.issues.length ? textMain : textSub }}>
-                      {(x.key || L('(blank key)', '(clave vacia)')) + ' - ' + x.len.toLocaleString() + L(' chars', ' caracteres') + (x.json === 'ok' ? ' - JSON ok' : '') + (x.stub ? L(' (pointer)', ' (enlace)') : '') + (x.mLen ? ' - Manifest json ' + x.mLen.toLocaleString() + L(' chars', ' caracteres') + (x.mjson === 'ok' ? ' - JSON ok' : '') : '')}
+                      {(x.key || L('(blank key', '(clave vacia') + (x.name ? L(', name "', ', nombre "') + x.name + '"' : '') + ')') + ' - ' + x.len.toLocaleString() + L(' chars', ' caracteres') + (x.json === 'ok' ? ' - JSON ok' : '') + (x.stub ? L(' (pointer)', ' (enlace)') : '') + (x.mLen ? ' - Manifest json ' + x.mLen.toLocaleString() + L(' chars', ' caracteres') + (x.mjson === 'ok' ? ' - JSON ok' : '') : '')}
                       {x.kind === 'legacy' && <span style={{ color: textSub }}>{L(' - old key, no app uses it (safe to leave)', ' - clave vieja, ninguna app la usa (se puede dejar)')}</span>}
                       {x.warnings.length > 0 && !x.issues.length && <span style={{ color: TONES.amber.fg }}>{warnText(x)}</span>}
                       {x.kind === 'unlisted' && x.key && <span style={{ color: TONES.amber.fg }}>{L(' - not on the contract list (tell the contract thread)', ' - no esta en la lista del contrato (avise al hilo del contrato)')}</span>}
@@ -2303,7 +2529,7 @@ export default function DataverseOrganizerApp(props) {
                     <div key={a.key} style={{ background: bgSub, padding: '14px', borderRadius: '6px', border: '1px solid ' + borderCol }}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginBottom: '6px' }}>
                         <div>
-                          <div style={{ fontSize: '14px', fontWeight: 700 }}>{a.app}{a.version ? ' ' + a.version : ''}</div>
+                          <div style={{ fontSize: '14px', fontWeight: 700 }}>{a.app}{a.version ? ' ' + a.version : ''}{a.fromScan ? L(' (from a code scan)', ' (de un escaneo de codigo)') : ''}</div>
                           <div style={{ fontSize: '11px', color: textSub }}>
                             {L('Saved ', 'Guardado ') + (a.savedAt ? new Date(a.savedAt).toLocaleString() : (a.modifiedOn ? new Date(a.modifiedOn).toLocaleString() : '?'))}
                             {a.contract ? ' - ' + L('built on contract ', 'hecha con contrato ') + a.contract + (a.contract !== CONTRACT_VERSION ? L(' (monitor has ', ' (el monitor tiene ') + CONTRACT_VERSION + ')' : '') : ''}
@@ -2332,6 +2558,87 @@ export default function DataverseOrganizerApp(props) {
                   );
                 })}
               </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* SCAN APP CODE: tables and columns an app names, checked and (optionally) watched */}
+      {activeTab === 'scancode' && (
+        <div style={{ background: bgCard, borderRadius: '8px', padding: '18px', border: '1px solid ' + borderCol }}>
+          <h2 style={{ margin: 0, fontSize: '18px' }}>{L('Scan an app\'s code', 'Escanear el codigo de una app')}</h2>
+          <div style={{ fontSize: '13px', color: textSub, marginTop: '4px', marginBottom: '14px' }}>
+            {L('Paste an app\'s code (or load its .txt file). The monitor finds every craa5 table and column the code names, checks them in Dataverse, and writes one short Copilot prompt per missing table. Save the scan and every later check watches that app, with no change to this page. Only table and column names are saved, never the code. Columns the code names that no table has are given to the nearest table in the code: that part is a guess, check it before you make the column.', 'Pegue el codigo de una app (o cargue su archivo .txt). El monitor encuentra cada tabla y columna craa5 que nombra el codigo, las revisa en Dataverse y escribe un prompt corto de Copilot por cada tabla que falta. Guarde el escaneo y cada revision siguiente vigila esa app, sin cambiar esta pagina. Solo se guardan nombres de tablas y columnas, nunca el codigo. Las columnas que ninguna tabla tiene se asignan a la tabla mas cercana en el codigo: eso es una suposicion, revisela antes de crear la columna.')}
+          </div>
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center', marginBottom: '8px' }}>
+            <select value={scanApp} onChange={e => setScanApp(e.target.value)} style={{ padding: '7px 10px', borderRadius: '6px', background: bgSub, color: textMain, border: '1px solid ' + borderCol, fontSize: '13px', maxWidth: '100%' }}>
+              <option value="">{L('Which app is this?', 'Que app es?')}</option>
+              {CONTRACT_APP_IDS.map(a => <option key={a} value={a}>{APP_WRITER_NAMES[a] || a}</option>)}
+              <option value="other">{L('Other (type a name)', 'Otra (escriba un nombre)')}</option>
+            </select>
+            {scanApp === 'other' && <input value={scanOther} onChange={e => setScanOther(e.target.value)} placeholder={L('App name', 'Nombre de la app')} style={{ padding: '7px 10px', borderRadius: '6px', background: bgSub, color: textMain, border: '1px solid ' + borderCol, fontSize: '13px', minWidth: 0 }} />}
+            <input type="file" accept=".txt,.js,.jsx,.ts,.tsx,.html" onChange={e => { const f = e.target.files && e.target.files[0]; if (!f) return; const fr = new FileReader(); fr.onload = () => setScanCode(String(fr.result || '')); fr.readAsText(f); }} style={{ fontSize: '12px', color: textSub, maxWidth: '100%' }} />
+          </div>
+          <textarea value={scanCode} onChange={e => setScanCode(e.target.value)} placeholder={L('Paste the app code here', 'Pegue aqui el codigo de la app')} style={{ width: '100%', boxSizing: 'border-box', height: '140px', background: bgSub, color: textMain, border: '1px solid ' + borderCol, borderRadius: '6px', padding: '10px', fontFamily: 'Consolas, monospace', fontSize: '12px' }} />
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px', alignItems: 'center' }}>
+            <button type="button" disabled={!scanCode.trim() || scanBusy} onClick={runCodeScan} style={btn(true)}>{scanBusy ? L('Scanning...', 'Escaneando...') : L('Scan code', 'Escanear codigo')}</button>
+            {scanResult && <button type="button" disabled={!scanAppId || !manifests || !manifests.table} onClick={saveCodeScan} style={btn(true, '#059669')}>{L('Save scan so every check watches this app', 'Guardar para que cada revision vigile esta app')}</button>}
+            {scanResult && !scanAppId && <span style={{ fontSize: '12px', color: TONES.amber.fg }}>{L('Pick the app first.', 'Primero elija la app.')}</span>}
+            {scanSaved && <span style={{ fontSize: '12px', color: /^(Could|No se)/.test(scanSaved) ? TONES.red.fg : textSub }}>{scanSaved}</span>}
+          </div>
+          {scanResult && (
+            <div style={{ marginTop: '14px' }}>
+              <div style={{ fontSize: '13px', color: textSub, marginBottom: '8px' }}>{L('Found ', 'Se encontraron ') + scanResult.tokenTables + L(' tables and ', ' tablas y ') + scanResult.tokenCols + L(' column names.', ' nombres de columna.')}</div>
+              <div style={{ display: 'grid', gap: '10px' }}>
+                {scanCards.map(c => {
+                  const tone = c.state === 'missing' ? 'red' : (c.state === 'denied' ? 'purple' : (c.state === 'found' ? (c.missing.length ? 'amber' : 'green') : 'gray'));
+                  const word = c.state === 'missing' ? L('Table missing', 'Falta la tabla') : (c.state === 'denied' ? L('No permission', 'Sin permiso') : (c.state === 'found' ? (c.missing.length ? c.missing.length + L(' column(s) missing', ' columna(s) faltan') : (c.checked ? L('Everything there', 'Todo existe') : L('Columns not checked', 'Columnas sin revisar'))) : L('Could not tell', 'No se pudo saber')));
+                  return (
+                    <div key={c.t} style={{ background: bgSub, padding: '12px', borderRadius: '6px', border: '1px solid ' + borderCol }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                        <span style={{ fontFamily: 'Consolas, monospace', fontSize: '13px', fontWeight: 700, wordBreak: 'break-word', minWidth: 0 }}>{c.t}</span>
+                        <span style={pill(TONES[tone] ? tone : 'gray')}>{word}</span>
+                      </div>
+                      {c.have.length > 0 && <div style={{ fontSize: '12px', color: textSub, marginTop: '4px', wordBreak: 'break-word' }}>{L('There: ', 'Existen: ') + c.have.join(', ')}</div>}
+                      {c.missing.length > 0 && <div style={{ fontSize: '12px', color: TONES.amber.fg, marginTop: '4px', wordBreak: 'break-word' }}>{(c.state === 'missing' ? L('Columns (guessed from the code): ', 'Columnas (adivinadas del codigo): ') : L('Missing (guessed, add by hand): ', 'Faltan (adivinadas, agregue a mano): ')) + c.missing.join(', ')}</div>}
+                      {c.text && <button type="button" onClick={() => copyText(c.text, L('the prompt', 'el prompt'))} style={{ ...btn(true, '#059669'), marginTop: '8px' }}>{L('Copy prompt', 'Copiar prompt')} ({c.text.length} {L('chars', 'caracteres')})</button>}
+                    </div>
+                  );
+                })}
+              </div>
+              {scanResult.loose.length > 0 && <div style={{ fontSize: '12px', color: textSub, marginTop: '10px', wordBreak: 'break-word' }}>{L('Names not placed on a table (could be settings keys or text): ', 'Nombres sin tabla (pueden ser claves o texto): ') + scanResult.loose.join(', ')}</div>}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* COPY COLUMN VALUES: one-time fill of new columns from an old one */}
+      {activeTab === 'copy' && (
+        <div style={{ background: bgCard, borderRadius: '8px', padding: '18px', border: '1px solid ' + borderCol }}>
+          <h2 style={{ margin: 0, fontSize: '18px' }}>{L('Copy one column into others', 'Copiar una columna a otras')}</h2>
+          <div style={{ fontSize: '13px', color: textSub, marginTop: '4px', marginBottom: '14px' }}>
+            {L('For one-time fills, like copying the old allergen clean flag into the new egg and pecan columns. Check first only reads and counts. Copy changes only the "to" columns, only where they differ, and skips rows where the "from" column is blank. This tab and saving a code scan are the only parts of the monitor that write to Dataverse.', 'Para llenados de una sola vez, como copiar la marca vieja de limpieza de alergeno a las columnas nuevas de huevo y nuez. Revisar solo lee y cuenta. Copiar cambia solo las columnas "a", solo donde son distintas, y salta filas donde la columna "de" esta vacia. Esta pestana y guardar un escaneo son las unicas partes del monitor que escriben en Dataverse.')}
+          </div>
+          {[[L('Table', 'Tabla'), copyTable, setCopyTable], [L('From column', 'De la columna'), copyFrom, setCopyFrom], [L('To columns (comma between)', 'A las columnas (separe con coma)'), copyTo, setCopyTo]].map(f => (
+            <label key={f[0]} style={{ display: 'block', fontSize: '12px', color: textSub, marginBottom: '8px' }}>{f[0]}
+              <input value={f[1]} onChange={e => { f[2](e.target.value); setCopyPlan(null); }} style={{ display: 'block', width: '100%', boxSizing: 'border-box', marginTop: '3px', padding: '7px 10px', borderRadius: '6px', background: bgSub, color: textMain, border: '1px solid ' + borderCol, fontSize: '13px', fontFamily: 'Consolas, monospace' }} />
+            </label>
+          ))}
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+            <button type="button" disabled={!!copyBusy} onClick={planCopy} style={btn(false)}>{L('Check first', 'Revisar primero')}</button>
+            {copyPlan && copyPlan.changes && copyPlan.changes.length > 0 && <button type="button" disabled={!!copyBusy} onClick={runCopy} style={btn(true, '#b45309')}>{L('Copy to ', 'Copiar a ') + copyPlan.changes.length + L(' rows', ' filas')}</button>}
+            {copyBusy && <span style={{ fontSize: '12px', color: textSub }}>{copyBusy}</span>}
+          </div>
+          {copyPlan && copyPlan.err && <div style={{ fontSize: '13px', color: TONES.red.fg, marginTop: '10px' }}>{copyPlan.err}</div>}
+          {copyPlan && copyPlan.changes && (
+            <div style={{ fontSize: '13px', marginTop: '10px' }}>
+              {copyPlan.total + L(' rows read. ', ' filas leidas. ') + copyPlan.changes.length + L(' will change. ', ' van a cambiar. ') + copyPlan.skippedBlank + L(' skipped because ', ' se saltan porque ') + copyPlan.from + L(' is blank.', ' esta vacia.')}
+              {copyPlan.changes.length === 0 && <span style={{ color: TONES.green.fg }}>{L(' Nothing to copy: the columns already match.', ' Nada que copiar: las columnas ya coinciden.')}</span>}
+            </div>
+          )}
+          {copyDone && (
+            <div style={{ fontSize: '13px', marginTop: '10px', color: copyDone.failed.length ? TONES.red.fg : TONES.green.fg }}>
+              {L('Done: ', 'Listo: ') + (copyDone.done - copyDone.failed.length) + L(' rows changed', ' filas cambiadas') + (copyDone.failed.length ? L(', ', ', ') + copyDone.failed.length + L(' failed (first error: ', ' fallaron (primer error: ') + copyDone.failed[0] + ')' : '') + L('. Press Check first again to confirm.', '. Presione Revisar primero otra vez para confirmar.')}
             </div>
           )}
         </div>
