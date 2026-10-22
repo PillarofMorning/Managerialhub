@@ -417,7 +417,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
-- **1.0.27 (2026-10-22)** Monitor run: `craa5_configjson` holds only 100 characters, so **every** hubconfig JSON value now goes in `craa5_manifestjson`; the manifest helper no longer writes a stub there; new `hubConfigJsonOf` (86 checks). Equipment allergen flags are `craa5_eggallergen` and `craa5_pecanallergen` (as Gerald made them); the minutes columns are still to make. Training: `craa5__t_skilllevel1` accepted as the skill level table name. hubconfig key `CHANGEOVER_RULES` found, owner unknown.
+- **1.0.27 (2026-10-22)** Monitor run: `craa5_configjson` holds only 100 characters, so **every** hubconfig JSON value now goes in `craa5_manifestjson`; the manifest helper no longer writes a stub there; new `hubConfigJsonOf` (86 checks). Equipment allergen flags are `craa5_eggallergen` and `craa5_pecanallergen` (as Gerald made them); the minutes columns are still to make. Training: `craa5__t_skilllevel1` accepted as the skill level table name. hubconfig key `CHANGEOVER_RULES` found, owner unknown (not the Scheduler).
 - **1.0.26 (2026-10-21)** `hub-shared.js`: the manifest table constant is now `HUB_MANIFEST_TABLE` (was `HUB_CONFIG_TABLE`, which MSS Calendar and MSS Log Input already declare). `contract.json`: Equipment `optionalCols` lists the egg / pecan columns and `craa5_minalrg`.
 - **1.0.25 (2026-10-21)** Q7 tables from the Ganttly thread: `_g_ Obstacle`, `_g_ Handover`, `_g_ Personnel note` (sections 3.3 and 13, contract.json). Ganttly stops writing notes into the Employee `craa5_remarks` JSON.
 - **1.0.24 (2026-10-21)** Section 2: egg / pecan minutes are labor person-minutes like `craa5_minalrg`; blank or 0 falls back to it.
