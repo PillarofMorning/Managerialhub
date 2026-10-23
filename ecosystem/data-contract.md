@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.52, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.53, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -100,7 +100,7 @@ Time loss log keeps the column names it was created with: `craa5_assetguid` hold
 
 | Table | Status | Writes it | Reads it |
 |---|---|---|---|
-| `craa5__facilityobservation` Map problems and pins | live | Map submission tool (owner). **Pathogen BOLO** creates its own pin rows only (a positive or harborage concern), row id `hubIdFromKey('bolo|' + swab key)`, and never edits a Map tool row | Pathogen BOLO, Manager hub |
+| `craa5__facilityobservation` Map problems and pins | live | Map submission tool (owner). **Pathogen BOLO** creates its own pin rows only (a positive or harborage concern), row id `hubIdFromKey('bolo|' + swab key)`, and never edits a Map tool row. BOLO rows are marked by `craa5__description` starting `(PATHOGEN BOLO - ` or `(HARBORAGE CONCERN - ` (keep these exact); the Map tool shows them read only | Pathogen BOLO, Manager hub |
 | `craa5___maps` Floor maps | live | Map submission tool | Pathogen BOLO |
 | `craa5_pathogenboloswabcatalog0320` Swab sites | live | Pathogen BOLO | Pathogen BOLO, Ganttly, Map tool |
 | `craa5__b_swabresult` Swab results (columns in contract.json; one row per sample, description and test; open hit = `craa5_result` positive, `craa5_closedkey` blank, `statecode` 0, and `craa5_collectiondate` within the alert window (`alertMonths` in Hub config key `PATHOGEN_BOLO_RULES`, default 2 months; older positives are history). A hit is closed by **any** MSS log row on the same equipment (or area, when the site has no equipment) with a shift date on or after the collection date: every clean follows the presumptive process (Gerald, 2026-10-23)) | **proposed** (BOLO v2.4, PR #37) | Pathogen BOLO | Manager hub, Ganttly, MSS Calendar |
@@ -441,6 +441,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.53 (2026-10-23)** BOLO map pin marker: description prefix `(PATHOGEN BOLO - ` or `(HARBORAGE CONCERN - `; Map tool shows those rows read only.
 - **1.0.52 (2026-10-23)** Pathogen BOLO 2.5: may create its own pin rows in `craa5__facilityobservation` (never edits Map tool rows); `PATHOGEN_BOLO_RULES` gains `closeDays` (default 7, positive Overdue after it).
 - **1.0.51 (2026-10-23)** Monitor printout: real names `craa5_gassignment` and `craa5_employeenote` (probe first); `_e_ Hub config` has no Config key column yet (apps fall back to the old table until it is added, `table-prompts.md` part 8); `craa5_manifestjson` optional on hubconfig; `craa5_roleid` is probably a lookup (read the formatted value); room is not a join key; the SAP work area pair is one way only (Equipment `craa5_workareacode` is found in `craa5_aa_ms_assets.craa5_title`, not the reverse); `craa5_mssresourcechemicalstandard` and `craa5_sanitationheadcountshiftrosterledger` listed as unclaimed (no app uses them); plain `craa5_shifttask` is not the Shift task table; config key `MONITOR_HISTORY` (monitor, daily counts only).
 - **1.0.50 (2026-10-23)** Scheduler v4.7 crew plan (PR #39, aae7e04): clean plan `staff` rows written; new section 7 number **Heads needed per shift**, worked out only by the Scheduler (default under Gerald's passive mode: one manpower engine, so MSS Log Input reads `staff` rows and its fixed posts move to `_e_ Shift task`); `PRODSCHED_CREWPLAN` in use; `_e_ Shift task` prompt in `table-prompts.md` part 9; Overdue by frequency = previous period missed too; MSS MANPOWER v1.1 listed in 12.2.
