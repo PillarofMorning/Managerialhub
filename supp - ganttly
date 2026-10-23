@@ -2,15 +2,14 @@
  * [PERSISTENT MEMORY & APP REGISTRATION BLOCK]
  * APP NAME:        Floor Ganttly
  * PHASE ID:        P3.1 (Ref: _00 - list of apps - defined how to integrate - link to masterplan)
- * CURRENT VERSION: v1.4.1 (HUB SHARED of contract 1.0.42; Mexican Spanish: cuarto, usted form in the manual. v1.4: _g_ tables, egg / pecan, manifest)
+ * CURRENT VERSION: v1.4.2 (no more archiving of Shift Start boards: Shift Start alone archives. v1.4.1 Mexican Spanish; v1.4 _g_ tables, egg / pecan, manifest)
  * FOLDER STATUS:   Root Workspace
  * REPO SOURCE:     P3.1 - supp - ganttly
  * 
  * DATAVERSE INTEGRATIONS:
  * - craa5_taskassignment (craa5_taskassignments, OTC: 10778) | Role: Read-Only (older shifts; active rows only, until retired into the archive)
- * - craa5_shiftboard (craa5_shiftboards)                    | Role: Read + updates column + archive (Shift Start live boards; archived 4h after shift end)
- * - craa5_shiftarchive (craa5_shiftarchives)                | Role: Read + Write (archived shifts; written when Ganttly archives an overdue board)
- * - craa5_shiftlog (craa5_shiftlogs)                        | Role: Write (activity log entry when Ganttly archives a board)
+ * - craa5_shiftboard (craa5_shiftboards)                    | Role: Read + craa5_updatesjson only (Shift Start live boards)
+ * - craa5_shiftarchive (craa5_shiftarchives)                | Role: Read-Only (archived shifts; Shift Start alone archives, contract 1.0.43)
  * - craa5_shiftplan (craa5_shiftplans)                      | Role: Never read (future-shift plans stay in Shift Start)
  * - craa5__aa_prd_schd (craa5__aa_prd_schds, OTC: 10797)     | Role: Read-Only
  * - craa5_changeover_rule (craa5_changeover_rules, OTC: 10854)| Role: Read-Only
@@ -3207,14 +3206,12 @@ function taskRowsSignature(rows) {
 const GB_BOARD_TABLE = 'craa5_shiftboard';
 const GB_PLAN_TABLE = 'craa5_shiftplan';
 const GB_ARCHIVE_TABLE = 'craa5_shiftarchive';
-const GB_LOG_TABLE = 'craa5_shiftlog';
 const GB_ARCHIVE_AFTER_MS = 4 * 3600000;
 const GB_PREP_MS = TASK_PRE_SHIFT_MIN * 60000;
 let GB_BOARD_MISSING = false;
 let GB_PLAN_MISSING = false;
 let GB_ARCHIVE_MISSING = false;
 let GB_HAS_UPDATES = true;
-let GB_AUTO_ARCHIVE_DONE = false;
 let GB_LIVE = [];
 let GB_ARCHIVES = [];
 const GB_OUT_RE = /\b(pto|sick|late|left early|ncns)\b/i;
@@ -3588,186 +3585,9 @@ function gbDropCovered(rows, shifts) {
     });
 }
 function gbBoardName(b) { return (b.crew || '?') + ' | ' + (b.team || '?') + ' | ' + new Date(b.slotStart).toISOString(); }
-function gbLogLine(b, by, what) { return (b.log || []).concat([{ at: new Date().toISOString(), by: by, what: what }]).slice(-60); }
-const GB_REFUSED_COLS = {};
-// Creates or updates a row; any column the table refuses (including craa5_title / craa5_shiftplan1 / craa5_shiftarchive1 if the table's primary column has another logical name) is left out (only the JSON payload is required).
-async function gbWriteRow(dataApi, table, id, data) {
-    const w = swWriter(dataApi);
-    if (!w) throw new Error('no way to write to Dataverse from here');
-    const d = Object.assign({}, data), refused = [];
-    const known = GB_REFUSED_COLS[table] || {};
-    if ('craa5_title' in d) {
-        if (table === GB_PLAN_TABLE && !known.craa5_shiftplan1 && !('craa5_shiftplan1' in d)) {
-            d.craa5_shiftplan1 = d.craa5_title;
-        } else if (table === GB_ARCHIVE_TABLE && !known.craa5_shiftarchive1 && !('craa5_shiftarchive1' in d)) {
-            d.craa5_shiftarchive1 = d.craa5_title;
-        } else if (known.craa5_title && table !== GB_PLAN_TABLE && table !== GB_ARCHIVE_TABLE && !known.craa5_name && !('craa5_name' in d)) {
-            d.craa5_name = d.craa5_title;
-        }
-    }
-    Object.keys(known).forEach(function (k) { if (known[k] && k in d && k !== 'craa5_boardjson' && k !== 'craa5_details') { refused.push(k); delete d[k]; } });
-    for (let attempt = 0; attempt < 16; attempt++) {
-        try {
-            if (id) { await w.update(table, id, d); return { id: id, refused: refused }; }
-            const res = await w.create(table, d);
-            const rid = String(typeof res === 'string' ? res : ((res && (res.id || res[table + 'id'] || res.rowId)) || '')).replace(/[{}]/g, '');
-            return { id: rid, refused: refused };
-        } catch (e) {
-            const m = String((e && e.message) || e || '');
-            const bad = (m.match(/craa5_[a-z0-9_]+/g) || []).find(function (n) { return n in d && n !== 'craa5_boardjson' && n !== 'craa5_details'; });
-            if (bad) {
-                refused.push(bad);
-                GB_REFUSED_COLS[table] = Object.assign({}, GB_REFUSED_COLS[table] || {}, { [bad]: true });
-                if (bad === 'craa5_title' && table !== GB_PLAN_TABLE && table !== GB_ARCHIVE_TABLE && !(GB_REFUSED_COLS[table] && GB_REFUSED_COLS[table].craa5_name) && !('craa5_name' in d)) {
-                    d.craa5_name = d.craa5_title;
-                }
-                delete d[bad];
-                continue;
-            }
-            if (/statuscode/i.test(m) && 'statuscode' in d) { delete d.statuscode; continue; }
-            throw e;
-        }
-    }
-    throw new Error('too many columns refused');
-}
-// Writes the live board itself (status, archive marks). The updates column is never part of it.
-async function gbWriteBoard(dataApi, b) {
-    const clean = Object.assign({}, b); delete clean.recordId; delete clean.updates;
-    await gbWriteRow(dataApi, GB_BOARD_TABLE, b.recordId, { craa5_title: gbBoardName(b), craa5_boardjson: JSON.stringify(clean), craa5_status: b.status, craa5_archivedon: b.archivedAt || null, craa5_archivedby: b.archivedBy || '' });
-}
-async function gbReadBoard(dataApi, id) {
-    try { const rows = await gbQuery(dataApi, GB_BOARD_TABLE + 'id eq ' + id, gbSelect(), 1); return rows.length ? gbParse(rows[0], GB_BOARD_TABLE) : null; } catch (e) { return null; }
-}
-// The archive row of a shift (a shift is archived once; doing it again updates the same row). Falls back to craa5_shiftarchive1 and craa5_boardjson if craa5_title is not a column on craa5_shiftarchive.
-async function gbArchiveIdByName(dataApi, name) {
-    const colsToTry = ['craa5_title', 'craa5_shiftarchive1'];
-    for (let c = 0; c < colsToTry.length; c++) {
-        const col = colsToTry[c];
-        if (!(GB_REFUSED_COLS[GB_ARCHIVE_TABLE] && GB_REFUSED_COLS[GB_ARCHIVE_TABLE][col])) {
-            try {
-                const rows = await gbQueryTable(dataApi, GB_ARCHIVE_TABLE, col + " eq '" + name.replace(/'/g, "''") + "'", [GB_ARCHIVE_TABLE + 'id', 'modifiedon'], 5);
-                return rows.length ? String(getRowField(rows[0], GB_ARCHIVE_TABLE + 'id') || '').replace(/[{}]/g, '') : '';
-            } catch (e) {
-                if (new RegExp(col, 'i').test(String((e && e.message) || e || ''))) {
-                    GB_REFUSED_COLS[GB_ARCHIVE_TABLE] = Object.assign({}, GB_REFUSED_COLS[GB_ARCHIVE_TABLE] || {}, { [col]: true });
-                } else return '';
-            }
-        }
-    }
-    try {
-        const rows = await gbQueryTable(dataApi, GB_ARCHIVE_TABLE, 'statecode eq 0', [GB_ARCHIVE_TABLE + 'id', 'craa5_boardjson', 'modifiedon'], 100);
-        for (let i = 0; i < rows.length; i++) {
-            const b = gbParse(rows[i], GB_ARCHIVE_TABLE);
-            if (b && gbBoardName(b) === name) return b.recordId || '';
-        }
-    } catch (e2) {}
-    return '';
-}
-// The activity log Shift Start keeps (craa5_shiftlog); Ganttly adds what it archives. Also written to the browser console.
-function gbLog(dataApi, entry) {
-    const e = Object.assign({ app: 'Ganttly', at: new Date().toISOString() }, entry);
-    try { console.info('[Ganttly activity] ' + e.at + ' - ' + (e.user || 'unknown') + ' - ' + e.action + (e.board ? ' - ' + e.board : ''), e.summary || ''); } catch (x) { /* console only */ }
-    const data = { craa5_title: (e.action + ' | ' + (e.user || '?') + ' | ' + e.at).slice(0, 200), craa5_details: JSON.stringify(e), craa5_action: e.action, craa5_user: e.user || '', craa5_useremail: e.email || '', craa5_board: e.board || '', craa5_boardid: e.boardId || '', craa5_crew: e.crew || '', craa5_team: e.team || '', craa5_summary: String(e.summary || '').slice(0, 3900), craa5_app: e.app, craa5_at: e.at };
-    return gbWriteRow(dataApi, GB_LOG_TABLE, '', data).catch(function () { /* only a log */ });
-}
-// Archives one board the way Shift Start does: claim it, write the shift to craa5_shiftarchive (with Ganttly's equipment and end
-// times on its rows), mark the live board archived and deactivate it. Nothing is ever deleted.
-async function gbArchiveBoard(dataApi, board, by) {
-    const w = swWriter(dataApi);
-    if (!w || !board.recordId) return { ok: false, skipped: true, written: 0, error: 'no way to write to Dataverse from here' };
-    if (GB_ARCHIVE_MISSING) return { ok: false, skipped: true, written: 0, error: 'the table ' + GB_ARCHIVE_TABLE + ' does not exist yet' };
-    let b = (await gbReadBoard(dataApi, board.recordId)) || board;
-    if (b.status === 'archived') return { ok: true, skipped: true, written: 0, error: '' };
-    if (b.claim && b.claim.id && Date.now() - new Date(b.claim.at).getTime() < 10 * 60000) return { ok: false, skipped: true, written: 0, error: 'someone else is archiving it' };
-    const claim = { id: by + '|' + Date.now() + '|' + Math.random().toString(36).slice(2, 8), by: by, at: new Date().toISOString() };
-    await gbWriteBoard(dataApi, Object.assign({}, b, { claim: claim }));
-    await new Promise(function (res) { setTimeout(res, 1200); });
-    const check = await gbReadBoard(dataApi, board.recordId);
-    if (check && (!check.claim || check.claim.id !== claim.id)) return { ok: false, skipped: true, written: 0, error: 'someone else took it over' };
-    b = Object.assign({}, check || b, { claim: claim });
-    const now = new Date().toISOString(), rows = gbApplyUpdates(b.rows || [], b.updates), archivedBy = 'auto (' + by + ', Ganttly)';
-    const arch = Object.assign({}, b, { kind: 'archive', rows: rows, status: 'archived', archivedAt: now, archivedBy: archivedBy, source: 'live', sourceBoardId: b.recordId, claim: null, reopened: false });
-    delete arch.recordId; delete arch.updates; delete arch.modifiedOn;
-    arch.log = gbLogLine(b, by, 'archived (auto, Ganttly): ' + rows.length + ' rows');
-    const data = {
-        craa5_title: gbBoardName(b), craa5_boardjson: JSON.stringify(arch), craa5_status: 'archived', craa5_crew: b.crew || '', craa5_team: b.team || '',
-        craa5_slotstart: new Date(b.slotStart).toISOString(), craa5_slotend: new Date(gbEnd(b)).toISOString(), craa5_savecount: b.saveCount || 0, craa5_lastsavedby: b.savedBy || '',
-        craa5_archivedon: now, craa5_archivedby: archivedBy, craa5_source: 'live', craa5_sourceboardid: b.recordId, craa5_retiredon: null
-    };
-    if (b.updates) data.craa5_updatesjson = JSON.stringify(b.updates);
-    let archiveId = '';
-    try {
-        const id = b.archiveId || (await gbArchiveIdByName(dataApi, data.craa5_title));
-        archiveId = (await gbWriteRow(dataApi, GB_ARCHIVE_TABLE, id, data)).id;
-    } catch (e) {
-        const m = String((e && e.message) || e || '');
-        if (gbMissing(m)) GB_ARCHIVE_MISSING = true;
-        try { await gbWriteBoard(dataApi, Object.assign({}, b, { claim: null, error: m, log: gbLogLine(b, by, 'archive (auto, Ganttly) stopped: ' + m) })); } catch (x) { /* the claim runs out by itself */ }
-        return { ok: false, skipped: false, written: 0, error: 'the archive could not be written: ' + m };
-    }
-    let error = '';
-    try {
-        await gbWriteBoard(dataApi, Object.assign({}, b, { status: 'archived', archivedAt: now, archivedBy: archivedBy, archiveId: archiveId, claim: null, reopened: false, error: '', log: gbLogLine(b, by, 'archived (auto, Ganttly) to ' + GB_ARCHIVE_TABLE) }));
-        await gbWriteRow(dataApi, GB_BOARD_TABLE, b.recordId, { statecode: 1, statuscode: 2 });
-    } catch (e) { error = 'archived, but the live row could not be closed: ' + String((e && e.message) || e || ''); }
-    const targetRecId = gbGuid(b.recordId || board.recordId);
-    const targetName = gbBoardName(b);
-    GB_LIVE = GB_LIVE.filter(function (x) { return gbGuid(x && (x.recordId || x.id)) !== targetRecId && gbBoardName(x) !== targetName; });
-    // Remove archived board from localStorage['ss_live_boards_local_v1'] and sessionStorage['SS_DATA_CACHE_V1'/'SS_DATA_CACHE_V2'] so it cannot resurrect
-    gbPruneLocalLiveStorage(function (lb) {
-        if (!lb) return true;
-        if (targetRecId && gbGuid(lb.recordId || lb.id) === targetRecId) return true;
-        if (gbBoardName(lb) === targetName) return true;
-        if (gbKey(lb.crew) === gbKey(b.crew) && gbKey(lb.team) === gbKey(b.team) && Number(lb.slotStart) === Number(b.slotStart)) return true;
-        return false;
-    });
-    // Best-effort: mark any open rows for this crew/team/slot in craa5_taskassignment as craa5_complete: true
-    try {
-        const slotFrom = b.slotStart - GB_PREP_MS, slotTo = gbEnd(b);
-        const openRows = await gbQueryTable(dataApi, 'craa5_taskassignment', 'statecode eq 0 and modifiedon ge ' + odataDate(slotFrom), ['craa5_taskassignmentid', 'craa5_team', 'craa5_shift', 'craa5_complete', 'craa5_datetimeofassignment', 'createdon'], 250);
-        for (let ri = 0; ri < (openRows || []).length; ri++) {
-            const tr = openRows[ri];
-            const tid = String(getRowField(tr, 'craa5_taskassignmentid') || '').replace(/[{}]/g, '');
-            if (!tid || getRowField(tr, 'craa5_complete') === true || getRowField(tr, 'craa5_complete') === 'true') continue;
-            const rt = rowTimeMs(getRowField(tr, 'craa5_datetimeofassignment')) || rowTimeMs(getRowField(tr, 'createdon'));
-            const rTeam = gbKey(getRowField(tr, 'craa5_team'));
-            const rShift = gbKey(getRowField(tr, 'craa5_shift'));
-            if (rt >= slotFrom && rt < slotTo && ((b.team && rTeam === gbKey(b.team)) || (!rTeam && b.crew && rShift === gbKey(b.crew)))) {
-                await w.update('craa5_taskassignment', tid, { craa5_complete: true }).catch(function () {});
-            }
-        }
-    } catch (eTask) {}
-    gbLog(dataApi, { action: 'archived', user: by, role: 'auto', board: gbBoardName(b), boardId: archiveId, crew: b.crew || '', team: b.team || '', summary: 'archived automatically by Ganttly (4 h after the shift): ' + rows.length + ' rows' });
-    return { ok: true, skipped: false, written: rows.length, error: error, board: b };
-}
-function gbNotice(text, ok) {
-    try {
-        if (typeof document === 'undefined' || !document.body) return;
-        const el = document.createElement('div');
-        el.setAttribute('role', 'status');
-        el.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:99999;max-width:520px;padding:10px 14px;border-radius:10px;font:600 12px Segoe UI,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.18);cursor:pointer;' + (ok ? 'background:#ECFDF5;color:#065F46;border:1px solid #A7F3D0;' : 'background:#FFF6E0;color:#8A5A00;border:1px solid #FFB81C;');
-        el.textContent = text + '  (click to dismiss)';
-        el.onclick = function () { if (el.parentNode) el.parentNode.removeChild(el); };
-        document.body.appendChild(el);
-        setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 20000);
-    } catch (e) { /* only a notice */ }
-}
+// Archiving belongs to Shift Start alone (data contract 1.0.43): it archives a board left open past its shift the next time it
+// opens. Ganttly only reads the archive and never writes craa5_shiftarchive or craa5_shiftlog.
 function gbWho() { let by = 'Ganttly'; try { const xrm = safeGetXrm(); if (xrm && xrm.Utility) by = xrm.Utility.getGlobalContext().userSettings.userName || by; } catch (e) {} return by; }
-// Shifts that ended more than 4 hours ago are archived once per opening of Ganttly (Shift Start does the same).
-async function gbArchiveOverdue(dataApi, boards) {
-    if (GB_AUTO_ARCHIVE_DONE) return;
-    GB_AUTO_ARCHIVE_DONE = true;
-    const due = (boards || []).filter(function (b) { return gbEnd(b) + GB_ARCHIVE_AFTER_MS <= Date.now(); }).sort(function (a, b) { return a.slotStart - b.slotStart; });
-    if (!due.length || GB_ARCHIVE_MISSING) return;
-    const by = gbWho(), done = [], bad = [];
-    for (let i = 0; i < due.length; i++) {
-        try { const r = await gbArchiveBoard(dataApi, due[i], by); if (r.ok && !r.skipped) done.push(due[i].team + ' (' + new Date(due[i].slotStart).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' }) + ', ' + r.written + ' rows)'); else if (!r.ok && !r.skipped) bad.push(due[i].team + ': ' + r.error); }
-        catch (e) { bad.push(due[i].team + ': ' + String((e && e.message) || e)); }
-        if (GB_ARCHIVE_MISSING) break;
-    }
-    if (done.length) gbNotice('Archived ' + done.length + ' Shift Start board' + (done.length === 1 ? '' : 's') + ' that ended more than 4 hours ago: ' + done.join('; ') + '.', true);
-    if (bad.length) gbNotice(bad.length + ' Shift Start board' + (bad.length === 1 ? '' : 's') + ' could not be archived (' + bad.join('; ') + '); retried next time.', false);
-}
 // ---- Ganttly -> live shift board: equipment done and high fives (written one at a time, newest read first, so none is lost) ----
 let GB_UPD_CHAIN = Promise.resolve();
 function gbBoardFor(people, area) {
@@ -3891,7 +3711,6 @@ async function fetchTaskAssignmentRows(dataApi, sinceMs, untilMs) {
     const archives = all[2] || [];
     const plans = all[3] || [];
     GB_ARCHIVES = archives;
-    if (boards.length) setTimeout(function () { gbArchiveOverdue(dataApi, boards).catch(function () {}); }, 1500);
     if (!boards.length && !archives.length && !plans.length) {
         return IS_CURRENT && Array.isArray(core) ? core.filter(function (r) { return !r || (!r.craa5_superseded && r.craa5_superseded !== 'true'); }) : core;
     }
@@ -5415,7 +5234,7 @@ function gtRemarkOf(r) {
 // The tables and columns this build uses (data contract 12.1): saved once per change to Hub config 'manifest|ganttly',
 // where the Dataverse monitor checks them. Logical names only.
 const GANTTLY_MANIFEST = {
-    appId: 'ganttly', app: 'Ganttly', version: '1.4.1',
+    appId: 'ganttly', app: 'Ganttly', version: '1.4.2',
     tables: [
         { t: 'craa5_aa_assets', names: ['craa5_aa_assets', 'craa5_aa_asset'], read: ['craa5_aa_assetsid', 'craa5_equipmentidentifier', 'craa5_areaname', 'craa5_roomname', 'craa5_workareacode', 'craa5_subcategory', 'craa5_hoursrequired', 'craa5_minalrg', 'craa5_eggminutes', 'craa5_pecanminutes', 'craa5_heads', 'craa5_priority', 'craa5_supportedline', 'craa5_cleanoffsetmins', 'craa5_dailyclean', 'craa5_midweek', 'craa5_weeklyclean', 'craa5_monthlyclean', 'craa5_month', 'craa5_quarterly', 'craa5_annually', 'craa5_eggallergen', 'craa5_pecanallergen'], write: [], opt: ['craa5_eggminutes', 'craa5_pecanminutes', 'craa5_eggallergen', 'craa5_pecanallergen', 'craa5_supportedline', 'craa5_cleanoffsetmins', 'craa5_priority'] },
         { t: 'craa5__aa_employee', names: ['craa5__aa_employee', 'craa5_aa_employee'], read: ['craa5__aa_employeeid', 'craa5_name', 'craa5_shift', 'craa5_role', 'craa5_email', 'craa5_remarks', 'craa5_remarkcategory'], write: ['craa5_remarks', 'craa5_remarkcategory'], opt: ['craa5_remarks', 'craa5_remarkcategory'] },
@@ -5428,8 +5247,7 @@ const GANTTLY_MANIFEST = {
         { t: 'craa5__log_', names: ['craa5__log_'], read: ['craa5_equipmentguid', 'craa5_lastcleaned', 'craa5_sap', 'craa5_daily', 'craa5_weekly', 'craa5_monthly', 'craa5_completionkey', 'craa5_cleankind', 'craa5_shiftdate'], write: ['craa5_equipmentguid', 'craa5_completionkey', 'craa5_shiftdate', 'craa5_shiftcode', 'craa5_cleankind', 'craa5_laborminutes', 'craa5_employeeguids', 'craa5_markedby', 'craa5_source', 'craa5_doneat', 'craa5_plankey', 'craa5_linekey', 'craa5_lastcleaned', 'craa5_lastcleanedby', 'craa5_hoursworked', 'craa5_sap', 'craa5_sapw', 'craa5_uid', 'craa5_pathogen', 'craa5_allergenclean', 'craa5_daily', 'craa5_weekly', 'craa5_monthly'], opt: ['craa5_completionkey', 'craa5_shiftdate', 'craa5_shiftcode', 'craa5_cleankind', 'craa5_laborminutes', 'craa5_employeeguids', 'craa5_markedby', 'craa5_source', 'craa5_doneat', 'craa5_plankey', 'craa5_linekey', 'craa5_allergenclean'] },
         { t: 'craa5_shiftboard', names: [GB_BOARD_TABLE], read: ['craa5_boardjson', 'craa5_updatesjson'], write: ['craa5_updatesjson'], opt: ['craa5_updatesjson'] },
         { t: 'craa5_shiftplan', names: [GB_PLAN_TABLE], read: ['craa5_boardjson'], write: [], opt: [] },
-        { t: 'craa5_shiftarchive', names: [GB_ARCHIVE_TABLE], read: ['craa5_boardjson', 'craa5_updatesjson', 'craa5_slotstart'], write: ['craa5_title', 'craa5_boardjson', 'craa5_updatesjson', 'craa5_team', 'craa5_crew', 'craa5_slotstart', 'craa5_slotend', 'craa5_sourceboardid', 'craa5_status', 'craa5_archivedon', 'craa5_archivedby', 'craa5_savecount', 'craa5_lastsavedby', 'craa5_retiredon'], opt: ['craa5_updatesjson', 'craa5_team', 'craa5_crew', 'craa5_slotend', 'craa5_sourceboardid', 'craa5_status', 'craa5_archivedon', 'craa5_archivedby', 'craa5_savecount', 'craa5_lastsavedby', 'craa5_retiredon'] },
-        { t: 'craa5_shiftlog', names: [GB_LOG_TABLE], read: [], write: ['craa5_title', 'craa5_action', 'craa5_app', 'craa5_at', 'craa5_board', 'craa5_boardid', 'craa5_crew', 'craa5_details', 'craa5_source', 'craa5_summary', 'craa5_team', 'craa5_user', 'craa5_useremail'], opt: ['craa5_action', 'craa5_app', 'craa5_at', 'craa5_board', 'craa5_boardid', 'craa5_crew', 'craa5_details', 'craa5_source', 'craa5_summary', 'craa5_team', 'craa5_user', 'craa5_useremail'] },
+        { t: 'craa5_shiftarchive', names: [GB_ARCHIVE_TABLE], read: ['craa5_boardjson', 'craa5_updatesjson', 'craa5_slotstart'], write: [], opt: ['craa5_updatesjson'] },
         { t: 'craa5_taskassignment', names: ['craa5_taskassignment'], read: TASK_ROW_FIELDS, write: [], opt: [] },
         { t: 'craa5__g_obstacle', names: GT_SPECS.obstacle.names, read: [GT_SPECS.obstacle.key].concat(GT_SPECS.obstacle.cols), write: [GT_SPECS.obstacle.key].concat(GT_SPECS.obstacle.cols), opt: GT_SPECS.obstacle.cols },
         { t: 'craa5__g_handover', names: GT_SPECS.handover.names, read: [], write: [GT_SPECS.handover.key].concat(GT_SPECS.handover.cols), opt: GT_SPECS.handover.cols },
