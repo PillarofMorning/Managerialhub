@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.66, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.67, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -460,6 +460,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.67 (2026-10-23)** Ordering hub v0.11 (PR #30) finished 12.3: HUB SHARED v1.3, saves `manifest|chemicals`, no table building. contract.json now carries `colTypes`, `label`, `owner` "user" and `primary` for the 10 `_c_` tables the hub uses (from /mnt/project-files/chemical-ordering/contract/c-tables.json); checklist task, clerk checklist, chemical standard and sanitation budget have none yet (later phase). Week start (Sunday in the hub vs Monday here) stays open with Gerald.
 - **1.0.66 (2026-10-23)** Production Scheduler v4.9 (PR #39, 6a0a8cb) finished 12.3: no `staff` rows, no Crew plan tab, no Shift task reads or writes, `PRODSCHED_CREWPLAN` legacy (no config keys of its own now); its Shifts tab reads `DIRECTOR_HEADS`. Rules stamp ends `|night1` again. `_e_ Shift task` readers: Shift Start, Ganttly, Manager hub (writer: the director).
 - **1.0.65 (2026-10-23)** `_b_ Swab result` is live (entity set `craa5__b_swabresults`, 20,000+ rows) with colTypes for it and the swab catalog; dates (`craa5_collectiondate`, `craa5_closedon`) stay text plant days and `craa5_result` / `craa5_test` / `craa5_stage` stay text, never choice. `_e_ Hub config` gains `noBuildCols` [`craa5_manifestjson`] (old table only; never add it to the new one). BOLO finished 12.3 (v2.5.2, HUB SHARED v1.3).
 - **1.0.64 (2026-10-23)** Sanitation director v1.1 (PR #44, 1e86e2e) works out heads needed per shift and publishes Hub config `DIRECTOR_HEADS` (guide /mnt/project-files/sanitation-director/director-heads.md); it writes `_e_ Shift task` (the Scheduler no longer does) and owns the MSS MANPOWER block. The Scheduler can stop writing `staff` rows and remove its Crew plan tab once Gerald pastes director v1.1.
