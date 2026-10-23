@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.38, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.39, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -262,7 +262,7 @@ Every app computes these the same way, from the same table, with the `hub-shared
 | **Headcount planned / present** | Board rows assigned / board rows with attendance `present`, `late` or `loaned` | Shift board | |
 | **Labor cost** | Labor minutes / 60 x the hourly rate for the person's role on the shift date (`_e_ Labor rate`). No default rate. With no rate, cost shows "no rate set". | MSS log + labor rate | `hubLaborCost` |
 | **Projected clean cost** | Planned, not actual: labor + chemical for a line's clean from the standards. Labor = standard labor minutes (`craa5_hoursrequired` and its kind columns) / 60 x the `_e_ Labor rate` row (role `Sanitor`, else `All`; newest Effective from on or before the plant day; undated rows not used; no default, "no rate set"). Chemical = gallons per clean (`_c_ Chemical standard`, newest Valid from on or before the plant day) x price per gallon (price per container / gallons per container). Always labeled "projected", never added to actual cost. | Equipment, labor rate, chemical standard, chemical | |
-| **Due by frequency** | A piece is done for a frequency (D, MW, W, M, Q, S, A) when a finished clean of equal or higher rank falls in **the same period as today**: plant day, Monday week (MW and W), calendar month, quarter, half year (S, flag `craa5_month`), year. Otherwise it is due. Ranks: daily / allergen / egg / pecan / changeover / corrective 1, midweek 2, eow 3, monthly 4, quarterly 5, semiannual 6, annual 7. Same rule as the MSS Calendar. | MSS log + Equipment flags | `hubPeriodKey`, `hubKindRank`, `hubFreqDone` |
+| **Due by frequency** | A piece is done for a frequency (D, MW, W, M, Q, S, A) when a finished clean of equal or higher rank falls in **the same period as today**: plant day, Monday week (MW and W), calendar month, quarter, half year (S, flag `craa5_month`), year. Otherwise it is due. Ranks: daily / allergen / egg / pecan / changeover / corrective 1, midweek 2, eow 3, monthly 4, quarterly 5, semiannual 6, annual 7. Old log rows with no clean kind rank by their flags (`hubLogRank`: monthly 7, weekly 3, daily 2, no flags 9 = counts for everything). Which periods owe a job is the reader's call, the same way as the MSS Calendar: Daily only on days the line ran or the Clean Plan marks due, a Saturday + Sunday stretch is one job done by a clean on either day, and a week the Clean Plan marks idle owes no MW / W job (neither done nor missed). | MSS log + Equipment flags + Clean Plan | `hubLogRank`, `hubPeriodKey`, `hubFreqDone` |
 | **Weekly cost recap** | Labor cost summed by week key, line key and clean kind | MSS log | `hubWeekKey` |
 | **Sanitation cost per pound** | (Labor cost + chemical cost for the week) / `craa5_dailyproduction.craa5_pounds` for the week. Chemical cost for the week = (drop in counts + received) between the two Sunday counts around the Monday-Sunday week, x unit price. If a count is missing, received spend is used and the number is marked so. **Draft, for Gerald to confirm.** | MSS log, chemical hub, daily production | |
 | **Time lost** | Minutes in `craa5__m_timelosslog` by kind. Kind `Weekend clean` rows come from PBED's Add time loss form: time lost during the weekend clean (`craa5_minuteslost`, a delay reason such as Waiting on FSQ, a department, status Open). Shown on their own as "from PBED" and left out of Time lost totals. Whether they count anywhere else is Gerald's call (asked). | Manager hub | |
@@ -425,6 +425,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.39 (2026-10-23)** Due by frequency: `hubLogRank` ranks old log rows by their flags; which days and weeks owe a job follows the MSS Calendar (due days, weekend stretch, idle weeks). 111 checks.
 - **1.0.38 (2026-10-23)** Section 7: Due by frequency, the MSS Calendar's period rule, now shared in `hub-shared.js` (`HUB_FREQS`, `hubKindRank`, `hubPeriodKey`, `hubFreqDone`; 105 checks) so the Scheduler and others reuse it instead of writing a second one.
 - **1.0.37 (2026-10-23)** Scheduler game plan, all **proposed, not approved by Gerald**: `_e_ Shift task` table; changeover rule types together / apart / nights-only / clean-order; override form `pin|who|why|HH:MM`; clean plan rowtype `staff`; hub config keys `PRODSCHED_CREWPLAN`, `PRODSCHED_SCENARIOS`.
 - **1.0.36 (2026-10-23)** contract.json rebuilt from c-tables.json: optional `craa5_actiontaken` on `_c_ Chemical usage log` (Ordering hub v0.9 Log tab). Section 5: usage log date is an entry timestamp, not a shift date.

@@ -99,6 +99,14 @@ var HUB_FREQS = [
 ];
 var HUB_KIND_RANK = { daily: 1, allergen: 1, egg: 1, pecan: 1, changeover: 1, corrective: 1, midweek: 2, eow: 3, monthly: 4, quarterly: 5, semiannual: 6, annual: 7, other: 0 };
 function hubKindRank(kind) { var k = hubCleanKind(kind); return k ? HUB_KIND_RANK[k] || 0 : 0; }
+// Rank of one MSS log row: its craa5_cleankind; old rows with no kind keep their old meaning from the flags
+// (daily also counts as mid-week, weekly 3, monthly also counts as quarterly to annual, no flags 9 = counts for everything).
+function hubLogRank(row) {
+    if (!row) return 0;
+    if (hubCleanKind(row.craa5_cleankind)) return hubKindRank(row.craa5_cleankind);
+    var yes = function (v) { return v === true || v === 1 || /^(yes|true|1)$/i.test(String(v === undefined || v === null ? '' : v)); };
+    return yes(row.craa5_monthly) ? 7 : yes(row.craa5_weekly) ? 3 : yes(row.craa5_daily) ? 2 : 9;
+}
 function hubFreqRank(code) { for (var i = 0; i < HUB_FREQS.length; i++) if (HUB_FREQS[i].code === code) return HUB_FREQS[i].rank; return 0; }
 // Period a plant day (YYYY-MM-DD) falls in, per frequency: day, Monday week, month, quarter, half year, year.
 function hubPeriodKey(code, day) {
@@ -115,13 +123,14 @@ function hubPeriodKey(code, day) {
     }
     return '';
 }
-// doneDays = plant days of finished cleans as [{ day, kind }]. True when one of rank >= the frequency is in today's period.
+// doneDays = finished cleans as [{ day, kind }] or [{ day, rank }] (rank from hubLogRank for MSS log rows).
+// True when one of rank >= the frequency is in today's period. Which days and weeks owe a job is the reader's call (section 7).
 function hubFreqDone(code, doneDays, today) {
     var need = hubFreqRank(code), p = hubPeriodKey(code, today);
     if (!need || !p) return false;
     for (var i = 0; i < (doneDays || []).length; i++) {
         var x = doneDays[i];
-        if (x && hubKindRank(x.kind) >= need && hubPeriodKey(code, x.day) === p) return true;
+        if (x && (x.rank !== undefined ? x.rank : hubKindRank(x.kind)) >= need && hubPeriodKey(code, x.day) === p) return true;
     }
     return false;
 }
