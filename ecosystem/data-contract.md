@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.68, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.69, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -460,6 +460,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.69 (2026-10-23)** c-tables.json from the chemical thread: `primary.n` now equals `primaryName` (the real Dataverse names) for `craa5__c_chemical` (`craa5__c_chemical_name`), `craa5__c_cartline` (`craa5_cartlinename`) and `craa5__c_chemicalcount` (`craa5_chemicalname`). Found by the Dataverse monitor.
 - **1.0.68 (2026-10-23)** Shift Start v0.0018 (PR #33, 7de6a6e) finished 12.3 and rules 10/11 (no Table Setup, saves `manifest|shiftstart`, shows `DIRECTOR_HEADS` read only). contract.json `colTypes` for `craa5_shiftboard`, `craa5_shiftplan`, `craa5_shiftarchive`, `craa5_updatepreset` and `craa5_shiftlog` copied from its manifest (primary name columns untyped). Employees: Shift Start writes only `statecode` / `statuscode`. `_e_ Shift task` row: writer the Sanitation director, Shift Start a planned reader.
 - **1.0.67 (2026-10-23)** Ordering hub v0.11 (PR #30) finished 12.3: HUB SHARED v1.3, saves `manifest|chemicals`, no table building. contract.json now carries `colTypes`, `label`, `owner` "user" and `primary` for the 10 `_c_` tables the hub uses (from /mnt/project-files/chemical-ordering/contract/c-tables.json); checklist task, clerk checklist, chemical standard and sanitation budget have none yet (later phase). Week start (Sunday in the hub vs Monday here) stays open with Gerald.
 - **1.0.66 (2026-10-23)** Production Scheduler v4.9 (PR #39, 6a0a8cb) finished 12.3: no `staff` rows, no Crew plan tab, no Shift task reads or writes, `PRODSCHED_CREWPLAN` legacy (no config keys of its own now); its Shifts tab reads `DIRECTOR_HEADS`. Rules stamp ends `|night1` again. `_e_ Shift task` readers: Shift Start, Ganttly, Manager hub (writer: the director).
