@@ -1,0 +1,532 @@
+# Ecosystem data contract
+
+Version 1.0.69, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+
+Files that go with it (same folder):
+
+- `contract.json`: the same tables and keys in a form a program can read (the Dataverse monitor reads it).
+- `hub-shared.js`: the helpers that build every key, date and number below. Paste the whole `HUB SHARED` block (now v1.1) into each app, unchanged. v1.0 apps keep working; v1.1 only adds the manifest helpers (12.1).
+- `table-prompts.md`: Copilot prompts and click-steps for the new table and columns.
+- `test/hub-shared.test.js`: `node ecosystem/test/hub-shared.test.js` checks the helpers (58 checks).
+
+Changes go through this thread. An app thread that needs a new key, column, status word or number asks here first. Then the change is added to this file, `contract.json` and the change log (section 15) in one step.
+
+---
+
+## 1. Ground rules
+
+1. **One writer per fact.** Each table, or each column group on a shared reference table, has one app that writes it. The other apps only read it (section 3).
+2. **Facts live in Dataverse, not in the browser.** Browser storage is only for one computer's own conveniences: language, theme, a collapsed panel, a save queue waiting to retry. Anything a second computer needs to see goes in a table (section 11 lists what moves).
+3. **Plain keys, no lookups.** Tables point at each other with text keys, set out in section 2. Lookup columns that already exist stay, but no app depends on them for a join.
+4. **Exact column names.** An app reads the column names in this contract. It does not guess from 22 possible names. A missing column is shown as missing (section 8.6) and is never filled in from another column.
+5. **Empty means empty.** When a read fails or comes back empty, the screen says so. It never shows sample, seed or remembered data as if it were real.
+6. **A save is done when Dataverse says so.** Nothing is marked sent, saved or logged before the write succeeds. A failed write stays queued and is retried. Repeated writes use a fixed row id built from the row's key (`hubIdFromKey`), so a retry or a second device updates the same row and never adds a second one. Exception: the chemical hub's `_c_` tables build their fixed ids with its own `chGuidFrom` (13,519 usage rows already carry them). Only the chemical hub writes those tables, so the two id builders never meet on the same row.
+7. **Plant time.** Every day, shift and week is read on the America/Chicago clock (section 5). Never use the UTC day.
+8. **Every word in English and Spanish (es-MX)**, with the shared words in section 9. Apps stay 7-bit ASCII (GEMINI.md), so Spanish accents are written as % codes. One exception: the Dataverse monitor, an admin tool, is English only (Gerald, 2026-10-22).
+9. **No pop-ups.** Power Apps pages silently block `window.confirm`, `alert` and `prompt`, so a button that relies on one does nothing. Ask for confirmation on the page itself (for example a second "Yes, do it" button) and show messages on the page.
+10. **Only Gerald builds tables** (Gerald, 2026-10-23). No app and no tool, the Dataverse monitor included, creates or changes a Dataverse table, column, key or choice, and no app shows a table-creation wizard or "create this table" screen. An app reads and writes **rows** only. It declares what it needs in its manifest (`manifest|<appId>` in Hub config, section 12.1; with HUB SHARED v1.3 each column's type and length in `cols`, for a table still to make `new`, `label`, `owner` and `primary`, and its recommended Copilot `prompt`, at most 2,000 characters). `contract.json` `colTypes` decides each type; a manifest type that disagrees shows as a conflict. The **Dataverse monitor** is the one place that reads, shows and tests what the apps need: it lists the tables and columns to make, shows each prompt, and checks types against Dataverse. Gerald builds from its prompts. An app that finds a table or column missing says so on the page ("not made yet, see the Dataverse monitor") and keeps working without it.
+11. **Headcount planning lives only in the Sanitation director** (Gerald, 2026-10-23). How many people a shift or crew needs, crew sizing, vacation cover and crew-builder what-ifs are worked out only in the director app. Other apps remove their own headcount or team builders and, where they show the number, read the director's. The daily board (who is here today, which team cleans what) stays in Shift Start and Ganttly: that is assignment, not headcount planning. Migration: section 12.3.
+
+---
+
+## 2. Shared keys
+
+These are the keys that join the apps. When a column holds one of these keys, it has the name given here.
+
+| Thing | The key | Where it comes from | Column name when stored elsewhere | Shown to people as |
+|---|---|---|---|---|
+| **Room** | Room name, e.g. `Creme`, `General`, `Bakery`, `Support`, `Warehouse` | `craa5_aa_mss_area.craa5_parentroom`, `craa5_aa_assets.craa5_roomname` | `craa5_room` | The name. **Not a join key:** the monitor (2026-10-23) found no Equipment room name among the area's parent rooms (3 distinct values), so the two columns hold different things. Join equipment to an area by `craa5_areaname`, never by room. |
+| **Area** (MSS area) | Area name exactly as in `craa5_aa_mss_area.craa5_area`, e.g. `IBL5`, `Smock Room`, `Dough Room` | `craa5_aa_mss_area` | `craa5_area` (text). Optionally also `craa5_mssareaguid` = `craa5_aa_mss_areaid` | The name |
+| **Line** | Line key = `hubLineKey(area, line)`: lower-case letters and digits, line number added when above 1: `ibl4`, `ibl5`, `waterjet`, `highspeed`, `breading2` | `craa5__aa_prd_schd.craa5_area` + `craa5_line` | `craa5_linekey` | Area name + "Line n" |
+| **SAP work area** | `craa5_aa_assets.craa5_workareacode`, e.g. `SSANIBL5W` | `craa5_aa_assets`, `craa5_aa_ms_assets.craa5_title` | `craa5_sapw` (as in the MSS log) | The code |
+| **Equipment** (one piece) | `craa5_aa_assets.craa5_aa_assetsid` (GUID, lower case, no braces) | `craa5_aa_assets` | `craa5_equipmentguid` (one), `craa5_equipmentguids` (several, lower case, `; ` between them: sorted with `hubGuidList`, except where a column is paired position by position with a names column, as on Map observations, where the order follows the names. Read with `hubSplitGuids`.) | `craa5_equipmentidentifier`, plus `#` + `craa5_uniqueid` when a number helps (e.g. "#549") |
+| **Employee** | `craa5__aa_employee.craa5__aa_employeeid` (GUID) | `craa5__aa_employee` | `craa5_employeeguid` (one), `craa5_employeeguids` (several). The old `craa5__aaemp_guid` on Task assignment means the same. | `craa5_name` turned to "First Last". Badge `craa5_badgenumber` is for badge readers later, not for joins. |
+| **Signed-in user** | `systemuser` id | `Xrm.Utility.getGlobalContext().userSettings` | `craa5_markedby` (full name, text) | Full name. Matched to an employee by e-mail (`craa5__aa_employee.craa5_email`) |
+| **Crew** | Letter `A`, `B`, `C` or `D` = `hubCrew(value)` | `craa5__aa_employee.craa5_shift` (1-4 or choice), `craa5_workshift.craa5_shiftcode` | `craa5_shiftcode` | "A shift" |
+| **Shift** | Shift key = `shiftDate|crew`, e.g. `2026-10-20|C` (`hubShiftKey`) | The live board: `craa5_shiftboard.craa5_slotstart` + `craa5_crew` | `craa5_shiftdate` (YYYY-MM-DD) + `craa5_shiftcode` | "Tue Oct 20, C shift" |
+| **Run** | `craa5__aa_prd_schd.craa5__aa_prd_schdid` | Production Scheduler | `craa5_runid` when stored elsewhere | Product + start time |
+| **Clean window** | `craa5_cleanplan.craa5_plankey`, e.g. `w|<run before>|<run after>` | Production Scheduler (Clean Plan) | `craa5_plankey` | Line + clean kind + start |
+| **Completion** (one clean of one piece) | Completion key = `assetGuid|shiftDate|cleanKind` (`hubCompletionKey`) | Written to the MSS log (section 6.3); other people's separate entry for the same clean gets `key|2` .. `key|9` | `craa5_completionkey` | Equipment + clean kind + shift date. **Count a clean once by the base key** (the key with a trailing `|2`..`|9` removed, `mlwBaseKey`); labor minutes of all entries add up |
+| **Week** | Monday of the plant week, YYYY-MM-DD (`hubWeekKey`) | Computed | `craa5_weekkey` | "Week of Oct 19" |
+
+Matching names: two names are the same when `hubCanon` (lower-case letters and digits only) gives the same text. A name that matches no area is shown as unmatched. It is never matched by "contains" or by nearest spelling. Old spellings ("WJ" for Waterjet, "Cook Rm") go in an alias list kept by the app that reads them. The chemical hub's `_c_ Area alias` is the model.
+
+Renaming an area or room breaks every text key that uses it. Treat a rename as a data change that this thread plans, not as a quick edit in the form.
+
+---
+
+## 3. Who writes what
+
+Status: **live** = in use; **proposed** = in this contract, not created yet; **legacy** = still read, being replaced; **abandoned** = no app may use it.
+**Primary name columns:** some tables were made with a primary name column other than the one their app first planned (for example `craa5__c_chemical` uses `craa5__c_chemical_name`). Gerald keeps them as they are. Apps read the table's `PrimaryNameAttribute` from metadata, or use the name in contract.json, and never require a renamed primary column.
+
+Ownership: User-owned tables need **Organization-level Read** on every hub security role, or people see only their own rows and the screen looks empty with no error.
+
+### 3.1 Reference data (set up once, edited rarely)
+
+| Table | Status | Writes it | Reads it | Notes |
+|---|---|---|---|---|
+| `craa5_aa_mss_area` Areas | live | Admin in the model-driven form. Shift Start writes only `craa5_clipboard` ("include in update"). | All floor apps, Scheduler, Manager hub, PBED | Key `craa5_area`. Room `craa5_parentroom`. Line setup (`craa5_numberoflines`, `craa5_supportingpart`, `craa5_supportingoffset`, `craa5_cleanoffsetmins`, `craa5_textadditions`) is read by the Scheduler and Ganttly. Map tool and BOLO should read it too, so their areas match. |
+| `craa5_aa_assets` Equipment | live | Admin form. **MSS Calendar** owns the frequency flags (`craa5_dailyclean`, `craa5_midweek`, `craa5_weeklyclean`, `craa5_monthlyclean`, `craa5_month`, `craa5_quarterly`, `craa5_annually`, and the new egg / pecan allergen columns). **Map tool** owns `craa5_maplocation` and the pictures. | Everyone | Key = GUID. `craa5_hoursrequired` = **standard labor minutes** (section 7). `craa5_heads` = people the piece needs. `craa5_subcategory` = clean step order ("1 - pic", "5 Staging"). `craa5_midweek` exists (Dataverse monitor, 2026-10-21). `craa5_month` is the **6-month (semiannual)** flag: it was meant to be `craa5_6month` and the 6 was lost when it was made (Gerald, Q4); its display name can be changed to "6 month", the schema name stays. Allergen cleans are split by allergen (Q8): `craa5_eggallergen` / `craa5_eggminutes` and `craa5_pecanallergen` / `craa5_pecanminutes` (`table-prompts.md` part 7); `craa5_minalrg` is the old combined allergen minutes. Egg / pecan minutes mean the same as `craa5_minalrg` (labor person-minutes, like `craa5_hoursrequired`), for that allergen only; a blank or 0 means use `craa5_minalrg`. |
+| `craa5_aa_ms_assets` MSS SAP catalog | live | Admin / MSS Log Input | MSS Log Input, MSS Calendar, Scheduler | SAP code `craa5_title`. `craa5_hourstoclean` is **minutes** (Gerald, Q3: the original data was hours; it is minutes now). |
+| `craa5__aa_employee` Employees | live | Manager hub (People page) and admin. **Ganttly** writes only `craa5_remarks` / `craa5_remarkcategory` (high fives). **Shift Start** writes only `statecode` / `statuscode` ("No longer with us" retires a person; nothing is deleted). | Everyone | Leavers: `statecode` = inactive, never a browser list. Role `craa5_role`: 256000000 Sanitor, 256000001 Lead, 256000002 Supervisor (hub role). Pay role `craa5_roleid` names the `_e_ Labor rate` role. `craa5_roleid` is a **lookup** to `craa5__aa_role` (monitor, 2026-10-23): read `_craa5_roleid_value` and its formatted value (`@OData.Community.Display.V1.FormattedValue`) as the role name. Role names today: Chemical Clerk, Inspector, Manager, Sanitaiton Admin (spelled so in the role row), Sanitation Tech 1, sanitation tech 2, sanitation tech 3, Supervisor, janitor, trash. A role with no `_e_ Labor rate` row costs at `sanitation tech 2` (15 of 122 people today). When a read returns only the id, read the role's name from `craa5__aa_role` (now live, read only). The hub role choice `craa5_role` is never used as a pay role. |
+| `craa5__aa_leadershipteam` | live | Admin | Shift Start | Lead/supervisor team names |
+| `craa5_workshift` Shift hours | live | Admin | Shift Start, Ganttly, Scheduler, Manager hub | Crew letter + weekday + start/end hour |
+| `craa5_linepriority` | live | Manager hub, Scheduler | Ganttly, Scheduler (default clean order, v4.6) | |
+| `craa5_changeover_rule` Run rules | live | **Production Scheduler** | PBED | The clean rules per line (section 6.1) live here and nowhere else |
+| `craa5_skumaster` | live | Production Scheduler | Production Scheduler | |
+| `_e_ Labor rate` (`craa5__e_laborrate`) | live | Gerald by hand (admin); apps never write | Manager hub, PBED, Ganttly People, director views | The only place a labor rate lives (section 7). One row per pay role in `craa5_role` (text): `sanitation tech 1`, `sanitation tech 2`, `sanitation tech 3`, `Adm`, `Int` |
+
+### 3.2 The daily flow (one owner per step)
+
+| Step | Table | Status | Writes it | Reads it |
+|---|---|---|---|---|
+| 1. Runs (week+) | `craa5__aa_prd_schd` | live | **Production Scheduler** only | Ganttly, Shift Start, MSS Calendar, PBED, Manager hub |
+| 1b. Clean plan | `craa5_cleanplan` (Org-owned) | live | **Production Scheduler** only | Ganttly, Shift Start, MSS Calendar, PBED, Manager hub |
+| 1c. Schedule change requests | `craa5_schedulechange` | proposed, optional (only for the schedule-change email inbox; the Scheduler works without it) | Production Scheduler | Production Scheduler |
+| 2. Crew board, live shift | `craa5_shiftboard` | live | **Shift Start** writes `craa5_boardjson` and the board columns. **Ganttly** writes only `craa5_updatesjson`. | Ganttly, Manager hub, PBED |
+| 2b. Next shift setup | `craa5_shiftplan` | live | Shift Start | Shift Start, Ganttly, PBED |
+| 2c. Past shifts | `craa5_shiftarchive` | live | Shift Start (when a shift is closed) | Manager hub, Ganttly, metrics |
+| 2d. Saved crew setups | `craa5_shiftpreset`, `craa5_updatepreset` | live | Shift Start | Shift Start |
+| 2e. Board audit trail | `craa5_shiftlog` | live | Shift Start (MSS Log Input also writes a row) | Manager hub, Dataverse monitor |
+| 2f. Roster rows (old) | `craa5_taskassignment` | legacy | Shift Start | Ganttly, Manager hub (move to the board, then retire) |
+| 3. Who cleans what + live progress | `craa5_cleancheckoff` | live | **Ganttly** only | Ganttly on every device, Manager hub, PBED (Execute) |
+| 4. A clean finished (record of truth) | `craa5__log_` MSS log | live | **Ganttly** (piece marked Done), **MSS Log Input** (paper, SAP, by hand), **MSS Calendar** (quick log). All three use the one shared "MSS LOG WRITE" block (section 6.3). **Shift Start does not write here.** | MSS Calendar, MSS Log Input, Manager hub, PBED, Ganttly People, metrics |
+| 4b. Skip codes | `craa5_mss_skipcode` | **missing** (not in Dataverse, 2026-10-21; apps treat it as optional) | MSS Log Input | MSS Calendar |
+| 5. Time lost / call-outs | `craa5__m_timelosslog` | proposed (not made yet) | Manager hub, PBED (Kind = `Weekend clean`) | Manager hub, PBED |
+
+Time loss log keeps the column names it was created with: `craa5_assetguid` holds the equipment key, `craa5_responsibleguid` the employee key and `craa5_crew` the crew letter. The contract names (`craa5_equipmentguid`, `craa5_employeeguid`, `craa5_shiftcode`) are for new tables. A reader of this table uses its own names.
+| 6. Weekend plan | `craa5__p_plan`, `_p_milestone`, `_p_workorder`, `_p_flocmap` | live | PBED | PBED, Manager hub |
+
+### 3.3 Other apps
+
+| Table | Status | Writes it | Reads it |
+|---|---|---|---|
+| `craa5__facilityobservation` Map problems and pins | live | Map submission tool (owner). **Pathogen BOLO** creates its own pin rows only (a positive or harborage concern), row id `hubIdFromKey('bolo|' + swab key)`, and never edits a Map tool row. BOLO rows are marked by `craa5__description` starting `(PATHOGEN BOLO - ` or `(HARBORAGE CONCERN - ` (keep these exact); the Map tool shows them read only. A few early pins (BOLO v2.4) carry an older id, so readers find BOLO pins by the prefix, never by computing the id | Pathogen BOLO, Manager hub |
+| `craa5___maps` Floor maps | live | Map submission tool | Pathogen BOLO |
+| `craa5_pathogenboloswabcatalog0320` Swab sites | live | Pathogen BOLO | Pathogen BOLO, Ganttly, Map tool |
+| `craa5__b_swabresult` Swab results (columns in contract.json; one row per sample, description and test; open hit = `craa5_result` positive, `craa5_closedkey` blank, `statecode` 0, and `craa5_collectiondate` within the alert window (`alertMonths` in Hub config key `PATHOGEN_BOLO_RULES`, default 2 months; older positives are history). A hit is closed by **any** MSS log row on the same equipment (or area, when the site has no equipment) with a shift date on or after the collection date: every clean follows the presumptive process (Gerald, 2026-10-23)) | live (entity set `craa5__b_swabresults`; BOLO v2.5, PR #37) | Pathogen BOLO | Manager hub, Ganttly, MSS Calendar |
+| `craa5__supervisor_todo` | live | Manager hub | Manager hub |
+| `craa5__m_formtemplate`, `craa5__m_quicktask` (both User-owned; quick tasks are a personal list on purpose) | live | Manager hub | Manager hub |
+| `craa5__m_employeenote` Manager notes on people | live; **real name `craa5_employeenote`** (monitor 2026-10-23), probe it first | Manager hub | Manager hub, manager role only. Sensitive: User-owned, never shown to peers, never in exports or the repo. Key `craa5_employeeguid`. |
+| `craa5__e_shifttask` Shift tasks (mandatory work with no clean minutes: trash, admin, chemical clerk, janitorial, steam pits) | **to make** (prompt in `table-prompts.md` part 9). Never fall back to the plain `craa5_shifttask`: it is an old unused table with other columns | Sanitation director (rule 11) | Ganttly, Manager hub; Shift Start planned (once the director rows carry fixed posts) | Organization-owned. Key `craa5_taskkey` (`night|trash`); `craa5_shift` day / night / both; `craa5_days` 7 digits Sun..Sat; `craa5_minutes` per shift, blank = whole shift. Replaces the fixed posts in `MSS_LOG_MANPOWER_SETUP` (default 1.0.50: one manpower engine, the Scheduler's crew plan). |
+| `craa5__g_assignment` Equipment to people, per shift | live; **real name `craa5_gassignment`** (monitor 2026-10-23), probe it first | **Shift Start** and **Ganttly**, both (pinned beats auto; higher `craa5_rev` wins between pinned saves). New pieces are split evenly by the ASSIGN SPLIT block (12.2): saved rows keep their people (first writer wins), new rows are `auto` and not pinned, a reorder sets `craa5_order` and pins the row, a drag in Ganttly is `ganttly` and pinned; Ganttly fills `craa5_plannedstart` / `craa5_plannedminutes` without bumping `craa5_rev` | Shift Start, Ganttly, Manager hub | Organization-owned. Key `<shift date>|<crew>|<equipment guid>|<kind>`, row id `hubIdFromKey('asg|' + key)`. Spec: `/mnt/project-files/ganttly-overhaul/shared-assignment.md`. |
+| `craa5__g_obstacle`, `craa5__g_handover` Floor obstacles and crew handovers | proposed; used by Ganttly 1.4 | Ganttly | Ganttly | Organization-owned. Keys `craa5_obstaclekey` / `craa5_handoverkey`; area, equipment and shift date as in section 2. Prompts: `/mnt/project-files/ganttly-overhaul/g-tables-prompts.md`. |
+| `craa5__g_personnelnote` Floor notes on people (high fives, incidents, coaching) | proposed; used by Ganttly 1.4 (incidents and coaching no longer go to Employee `craa5_remarks`) | Ganttly | Ganttly (writer's own notes), Manager hub (managers read all) | **Sensitive**: User-owned; floor users Create + User-level Read/Write, managers Organization Read. Never shown to peers, exported or in the repo. Separate from `craa5__m_employeenote`. Replaces the `craa5_remarks` JSON on the Employee row. Key `craa5_employeeguid`. |
+| `craa5__c_*` chemical tables (14 in contract.json, taken from the chemical hub's own spec file chemical-ordering/contract/c-tables.json, with full columns; 11 live, Chemical alias and Sanitation budget proposed, Chemical standard unknown) | live | Chemical hub | Chemical hub; Manager hub for cost. User/team-owned with Organization-level Read. The old chem log's employee, shift and equipment columns stay as text as written. |
+| `craa5_dailyproduction` | live | (import) | Chemical hub, cost per pound |
+| `craa5__e_hubconfig` Hub config (shared settings and app manifests) | proposed (Gerald making it 2026-10-22) | Each app writes only its own `craa5_configkey` rows | The same app; keys in section 12 | Organization-owned. Replaces `craa5__0_hubconfig` (User-owned, Config json only 100 characters), which apps read second until the new one exists. |
+| `craa5__sani_schedule_` | live | MSS Calendar | MSS Calendar |
+| `craa5_mss_useraccesslog`, `craa5_useraccesslog` | **missing** (not in Dataverse; logging is optional) | MSS apps, Shift Start | Dataverse monitor |
+| `craa5__t_skill` (one row per skill; key `craa5_skillkey` = exact area name or `SYS-xxx`), `craa5__t_skilllevel` (one row per person per skill; key `craa5_levelkey` = `employeeguid|skillkey`, row id `hubIdFromKey`; level 0-3), `craa5__t_trainingevent` (append-only history) | **to make: the Dataverse monitor builds it** from `manifest|training` (ground rule 10) | Training page only | Manager hub, Ganttly People, Shift Start Assign |
+| `craa5__0_*` (asset, employee, mssarea, prodweek, saporder, shiftarchive, shiftboard, shiftlog, shiftplan) | **abandoned** | nobody | nobody (`craa5__0_hubconfig` is the one exception and stays) |
+| `craa5_sanitationshiftreport` | legacy (exists, 0 rows) | nobody new | Ganttly (old read) |
+| `craa5_mss_shift_capacity`, `craa5_mss_quality_verifications`, `craa5_mss_downtime_events`, `craa5_mss_cost_model`, `craa5_mss_capex_lifecycle`, `craa5_pathogen_bolo_sample`, `craa5_pathogen_bolo_harborage`, `craa5_quickload_assets` | **absent** (not in Dataverse, 2026-10-21) | nobody | Remove the code that reads them |
+| 47 other craa5 tables found in Dataverse (old chemical set, old MSS tables, `craa5_table1` and others; full list in contract.json, group `unlisted`) | abandoned (3 legacy: `craa5_cart`, `craa5_distributor`, `craa5_log`, read only by old pages) | nobody | Used by no current app. Delete only when Gerald chooses. |
+
+---
+
+## 4. The daily flow in one paragraph
+
+The **Production Scheduler** writes runs and publishes the clean plan. It is the only place the clean rules live, so it decides which clean happens when. **Shift Start** builds the crew board: leads, teams, who is out. The supervisor posts its status to Teams at 9, 12 and 3. **Ganttly** reads the board and the clean plan and fills in who cleans which piece in the shared assignment table `craa5__g_assignment`, which a lead can also change from Shift Start (pinned pieces stay where a person put them). Ganttly records Start and Done per piece in the check-off table. When a piece is marked Done, Ganttly writes one MSS log row. The **MSS Calendar** shows compliance from those rows. The **Manager hub**, **PBED** and the director views compute every metric from the same rows with the definitions in section 7. Ganttly and Shift Start will later merge, and because they already share these tables, the merge is a move, not a rebuild.
+
+---
+
+## 5. Dates, shifts and weeks
+
+- **Plant clock:** America/Chicago, with daylight saving (`HUB_TZ`). Every "day" in any app is a plant day, `hubPlantDay(ms)`.
+- **Shift date:** the plant day the shift **started**, taken from the board's `craa5_slotstart` (`hubShiftDate`). Everything done on a night shift that starts Tuesday 18:00 belongs to Tuesday, including work after midnight. Never date work by the clock time it was marked.
+- **Date-only values in Dataverse** (MSS log `craa5_lastcleaned`) hold midnight UTC of the shift date: `2026-10-20T00:00:00Z` (`hubDateOnlyUtc`). Readers take the first 10 characters (`hubDayFromDateOnly`) and never convert the time zone.
+- **Text date keys** (`craa5_shiftdate`, `craa5_day`, `craa5_weekkey`) are `YYYY-MM-DD`. One existing exception: `_c_ Clerk checklist.craa5_shiftdate` is a date-only column. It stays; readers take its first 10 characters. Also: `_c_ Chemical usage log.craa5_logdate` is the moment of the entry (a timestamp, like the old day sheets), not a shift date; a 2nd-shift entry after midnight carries the next day. Readers that need a shift date compute it from the time.
+- **Timestamps** (started, done, saved) are stored as UTC date-times and shown on the plant clock.
+- **Week:** Monday to Sunday by shift date. The week key is that Monday (`hubWeekKey`). Production usually ends Saturday or Sunday, so the EOW clean falls in the week it ends.
+- **Teams status times:** 09:00, 12:00 and 15:00 plant time (Shift Start setting).
+
+---
+
+## 6. Cleans
+
+### 6.1 The clean rules (set once, in the Scheduler's Run rules)
+
+| Line | Between runs | Midweek | End of week (EOW) | Included |
+|---|---|---|---|---|
+| IBL4 | none | Required after **72 run hours**. Timing is the scheduling department's call. Override: `craa5__aa_prd_schd.craa5_cleanoverride` (proposed). | yes | Midweek: every piece with `craa5_midweek` = yes. Caseout / dry-clean items and the freezer are set to no. EOW: everything. |
+| IBL5 | nightly | not used | yes | Nightly: every piece with `craa5_dailyclean` = yes (some PIC areas no). EOW: everything. |
+| Waterjet | nightly | not used | yes | Same as IBL5 |
+| Highspeed | minimal daily | not used | yes | Daily: short list (`craa5_dailyclean` = yes). EOW: everything, kettles included. Never runs at the same time as Custard. |
+| Custard | minimal daily | not used | yes | Same as Highspeed |
+| Dough room, silo, sifter | with Highspeed/Custard | not used | starts 4-6 h before the line's EOW | Early start comes from the area's `craa5_supportingoffset` (minutes) |
+
+Ganttly, Shift Start and the MSS Calendar do **not** keep their own copy of these rules. They read the kind of clean from `craa5_cleanplan`.
+
+### 6.2 Clean kinds
+
+| Completion kind (`hubCleanKind`) | Clean Plan word (`craa5_cleankind`) | English / Spanish | MSS log flags set (`craa5_daily` / `craa5_weekly` / `craa5_monthly`) |
+|---|---|---|---|
+| `daily` | `full` | Daily / Diaria | daily |
+| `midweek` | `midweek` | Midweek 72h / Media semana 72h | daily |
+| `eow` | `weekly` | End of week (EOW) / Fin de semana | daily + weekly |
+| `egg` | `egg` (Scheduler, when it splits) | Egg allergen / Alérgeno huevo | daily, and `craa5_allergenclean` = Yes |
+| `pecan` | `pecan` (Scheduler, when it splits) | Pecan allergen / Alérgeno nuez pecana | daily, and `craa5_allergenclean` = Yes |
+| `allergen` | `allergen` | Allergen / Alérgeno (old: egg and pecan together, until the split) | daily, and `craa5_allergenclean` = Yes |
+| `changeover` | `changeover` | Changeover / Cambio de producto | daily |
+| `monthly`, `quarterly`, `semiannual`, `annual` | (none: the MSS frequency) | Mensual, Trimestral, Semestral, Anual | daily + weekly + monthly |
+| `corrective` | (none: a pathogen or inspection follow-up) | Corrective / Correctiva | daily, and `craa5_pathogen` = Yes when it follows a swab hit (any clean after the hit closes it; section 3) |
+| `other` | (none) | Other / Otra | none |
+
+Old spellings the apps still use map like this (MSS LOG WRITE v1.0, `ecosystem/mss-log-write.js` on PR #40): shift, nightly -> `daily`; weekly, biweekly, 2-week -> `eow`; 2-month, 4-month, deepclean -> `monthly`; 6-month -> `semiannual`; as-needed -> `other` (no flags).
+
+The flags say which requirements the clean **satisfies**. They are set from the clean that was done, never from the piece's highest frequency. A daily clean on a piece that also has a monthly job does not count as monthly. The MSS log thread owns the exact flag rules in its shared block. Any change to them goes in this table first.
+
+### 6.3 Writing a completion to the MSS log (`craa5__log_`)
+
+One row = one piece of equipment, one clean, one shift date. The rules (from the MSS log input thread's draft, settled here):
+
+1. **Only when a piece is marked Done** (in Ganttly, piece by piece), or entered by hand in MSS Log Input or the Calendar. An area at 100% in Shift Start is a status for the Teams post. It writes nothing to the log. **Anyone on the crew may mark a piece Done** (Gerald, Q2); `craa5_markedby` records who pressed it.
+2. **No equipment id, no row.** `craa5_equipmentguid` = the asset GUID is required.
+3. Row id = `hubLogIdOf(completionKey)`, and `craa5_completionkey` = `hubCompletionKey(asset, shiftDate, kind)`. Before creating, read by that key. If it exists with the same people (any order or case), it is the same clean (`already`). If it exists with different people (a second crew, or the night shift of the same plant day), save a separate entry with key `key|2` (up to `|9`) and id `hubLogIdOf(key|n)`, so no names or minutes are lost (Gerald, 2026-10-23: duplicates beat missed entries). Never rely on a per-browser "already sent" list. **Readers count cleans by the base key** (`mlwBaseKey`, or `equipment|shiftdate|kind`), never by the raw key, and add the minutes of every entry.
+4. `craa5_lastcleaned` = `hubDateOnlyUtc(shiftDate)`. `craa5_shiftdate` = shiftDate, `craa5_shiftcode` = crew.
+5. `craa5_cleankind` = the kind from 6.2. The flags are set from it.
+6. `craa5_sap` = the real SAP order number, or `auto-<kind>` (e.g. `auto-eow`). `craa5_sapw` = the piece's work area code. `craa5_uid` keeps its current meaning (the SAP code) and is **not** reused as a key. It is the table's primary name column, so writers should still fill it with the SAP code (the same value as `craa5_sapw`), or the row shows blank in forms and views.
+7. People: `craa5_employeeguids` = every person who did it (`hubGuidList`). `craa5_lastcleanedby` = their names, "First Last", joined with ` / `, never "Crew". A name needs at least two letters; `X`, `-`, `?`, none, unknown, test and xx are refused (`not_a_name`). `craa5_markedby` = the signed-in person who pressed Done.
+8. Minutes: `craa5_laborminutes` = **person-minutes** actually spent (see 7). `craa5_hoursworked` = `Math.round(laborminutes / 60)` for older readers.
+9. `craa5_doneat` = when Done was pressed. `craa5_plankey` and `craa5_linekey` = the clean window it belonged to, when known.
+10. `craa5_source` = `Ganttly`, `Log input`, `Calendar` or `Import`. `craa5_pathogen` = `Yes` or `No`, never blank.
+11. Mark the row "sent" only after the save succeeds. Keep failed saves in the retry queue.
+12. `craa5_allergenclean`: try the text `Yes` first, then `true` (a Yes/No column); drop the column only if neither fits. Readers count `Yes`, `true` or `1` as done.
+13. Checks: MSS Log Input's Check tab flags more than 24 labor hours on one piece (`hours_high`).
+
+The block that does all of this is MSS LOG WRITE v1.4 ([mss-log-write.js](/mnt/project-files/mss-log-input/mss-log-write.js), commit 5fcab26 on PR #40): `mlwWrite` returns `entry`, `separate` and the key and id it used; `mlwUndo(api, guid, day, kind, {key} or {names})` undoes one entry (the first without options); text codes `saved_separate`, `second_entry`. Every log writer pastes it unchanged.
+
+**Transition (until Ganttly logs piece by piece):** Shift Start may keep logging an area at 100%, only that clean's pieces, behind its switch `SHIFT_START_LOGS_MSS`, dated by `hubShiftDate`. Those rows should use the same completion key and row id as above, so Ganttly's later row for the same piece updates them instead of adding a second. The switch goes off when Ganttly's per-piece logging is live.
+
+Undo of a Done within the same shift sets the check-off back and **deactivates** the log row (statecode 1). It does not delete it, so every device drops it too.
+
+### 6.4 Live progress (`craa5_cleancheckoff`)
+
+Ganttly's check-off table stays the live record of Start / Done / Undo during the shift. There is one row per check-off, updated in place, and every device reads it every 2 minutes. It holds progress; the MSS log holds the finished record. Only Ganttly writes it.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `craa5_checkoffkey` | text (primary) | The check-off's key: Ganttly block id + `~` + first press time (base 36 seconds). Row id = `hubIdFromKey(key)`. If a table was made with another primary column, Ganttly writes the key into `craa5_cleancheckoff1` or `craa5_name`. Readers try those in that order. |
+| `craa5_status` | text | Stored values: `started`, `done`, `undone`. "Planned" means no row yet. "Overdue" is a display state (section 8.1). |
+| `craa5_startedat` | date-time (UTC) | When Start was pressed. Blank if Done was pressed without Start. |
+| `craa5_doneat` | date-time (UTC) | When Done was pressed. |
+| `craa5_keepuntil` | date-time (UTC) | Until when the check-off still counts on screen (a monthly clean: a month). |
+| `craa5_equipmentguid` | text | Asset GUID |
+| `craa5_equipment` | text | Equipment name, for people |
+| `craa5_area` | text | The MSS area name. Rows written before 1.0.6 may hold the room. A reader that gets no area match falls back to the asset's area. |
+| `craa5_details` | multiple lines (JSON) | `{status, parentId, name, startMs, durationMins, laneKeys, workMins, heads, updatedAt, startedAt, doneAt, noStart, syncAt}`. Times are epoch ms. `workMins` = person-minutes worked. `heads` = people on it. `laneKeys` are Ganttly lanes, **not** employee ids. |
+| `craa5_shiftdate`, `craa5_cleankind`, `craa5_completionkey`, `craa5_employeeguids` | text | **Proposed** (table-prompts.md part 3). The shift date, kind, completion key and the people on the piece (`hubGuidList`). Until they exist, people come from the board's `craa5_updatesjson.work[].workers[].empId`. |
+| `modifiedon` | system | Last change. Use it only to order rows and to read "changed since"; never as Start or Done time. |
+
+`craa5_shiftboard.craa5_updatesjson` (written by Ganttly): `remarks` (high fives) stays. `work` (pieces cleaned, with workers) stays for now as the board's display copy, so Shift Start and the archive show who cleaned what. It is never a source for metrics or the MSS log. It goes when the check-off people column exists and Ganttly and Shift Start merge (Ganttly Phase 5). PBED's Execute and the Manager hub read progress from the check-off table and finished pieces from the MSS log.
+
+This replaces the "new Completion table" in the Ganttly overhaul plan: the check-off table already exists, and the MSS log, with the columns in part 1 of table-prompts.md, is the completion record. That is one fewer table to make and only one place a finished clean is counted.
+
+### 6.5 The clean plan (`craa5_cleanplan`), as readers see it
+
+Written only by the Production Scheduler. **The full reader guide is the Scheduler's own: `/mnt/project-files/production-schedule/clean-plan-contract.md` (code on draft PR #39). Where it and this summary differ, the guide wins.** All date-times are UTC. Readers select only active rows (`statecode eq 0`).
+
+| Column | Meaning |
+|---|---|
+| `craa5_rowtype` | `window` (a stop between runs), `day` (one line, one plant day), `week` (one row per Monday), `config` (shared settings), `scope` (which pieces a line's clean kind includes), `alert` (a rule needing attention). `staff` (**retired** in Scheduler v4.9: old rows stay inactive, never deleted; headcount is the director's `DIRECTOR_HEADS`. Was: one row per sanitation shift, key `f|YYYY-MM-DD|<crew letter, or day/night>` plus `|HH` when a crew has two shifts starting that day; heads needed, heads on crew, hours used, peak hour; details in the reader guide section 6a) |
+| `craa5_plankey` | Window: `w|<run before id>|<run after id or "last">`, or `o|<run>|<run>` for runs that overlap. Day: `d|<line key>|YYYY-MM-DD`. Week: `k|<Monday>`. Config: `config`. Scope: `s|<line>|<kind>|<part>` (start/end 2000-01-01). Alert: `a|over72|<line>|<runId>`, `a|noeow|<line>|<Monday>`, `a|apart|<runIdA>|<runIdB>` |
+| `craa5_linekey` | The line key (`hubLineKey`); day rows hold the MSS area key; week rows hold `*` |
+| `craa5_start` / `craa5_end` | Window: when the line stops (end of the run before) / when the next run starts (open stops: where the plan ends). Day: plant midnight to next midnight. Week: Monday midnight to next Monday |
+| `craa5_day` | The plant day, YYYY-MM-DD (window: the day the stop starts; a night stop counts for the day it starts on) |
+| `craa5_cleankind` | Window: `allergen`, `weekly` (EOW), `midweek`, `full` (daily), `changeover`, `none` (map with `hubCleanKind`). Day: `due`, `stretch`, `covered`, `none`, `unplanned` |
+| `craa5_minutes` | Window: minutes the clean takes with the crew on shift. Day: minutes of production that day |
+| `craa5_status` | Window: `ok`, `tight`, `short`, `overlap`, `nocrew`, `none`. Day: `ran`, `idle`, `unplanned`. Week: `writing`, `done`. Alert: `open`, `approved` (the alert's kind is in `craa5_cleankind`) |
+| `craa5_area`, `craa5_line`, `craa5_mssareaguid` | Area as the runs spell it, line number (window rows), MSS area id |
+| `craa5_reason` | One plain sentence: why this clean, how long, what is short |
+| `craa5_details` | JSON. Window rows: `{v, stop, open, gapMin, idle, prev, next, allergen, need: {basis, work, floor, manual, pieces, weekly, midweek, crumb, noDaily, sapOrder}, crew: {assumed, heads}, cleanStart, cleanEnd, shortMin, spareMin, maint: [[start, end]...], area, line, areaId}`, now `v: 2`, adding `scope {key, parts, hash, pieces, left}`, `run72 {hours, limit, overBy, by, mode}`, `support [{area, off, start, end, ready, mins, late}]`, and (Scheduler v4.6, optional) `pin {at, by}` (start pinned by scheduling), `after {mode: apart|together, line, at}` (moved because of a linked line) and `order` (the line's place in that day's clean order, 1 = first). `cleanStart` already includes any pin or move. Over 1,900 characters, fields drop in this order: maint, crew, need, support. `cleanStart`/`cleanEnd` are the planned clean slot inside the stop. `prev`/`next` are short run summaries. Day rows: `{v, prod, len, kind, weekOn, planned, job, lines, areaId}`. Scope rows: `{v, line, kind, part, parts, hash, cols, pieces: [[assetId, name, area, room, mins, heads, offsetMins, leftOutBy]]}`. Config row: the shared cleaning settings, which may hold `links: [{a, b, mode}]` (line-key prefixes; default IBL5 apart from Waterjet) and `order: {YYYY-MM-DD: [line keys]}` (a day's own clean order; otherwise `craa5_linepriority`) |
+| `craa5_cleanplanname`, `craa5_name`, `craa5_contenthash`, `craa5_publishbatch` | Label for people; change fingerprint; which publish wrote it. Not for logic |
+
+For PBED's weekend: the stop is the `window` row whose `craa5_start` falls in the weekend; restart = its `craa5_end`, except on an open stop; the clean slot = `details.cleanStart`/`cleanEnd`; status = `craa5_status`.
+
+An open stop (plan key ending in `|last`, `details.open` set) has no restart yet: readers must not use `craa5_end` as one. Show "restart not planned yet" instead. This is the normal Thursday/Friday state before next week's runs are entered.
+
+---
+
+## 7. Numbers: one definition each
+
+Every app computes these the same way, from the same table, with the `hub-shared.js` helper named. If a screen shows a number not on this list, it must say how it was computed, in words, next to it.
+
+| Number | Definition | From | Helper |
+|---|---|---|---|
+| **Standard minutes** (a piece) | `craa5_aa_assets.craa5_hoursrequired`, always **minutes of labor** (person-minutes). Blank or 0 = unknown, shown as "no standard", never guessed. No "divide by 60 if over 8". | Equipment | `hubStdMinutes` |
+| **Crew minutes** (how long a clean takes on the clock) | Sum of standard minutes / people on it. People are capped by the crew on shift. | Equipment + board | |
+| **Labor minutes** (actual) | Person-minutes spent on a completion: clock minutes from Start to Done x people on it, or typed in. | MSS log `craa5_laborminutes` | |
+| **Hours worked** (old column) | `round(labor minutes / 60)`. Kept only for older readers. Never summed for new reports. | MSS log `craa5_hoursworked` | |
+| **Completion %** (a clean, an area, a shift) | Standard minutes of pieces done / standard minutes of pieces planned x 100, over pieces that have a standard. Pieces without one are not guessed: the screen says "n pieces have no standard" and shows pieces done / planned next to the %. | Clean plan + check-offs | |
+| **Pieces done** | Count of MSS log rows (active), by shift date | MSS log | |
+| **Pace** (a person, a crew) | Total standard minutes / total labor minutes x 100, over the same completions. 100 = on standard. Each person gets an equal share of a completion's minutes. Last 30 shift days, at least 10 completions, or no number. | MSS log + equipment | `hubPace`, `hubShare` |
+| **On-time %** | Share of completions with `craa5_doneat` before the end of their clean window (`craa5_cleanplan.craa5_end`) | MSS log + clean plan | |
+| **Rework** | Done, then undone or redone in the same shift, plus pathogen / inspection hits on the piece within 7 days | Check-offs, `_b_ Swab result` | |
+| **Run hours since a full clean** (IBL4 72 h) | Sum of run hours on the line since the end of its last midweek or EOW clean. Computed **only** by the Production Scheduler, published in the clean plan (`run72` in details, and `alert` rows). Others display it and do not recompute it. | Clean plan | |
+| **Headcount planned / present** | Board rows assigned / board rows with attendance `present`, `late` or `loaned` | Shift board | |
+| **Scheduled hours** | Roster: active crew heads (employees whose Shift is the crew) x the Work Shift hours. On the clock: board headcount present (see Headcount planned / present) x shift hours, or the roster hours when there is no board. Day shift = shift start hour 04:00-15:59, unless a staff row's `details.shift` says otherwise | Employees, Work Shifts, Shift board | Sanitation director |
+| **Utilization % (actual)** | Labor minutes logged (MSS log, all entries, by shift date + crew `craa5_shiftcode`) / on-the-clock person-minutes. Not the same as a staff row's `used`, which is **planned** utilization from the Scheduler. Whole-shift fixed posts (staff row `fixed`, `_e_ Shift task`) are shown separately so they never read as idle time | MSS log, Shift board, clean plan staff rows | Sanitation director |
+| **Unused wage** | Scheduled wage (on-the-clock hours x each person's rate) minus logged wage (Labor cost) minus fixed-post wage. Rates as in Labor cost | MSS log, labor rate, staff rows | Sanitation director |
+| **Projected hours (year out)** | Labeled "projected", never mixed with actuals. Wherever the Scheduler has published staff rows, those win | Clean plan staff rows, Work Shifts | Sanitation director |
+| **Labor cost** | Labor minutes / 60 x the hourly rate for the person's pay role on the shift date. Pay role = the employee's `craa5_roleid`, matched to `_e_ Labor rate` `craa5_role` trimmed and in any case. Rate = newest row with Effective from on or before the shift date (undated rows not used). A person with no pay role, or a role with no row, uses `sanitation tech 2`, then `Sanitor`, then `All` (Gerald, 2026-10-23: "when in doubt assume tech 2"). An MSS log row's minutes are shared equally among its `craa5_employeeguids`, each at their own rate. With no row at all, cost shows "no rate set". | MSS log + labor rate | `hubLaborCost` |
+| **Heads needed per shift** | People a sanitation shift needs = clean heads + fixed heads. Clean heads = the shift's work (line cleans + shift tasks with minutes + MSS pieces due by frequency) / (shift minutes x share), or the most people overlapping line cleans need at once, whichever is more, rounded up. Fixed heads = people on whole-shift tasks. Crew size to cover = busiest shift + vacation cover. Worked out only by the **Sanitation director** (ground rule 11; v1.1 on PR #44). It publishes Hub config key `DIRECTOR_HEADS` (this week + 13 weeks, one row per shift, `crews.<letter>.plan` = crew size to cover): every other screen reads that and shows "no crew plan yet" without it. Guide: [director-heads.md](/mnt/project-files/sanitation-director/director-heads.md). The Scheduler's old `staff` rows are only a stand-in for a published week the director cannot work out. | Clean plan, Work Shifts, Employees, Shift task, MSS log | Sanitation director (Scheduler staff rows until migrated) |
+| **Projected clean cost** | Planned, not actual: labor + chemical for a line's clean from the standards. Labor = standard labor minutes (`craa5_hoursrequired` and its kind columns) / 60 x the `_e_ Labor rate` row (role `sanitation tech 2`, else `Sanitor`, else `All`, and the screen names the role used; newest Effective from on or before the plant day; undated rows not used; no default, "no rate set"). Chemical = gallons per clean (`_c_ Chemical standard`, newest Valid from on or before the plant day) x price per gallon (price per container / gallons per container). Always labeled "projected", never added to actual cost. | Equipment, labor rate, chemical standard, chemical | |
+| **Due by frequency** | A piece is done for a frequency (D, MW, W, M, Q, S, A) when a finished clean of equal or higher rank falls in **the same period as today**: plant day, Monday week (MW and W), calendar month, quarter, half year (S, flag `craa5_month`), year. Otherwise it is due. Ranks: daily / allergen / egg / pecan / changeover / corrective 1, midweek 2, eow 3, monthly 4, quarterly 5, semiannual 6, annual 7. Old log rows with no clean kind rank by their flags (`hubLogRank`: monthly 7, weekly 3, daily 2, no flags 9 = counts for everything). Which periods owe a job is the reader's call, the same way as the MSS Calendar: Daily only on days the line ran or the Clean Plan marks due, a Saturday + Sunday stretch is one job done by a clean on either day, and a week the Clean Plan marks idle owes no MW / W job (neither done nor missed). A monthly or longer piece is planned in one week of its period (a week belongs to the period its Monday is in). **Overdue** (by frequency) = the period before was missed too; with no readable MSS log nothing is overdue. | MSS log + Equipment flags + Clean Plan | `hubLogRank`, `hubPeriodKey`, `hubFreqDone` |
+| **Weekly cost recap** | Labor cost summed by week key, line key and clean kind | MSS log | `hubWeekKey` |
+| **Sanitation cost per pound** | (Labor cost + chemical cost for the week) / `craa5_dailyproduction.craa5_pounds` for the week. Chemical cost for the week = (drop in counts + received) between the two Sunday counts around the Monday-Sunday week, x unit price. If a count is missing, received spend is used and the number is marked so. **Draft, for Gerald to confirm.** | MSS log, chemical hub, daily production | |
+| **Time lost** | Minutes in `craa5__m_timelosslog` by kind. Kind `Weekend clean` rows come from PBED's Add time loss form: time lost during the weekend clean (`craa5_minuteslost`, a delay reason such as Waiting on FSQ, a department, status Open). Shown on their own as "from PBED" and left out of Time lost totals. Whether they count anywhere else is Gerald's call (asked). | Manager hub | |
+
+People thresholds (coaching below 75 % pace for 14 days, high performer list) are settings in Hub config key `hub_people_thresholds`, not constants in an app. The coaching list is for supervisors and managers only, never shown to peers.
+
+---
+
+## 8. Status words
+
+Stored as lower-case English codes. Shown with the label in the language chosen. Colors are in section 10.
+
+1. **Piece / check-off** (`craa5_cleancheckoff.craa5_status`): stored `started`, `done`, `undone` (a Done taken back). Shown also: **Planned** (no row yet), **Skipped** (an MSS skip code from `craa5_mss_skipcode`), and **Overdue** (past its window end and not done). These three are display states, never stored in the check-off.
+2. **Clean window** (Clean Plan `craa5_status`, Scheduler's words): `ok`, `tight`, `short`, `overlap`, `nocrew`, `none`. Shown as On track, Tight, Short of people, Overlaps a run, No crew, Nothing to do.
+3. **Board** (`craa5_shiftboard.craa5_status`): `planned`, `live`, `archived`, `used`, `cancelled`.
+4. **Attendance** (on a board row): `present`, `late`, `sick`, `pto`, `left_early`, `no_call`, `loaned`, `training`. Shift Start's current PTO / Sick / Late / Left Early map to these. The badge reader will later write the same words.
+5. **Role** (`craa5__aa_employee.craa5_role`): Sanitor 256000000, Lead 256000001, Supervisor 256000002. Manager and Admin come from the Dataverse security role.
+6. **Loading a table** (every app, same words): Loading, Ready, Nothing here yet (read worked, no rows), Table missing, No access (privilege), Could not load (network or other). An app shows one of these per table it reads. It never shows sample data instead.
+7. **Swab result** (BOLO): `positive`, `negative`, `pending`, `count` (a lab number: counts as a pass in APC and ATP rates, in no rate elsewhere, such as Listeria and Salmonella). A reading with `>` or TNTC on APC, ATP, coliform or yeast/mold is stored `positive` (always past the threshold); "EST" is wording only, so 2,500 EST is the count 2,500. Targets and the alert window are in Hub config key `PATHOGEN_BOLO_RULES` (defaults: pathogen 2 %, APC 5 %, ATP 5 %, repeat 21 days, alert window 2 months, close within 7 days: a positive with no MSS log clean of its equipment or area within `closeDays` of the swab is **Overdue**), `replaced` (a superseded row, kept, never deleted: skip it everywhere). In the MSS log, `craa5_pathogen` is `Yes` / `No`.
+8. **Order / cart** (chemical hub): Draft (not in SAP yet), Submitted, Approved, Ordered, Partially received, Received, Cancelled.
+
+---
+
+## 9. Language, words and manuals
+
+- **One switch for all apps:** browser key `hub_lang` (`en` or `es`), read with `hubGetLang()`. On first use it picks up the old per-app keys. Every app header has the same EN / ES toggle.
+- **es-MX.** Every visible word goes through the app's translate function, keyed by the English text, as in PBED's `pbT`. Each app's build check fails when a string has no Spanish.
+- **ASCII only:** Spanish is written with % codes (`%a` = á, `%n` = ñ, `%?` = ¿; full list in `hub-shared.js`) and decoded at run time.
+- **Shared words:** the `HUB_ES` list in `hub-shared.js`. Status words, clean kinds, attendance, roles, load states and core nouns. An app may add words but never gives a shared word another Spanish, and never reuses a shared English key with a different meaning (for example "Late" is attendance only; a late piece is "Overdue"). An app whose own list uses a shared key differently renames its key. Examples: Done = Terminado, Started = En proceso, Overdue = Atrasado, Late (attendance) = Retardo, Area = Área, Line = Línea, Crew = Cuadrilla, Team = Grupo (not "Equipo", which is Equipment), Swab = Hisopo, EOW = Fin de semana, Room = Cuarto, Training = Capacitación. **Mexican plant Spanish (es-MX), usted form:** computadora, celular, tomar, presionar / dar clic, llenar, tarima, retardo; never vosotros forms, ordenador, móvil for a phone (the adjective is fine: Promedio móvil, Zona 4 / Móvil), coger, pulsar or rellenar (Gerald, 2026-10-23: some text read as Spain Spanish). **Gerald: please have a Spanish-speaking lead check these words once (Q6).**
+- **Manuals:** every screen has a `?` button that opens a one-page picture guide in the current language. It can be printed for training. At most 7 short steps, one action each ("Tap the piece. Check your name. Tap Done."), a screenshot per step, and the same layout in every app. Each app keeps its guide text in its own word list, so the Spanish check covers it.
+
+---
+
+## 10. Look (shared theme)
+
+- **Theme switch:** browser key `hub_theme` (`light` / `dark`). Same toggle in every header.
+- **Header:** CJ / Schwan's logo on the left (tapping it opens the admin view: setup, data check), app name, signed-in name, EN/ES, light/dark, `?`.
+- **Tokens** (`HUB_COLORS` in `hub-shared.js`):
+
+| Token | Light | Dark |
+|---|---|---|
+| background | `#F1F5F9` | `#1B2740` |
+| card | `#FFFFFF` | `#24324D` |
+| border | `#E2E8F0` | `#33425F` |
+| text | `#1E293B` | `#E2E8F0` |
+| muted text | `#64748B` | `#94A3B8` |
+| primary (CJ blue) | `#0072CE` | `#4DA3E8` |
+| primary dark (navy) | `#00468B` | `#B3D4F2` |
+| accent (CJ yellow) | `#FFB81C` | `#FFB81C` |
+
+- **Status colors** (the same in every app, `HUB_STATUS_COLORS`): done green `#059669`, started / in progress blue `#0072CE`, planned gray `#64748B`, at risk / skipped amber `#D97706`, **overdue red `#DC2626`**. Red is used only for overdue, a failed save and a positive swab. Brand red `#E4002B` is for the logo only.
+- **Clean kind colors on clocks and Gantts:** daily blue, midweek amber, EOW navy, allergen purple `#7C3AED`, changeover gray. Production runs are solid slate `#475569`.
+- Tap targets at least 44 px on phone screens. The same cards and chips in every app.
+
+---
+
+## 11. Browser storage: what moves to tables
+
+| Browser key today | Holds | Moves to |
+|---|---|---|
+| `prodsched_clean_windows_v1` | Clean windows, read by Ganttly / Shift Start | `craa5_cleanplan` (Ganttly reads the table; Phase 1 of the Ganttly plan) |
+| `ss_live_boards_local_v1`, `SS_DATA_CACHE_V1/V2` | Live boards, cached tables | `craa5_shiftboard`. A cache may stay as a speed-up, never as the source. |
+| `ss_presets_v1` | Crew setups | `craa5_shiftpreset` |
+| `ss_deactivated_employees_v1` | People who left | `craa5__aa_employee.statecode` |
+| Ganttly `itp_*` keys (check-off fallback, removed / skipped tasks, obstacles, handovers, personnel notes, settings) | Floor work | Check-offs to `craa5_cleancheckoff`. Settings to Hub config key `ganttly_settings`. Gerald keeps all three (Q7): obstacles, handovers and personnel notes move to tables (Ganttly thread designs them, `_g_` prefix, plain keys). Personnel notes must stay readable by managers after supervisors and leads lose access to the Manager hub; a later supervisor hub may show them too. |
+| `itp_settings_v10` `avgHourlyRate` ($21) | Labor rate | `_e_ Labor rate` |
+| `mss_completion_excluded_v1` | Rooms, areas and equipment left out of MSS percentages | Hub config key `mss_completion_exclusions` (MSS Calendar) |
+| `mss_line_downtime_v1` | Lines off schedule (date ranges), lines added by hand | When a line is off comes from the Clean Plan `day` rows (`craa5_status` idle / unplanned, `craa5_cleankind` none / covered). Only lines the Scheduler does not plan keep hand-entered ranges, in `craa5__0_hubconfig` key `mss_line_downtime` (MSS Calendar) |
+| `mss_log_input_view_module_v1` | Log Input view rules for the Calendar | Hub config key `mss_view_rules` |
+| BOLO IndexedDB swab results + `PATHOGEN_BOLO_MANAGERS_HUB_GRAPHS` blob | Swab results | `_b_ Swab result` |
+| `itp_lang_v1`, `ss_lang_v1`, `prodsched_lang_v1`, `stillwell_*_lang_v1` | Language | `hub_lang` (stays in the browser, one key) |
+| `itp_theme_v1`, `schwans_theme`, `stillwell_*_dark_v1` | Theme | `hub_theme` (stays in the browser, one key) |
+
+---
+
+## 12. Table names, prefixes and shared settings
+
+New tables are named `_<letter>_ Name`, so the schema name is `craa5__<letter>_name`. Columns get no prefix. Every new table is **Organization-owned**, has no lookup columns, uses Currency for money, and has a primary column named so that the display name without spaces, in lower case, equals the part after `craa5_`.
+
+| Prefix | App | Status |
+|---|---|---|
+| `_c_` | Chemical hub | in use |
+| `_m_` | Manager hub | in use |
+| `_p_` | PBED | in use (the BOLO "_p_ swab result" idea must use `_b_` instead) |
+| `_b_` | Pathogen BOLO | new |
+| `_t_` | Training matrix | new |
+| `_g_` | Ganttly / Shift Start (merged floor app) | in use: obstacle, handover, personnel note (1.0.25) |
+| `_e_` | Shared by the whole ecosystem (owned by this contract) | new |
+| `_0_` | Abandoned set | do not use (`craa5__0_hubconfig` only until the apps move to `craa5__e_hubconfig`) |
+
+Apps look a table up by its prefixed name first and its plain name second, as Manager hub v6.8 does, because Gerald may create either.
+
+**Shared settings** live in **Hub config**: the new `craa5__e_hubconfig` ("_e_ Hub config", Organization-owned; columns `craa5_configname` primary, `craa5_configkey`, `craa5_configjson` Multiple lines max 1,048,576; prompt in `table-prompts.md` part 8). One row per `craa5_configkey`, each key written by one app, and the key is always filled. Apps look for `craa5__e_hubconfig` first and the old `craa5__0_hubconfig` second (`HUB_CONFIG_TABLES`). On the old table the JSON goes in `craa5_manifestjson`, because its `craa5_configjson` holds only 100 characters; on the new table it goes in `craa5_configjson`. A row with empty JSON means "no settings yet" (the monitor can pre-create rows with only the key and name): readers treat an empty string as no settings and use their defaults, and the owning app fills it on its first save. Readers use `hubConfigJsonOf(row)` and match `craa5_configkey` first, `craa5_configname` second for old rows with a blank key. Gerald adds the keys to the new table once it exists; the old one stays until every app has switched. Keys:
+`hub_people_thresholds` (Manager hub), `ganttly_settings` (Ganttly), `mss_view_rules` (MSS Log Input), `scheduler_shared` (Production Scheduler; today its `config` row in the Clean Plan, which may stay there), `training_settings` (Training page: minimum shifts, refresher days), `director_settings` (Sanitation director: crew builder setups, target utilization, day/night cutoff), `mss_completion_exclusions` and `mss_line_downtime` (MSS Calendar; downtime only for lines the Scheduler does not plan). Plus one `manifest|<appId>` row per app, written by that app (12.1).
+
+**Keys in use today** (older names, listed so the monitor does not flag them): `MSS_CALENDAR_VIEW_CONFIG` and `MSS_SKIPPED_ENTRIES_LOG` (MSS Calendar), `MSS_LOG_SKIPPED_ENTRIES` and `MSS_LOG_MANPOWER_SETUP` (MSS Log Input; the manpower plan's fixed posts and vacation cover, a screen estimate, not a section 7 number). Proposed, not approved: `PRODSCHED_CREWPLAN` and `PRODSCHED_SCENARIOS` (Production Scheduler), `MSS_LOG_VIEW_CONFIG` (MSS Log Input; becomes `mss_view_rules`), `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG` (MSS Log Input; the Calendar only reads skip codes), `MSS_CALENDAR_ACCESS_LOG` (MSS Calendar's own access log), `PBED_WEEKEND_PLAN` (old PBED, unused), ten `PATHOGEN_BOLO_*` keys (Pathogen BOLO; `PATHOGEN_BOLO_RULES` holds targets and the alert window that other apps read). Keys match exactly, case included. The full list with owners is `configKeys` in `contract.json`.
+
+### 12.1 App manifests (self-check)
+
+Each app says in its own code which tables and columns it uses, and saves that list to Dataverse when it opens. The Dataverse monitor then checks every app at once against what really exists, with nothing pasted by hand. Smallest version: no new table.
+
+- **Where:** Hub config (`craa5__e_hubconfig`, else the old `craa5__0_hubconfig`), `craa5_configkey` = `manifest|<appId>`, name "<App> manifest". JSON in the new table's `craa5_configjson`; on the old table in `craa5_manifestjson`. `hubSaveManifest` picks the first that reads.
+- **appIds:** `ganttly`, `shiftstart`, `prodsched`, `msscalendar`, `msslog`, `pbed`, `bolo`, `managerhub`, `chemicals`, `mapsubmit`, `monitor`, `training`, `director` (Sanitation objectives director).
+- **What the app writes:** `{ appId, app, version, tables: [{ t, names, read, write, opt, cols?, label?, new?, owner?, primary? }], config }` (the build fields from HUB SHARED v1.3: also `prompt`, ground rule 10). `t` is the table's logical name, `names` the names the app tries in order (prefixed first), `read`/`write` the columns, `opt` the columns it works without (the monitor shows them as "not yet", not "missing"), `config` the hubconfig keys it writes. Logical names only, never data or people.
+- **What gets stored:** `hubManifest()` adds `m: 1`, `contract` (the version of the pasted HUB SHARED block, e.g. 1.1, not this document's version), a `hash` and `savedAt`, and sorts every list.
+- **When:** call `hubSaveManifest(io, manifest)` once after the app loads. It reads the row (one small read), writes only when the hash changed, never blocks the app and never shows an error. `io` is the app's own query / create / update (Ganttly: `swQuery` + `swWriter`).
+- **Who reads it:** the Dataverse monitor. It reports "Ganttly 2.0.0 (saved <date>) needs X, missing Y", and builds the one-table Copilot prompts and click-steps for what is missing.
+- **How it relates to `contract.json`:** `contract.json` is the plan: which tables should exist, keys, statuses, owners. Manifests are what each app build really uses. The monitor checks manifests against Dataverse (does it exist?) and against `contract.json` (is the app writing a table it does not own, or reading an abandoned one?). When a manifest and the contract disagree, the contract thread fixes one of them.
+- **Dataverse setup:** the new Hub config table (`table-prompts.md` part 8). It was made User-owned (monitor, 2026-10-23), so every hub role needs **Organization** Read, Create and Write on it (`table-prompts.md` part 10), and any app can update a manifest someone else saved.
+- **Code scans:** until an app carries its own manifest, Gerald can paste its code into the Dataverse monitor, which saves the craa5 names it finds as `scan|<appId>` (same format, `source: 'scan'`). A real `manifest|<appId>` wins over a scan.
+- **One-time copy:** the monitor has a tab Gerald runs once to copy `craa5_allergenclean` into `craa5_eggallergen` and `craa5_pecanallergen`. After that the MSS Calendar owns those flags.
+- **First app:** Ganttly, in its Phase 2. The others add theirs when they next change.
+
+### 12.2 Shared code blocks
+
+Each block is pasted unchanged into every app that uses it. Its owner changes it and tells this thread; a new version goes in the change log here.
+
+| Block | File | Owner | Pasted by |
+|---|---|---|---|
+| HUB SHARED v1.3 | [hub-shared.js](/mnt/project-files/ecosystem-contract/hub-shared.js) | this thread | every hub app |
+| MSS MANPOWER v1.1 | [mss-manpower.js](/mnt/project-files/mss-log-input/mss-manpower.js) (repo `ecosystem/mss-manpower.js`, PR #40) | Sanitation director thread (from 1.0.64) | Production Scheduler, Sanitation director (shift hours from Work Shifts). MSS Log Input no longer pastes it |
+| MSS LOG WRITE v1.4 | [mss-log-write.js](/mnt/project-files/mss-log-input/mss-log-write.js) | MSS log input thread | every MSS log writer: Ganttly, MSS Log Input, MSS Calendar (section 6.3) |
+| HUB SHARED v1.3 note | 1.2 kept the manifest build fields (`cols`, `label`, `new`, `owner`, `primary`); 1.3 adds `prompt`. Apps on 1.1 or 1.2 keep working; re-paste 1.3 at the next version. | | |
+| ASSIGN SPLIT v1.0 | [assign-split.js](/mnt/project-files/ganttly-overhaul/assign-split.js), tests [assign-split.test.js](/mnt/project-files/ganttly-overhaul/test/assign-split.test.js) | Ganttly thread | Ganttly v1.5, Shift Start v0.0012+ (the even split for `_g_ Assignment`; rules in [shared-assignment.md](/mnt/project-files/ganttly-overhaul/shared-assignment.md)) |
+
+
+### 12.3 Migration for ground rules 10 and 11 (1.0.60)
+
+Each thread does this in its next version. Nothing is deleted from Dataverse; only app code changes.
+
+- **Table building (rule 10).** Remove every setup wizard, "make this table" screen and any code that calls the Dataverse metadata API to create or change a table, column, key or choice. Keep the read-only checks ("is this column there?") and show missing ones as "not made yet". Put the column types and lengths in the app's manifest (`tables[].cols`, plus `new`, `label`, `owner`, `primary` and the recommended Copilot `prompt` for a table still to make). The monitor shows them and Gerald builds. Prompts already in `table-prompts.md` and other threads' prompt files stay valid until the monitor shows the same.
+- **Headcount (rule 11).** The Sanitation director takes over crew sizing, heads needed per shift, vacation cover and crew-builder what-ifs, and writes the shift tasks (`_e_ Shift task`) once it is made.
+  - **Production Scheduler (done, v4.9):** keep publishing the clean plan (windows, scope, day and week rows: the work). Keep writing `staff` rows only until the director shows heads needed per shift; then stop and remove the Crew plan tab. `PRODSCHED_CREWPLAN` settings move to `director_settings`.
+  - **MSS Log Input:** remove the manpower plan and its setup (`MSS_LOG_MANPOWER_SETUP`); its fixed posts become `_e_ Shift task` rows through the director. The MSS MANPOWER block stays only for shift hours if other code needs them.
+  - **Manager hub, PBED, Shift Start, Ganttly, Training:** remove any headcount or crew-size planner; show the director's number where a screen needs it. PBED keeps the weekend clean plan's people per job (that is assignment).
+- **Hub config.** Apps keep writing only their own settings keys and `manifest|<appId>`.
+
+---
+
+## 13. New tables and columns in this version
+
+The Dataverse monitor shows the prompts and click-steps and Gerald builds (ground rule 10), from `contract.json` (`colTypes` per table, `new` / `label` / `primary` for tables to make) and the apps' manifests. `table-prompts.md` stays as the reference until the monitor's builder covers it.
+
+| What | Why | Who creates it |
+|---|---|---|
+| 11 optional columns on `craa5__log_` (completion key, shift date, shift code, clean kind, labor minutes, employee ids, marked by, source, done at, plan key, line key) | One honest completion record with dedup, shift date, people and minutes | Gerald, part 1 |
+| `craa5_midweek` on `craa5_aa_assets` | Already exists. Gerald only sets it to Yes on IBL4 midweek pieces. | Gerald, part 2 |
+| 4 optional columns on `craa5_cleancheckoff` (shift date, clean kind, completion key, employee guids) | Join live progress to the log and record who is on each piece | Gerald, part 3 |
+| `_e_ Labor rate` table | Made 2026-10-23 with 5 pay roles | done |
+| 4 columns on `craa5_aa_assets`: Egg clean, Egg clean minutes, Pecan clean, Pecan clean minutes | Egg and pecan allergen cleans have different pieces and times (Q8) | Gerald, part 7 |
+| `craa5_cleanoverride` text on `craa5__aa_prd_schd` | IBL4 72 h override (Scheduler thread): `midweek|who|why`, `skip|who|why`, `pin|who|why|YYYY-MM-DDTHH:MM` (plant time, built in v4.6) | Scheduler thread's prompt |
+| `_e_ Shift task` table | Mandatory shift tasks (proposed, not approved) | Scheduler game plan's prompt |
+| `_b_ Swab result` | Swab results as rows (BOLO thread) | BOLO thread's prompt, keys per section 2 |
+| `_g_ Assignment` | Equipment to people, shared by Shift Start and Ganttly | Ganttly thread's prompt, `/mnt/project-files/ganttly-overhaul/shared-assignment.md` (made 2026-10-22) |
+| `_g_ Obstacle`, `_g_ Handover`, `_g_ Personnel note` | Ganttly obstacles, handovers and personnel notes leave browser memory (Q7) | Ganttly thread's prompts, `/mnt/project-files/ganttly-overhaul/g-tables-prompts.md` |
+| `_t_ Skill`, `_t_ Skill level`, `_t_ Training event` | Training matrix (floor sessions are inferred from MSS log `craa5_employeeguids`) | Training thread's prompt, keys per section 2 |
+
+Rules for other threads' new tables: area = `craa5_area` (exact area name), equipment = `craa5_equipmentguid(s)`, employee = `craa5_employeeguid(s)` plus a name column for people, dates as in section 5, Organization-owned.
+
+### 13.1 Answers to the threads (2026-10-21)
+
+- **MSS Calendar:** all four points accepted. Shift date (section 5), one row per piece actually done, kind from the clean done (6.2), and dedup by `craa5_completionkey`, not `craa5_uid`. Read `craa5_shiftdate` when present, else the first 10 characters of `craa5_lastcleaned`. Midweek is `craa5_cleankind` = `midweek` with the daily flag. There is no new midweek flag column on the log.
+- **MSS Log Input:** your draft is the rule (6.3). Additions: `craa5_completionkey` and a fixed row id, plus `craa5_cleankind`, `craa5_shiftdate`, `craa5_shiftcode`, `craa5_employeeguids`, `craa5_doneat`, `craa5_plankey`, `craa5_linekey`. Your shared block should call `hub-shared.js` for keys and dates. You own the block. This contract owns the column list.
+- **Production Scheduler:** accepted as written. You are the only writer of `craa5_cleanplan` and the line key is your `canonLine` (= `hubLineKey`). `craa5_cleanoverride` and the `alert` rowtype are added. Please keep `craa5_cleankind` words as they are. Readers map them with `hubCleanKind`.
+- **Map submission tool:** `craa5__area` = exact `craa5_aa_mss_area.craa5_area`; `craa5__room` = exact room name; equipment = `craa5_equipmentguids`. Name the area id column `craa5_mssareaguid` (not `craa5_areaguid`), to match the Scheduler. The number people see is `craa5_uniqueid`. `craa5_assetcode` is empty and is not used. Please read `craa5_aa_mss_area` for the area list.
+- **Pathogen BOLO:** use prefix `_b_` (`_p_` is PBED). Store `craa5_area` = the exact MSS area name. Keep your room keys (WJ, Okra/01MIX...) as an alias list that maps to area names. Store equipment as `craa5_equipmentguid`, with `craa5_uniqueid` only for display. Your OK tag can be its own text column `craa5_assettag`. Collection date is a plant day `YYYY-MM-DD`. A positive result is closed by an MSS log row with `craa5_cleankind` = `corrective` and `craa5_pathogen` = Yes on the same piece or area.
+- **Dataverse monitor:** read `contract.json` (same folder). Per table it has logical name, entity set, id and name columns, prefix candidates, writers, readers, required columns, keys with what they must match, and status.
+
+---
+
+## 14. Open questions for Gerald
+
+- **Q1.** Answered 2026-10-21 by the Dataverse monitor: `craa5_cleancheckoff` and `craa5_midweek` both exist.
+- **Q2.** Answered 2026-10-21: anyone on the crew may mark a piece Done (section 6.3 rule 1).
+- **Q3.** Answered 2026-10-21: `craa5_hourstoclean` is minutes.
+- **Q4.** Answered 2026-10-21: `craa5_month` is the 6-month (semiannual) flag, meant to be `craa5_6month`.
+- **Q5.** Answered 2026-10-21: labor rate by role, not per person (pay stays private and rates forecast better).
+- **Q6.** Partly answered 2026-10-21: one Spanish-speaking lead looked and said it is okay. More checks welcome.
+- **Q7.** Answered 2026-10-21: keep obstacles, handovers and personnel notes; they move to tables (section 11).
+- **Q8.** Answered in part 2026-10-21: `craa5_allergenclean` says an allergen clean was done. Egg and pecan are split into separate cleans with different times (kinds `egg`, `pecan`; Equipment columns in part 7). Type closed by default 2026-10-23 (Gerald's passive mode): MSS LOG WRITE v1.3 tries `Yes`, then `true`, and drops the column only if neither fits; readers count `Yes`, `true` or `1` as done (6.3 rule 12).
+- **Q9.** Closed by default 2026-10-23: plain wage. The rates Gerald entered ($19 / $21 / $24 / $20) are hourly pay, so cost screens say "wage cost" (Spanish "costo de salario"). If he later enters loaded rates, the label changes to "loaded labor cost"; nothing else does.
+
+---
+
+## 15. Change log
+
+- **1.0.69 (2026-10-23)** c-tables.json from the chemical thread: `primary.n` now equals `primaryName` (the real Dataverse names) for `craa5__c_chemical` (`craa5__c_chemical_name`), `craa5__c_cartline` (`craa5_cartlinename`) and `craa5__c_chemicalcount` (`craa5_chemicalname`). Found by the Dataverse monitor.
+- **1.0.68 (2026-10-23)** Shift Start v0.0018 (PR #33, 7de6a6e) finished 12.3 and rules 10/11 (no Table Setup, saves `manifest|shiftstart`, shows `DIRECTOR_HEADS` read only). contract.json `colTypes` for `craa5_shiftboard`, `craa5_shiftplan`, `craa5_shiftarchive`, `craa5_updatepreset` and `craa5_shiftlog` copied from its manifest (primary name columns untyped). Employees: Shift Start writes only `statecode` / `statuscode`. `_e_ Shift task` row: writer the Sanitation director, Shift Start a planned reader.
+- **1.0.67 (2026-10-23)** Ordering hub v0.11 (PR #30) finished 12.3: HUB SHARED v1.3, saves `manifest|chemicals`, no table building. contract.json now carries `colTypes`, `label`, `owner` "user" and `primary` for the 10 `_c_` tables the hub uses (from /mnt/project-files/chemical-ordering/contract/c-tables.json); checklist task, clerk checklist, chemical standard and sanitation budget have none yet (later phase). Week start (Sunday in the hub vs Monday here) stays open with Gerald.
+- **1.0.66 (2026-10-23)** Production Scheduler v4.9 (PR #39, 6a0a8cb) finished 12.3: no `staff` rows, no Crew plan tab, no Shift task reads or writes, `PRODSCHED_CREWPLAN` legacy (no config keys of its own now); its Shifts tab reads `DIRECTOR_HEADS`. Rules stamp ends `|night1` again. `_e_ Shift task` readers: Shift Start, Ganttly, Manager hub (writer: the director).
+- **1.0.65 (2026-10-23)** `_b_ Swab result` is live (entity set `craa5__b_swabresults`, 20,000+ rows) with colTypes for it and the swab catalog; dates (`craa5_collectiondate`, `craa5_closedon`) stay text plant days and `craa5_result` / `craa5_test` / `craa5_stage` stay text, never choice. `_e_ Hub config` gains `noBuildCols` [`craa5_manifestjson`] (old table only; never add it to the new one). BOLO finished 12.3 (v2.5.2, HUB SHARED v1.3).
+- **1.0.64 (2026-10-23)** Sanitation director v1.1 (PR #44, 1e86e2e) works out heads needed per shift and publishes Hub config `DIRECTOR_HEADS` (guide /mnt/project-files/sanitation-director/director-heads.md); it writes `_e_ Shift task` (the Scheduler no longer does) and owns the MSS MANPOWER block. The Scheduler can stop writing `staff` rows and remove its Crew plan tab once Gerald pastes director v1.1.
+- **1.0.63 (2026-10-23)** MSS Log Input done with 12.3 (PR #40, d6d1f4d): manpower plan removed (`MSS_LOG_MANPOWER_SETUP` no longer written; its row stays for the director to read), MSS MANPOWER block has its own file and is pasted only by the Scheduler and the director. Skip codes live only in Hub config `MSS_SKIP_CODES`, so `craa5_mss_skipcode` is optional with no writer and MSS Log Input no longer writes `craa5_mss_useraccesslog`. `craa5__log_` colType `craa5_sapw` text 100.
+- **1.0.62 (2026-10-23)** Gerald's correction: ground rule 10 is now "only Gerald builds tables". The Dataverse monitor never writes Dataverse either; it reads, shows and tests what apps need, and Gerald builds from its prompts. HUB SHARED v1.3: manifests also keep each table's recommended Copilot `prompt` (2,000 characters max; 123 checks). `MONITOR_BUILD_LOG` is legacy.
+- **1.0.61 (2026-10-23)** `craa5_schedulechange` is optional (proposed, not missing). `contract.json` column types add `image` and `file` for existing picture and file columns (contract and monitor only; manifests cannot declare them in HUB SHARED v1.2).
+- **1.0.60 (2026-10-23)** Gerald's ruling: ground rule 10 (apps never build tables; the Dataverse monitor is the only table builder, from manifests and `contract.json`) and ground rule 11 (headcount planning only in the Sanitation director). Migration in 12.3. HUB SHARED v1.2: manifests keep `cols` ({column: {type, len, label, options, min, max, precision, default}}; types text, memo, int, decimal, money, yesno, date, datetime, choice, guid), `label`, `new`, `owner`, `primary` (the monitor thread's shape; 121 checks). `contract.json` gains `buildRule`, `columnTypes`, per-table `colTypes` (the contract decides types), `new` tables, and config key `MONITOR_BUILD_LOG`. Heads needed per shift moves to the director (Scheduler staff rows until then); `MSS_LOG_MANPOWER_SETUP` and `PRODSCHED_CREWPLAN` retiring.
+- **1.0.59 (2026-10-23)** `craa5__aa_role` (pay roles) is live, read by PBED, Ganttly, Manager hub and the director to name `craa5_roleid` when only the id comes back. The hub role choice is never a pay role. Security roles list updated.
+- **1.0.58 (2026-10-23)** BOLO v2.5 (PR #37): early v2.4 map pins keep an older id and are updated in place; readers find BOLO pins by the description prefix only.
+- **1.0.57 (2026-10-23)** Sanitation director page on draft PR #44: reads Employees, Work Shifts, clean plan (published weeks only), Equipment, MSS log, shift board and archive, labor rate, `PRODSCHED_CREWPLAN`; writes only `director_settings` and `manifest|director`; pastes HUB SHARED v1.1 and MSS MANPOWER v1.1.
+- **1.0.56 (2026-10-23)** `craa5_roleid` confirmed a lookup to `craa5__aa_role` (role names listed in section 3). `_e_ Hub config` was made User-owned, so every hub role needs Organization Read and Write on it. New `table-prompts.md` part 10: two security roles (Hub floor, Hub manager) with each table's privileges, since only admins can read hub tables today.
+- **1.0.55 (2026-10-23)** New Sanitation objectives director app (appId `director`, key `director_settings`, reads only). Section 7: Scheduled hours, Utilization % (actual, separate from the Scheduler's planned `used`), Unused wage (fixed posts left out so they never read as idle), Projected hours (year out).
+- **1.0.54 (2026-10-23)** MSS LOG WRITE v1.4 (PR #40, 5fcab26): a clean already logged by other people is saved as its own entry `key|2`..`key|9` instead of being dropped. Readers count cleans by the base key and add every entry's minutes. MSS Log Input's manpower panel reads the Scheduler's staff rows (f14234e).
+- **1.0.53 (2026-10-23)** BOLO map pin marker: description prefix `(PATHOGEN BOLO - ` or `(HARBORAGE CONCERN - `; Map tool shows those rows read only.
+- **1.0.52 (2026-10-23)** Pathogen BOLO 2.5: may create its own pin rows in `craa5__facilityobservation` (never edits Map tool rows); `PATHOGEN_BOLO_RULES` gains `closeDays` (default 7, positive Overdue after it).
+- **1.0.51 (2026-10-23)** Monitor printout: real names `craa5_gassignment` and `craa5_employeenote` (probe first); `_e_ Hub config` has no Config key column yet (apps fall back to the old table until it is added, `table-prompts.md` part 8); `craa5_manifestjson` optional on hubconfig; `craa5_roleid` is probably a lookup (read the formatted value); room is not a join key; the SAP work area pair is one way only (Equipment `craa5_workareacode` is found in `craa5_aa_ms_assets.craa5_title`, not the reverse); `craa5_mssresourcechemicalstandard` and `craa5_sanitationheadcountshiftrosterledger` listed as unclaimed (no app uses them); plain `craa5_shifttask` is not the Shift task table; config key `MONITOR_HISTORY` (monitor, daily counts only).
+- **1.0.50 (2026-10-23)** Scheduler v4.7 crew plan (PR #39, aae7e04): clean plan `staff` rows written; new section 7 number **Heads needed per shift**, worked out only by the Scheduler (default under Gerald's passive mode: one manpower engine, so MSS Log Input reads `staff` rows and its fixed posts move to `_e_ Shift task`); `PRODSCHED_CREWPLAN` in use; `_e_ Shift task` prompt in `table-prompts.md` part 9; Overdue by frequency = previous period missed too; MSS MANPOWER v1.1 listed in 12.2.
+- **1.0.49 (2026-10-23)** New section 12.2, the list of shared code blocks (HUB SHARED, MSS LOG WRITE, ASSIGN SPLIT). `_g_ Assignment` even-split rules from ASSIGN SPLIT v1.0 (Gerald: auto assign evenly, reorder for completion).
+- **1.0.48 (2026-10-23)** Section 6.5 follows Scheduler v4.6 (PR #39, b35d8e9): window details gain optional `pin`, `after`, `order`; config row may hold `links` and `order`; override pin is `pin|who|why|YYYY-MM-DDTHH:MM`; Scheduler reads `craa5_linepriority` as the default clean order; a night stop counts for the day it starts on (more Daily windows for IBL5 and Waterjet). Built under Gerald's passive mode; he reviews at the end.
+- **1.0.47 (2026-10-23)** Section 6.3 follows MSS LOG WRITE v1.3 (PR #40, 200f922): names need two letters (`not_a_name`), `craa5_allergenclean` tries `Yes` then `true`, Check tab flags over 24 labor hours on a piece (`hours_high`). MSS Log Input now uses `hub_lang` / `hub_theme`.
+- **1.0.46 (2026-10-23)** Gerald moved to passive mode (follow the plan, use sensible defaults, say which). Q9 closed as plain wage (the rates entered are hourly pay; screens say "wage cost"). Q8 closed: send `Yes`, readers accept Yes / true / 1.
+- **1.0.45 (2026-10-23)** `_e_ Labor rate` is live (Gerald's export, 5 pay roles: sanitation tech 1-3, Adm, Int; no Sanitor or All row). Labor cost uses the employee's pay role `craa5_roleid`, falling back to `sanitation tech 2`, then Sanitor, then All. Projected and planned cost use `sanitation tech 2`. Same as PBED v1.7 (PR #31).
+- **1.0.44 (2026-10-23)** Spanish rule: "móvil" is banned only for a phone (use celular); the adjective stays (Promedio móvil, Zona 4 / Móvil). `craa5_shiftlog` writers stay Shift Start and MSS Log Input: Ganttly's archive log row goes away with its fallback archive.
+- **1.0.43 (2026-10-23)** Shift Start is the only writer of `craa5_shiftarchive` and its shift log row; Ganttly drops its 4-hour fallback archive (Shift Start has a close-out button and archives overdue boards itself). Ganttly's Employee `craa5_remarks` and Shift board `craa5_updatesjson` writes stay as column owners.
+- **1.0.42 (2026-10-23)** Spanish set to Mexican plant usage: Room = Cuarto, EOW = Fin de semana (not FDS), Training = Capacitación, Late = Retardo; Spain words listed as never-use (section 9). `hub-shared.js` 113 checks.
+- **1.0.41 (2026-10-23)** Ganttly 1.4 (PR #32) uses the three `_g_` tables, saves `manifest|ganttly`, and reads egg / pecan flags and minutes. The tables stay "proposed" until the monitor sees them in Dataverse.
+- **1.0.40 (2026-10-23)** BOLO v2.4 (Gerald's answers): any clean after a swab hit closes it; open hits only inside the alert window; `>` / TNTC readings are positive, EST is wording; count is a pass in APC and ATP rates only; new key `PATHOGEN_BOLO_RULES`.
+- **1.0.39 (2026-10-23)** Due by frequency: `hubLogRank` ranks old log rows by their flags; which days and weeks owe a job follows the MSS Calendar (due days, weekend stretch, idle weeks). 110 checks.
+- **1.0.38 (2026-10-23)** Section 7: Due by frequency, the MSS Calendar's period rule, now shared in `hub-shared.js` (`HUB_FREQS`, `hubKindRank`, `hubPeriodKey`, `hubFreqDone`; 105 checks) so the Scheduler and others reuse it instead of writing a second one.
+- **1.0.37 (2026-10-23)** Scheduler game plan, all **proposed, not approved by Gerald**: `_e_ Shift task` table; changeover rule types together / apart / nights-only / clean-order; override form `pin|who|why|HH:MM`; clean plan rowtype `staff`; hub config keys `PRODSCHED_CREWPLAN`, `PRODSCHED_SCENARIOS`.
+- **1.0.36 (2026-10-23)** contract.json rebuilt from c-tables.json: optional `craa5_actiontaken` on `_c_ Chemical usage log` (Ordering hub v0.9 Log tab). Section 5: usage log date is an entry timestamp, not a shift date.
+- **1.0.35 (2026-10-22)** configKeys adds `MSS_LOG_MANPOWER_SETUP` (MSS Log Input, PR #40).
+- **1.0.34 (2026-10-22)** configKeys adds BOLO's nine `PATHOGEN_BOLO_*` keys. `hubManifest` keeps the case of config keys (93 checks); table and column names stay lower case.
+- **1.0.33 (2026-10-22)** `_g_ Assignment` (`craa5__g_assignment`): equipment to people per shift, written by both Shift Start and Ganttly with pinned / source / rev rules (sections 3, 4, 13; contract.json with name candidates).
+- **1.0.32 (2026-10-22)** BOLO v2.3: swab result rows keyed by sample + description + test; results add `count` and `replaced`; readers add `statecode eq 0`, skip replaced, keep count out of rates.
+- **1.0.31 (2026-10-22)** Ground rule 9: no pop-ups (Power Apps blocks confirm / alert / prompt). Empty Hub config JSON = no settings yet. The Dataverse monitor is English only.
+- **1.0.30 (2026-10-22)** Hub config moves to a new table `craa5__e_hubconfig` (agreed with the Dataverse monitor; Gerald asked for it): Organization-owned, same column names, big `craa5_configjson`. Apps probe it first, the old `craa5__0_hubconfig` second. `hub-shared.js`: `HUB_CONFIG_TABLES`, `hubSaveManifest` tries the new table first (92 checks). `table-prompts.md` part 8.
+- **1.0.29 (2026-10-22)** MSS Log Input writes its skipped entries to its own key `MSS_LOG_SKIPPED_ENTRIES`; `MSS_SKIPPED_ENTRIES_LOG` is the Calendar's alone.
+- **1.0.28 (2026-10-22)** 12.1: monitor code scans saved as hubconfig `scan|<appId>` (in `configKeys`); one-time allergen flag copy run by Gerald.
+- **1.0.27 (2026-10-22)** Monitor run: `craa5_configjson` holds only 100 characters, so **every** hubconfig JSON value now goes in `craa5_manifestjson`; the manifest helper no longer writes a stub there; new `hubConfigJsonOf` (86 checks). Equipment allergen flags are `craa5_eggallergen` and `craa5_pecanallergen` (as Gerald made them); the minutes columns are still to make. Training: `craa5__t_skilllevel1` accepted as the skill level table name. hubconfig key `CHANGEOVER_RULES` found, owner unknown (not the Scheduler).
+- **1.0.26 (2026-10-21)** `hub-shared.js`: the manifest table constant is now `HUB_MANIFEST_TABLE` (was `HUB_CONFIG_TABLE`, which MSS Calendar and MSS Log Input already declare). `contract.json`: Equipment `optionalCols` lists the egg / pecan columns and `craa5_minalrg`.
+- **1.0.25 (2026-10-21)** Q7 tables from the Ganttly thread: `_g_ Obstacle`, `_g_ Handover`, `_g_ Personnel note` (sections 3.3 and 13, contract.json). Ganttly stops writing notes into the Employee `craa5_remarks` JSON.
+- **1.0.24 (2026-10-21)** Section 2: egg / pecan minutes are labor person-minutes like `craa5_minalrg`; blank or 0 falls back to it.
+- **1.0.23 (2026-10-21)** Gerald's answers Q2-Q8: anyone may mark Done; `craa5_hourstoclean` minutes; `craa5_month` = 6-month flag; labor rate by role; Spanish checked once; Ganttly obstacles / handovers / personnel notes kept and move to tables; allergen split into `egg` and `pecan` clean kinds (hub-shared.js, 85 checks) with 4 Equipment columns (`table-prompts.md` part 7).
+- **1.0.22 (2026-10-21)** contract.json rebuilt from c-tables.json: `_c_ Chemical standard` live (read by Chemical hub and Manager hub, kept by Admin form); Chemical price per unit = current price of one container.
+- **1.0.21 (2026-10-21)** Section 7: Projected clean cost (manager hub v7.0 Line clean cost tab, PR #42). Q9: wage or loaded labor rate.
+- **1.0.20 (2026-10-21)** 12.1: Config json's length cannot be changed, so manifests go in a new optional hubconfig column Manifest json (`craa5_manifestjson`) when present; `hubSaveManifest` falls back to Config json (82 checks). hubconfig is not recreated.
+- **1.0.19 (2026-10-21)** One writer per hubconfig key again: MSS Log Input owns `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG`; the Calendar writes its own `MSS_CALENDAR_ACCESS_LOG` (Calendar PR #38).
+- **1.0.18 (2026-10-21)** `contract.json` gains `configKeys` (every hubconfig key, its owner app and status) for the monitor's hubconfig check. Section 12 lists the keys in use today; `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG` have two writers (open).
+- **1.0.17 (2026-10-21)** 12.1 App manifests: each app saves the tables and columns it uses to hubconfig `manifest|<appId>`; the Dataverse monitor checks them. `hub-shared.js` v1.1 adds `hubManifest`, `hubManifestKey`, `hubSaveManifest` (77 checks). `contract.json` gains a `manifests` block.
+- **1.0.16 (2026-10-21)** Section 7: `Weekend clean` time loss rows are time lost during the weekend clean (PBED's Add time loss form), not planned work. Still left out of Time lost totals (manager hub v6.9, PR #41).
+- **1.0.15 (2026-10-21)** 6.5: an open stop (`|last`, `details.open` set) has no restart; readers must not use its `craa5_end` as one (found by PBED).
+- **1.0.14 (2026-10-21)** contract.json rebuilt from the chemical thread's updated c-tables.json: the four kept `_c_` primary name columns (Chemical `craa5__c_chemical_name`, Cart line `craa5_cartlinename`, Chemical count `craa5_chemicalname`, Clerk checklist `craa5__c_clerkchecklist1`). Apps read the primary column from the table definition.
+- **1.0.13 (2026-10-21)** Dataverse monitor results: check-off table and Midweek column exist; skip code and access log tables missing; time loss log and quick task not made yet; 8 named tables absent; 47 unlisted tables marked abandoned (3 legacy); primary name columns kept as made. Labor rate prompt shortened (Copilot makes one table per short prompt).
+- **1.0.12 (2026-10-21)** MSS Calendar config keys `mss_completion_exclusions` and `mss_line_downtime`. Line downtime comes from the Clean Plan; hand-entered ranges only for lines the Scheduler does not plan.
+- **1.0.11 (2026-10-21)** Section 6.2: old frequency spellings mapped (MSS LOG WRITE v1.0, PR #40). 6.3: fill `craa5_uid` (primary name) with the SAP code. Q8: `craa5_allergenclean` type.
+- **1.0.10 (2026-10-21)** BOLO v2.2: `craa5__b_swabresult` columns and keys, and four new text columns on the swab catalog.
+- **1.0.9 (2026-10-21)** Section 6.5 points to the Scheduler's reader guide; adds scope and alert rows and window details v2. `craa5_cleanoverride` ("midweek|who|why" or "skip|who|why") is for the Scheduler only.
+- **1.0.8 (2026-10-21)** Section 6.5: the clean plan's columns, keys and details JSON for readers.
+- **1.0.7 (2026-10-21)** contract.json takes the 14 `_c_` entries from the chemical hub's c-tables.json (columns, keys, statuses). Clerk checklist date-only shift date noted as an exception.
+- **1.0.6 (2026-10-21)** Section 6.4 lists the check-off columns exactly; `updatesjson.work` is a display copy only; check-off stored statuses are started/done/undone; section 9: no reuse of a shared key with another meaning; table-prompts part 3 adds Employee guids.
+- **1.0.5 (2026-10-21)** Chemical hub review: `chGuidFrom` id exception to rule 6, draft chemical cost for cost per pound, cart label "Draft (not in SAP yet)", `_c_` ownership note.
+- **1.0.4 (2026-10-21)** contract.json lists the 14 `_c_` chemical tables.
+- **1.0.3 (2026-10-21)** Manager hub review: time loss log keeps its column names (listed), Weekend clean left out of Time lost, quick task User-owned, `craa5__m_employeenote` added. Map: equipment id lists may follow a paired names column's order. table-prompts.md part 5 (observation columns).
+- **1.0.2 (2026-10-21)** Training matrix tables added (sections 3.3, 12, 13; contract.json).
+- **1.0.1 (2026-10-21)** Section 6.3: Shift Start's interim area logging (switch `SHIFT_START_LOGS_MSS`) allowed until Ganttly logs per piece, using the same completion keys.
+- **1.0 (2026-10-21)** First version. Keys, owners, dates, clean kinds, MSS log write rule, number definitions, status words, language, theme, browser storage moves, prefixes, new columns and the labor rate table. The Ganttly plan's new Completion table is replaced by the existing check-off table plus new MSS log columns.
