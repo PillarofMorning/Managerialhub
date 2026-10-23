@@ -5,7 +5,7 @@ assert.strictEqual(/[^\x00-\x7F]/.test(src), false, 'hub-shared.js must be 7-bit
 assert.strictEqual(/\\u[0-9a-fA-F]{4}/.test(src), false, 'no \\u escapes');
 var store = {};
 global.window = { localStorage: { getItem: function (k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; }, setItem: function (k, v) { store[k] = String(v); } } };
-var H = new Function(src + '; return { hubCanon: hubCanon, hubLineKey: hubLineKey, hubSameName: hubSameName, hubGuid: hubGuid, hubGuidList: hubGuidList, hubSplitGuids: hubSplitGuids, hubCrew: hubCrew, hubIdFromKey: hubIdFromKey, hubPlantDay: hubPlantDay, hubShiftDate: hubShiftDate, hubShiftKey: hubShiftKey, hubDateOnlyUtc: hubDateOnlyUtc, hubDayFromDateOnly: hubDayFromDateOnly, hubWeekKey: hubWeekKey, hubCleanKind: hubCleanKind, hubCompletionKey: hubCompletionKey, hubLogIdOf: hubLogIdOf, hubStdMinutes: hubStdMinutes, hubPace: hubPace, hubShare: hubShare, hubLaborCost: hubLaborCost, hubGetLang: hubGetLang, hubSetLang: hubSetLang, hubT: hubT, hubDecodeEs: hubDecodeEs, hubManifest: hubManifest, hubManifestKey: hubManifestKey, hubSaveManifest: hubSaveManifest, hubConfigJsonOf: hubConfigJsonOf };')();
+var H = new Function(src + '; return { hubCanon: hubCanon, hubLineKey: hubLineKey, hubSameName: hubSameName, hubGuid: hubGuid, hubGuidList: hubGuidList, hubSplitGuids: hubSplitGuids, hubCrew: hubCrew, hubIdFromKey: hubIdFromKey, hubPlantDay: hubPlantDay, hubShiftDate: hubShiftDate, hubShiftKey: hubShiftKey, hubDateOnlyUtc: hubDateOnlyUtc, hubDayFromDateOnly: hubDayFromDateOnly, hubWeekKey: hubWeekKey, hubCleanKind: hubCleanKind, hubCompletionKey: hubCompletionKey, hubLogIdOf: hubLogIdOf, hubStdMinutes: hubStdMinutes, hubPace: hubPace, hubShare: hubShare, hubLaborCost: hubLaborCost, hubGetLang: hubGetLang, hubSetLang: hubSetLang, hubT: hubT, hubDecodeEs: hubDecodeEs, hubManifest: hubManifest, hubManifestKey: hubManifestKey, hubSaveManifest: hubSaveManifest, hubConfigJsonOf: hubConfigJsonOf, hubPeriodKey: hubPeriodKey, hubFreqDone: hubFreqDone, hubKindRank: hubKindRank };')();
 var n = 0; function ok(a, b, m) { assert.deepStrictEqual(a, b, m); n++; }
 ok(H.hubLineKey('IBL4', 1), 'ibl4'); ok(H.hubLineKey('IBL 4', 1), 'ibl4'); ok(H.hubLineKey('Breading', 2), 'breading2'); ok(H.hubLineKey('Highspeed', null), 'highspeed');
 ok(H.hubSameName(' Dough Room', 'dough-room'), true); ok(H.hubSameName('', ''), false);
@@ -41,6 +41,11 @@ ok(H.hubGetLang(), 'en'); store.itp_lang_v1 = 'es'; ok(H.hubGetLang(), 'es'); H.
 ok(H.hubT('Done'), 'Terminado'); ok(H.hubT('Allergen'), 'Alérgeno'); ok(H.hubT('Late'), 'Llegó tarde'); ok(H.hubT('Overdue'), 'Atrasado');
 ok(H.hubT('Unknown words'), 'Unknown words'); ok(H.hubT('Mine', 'es', { 'Mine': 'M%io' }), 'Mío'); ok(H.hubT('Done', 'en'), 'Done');
 ok(H.hubDecodeEs('%%5 %?Listo%!'), '%5 ¿Listo¡');
+// frequency periods and due
+ok(H.hubPeriodKey('M', '2026-10-23'), '2026-10'); ok(H.hubPeriodKey('Q', '2026-10-23'), '2026-Q4'); ok(H.hubPeriodKey('S', '2026-06-30'), '2026-H1'); ok(H.hubPeriodKey('W', '2026-10-25'), 'w2026-10-19'); ok(H.hubPeriodKey('A', '2026-01-01'), '2026'); ok(H.hubPeriodKey('X', '2026-01-01'), '');
+ok(H.hubKindRank('weekly'), 3); ok(H.hubKindRank('egg'), 1);
+ok(H.hubFreqDone('M', [{ day: '2026-10-02', kind: 'quarterly' }], '2026-10-23'), true); ok(H.hubFreqDone('M', [{ day: '2026-10-02', kind: 'eow' }], '2026-10-23'), false);
+ok(H.hubFreqDone('Q', [{ day: '2026-09-30', kind: 'quarterly' }], '2026-10-23'), false); ok(H.hubFreqDone('W', [{ day: '2026-10-19', kind: 'eow' }], '2026-10-25'), true);
 // app manifest
 var man = { appId: 'Ganttly', app: 'Ganttly', version: '2.0.0', config: ['ganttly_settings'],
     tables: [{ t: 'craa5_cleancheckoff', read: ['craa5_status', 'craa5_assetguid', 'craa5_status'], write: ['craa5_status'], opt: ['craa5_shiftdate'] }, { t: 'craa5_aa_assets', names: ['craa5_aa_assets'], read: ['craa5_midweek'] }] };
