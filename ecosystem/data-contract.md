@@ -425,7 +425,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
-- **1.0.39 (2026-10-23)** Due by frequency: `hubLogRank` ranks old log rows by their flags; which days and weeks owe a job follows the MSS Calendar (due days, weekend stretch, idle weeks). 111 checks.
+- **1.0.39 (2026-10-23)** Due by frequency: `hubLogRank` ranks old log rows by their flags; which days and weeks owe a job follows the MSS Calendar (due days, weekend stretch, idle weeks). 110 checks.
 - **1.0.38 (2026-10-23)** Section 7: Due by frequency, the MSS Calendar's period rule, now shared in `hub-shared.js` (`HUB_FREQS`, `hubKindRank`, `hubPeriodKey`, `hubFreqDone`; 105 checks) so the Scheduler and others reuse it instead of writing a second one.
 - **1.0.37 (2026-10-23)** Scheduler game plan, all **proposed, not approved by Gerald**: `_e_ Shift task` table; changeover rule types together / apart / nights-only / clean-order; override form `pin|who|why|HH:MM`; clean plan rowtype `staff`; hub config keys `PRODSCHED_CREWPLAN`, `PRODSCHED_SCENARIOS`.
 - **1.0.36 (2026-10-23)** contract.json rebuilt from c-tables.json: optional `craa5_actiontaken` on `_c_ Chemical usage log` (Ordering hub v0.9 Log tab). Section 5: usage log date is an entry timestamp, not a shift date.
