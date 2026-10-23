@@ -1,14 +1,12 @@
-// Run: node --test tests/mss-log-input-manpower.test.js   (MSS MANPOWER block of "mss - log input"; made-up rows only, any TZ)
+// Run: node --test ecosystem/test/mss-manpower.test.js   (the shared MSS MANPOWER block, ecosystem/mss-manpower.js; made-up rows only, any TZ)
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-const HUB = fs.readFileSync(path.join(__dirname, '..', 'ecosystem', 'hub-shared.js'), 'utf8');
-let SRC = fs.readFileSync(path.join(__dirname, '..', 'mss - log input'), 'utf8');
-const a = SRC.indexOf('/* ============================== START MSS MANPOWER'), b = SRC.indexOf('END MSS MANPOWER');
-SRC = SRC.slice(a, SRC.indexOf('\n', b));
+const HUB = fs.readFileSync(path.join(__dirname, '..', 'hub-shared.js'), 'utf8');
+const SRC = fs.readFileSync(path.join(__dirname, '..', 'mss-manpower.js'), 'utf8');
 function load() {
     const ctx = { console, Intl, Date, JSON, Math, Object, Array, String, Number, isNaN, isFinite, parseInt, RegExp };
     ctx.window = { localStorage: { getItem: () => null, setItem: () => {} } };
@@ -222,49 +220,3 @@ test('shift layout with spread work: every hour gets its share; no shift rows = 
 });
 
 // ---------- crew plan from the Production Scheduler (Clean Plan 'staff' rows, reader guide 6a) ----------
-function loadStaff() {
-    const page = fs.readFileSync(path.join(__dirname, '..', 'mss - log input'), 'utf8');
-    const s = page.indexOf('const mpWeekState = '), e = page.indexOf('const mpShiftName = ');
-    const ctx = { console, Intl, Date, JSON, Math, Object, Array, String, Number, isNaN, isFinite, parseInt, RegExp };
-    ctx.window = { localStorage: { getItem: () => null, setItem: () => {} } };
-    vm.createContext(ctx);
-    vm.runInContext(HUB + '\n' + SRC + '\nconst safeString = (v) => (v === null || v === undefined ? "" : String(v).trim());\n' + page.slice(s, e) + '\n;globalThis.__s = { mpWeekState, mpStaffPlan };', ctx);
-    return ctx.__s;
-}
-const staffRow = (day, crew, d, status, minutes) => ({ craa5_plankey: `f|${day}|${crew}`, craa5_rowtype: 'staff', craa5_day: day, craa5_status: status || 'ok', craa5_minutes: minutes || 0,
-    craa5_details: JSON.stringify(Object.assign({ v: 1, crew: /^[A-D]$/.test(crew) ? crew : '', shift: 'day', start: '06:00', hours: 12, vac: 2 }, d)) });
-const kRow = (mon, status) => ({ craa5_rowtype: 'week', craa5_plankey: 'k|' + mon, craa5_day: mon, craa5_status: status });
-
-test('crew plan: a crew is its busiest shift need + vacation, per week, as the Scheduler publishes it', () => {
-    const s = loadStaff();
-    const rows = [
-        staffRow('2026-10-19', 'A', { need: 7, clean: 5, fixed: 2, onCrew: 4, work: { line: 300, tasks: 0, mss: 60, fixed: 1440 } }, 'short', 1800),
-        staffRow('2026-10-20', 'A', { need: 8, clean: 6, fixed: 2, onCrew: 4, work: { line: 360, tasks: 30, mss: 0, fixed: 1440 } }, 'short', 1830),
-        staffRow('2026-10-20', 'B', { need: 3, clean: 1, fixed: 2, onCrew: 3, shift: 'night', start: '18:00' }, 'ok', 900),
-        staffRow('2026-10-19', 'day', { need: 1, clean: 1, fixed: 0, onCrew: null, vac: 2 }, 'nocrew', 480),
-        staffRow('2026-10-27', 'A', { need: 9, onCrew: 4 }, 'short'),          // week of Oct 26: done
-        staffRow('2026-11-03', 'A', { need: 12, onCrew: 4 }, 'short'),         // week of Nov 2: still being written -> not used
-        staffRow('2026-11-10', 'A', { need: 12, onCrew: 4 }, 'short'),         // week of Nov 9: no week row -> not used
-    ];
-    const p = s.mpStaffPlan(rows, [kRow('2026-10-19', 'done'), kRow('2026-10-26', 'done'), kRow('2026-11-02', 'writing')]);
-    eq(p.weeks.map(w => w.week), ['2026-10-19', '2026-10-26']);
-    eq(p.waiting, ['2026-11-02', '2026-11-09']);
-    const w = p.weeks[0];
-    eq(w.crews.map(c => [c.crew, c.need, c.vacation, c.plan, c.onCrew, c.short, c.busiest.day]), [['A', 8, 2, 10, 4, 2, '2026-10-20'], ['B', 3, 2, 5, 3, 0, '2026-10-20']]);
-    assert.strictEqual(w.heads, 15, 'a shift with no crew letter adds no crew');
-    assert.strictEqual(w.short, 2);
-    eq([w.cleanHours, w.fixedHours, w.totalHours], [12.5, 48, 83.5]);
-    eq(w.shifts.map(x => x.label), ['A', 'day', 'A', 'B']);
-    eq(p.weeks[1].crews.map(c => c.plan), [11]);
-});
-
-test('crew plan: broken details, a crew from the key, and a crew with no need', () => {
-    const s = loadStaff();
-    const rows = [
-        { craa5_plankey: 'f|2026-10-21|C', craa5_day: '', craa5_status: 'ok', craa5_details: 'not json' },
-        staffRow('2026-10-22', 'D', { need: 0, onCrew: 5 }),
-    ];
-    const p = s.mpStaffPlan(rows, [kRow('2026-10-19', 'done')]);
-    eq(p.weeks[0].crews.map(c => [c.crew, c.need, c.plan, c.vacation]), [['C', 0, 0, 0], ['D', 0, 0, 0]]);
-    eq(s.mpStaffPlan([], []).weeks, []);
-});
