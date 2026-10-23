@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.35, 2026-10-22. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.36, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -134,7 +134,7 @@ The **Production Scheduler** writes runs and publishes the clean plan. It is the
 - **Plant clock:** America/Chicago, with daylight saving (`HUB_TZ`). Every "day" in any app is a plant day, `hubPlantDay(ms)`.
 - **Shift date:** the plant day the shift **started**, taken from the board's `craa5_slotstart` (`hubShiftDate`). Everything done on a night shift that starts Tuesday 18:00 belongs to Tuesday, including work after midnight. Never date work by the clock time it was marked.
 - **Date-only values in Dataverse** (MSS log `craa5_lastcleaned`) hold midnight UTC of the shift date: `2026-10-20T00:00:00Z` (`hubDateOnlyUtc`). Readers take the first 10 characters (`hubDayFromDateOnly`) and never convert the time zone.
-- **Text date keys** (`craa5_shiftdate`, `craa5_day`, `craa5_weekkey`) are `YYYY-MM-DD`. One existing exception: `_c_ Clerk checklist.craa5_shiftdate` is a date-only column. It stays; readers take its first 10 characters.
+- **Text date keys** (`craa5_shiftdate`, `craa5_day`, `craa5_weekkey`) are `YYYY-MM-DD`. One existing exception: `_c_ Clerk checklist.craa5_shiftdate` is a date-only column. It stays; readers take its first 10 characters. Also: `_c_ Chemical usage log.craa5_logdate` is the moment of the entry (a timestamp, like the old day sheets), not a shift date; a 2nd-shift entry after midnight carries the next day. Readers that need a shift date compute it from the time.
 - **Timestamps** (started, done, saved) are stored as UTC date-times and shown on the plant clock.
 - **Week:** Monday to Sunday by shift date. The week key is that Monday (`hubWeekKey`). Production usually ends Saturday or Sunday, so the EOW clean falls in the week it ends.
 - **Teams status times:** 09:00, 12:00 and 15:00 plant time (Shift Start setting).
@@ -422,6 +422,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.36 (2026-10-23)** contract.json rebuilt from c-tables.json: optional `craa5_actiontaken` on `_c_ Chemical usage log` (Ordering hub v0.9 Log tab). Section 5: usage log date is an entry timestamp, not a shift date.
 - **1.0.35 (2026-10-22)** configKeys adds `MSS_LOG_MANPOWER_SETUP` (MSS Log Input, PR #40).
 - **1.0.34 (2026-10-22)** configKeys adds BOLO's nine `PATHOGEN_BOLO_*` keys. `hubManifest` keeps the case of config keys (93 checks); table and column names stay lower case.
 - **1.0.33 (2026-10-22)** `_g_ Assignment` (`craa5__g_assignment`): equipment to people per shift, written by both Shift Start and Ganttly with pinned / source / rev rules (sections 3, 4, 13; contract.json with name candidates).
