@@ -1,6 +1,6 @@
 # Clean Plan reader guide (craa5_cleanplan)
 
-Written by the Production Scheduler ("hub - production schedule" v4.8). No other app writes this table. Ganttly, Shift Start, the MSS Calendar, PBED and the Manager hub only read it. This guide wins over section 6.5 of the data contract on any detail.
+Written by the Production Scheduler ("hub - production schedule" v4.8.1). No other app writes this table. Ganttly, Shift Start, the MSS Calendar, PBED and the Manager hub only read it. This guide wins over section 6.5 of the data contract on any detail.
 
 All date-times are UTC. Read only active rows (`statecode eq 0`). The line key in `craa5_linekey` is the Scheduler's `canonLine(area, line)`, which is the same as `hubLineKey`: lowercase letters and digits only, for example `ibl4`, `highspeed1`.
 
@@ -128,7 +128,7 @@ Settings and tasks: Hub config key `PRODSCHED_CREWPLAN` holds `{v: 1, share, vac
 
 ## 8. Tables and columns this page needs (v4.8)
 
-Apps no longer make or change Dataverse tables (data contract 1.0.60, ground rule 10). The Production Scheduler saves the tables and columns it uses, with each column's type, to Hub config as `manifest|prodsched` every time it opens. The **Dataverse monitor** reads that list and builds the prompts and click-steps for anything missing. The prompts that used to be here now come from the monitor, and [table-prompts.md](/mnt/project-files/ecosystem-contract/table-prompts.md) stays the reference until the monitor shows the same.
+Apps no longer make or change Dataverse tables (data contract 1.0.60, ground rule 10). The Production Scheduler saves the tables and columns it uses, with each column's type, to Hub config as `manifest|prodsched` every time it opens. The manifest also carries a recommended Copilot prompt per table (2,000 characters at most). The **Dataverse monitor** reads that list, shows it and tests what exists; it never changes Dataverse. Gerald makes anything missing from the prompt the monitor shows, and [table-prompts.md](/mnt/project-files/ecosystem-contract/table-prompts.md) stays the reference until the monitor shows the same.
 
 Still to make, from that list:
 
@@ -136,7 +136,7 @@ Still to make, from that list:
 - `_e_ Shift task` (`craa5__e_shifttask`): its column types are in [contract.json](/mnt/project-files/ecosystem-contract/contract.json). The Sanitation director becomes its writer (ground rule 11). Until it exists the Crew plan keeps its tasks in Hub config `PRODSCHED_CREWPLAN`.
 - `Schedule Change` (`craa5_schedulechange`), only if the email inbox for change requests is wanted.
 
-After the monitor has added one, open the Production Scheduler, go to Data Check > Tables and columns, press Refresh Dataverse & Test All Columns, and check it shows as found.
+After one is made, open the Production Scheduler, go to Data Check > Tables and columns, press Refresh Dataverse & Test All Columns, and check it shows as found.
 
 ## 9. Heads per shift move to the Sanitation director
 
