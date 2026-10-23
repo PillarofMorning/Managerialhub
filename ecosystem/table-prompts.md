@@ -127,3 +127,79 @@ Create a table named "Shift task" with schema prefix craa5__e_, Organization own
 ```
 
 After it is made: open the Scheduler's Crew plan tab, unlock the page, press **Edit tasks**, then **Save tasks** once. The tasks are copied into the new table. Source: the Scheduler's guide, section 9 of /mnt/project-files/production-schedule/clean-plan-contract.md.
+
+## Part 10. Security roles: who can see and save what
+
+The monitor (2026-10-23) found that only admins can read the hub tables today, so the apps show empty screens for everyone else. Make two roles once: Power Platform admin center > your environment > **Settings** > **Users + permissions** > **Security roles** > **New role**. On each table set every privilege listed to **Organization** (the full green circle), except where it says User. Never give Delete: the apps deactivate rows instead.
+
+- **Hub floor**: sanitors, leads and supervisors (Shift Start, Ganttly, MSS Log Input, MSS Calendar, Map tool).
+- **Hub manager**: managers and you. Give managers both roles.
+
+Also give both roles **Read** on `systemuser` (the apps read who is signed in). A table not yet made can be skipped and added when it exists.
+
+| Table | Hub floor | Hub manager |
+|---|---|---|
+| `craa5_aa_mss_area` | Read, Write | Read, Write |
+| `craa5_aa_assets` | Read, Write | Read, Write |
+| `craa5_aa_ms_assets` | Read, Create, Write | Read, Create, Write |
+| `craa5__aa_employee` | Read, Write | Read, Create, Write |
+| `craa5__aa_leadershipteam` | Read | Read |
+| `craa5_workshift` | Read | Read |
+| `craa5_linepriority` | Read | Read, Create, Write |
+| `craa5_changeover_rule` | none | Read, Create, Write |
+| `craa5_skumaster` | none | Read, Create, Write |
+| `craa5__e_laborrate` | none (pay stays with managers) | Read |
+| `craa5__aa_prd_schd` | Read | Read, Create, Write |
+| `craa5_cleanplan` | Read | Read, Create, Write |
+| `craa5_schedulechange` | none | Read, Create, Write |
+| `craa5_shiftboard` | Read, Create, Write | Read, Create, Write |
+| `craa5_shiftplan` | Read, Create, Write | Read, Create, Write |
+| `craa5_shiftarchive` | Read, Create, Write | Read, Create, Write |
+| `craa5_shiftpreset` | Read, Create, Write | Read, Create, Write |
+| `craa5_updatepreset` | Read, Create, Write | Read, Create, Write |
+| `craa5_shiftlog` | Read, Create, Write | Read, Create, Write |
+| `craa5_cleancheckoff` | Read, Create, Write | Read, Create, Write |
+| `craa5__log_` | Read, Create, Write | Read, Create, Write |
+| `craa5_mss_skipcode` (when made) | Read, Create, Write | Read, Create, Write |
+| `craa5__m_timelosslog` (when made) | none | Read, Create, Write |
+| `craa5__p_plan` | none | Read, Create, Write |
+| `craa5__p_milestone` | none | Read, Create, Write |
+| `craa5__p_workorder` | none | Read, Create, Write |
+| `craa5__p_flocmap` | none | Read, Create, Write |
+| `craa5__facilityobservation` | Read, Create, Write | Read, Create, Write |
+| `craa5___maps` | Read, Create, Write | Read, Create, Write |
+| `craa5_pathogenboloswabcatalog0320` | Read | Read, Create, Write |
+| `craa5__b_swabresult` (when made) | Read | Read, Create, Write |
+| `craa5__supervisor_todo` | none | Read, Create, Write |
+| `craa5__m_formtemplate` | none | Read, Create, Write |
+| `craa5__m_quicktask` (when made) | none | Read, Create, Write |
+| `craa5__m_employeenote` | none | Read, Create, Write (managers only) |
+| `craa5__e_hubconfig` | Read, Create, Write | Read, Create, Write |
+| `craa5__sani_schedule_` | Read, Create, Write | Read, Create, Write |
+| `craa5_mss_useraccesslog` (when made) | Read, Create, Write | Read, Create, Write |
+| `craa5_useraccesslog` (when made) | Read, Create, Write | Read, Create, Write |
+| `craa5_dailyproduction` | none | Read |
+| `craa5__t_skill` (when made) | Read | Read, Create, Write |
+| `craa5__t_skilllevel` (when made) | Read | Read, Create, Write |
+| `craa5__t_trainingevent` (when made) | none | Read, Create, Write |
+| `craa5__c_distributor` | none | Read, Create, Write |
+| `craa5__c_chemical` | none | Read, Create, Write |
+| `craa5__c_chemicalinventory` | none | Read, Create, Write |
+| `craa5__c_cart` | none | Read, Create, Write |
+| `craa5__c_cartline` | none | Read, Create, Write |
+| `craa5__c_chemicalcount` | none | Read, Create, Write |
+| `craa5__c_chemicalusagelog` | none | Read, Create, Write |
+| `craa5__c_titrationtarget` | none | Read, Create, Write |
+| `craa5__c_checklisttask` | none | Read, Create, Write |
+| `craa5__c_clerkchecklist` | none | Read, Create, Write |
+| `craa5__c_chemicalstandard` | none | Read |
+| `craa5__c_areaalias` | none | Read, Create, Write |
+| `craa5__c_chemicalalias` (when made) | none | Read, Create, Write |
+| `craa5__c_sanitationbudget` (when made) | none | Read, Create, Write |
+| `craa5__g_assignment` | Read, Create, Write | Read, Create, Write |
+| `craa5__g_obstacle` (when made) | Read, Create, Write | Read, Create, Write |
+| `craa5__g_handover` (when made) | Read, Create, Write | Read, Create, Write |
+| `craa5__g_personnelnote` (when made) | Create, plus Read and Write at **User** level (own notes only) | Read, Create, Write |
+| `craa5__e_shifttask` (when made) | Read | Read, Create, Write |
+
+Chemical clerks: the chemical thread keeps its own clerk checklist (usage log Create and Write). Give a clerk the Hub floor role plus that.
