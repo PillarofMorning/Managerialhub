@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.65, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.66, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -230,7 +230,7 @@ Written only by the Production Scheduler. **The full reader guide is the Schedul
 
 | Column | Meaning |
 |---|---|
-| `craa5_rowtype` | `window` (a stop between runs), `day` (one line, one plant day), `week` (one row per Monday), `config` (shared settings), `scope` (which pieces a line's clean kind includes), `alert` (a rule needing attention). `staff` (Scheduler v4.7: one row per sanitation shift, key `f|YYYY-MM-DD|<crew letter, or day/night>` plus `|HH` when a crew has two shifts starting that day; heads needed, heads on crew, hours used, peak hour; details in the reader guide section 6a) |
+| `craa5_rowtype` | `window` (a stop between runs), `day` (one line, one plant day), `week` (one row per Monday), `config` (shared settings), `scope` (which pieces a line's clean kind includes), `alert` (a rule needing attention). `staff` (**retired** in Scheduler v4.9: old rows stay inactive, never deleted; headcount is the director's `DIRECTOR_HEADS`. Was: one row per sanitation shift, key `f|YYYY-MM-DD|<crew letter, or day/night>` plus `|HH` when a crew has two shifts starting that day; heads needed, heads on crew, hours used, peak hour; details in the reader guide section 6a) |
 | `craa5_plankey` | Window: `w|<run before id>|<run after id or "last">`, or `o|<run>|<run>` for runs that overlap. Day: `d|<line key>|YYYY-MM-DD`. Week: `k|<Monday>`. Config: `config`. Scope: `s|<line>|<kind>|<part>` (start/end 2000-01-01). Alert: `a|over72|<line>|<runId>`, `a|noeow|<line>|<Monday>`, `a|apart|<runIdA>|<runIdB>` |
 | `craa5_linekey` | The line key (`hubLineKey`); day rows hold the MSS area key; week rows hold `*` |
 | `craa5_start` / `craa5_end` | Window: when the line stops (end of the run before) / when the next run starts (open stops: where the plan ends). Day: plant midnight to next midnight. Week: Monday midnight to next Monday |
@@ -406,7 +406,7 @@ Each thread does this in its next version. Nothing is deleted from Dataverse; on
 
 - **Table building (rule 10).** Remove every setup wizard, "make this table" screen and any code that calls the Dataverse metadata API to create or change a table, column, key or choice. Keep the read-only checks ("is this column there?") and show missing ones as "not made yet". Put the column types and lengths in the app's manifest (`tables[].cols`, plus `new`, `label`, `owner`, `primary` and the recommended Copilot `prompt` for a table still to make). The monitor shows them and Gerald builds. Prompts already in `table-prompts.md` and other threads' prompt files stay valid until the monitor shows the same.
 - **Headcount (rule 11).** The Sanitation director takes over crew sizing, heads needed per shift, vacation cover and crew-builder what-ifs, and writes the shift tasks (`_e_ Shift task`) once it is made.
-  - **Production Scheduler:** keep publishing the clean plan (windows, scope, day and week rows: the work). Keep writing `staff` rows only until the director shows heads needed per shift; then stop and remove the Crew plan tab. `PRODSCHED_CREWPLAN` settings move to `director_settings`.
+  - **Production Scheduler (done, v4.9):** keep publishing the clean plan (windows, scope, day and week rows: the work). Keep writing `staff` rows only until the director shows heads needed per shift; then stop and remove the Crew plan tab. `PRODSCHED_CREWPLAN` settings move to `director_settings`.
   - **MSS Log Input:** remove the manpower plan and its setup (`MSS_LOG_MANPOWER_SETUP`); its fixed posts become `_e_ Shift task` rows through the director. The MSS MANPOWER block stays only for shift hours if other code needs them.
   - **Manager hub, PBED, Shift Start, Ganttly, Training:** remove any headcount or crew-size planner; show the director's number where a screen needs it. PBED keeps the weekend clean plan's people per job (that is assignment).
 - **Hub config.** Apps keep writing only their own settings keys and `manifest|<appId>`.
@@ -460,6 +460,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.66 (2026-10-23)** Production Scheduler v4.9 (PR #39, 6a0a8cb) finished 12.3: no `staff` rows, no Crew plan tab, no Shift task reads or writes, `PRODSCHED_CREWPLAN` legacy (no config keys of its own now); its Shifts tab reads `DIRECTOR_HEADS`. Rules stamp ends `|night1` again. `_e_ Shift task` readers: Shift Start, Ganttly, Manager hub (writer: the director).
 - **1.0.65 (2026-10-23)** `_b_ Swab result` is live (entity set `craa5__b_swabresults`, 20,000+ rows) with colTypes for it and the swab catalog; dates (`craa5_collectiondate`, `craa5_closedon`) stay text plant days and `craa5_result` / `craa5_test` / `craa5_stage` stay text, never choice. `_e_ Hub config` gains `noBuildCols` [`craa5_manifestjson`] (old table only; never add it to the new one). BOLO finished 12.3 (v2.5.2, HUB SHARED v1.3).
 - **1.0.64 (2026-10-23)** Sanitation director v1.1 (PR #44, 1e86e2e) works out heads needed per shift and publishes Hub config `DIRECTOR_HEADS` (guide /mnt/project-files/sanitation-director/director-heads.md); it writes `_e_ Shift task` (the Scheduler no longer does) and owns the MSS MANPOWER block. The Scheduler can stop writing `staff` rows and remove its Crew plan tab once Gerald pastes director v1.1.
 - **1.0.63 (2026-10-23)** MSS Log Input done with 12.3 (PR #40, d6d1f4d): manpower plan removed (`MSS_LOG_MANPOWER_SETUP` no longer written; its row stays for the director to read), MSS MANPOWER block has its own file and is pasted only by the Scheduler and the director. Skip codes live only in Hub config `MSS_SKIP_CODES`, so `craa5_mss_skipcode` is optional with no writer and MSS Log Input no longer writes `craa5_mss_useraccesslog`. `craa5__log_` colType `craa5_sapw` text 100.
