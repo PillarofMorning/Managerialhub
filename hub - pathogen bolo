@@ -1,7 +1,28 @@
 /* =======================================================================
-PATHOGEN BOLO & ENVIRONMENTAL SWAB INTELLIGENCE HUB (v2.3.2)
+PATHOGEN BOLO & ENVIRONMENTAL SWAB INTELLIGENCE HUB (v2.4)
 File: pathogen bolo.txt
 =======================================================================
+v2.4 (2026-10-23) - the swab table is the record, and Gerald's answers:
+- Every open loads the "_b_ Swab result" table and joins it to what this computer holds, so a computer whose saved
+  copy is gone (Power Apps may clear it) shows every row without a re-upload. The read asks only for the columns the
+  table has and skips rows marked replaced.
+- Table check (top of 4. Data Manipulation Lab): swab table rows against this computer's rows, by year, with Save now
+  and Read the table again. Re-upload runs one click at a time: 1. clear this computer (the table is not touched),
+  2. upload every lab file (rows already in the table are not sent again), 3. the table rows no file brought back are
+  listed: Mark replaced (never deleted) or Keep them. v2.3.2 marked every table row replaced before the upload while
+  the upload was saving, so rows could end up marked replaced and a second re-upload was needed.
+- Saves go 100 rows to a $batch request, three at a time, and wait when Dataverse says it is busy (429 / 503,
+  Retry-After) instead of losing rows; a column the table lacks is left out; one PATCH a row where $batch is refused.
+- APC, ATP, coliform and yeast/mold: ">250", "TNTC" and the like are past the limit, so they are fails. "est" is only
+  the lab's wording: "2,500 EST" is the number 2,500. A plain APC / ATP number is a swab that did not fail, so their
+  rates are fails out of every finished swab. On Listeria / Salmonella a number stays out of the rate.
+- Targets and alert rules (Data tab, saved in Hub config PATHOGEN_BOLO_RULES): 2.0% pathogen, 5% APC and ATP; two
+  hits at one site within 21 days is a repeat; alerts, the stage split and the surface chart look back 2 months and
+  each alert shows its "since" date. The graph target line and the headline cards use the saved targets.
+- Open positives: any MSS log clean of the same equipment (or area) on or after the swab day closes one (every clean
+  follows the presumptive process); oldest open first, days open, owner by stage (start-up Sanitation, in-process
+  Production). Positives older than the alert window are history.
+- A day with results still at the lab is no longer shown as clean; the week says how many are still out.
 v2.3.2 (2026-10-22) - data contract 1.0.32:
 - No browser pop-ups (Power Apps blocks them, so Start over, Reset typed YoY and the bulk clear did nothing there).
   Each one now asks on the page: the button turns into "Yes, ..." and "Cancel".
@@ -1581,7 +1602,8 @@ const STORAGE_KEYS = {
   yoyBenchmarkData: 'stillwell.pathogenBolo.yoyBenchmarkData.v3.real',
   resultCategoryMode: 'stillwell.pathogenBolo.resultCategoryMode.v2',
   uiLanguage: 'stillwell.pathogenBolo.uiLanguage.v2',
-  managersHubGraphSnapshot: 'stillwell.pathogenBolo.managersHubGraphSnapshot.v3.real'
+  managersHubGraphSnapshot: 'stillwell.pathogenBolo.managersHubGraphSnapshot.v3.real',
+  boloRules: 'stillwell.pathogenBolo.rules.v1'
 };
 
 // ============================================================================
@@ -1600,7 +1622,8 @@ const MANAGERS_HUB_GRAPH_DATAVERSE_CONTRACT = {
   configKeys: {
     managersHubGraphsSnapshot: 'PATHOGEN_BOLO_MANAGERS_HUB_GRAPHS',
     yoyBenchmarksSeries: 'PATHOGEN_BOLO_YOY_BENCHMARKS',
-    executiveSynopses: 'PATHOGEN_BOLO_EXEC_SYNOPSES'
+    executiveSynopses: 'PATHOGEN_BOLO_EXEC_SYNOPSES',
+    targetsAndAlertRules: 'PATHOGEN_BOLO_RULES'
   },
   version: '2.0-managers-hub-ready'
 };
@@ -3662,13 +3685,42 @@ function mapLabHeader(cols) {
   return map.desc !== undefined && (map.sampleId !== undefined || map.date !== undefined) ? map : null;
 }
 
-// Lab result text to Positive / Negative / Count / Pending.
+// A lab number as the lab writes it: "150", "<10 CFU/swab", ">2,500,000 est", "Est. 1.2E+04", "2.4 x 10^3 CFU/sponge",
+// "TNTC". Gerald (2026-10-23): ">" means more than the number and is always past the threshold; "est" (estimated) is
+// only the lab's wording, the number is the number. "TNTC" (too numerous to count) is past the countable range, so it
+// reads like ">". Returns { over, under, value } or null when the text is not a number.
+const LAB_ESTIMATE_WORDS = /\(\s*(est\.?|estimated|approx\.?|approximately)\s*\)|\b(est|estimated|approx|approximately|ca)\b\.?|~/g;
+function readLabCount(raw) {
+  let s = String(raw || '').toLowerCase().replace(/\u2265/g, '>').replace(/\u2264/g, '<').replace(LAB_ESTIMATE_WORDS, ' ');
+  s = s.replace(/\s+e\s*$/, ' ').replace(/\s+/g, ' ').trim();
+  let over = false;
+  let under = false;
+  const lead = /^(>\s*=?|greater\s+than(\s+or\s+equal\s+to)?|more\s+than|over|above|<\s*=?|less\s+than|under|below)\s*/.exec(s);
+  if (lead) {
+    if (/^(>|greater|more|over|above)/.test(lead[1])) over = true;
+    else under = true;
+    s = s.slice(lead[0].length);
+  }
+  if (/^(tntc|too\s+numerous(\s+to\s+count)?)\b/.test(s)) return { over: true, under: false, value: null };
+  const m = /^(\d[\d,]*(\.\d+)?|\.\d+)\s*(e\s*([+-]?\d+)|[x*]\s*10\s*(\^|\*\*|e)?\s*([+-]?\d+))?\s*(cfu'?s?|rlu|mpn|colonies)?\s*((\/|per)\s*[a-z0-9 .^\u00b2]+)?$/.exec(s);
+  if (!m) return null;
+  let value = parseFloat(m[1].replace(/,/g, ''));
+  const exp = m[4] !== undefined ? m[4] : m[6];
+  if (exp !== undefined) value *= Math.pow(10, parseInt(exp, 10));
+  return { over, under, value: isNaN(value) ? null : value };
+}
+
+// Tests whose result is a count with a limit (indicators). A ">" count on one of these is a fail.
+const COUNT_LIMIT_TESTS = { APC: 1, ATP: 1, COLIFORM: 1, YEAST_MOLD: 1 };
+
+// Lab result text to Positive / Negative / Count / Pending. testCode is the row's test (LIS, SAL, APC, ATP ...).
 // - "Not detected", "ND", "Negative", "Pass" are Negative (checked first: "not detected" holds the word "detected").
 // - "Potential Positive", "Presumptive", "Detected", "Fail" are Positive.
-// - A number ("<10", "250 CFU", "TNTC") is a Count: the lab finished, but the row makes no pass/fail call, so it is left
-//   out of every rate (APC and ATP limits differ by site).
+// - On APC, ATP, coliform and yeast/mold a ">" number or "TNTC" is Positive (a fail, past the threshold) and marked over.
+// - Any other number ("<10", "250 CFU", "2,500 est") is a Count. On APC and ATP a count is a swab that did not fail
+//   (rateCallOf); on Listeria and Salmonella it stays out of the rate.
 // - Text the reader does not know stays Pending and is flagged (unread) for the Import check.
-function readLabResult(raw) {
+function readLabResult(raw, testCode) {
   const s = String(raw || '').trim();
   if (!s || /^(pending|in\s*progress|tbd|waiting|hold|on\s*hold|incubating|-+|n\/a|na)$/i.test(s)) return { result: 'Pending', unread: false };
   const t = s.toLowerCase();
@@ -3678,11 +3730,28 @@ function readLabResult(raw) {
   if (/\bpositive\b|\bpos\b|\bpresumptive\b|\bdetected\b|\bpresent\b|\bfail(ed|ure|s)?\b|\bconfirmed\b|\bout\s+of\s+spec\b|\bover\s+limit\b/.test(t)) {
     return { result: 'Positive', unread: false };
   }
-  if (/^[<>~]?\s*=?\s*\d[\d,]*(\.\d+)?\s*(cfu|rlu|mpn)?(\s*\/\s*[a-z0-9 ]+)?$/i.test(s) || /^tntc$/i.test(s) || /^est\.?\s*[<>]?\s*\d/i.test(s)) {
+  const count = readLabCount(s);
+  if (count) {
+    if (count.over && COUNT_LIMIT_TESTS[String(testCode || '').toUpperCase()]) return { result: 'Positive', unread: false, over: true };
     return { result: 'Count', unread: false };
   }
   return { result: 'Pending', unread: true };
 }
+
+// Pass or fail for the rates: 'fail', 'pass', or '' (no call: pending, or a count on a test with no limit reading).
+// Listeria / Salmonella: Positive fails, Negative passes, a count is no call. APC / ATP: Positive fails (a fail word, ">"
+// or TNTC), Negative or any other count passes, so the APC and ATP rates are fails out of every finished swab, the way
+// the QA email counts them.
+function rateCallOf(r) {
+  if (!r) return '';
+  if (r.result === 'Positive') return 'fail';
+  if (r.result === 'Negative') return 'pass';
+  if (r.result === 'Count' && (r.testCode === 'APC' || r.testCode === 'ATP')) return 'pass';
+  return '';
+}
+
+// Rows read by v2.4 carry v = 24. A v2.3 row kept on this computer only has its result read again (rereadResultsV24).
+const LEDGER_ROW_VERSION = 24;
 
 // What a row counts toward:
 // routine = environmental Listeria / Salmonella swab (the plant rate); retest = re-swab after a positive;
@@ -3808,8 +3877,8 @@ function parseSingleCsvRow(cols, rowIndex, rulesCompiled, aliases, colMap) {
     description = (prodMatch[2] || sampleDesc).trim();
   }
 
-  const read = readLabResult(rawResult);
   const testCode = normalizeTestProgramCode(testMethod, `${program} ${sampleDesc}`);
+  const read = readLabResult(rawResult, testCode);
   const testGuessed = !testMethod && !testCodeFromText(`${program} ${sampleDesc}`);
 
   const normSampleId = String(sampleId || '').trim().toUpperCase();
@@ -3830,6 +3899,7 @@ function parseSingleCsvRow(cols, rowIndex, rulesCompiled, aliases, colMap) {
     testGuessed,
     result: read.result,
     resultUnread: read.unread,
+    overLimit: !!read.over,
     rawResult: rawResult || '',
     isBlankResult: read.result === 'Pending',
     isBlankSampleId: !sampleId,
@@ -3845,7 +3915,7 @@ function parseSingleCsvRow(cols, rowIndex, rulesCompiled, aliases, colMap) {
     stage,
     program
   };
-  row.v = 23;
+  row.v = LEDGER_ROW_VERSION;
   row.swabKind = swabKindOf(row);
   row.idAndDescKey = ledgerRowKey(row);
   row.id = row.idAndDescKey || noIdRowKey(row) || `row-${rowIndex}-${dateKey || 'undated'}`;
@@ -4143,13 +4213,14 @@ function hitTestTypeOf(r) {
   return 'LIS';
 }
 
-// Swabs / positives / pending for one slice. swabs = finished with a pass/fail call (Positive or Negative); a Count
-// (number with no call) is neither, so a rate never mixes them in.
+// Swabs / positives / pending for one slice. swabs = finished with a pass or fail call (rateCallOf): on Listeria and
+// Salmonella a Count (number with no call) is neither; on APC and ATP a count is a swab that did not fail.
 function newTally() { return { swabs: 0, positives: 0, pending: 0 }; }
 function addToTally(t, r) {
   if (r.manualResult) return;
-  if (r.result === 'Positive') { t.swabs += 1; t.positives += 1; }
-  else if (r.result === 'Negative') t.swabs += 1;
+  const call = rateCallOf(r);
+  if (call === 'fail') { t.swabs += 1; t.positives += 1; }
+  else if (call === 'pass') t.swabs += 1;
   else if (r.result === 'Pending') t.pending += 1;
 }
 function tallyRate(t) { return t && t.swabs > 0 ? round2((t.positives / t.swabs) * 100) : null; }
@@ -4201,7 +4272,7 @@ function addRowToBucket(b, r, keepRows) {
   } else if (kind === 'retest') addToTally(b.retest, r);
   else if (kind === 'indicator') {
     if (r.result === 'Count') b.indicatorCounts += 1;
-    else if (r.testCode === 'ATP') addToTally(b.atp, r);
+    if (r.testCode === 'ATP') addToTally(b.atp, r);
     else if (r.testCode === 'APC') addToTally(b.apc, r);
   } else if (kind === 'vector') addToTally(b.vector, r);
   else if (kind === 'product') addToTally(b.productTally, r);
@@ -4242,7 +4313,9 @@ function buildRollupFromLedger(rawRows, dedupReceipt = null) {
     guessedTestCount: 0,
     conflictCount: 0,
     needsReuploadCount: 0,
-    unknownAreaCount: 0
+    unknownAreaCount: 0,
+    overLimitCount: 0,
+    countsApcAtp: 0
   };
   const sampleIdGroups = {};
   const sameIdDiffDescGroups = [];
@@ -4280,6 +4353,8 @@ function buildRollupFromLedger(rawRows, dedupReceipt = null) {
     if (r.resultConflict) totals.conflictCount += 1;
     if (r.needsReupload) totals.needsReuploadCount += 1;
     if (r.areaUnknown) totals.unknownAreaCount += 1;
+    if (r.overLimit) totals.overLimitCount += 1;
+    if (r.result === 'Count' && (r.testCode === 'APC' || r.testCode === 'ATP')) totals.countsApcAtp += 1;
 
     const normId = r.normSampleId || String(r.sampleId || '').trim().toUpperCase();
     if (normId) {
@@ -4425,7 +4500,7 @@ function cleanSavedLedgerV23(savedRows, rules, aliases) {
   const out = [];
   (savedRows || []).forEach((r, i) => {
     if (!r) return;
-    if (r.v === 23) { out.push(r); return; }
+    if (r.v === 23 || r.v === LEDGER_ROW_VERSION) { out.push(r); return; }
     if (EXAMPLE_ROW_SIGS[exampleRowSig(r.sampleId, r.sampleDesc)] || r.lastUpdatedSource === SIMULATED_SOURCE_LABEL) {
       report.removedExample += 1;
       return;
@@ -4467,6 +4542,20 @@ function cleanSavedLedgerV23(savedRows, rules, aliases) {
   const rebuilt = ingestRowsWithDeduplication([], out, 'v2.3 cleanup').ledger;
   report.after = rebuilt.length;
   return { rows: rebuilt, report };
+}
+
+// v2.4 reads ">" and "est" on APC / ATP (readLabResult). A v2.3 row kept on this computer gets its result read again from
+// the lab's text; a result set by hand, a row whose two results disagreed and an old two-test row keep theirs.
+function rereadResultsV24(rows) {
+  let changed = 0;
+  const out = (rows || []).map(r => {
+    if (!r || r.v !== 23) return r;
+    if (r.manualResult || r.conflictResolved || r.needsReupload) return { ...r, v: LEDGER_ROW_VERSION };
+    const read = readLabResult(r.rawResult, r.testCode);
+    if (read.result !== r.result) changed += 1;
+    return { ...r, result: read.result, resultUnread: read.unread, overLimit: !!read.over, isBlankResult: read.result === 'Pending', v: LEDGER_ROW_VERSION };
+  });
+  return { rows: out, changed };
 }
 
 // v2.1 moved the paste boxes to new storage keys, which hid the text v2.0 had saved. v2.3 brings that text back,
@@ -4663,7 +4752,8 @@ function buildImportCheck(parsedCsv, parsedPrompt, emailLabMatch, opts) {
   add('typed_yoy', 'info', o.typedYoYCells || 0, []);
   add('typed_yoy_example', 'info', o.exampleYoYCells || 0, []);
   add('legacy_dv', 'info', o.legacyDvRows || 0, []);
-  add('counts', 'info', t.totalCounts || 0, []);
+  add('over_limit', 'info', t.overLimitCount || 0, topValues(r => r.overLimit, r => `${r.testCode || ''}: "${String(r.rawResult || '').trim()}"`));
+  add('counts', 'info', t.totalCounts || 0, [], { apcAtp: t.countsApcAtp || 0 });
   const restore = o.restoreReport || null;
   const restoredChars = restore ? ((restore.email && restore.email.restoredChars) || 0) + ((restore.csv && restore.csv.restoredChars) || 0) : 0;
   add('restored_paste', 'info', restoredChars > 0 ? 1 : 0, [], { report: restore });
@@ -4712,12 +4802,13 @@ function simulatePositiveCuts(rows, cat, cuts) {
   };
   (rows || []).forEach(r => {
     if (!r || !r.date || r.date.slice(0, 4) !== yr || r.date > LIVE_TODAY_DATE_KEY || r.manualResult) return;
-    if (r.result !== 'Positive' && r.result !== 'Negative') return;
+    const call = rateCallOf(r);
+    if (!call) return;
     const kind = r.swabKind || swabKindOf(r);
     if (kind !== 'routine' && kind !== 'indicator') return;
     const rc = rateCategoryOf(r);
     if (!rc || (cat !== 'all' && rc !== cat)) return;
-    const pos = r.result === 'Positive';
+    const pos = call === 'fail';
     const stage = r.stage === 'ST' || r.stage === 'INP' ? r.stage : '';
     const keep = (1 - pctOf(roomCuts[r.room])) * (1 - (stage ? pctOf(stageCuts[stage]) : 0));
     addTo(acc.overall, pos, keep);
@@ -4817,7 +4908,108 @@ const INLINE_THEME = {
 // =======================================================================
 // Every number below comes from loaded swab rows (ledger) or, when no ledger rows exist for this year,
 // from the totals printed in the pasted weekly email. Nothing is invented: a rate with no swabs behind it is null and shows as "--".
-function computePlantPressurePoints(allHits, repeatStreaks, parsedPrompt, ledgerRollup, suggestedActionsMap = {}) {
+// ---------- Targets and alert rules (v2.4) ----------
+// Gerald (2026-10-23): the goal is 2.0% for pathogen and 5% for APC and ATP, kept where it can be edited; two hits at a
+// site within 3 weeks call for action; alerts look back 2 months. Saved in Hub config (PATHOGEN_BOLO_RULES) so every
+// computer and the other apps read the same numbers. These are the values until someone saves others.
+const BOLO_RULES_KEY = 'PATHOGEN_BOLO_RULES';
+const BOLO_RULES_DEFAULT = { targets: { pathogen: 2, apc: 5, atp: 5 }, repeatDays: 21, alertMonths: 2 };
+function normalizeBoloRules(raw) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const t = src.targets && typeof src.targets === 'object' ? src.targets : {};
+  const num = (v, d, lo, hi) => {
+    const n = parseFloat(v);
+    return isNaN(n) ? d : Math.min(hi, Math.max(lo, n));
+  };
+  const D = BOLO_RULES_DEFAULT;
+  return {
+    targets: {
+      pathogen: round2(num(t.pathogen, D.targets.pathogen, 0, 100)),
+      apc: round2(num(t.apc, D.targets.apc, 0, 100)),
+      atp: round2(num(t.atp, D.targets.atp, 0, 100))
+    },
+    repeatDays: Math.round(num(src.repeatDays, D.repeatDays, 1, 365)),
+    alertMonths: Math.round(num(src.alertMonths, D.alertMonths, 1, 36))
+  };
+}
+// First day of the alert window: the same day alertMonths months back (Oct 23 -> Aug 23; Dec 31 -> Oct 31)
+function alertSinceOf(rules, todayKey) {
+  const months = normalizeBoloRules(rules).alertMonths;
+  const t = String(todayKey || LIVE_TODAY_DATE_KEY);
+  let y = parseInt(t.slice(0, 4), 10);
+  let m = parseInt(t.slice(5, 7), 10) - months;
+  while (m < 1) { m += 12; y -= 1; }
+  const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return `${y}-${pad2(m)}-${pad2(Math.min(parseInt(t.slice(8, 10), 10), last))}`;
+}
+// Whole days from one date key to another (positive when toKey is later)
+function dayDiff(fromKey, toKey) {
+  const a = Date.parse(`${fromKey}T12:00:00Z`);
+  const b = Date.parse(`${toKey}T12:00:00Z`);
+  return isNaN(a) || isNaN(b) ? NaN : Math.round((b - a) / 86400000);
+}
+// Who acts on a positive (Gerald 2026-10-23): Sanitation owns start-up (ST), Production owns in-process (INP)
+function ownerOfStage(stage) {
+  if (stage === 'ST') return 'Sanitation';
+  if (stage === 'INP') return 'Production';
+  return '';
+}
+
+// Repeat sites: positives at the same site and in the same test family (Listeria, Salmonella and retests together;
+// APC, ATP and other tests each on their own) on two or more different days, each no more than repeatDays after the
+// one before. Hits further apart start a new run, so a site positive on Oct 30 and Nov 2 is a repeat and one positive
+// in March and again in June is not.
+function findRepeatSites(hits, repeatDays) {
+  const gap = repeatDays > 0 ? repeatDays : BOLO_RULES_DEFAULT.repeatDays;
+  const isPath = (t) => t === 'LIS' || t === 'RETEST-LIS' || t === 'SAL';
+  const groups = {};
+  const order = [];
+  (hits || []).forEach(h => {
+    if (!h || !h.date) return;
+    const fam = isPath(h.testType) ? 'PATHOGEN' : String(h.testType || '');
+    const key = `${fam}::${h.siteCode || `${h.room}::${h.surface}::${h.description}`}`;
+    if (!groups[key]) { groups[key] = []; order.push(key); }
+    groups[key].push(h);
+  });
+  const out = [];
+  order.forEach(key => {
+    const list = groups[key].slice().sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    let run = [];
+    const flush = () => {
+      const days = [];
+      run.forEach(x => { if (days.indexOf(x.date) === -1) days.push(x.date); });
+      if (days.length < 2) return;
+      const h0 = run[0];
+      out.push({
+        key: `${key}::${days[0]}`,
+        siteCode: h0.siteCode,
+        room: h0.room,
+        surface: h0.surface,
+        description: h0.description,
+        assetTag: h0.assetTag,
+        spot: h0.spot,
+        testFamily: key.split('::')[0],
+        hits: run,
+        count: run.length,
+        uniqueDays: days.length,
+        dates: days,
+        firstDate: days[0],
+        lastDate: days[days.length - 1]
+      });
+    };
+    list.forEach(h => {
+      if (run.length > 0 && dayDiff(run[run.length - 1].date, h.date) > gap) {
+        flush();
+        run = [];
+      }
+      run.push(h);
+    });
+    flush();
+  });
+  return out.sort((a, b) => (b.count - a.count) || String(b.lastDate).localeCompare(String(a.lastDate)));
+}
+
+function computePlantPressurePoints(allHits, repeatStreaks, parsedPrompt, ledgerRollup, suggestedActionsMap = {}, rules = null) {
   const hitsIn = Array.isArray(allHits) ? allHits : [];
   const streaks = Array.isArray(repeatStreaks) ? repeatStreaks : [];
   const ledgerRows = (ledgerRollup && Array.isArray(ledgerRollup.rows)) ? ledgerRollup.rows : [];
@@ -4855,7 +5047,7 @@ function computePlantPressurePoints(allHits, repeatStreaks, parsedPrompt, ledger
   // indicator swabs. Retests, vectors, product, water, rows the reader did not recognize and results set by hand are
   // reported on their own and never move a rate.
   const done = ledgerRows.filter(r => {
-    if (!r || !r.date || r.manualResult || (r.result !== 'Positive' && r.result !== 'Negative')) return false;
+    if (!r || !r.date || r.manualResult || !rateCallOf(r)) return false;
     const k = r.swabKind || swabKindOf(r);
     return k === 'routine' || k === 'indicator';
   });
@@ -4879,7 +5071,7 @@ function computePlantPressurePoints(allHits, repeatStreaks, parsedPrompt, ledger
       if (!inCategory(rowTest(r), cat)) continue;
       if (pred && !pred(r)) continue;
       s += 1;
-      if (r.result === 'Positive') p += 1;
+      if (rateCallOf(r) === 'fail') p += 1;
     }
     return { positives: p, swabs: s, rate: pct(p, s) };
   };
@@ -4943,7 +5135,11 @@ function computePlantPressurePoints(allHits, repeatStreaks, parsedPrompt, ledger
     if (rCmp !== 0) return rCmp;
     return String(a.siteCode || a.id || '').localeCompare(String(b.siteCode || b.id || ''));
   });
-  const pathogenHitsList = sortedAllHits.filter(h => isPathogenType(h.testType));
+  // Alerts, the stage split and the surface chart look back over the alert window only (2 months unless saved
+  // otherwise); older hits stay in the graphs and the calendar
+  const alertSince = alertSinceOf(rules);
+  const recentHits = sortedAllHits.filter(h => h.date && h.date >= alertSince);
+  const pathogenHitsList = recentHits.filter(h => isPathogenType(h.testType));
   const timedHits = pathogenHitsList.filter(h => hitStage(h) !== '');
   const inpPathogenCount = timedHits.filter(h => hitStage(h) === 'INP').length;
   const stPathogenCount = timedHits.filter(h => hitStage(h) === 'ST').length;
@@ -5171,27 +5367,30 @@ function computePlantPressurePoints(allHits, repeatStreaks, parsedPrompt, ledger
   const points = [];
   const DEFAULT_ACTION = 'Check the last MSS clean for this equipment, schedule a corrective clean, and retest the site.';
 
-  // 1. Repeat positive sites (same 0320 site positive on 2+ days)
-  streaks.slice(0, 3).forEach(st => {
+  // 1. Repeat positive sites (findRepeatSites: the same site positive on 2+ days, each within the repeat window of the
+  // one before), when the last hit is inside the alert window
+  const repeatDays = normalizeBoloRules(rules).repeatDays;
+  streaks.filter(st => st.lastDate && st.lastDate >= alertSince).slice(0, 12).forEach(st => {
     const stCount = st.hits ? st.hits.filter(h => hitStage(h) === 'ST').length : 0;
     points.push({
-      id: `pp-site-${st.siteCode || normToken(`${st.room} ${st.surface} ${st.description}`)}`,
+      id: `pp-site-${st.siteCode || normToken(`${st.room} ${st.surface} ${st.description}`)}${st.testFamily && st.testFamily !== 'PATHOGEN' ? `-${normToken(st.testFamily)}` : ''}`,
       score: Math.min(99, 60 + st.count * 8),
       severity: 'REPEAT POSITIVE SITE',
       color: '#E4002B',
+      since: st.firstDate,
       room: st.room,
       siteCode: st.siteCode || '',
       assetTag: st.assetTag || '',
-      title: `${st.room}: ${st.surface} - ${st.description}`,
+      title: `${st.room}: ${st.surface} - ${st.description}${st.testFamily && st.testFamily !== 'PATHOGEN' ? ` (${st.testFamily})` : ''}`,
       subtitle: `${st.count} positives across ${st.uniqueDays} days (${st.dates.map(formatShortDate).join(', ')})`,
-      diagnosis: `${st.count} positive results at ${st.siteCode || st.surface} between ${formatShortDate(st.firstDate)} and ${formatShortDate(st.lastDate)}${stCount > 0 ? `, ${stCount} of them at Start-Up (ST)` : ''}.`,
+      diagnosis: `${st.count} positive results at ${st.siteCode || st.surface} between ${formatShortDate(st.firstDate)} and ${formatShortDate(st.lastDate)}, each within ${repeatDays} days of the one before${stCount > 0 ? `; ${stCount} of them at Start-Up (ST)` : ''}.`,
       action: DEFAULT_ACTION
     });
   });
 
   // 2. Rooms with hits on 3+ different sites
   const byRoom = {};
-  sortedAllHits.forEach(h => {
+  recentHits.forEach(h => {
     if (!h.room) return;
     if (!byRoom[h.room]) byRoom[h.room] = { hits: [], sites: {} };
     byRoom[h.room].hits.push(h);
@@ -5208,6 +5407,7 @@ function computePlantPressurePoints(allHits, repeatStreaks, parsedPrompt, ledger
       score: Math.min(95, 55 + siteCount * 6),
       severity: 'MULTI-SITE CLUSTER',
       color: '#7E22CE',
+      since: g.hits[0].date,
       room: rk,
       siteCode: g.hits[0].siteCode || '',
       assetTag: g.hits[0].assetTag || '',
@@ -5219,7 +5419,7 @@ function computePlantPressurePoints(allHits, repeatStreaks, parsedPrompt, ledger
   });
 
   // 3. Failed retests
-  const retestHits = sortedAllHits.filter(h => h.testType === 'RETEST-LIS' || h.stage === 'RETEST');
+  const retestHits = recentHits.filter(h => h.testType === 'RETEST-LIS' || h.stage === 'RETEST');
   const retestByRoom = {};
   retestHits.forEach(h => {
     const rk = h.room || 'Unknown';
@@ -5233,6 +5433,7 @@ function computePlantPressurePoints(allHits, repeatStreaks, parsedPrompt, ledger
       score: Math.min(97, 80 + list.length * 3),
       severity: 'RETEST ESCALATION',
       color: '#E11D48',
+      since: list[0].date,
       room: rk,
       siteCode: list[0].siteCode || '',
       assetTag: list[0].assetTag || '',
@@ -5252,6 +5453,7 @@ function computePlantPressurePoints(allHits, repeatStreaks, parsedPrompt, ledger
       score: Math.min(90, 60 + Math.round(rs.pathogenRate - rs.lyPathRate) * 4),
       severity: 'ELEVATED POSITIVITY %',
       color: '#0D9488',
+      since: `${tyYear}-01-01`,
       room: rs.room,
       siteCode: '',
       assetTag: '',
@@ -5263,8 +5465,8 @@ function computePlantPressurePoints(allHits, repeatStreaks, parsedPrompt, ledger
   });
 
   // 5. Stage and surface pattern (only once there are enough timed hits to mean something)
-  const floorDrainCount = sortedAllHits.filter(h => /floor|drain/i.test(`${h.surface} ${h.description}`)).length;
-  const floorDrainPct = pct(floorDrainCount, sortedAllHits.length);
+  const floorDrainCount = recentHits.filter(h => /floor|drain/i.test(`${h.surface} ${h.description}`)).length;
+  const floorDrainPct = pct(floorDrainCount, recentHits.length);
   if (timedHits.length >= 5) {
     const roomCounts = {};
     timedHits.forEach(h => { roomCounts[h.room] = (roomCounts[h.room] || 0) + 1; });
@@ -5274,6 +5476,7 @@ function computePlantPressurePoints(allHits, repeatStreaks, parsedPrompt, ledger
       score: 50,
       severity: 'STAGE & SURFACE PATTERN',
       color: '#0072CE',
+      since: alertSince,
       room: topRoom,
       siteCode: '',
       assetTag: '',
@@ -5324,7 +5527,7 @@ function computePlantPressurePoints(allHits, repeatStreaks, parsedPrompt, ledger
     { label: 'Conveyors, Belts & Sheeters', count: 0, color: '#EA580C' },
     { label: 'Utensils, Scales & Other', count: 0, color: '#D97706' }
   ];
-  sortedAllHits.forEach(h => {
+  recentHits.forEach(h => {
     const s = `${h.surface} ${h.description}`;
     if (/floor/i.test(s)) surfaceBuckets[0].count += 1;
     else if (/drain/i.test(s)) surfaceBuckets[1].count += 1;
@@ -5350,6 +5553,8 @@ function computePlantPressurePoints(allHits, repeatStreaks, parsedPrompt, ledger
 
   return {
     points: enrichedPoints,
+    alertSince,
+    alertHits: recentHits.length,
     surfaceBuckets,
     inpCount: inpPathogenCount,
     stCount: stPathogenCount,
@@ -5587,26 +5792,72 @@ function findSwabClosures(ledgerRows, logRows, ctx) {
   return out;
 }
 
-// Read every page of an OData query (Dataverse returns @odata.nextLink while more rows remain)
-async function fetchAllPages(firstUrl, maxRows) {
+// ---------- Busy answers (v2.4) ----------
+// Dataverse allows each user 6,000 requests in 5 minutes and answers 429 (Too Many Requests, with Retry-After in
+// seconds) past that, or 503 when it is busy. Every writer here waits the time asked for and sends again, and all of
+// them hold off together (boloPauseUntil), so a bulk save slows down instead of losing rows.
+let boloPauseUntil = 0;
+function boloSleep(ms) {
+  return new Promise(resolve => { window.setTimeout(resolve, Math.max(0, ms)); });
+}
+// The wait a busy answer asks for (Retry-After), else 2, 4, 8 ... seconds; at least 1 second and never over 5 minutes
+function boloRetryWaitMs(retryAfter, tries) {
+  const n = parseFloat(retryAfter);
+  if (!isNaN(n) && n >= 0) return Math.min(300000, Math.max(1000, n * 1000));
+  return Math.min(120000, 2000 * Math.pow(2, Math.max(0, (tries || 1) - 1)));
+}
+function boloPause(ms) {
+  boloPauseUntil = Math.max(boloPauseUntil, Date.now() + ms);
+}
+async function boloWaitForPause() {
+  const w = boloPauseUntil - Date.now();
+  if (w > 0) await boloSleep(w);
+}
+function boloRetryAfterOf(res) {
+  try { return (res && res.headers && res.headers.get ? res.headers.get('Retry-After') : '') || ''; } catch (e) { return ''; }
+}
+function boloIsBusy(status) { return status === 429 || status === 503; }
+
+// Read every page of an OData query (Dataverse returns @odata.nextLink while more rows remain). A busy answer waits
+// and asks for the same page again. onPage(rowsSoFar) is called after each page.
+async function fetchAllPages(firstUrl, maxRows, onPage) {
   const rows = [];
   let url = firstUrl;
+  let waits = 0;
   while (url && rows.length < (maxRows || 200000)) {
+    await boloWaitForPause();
     const res = await fetch(url, { headers: { ...ODATA_HEADERS, Prefer: 'odata.maxpagesize=5000' } });
+    if (boloIsBusy(res.status) && waits < 8) {
+      waits += 1;
+      boloPause(boloRetryWaitMs(boloRetryAfterOf(res), waits));
+      continue;
+    }
     if (!res.ok) throw new Error(await readApiError(res));
+    waits = 0;
     const data = await res.json();
     (data.value || []).forEach(v => rows.push(v));
     url = data['@odata.nextLink'] || '';
+    if (onPage) onPage(rows.length);
   }
   return rows;
 }
 
-// PATCH one row; when Dataverse names a column that does not exist, drop it and try again.
-// Returns { ok, missing: [columns dropped], error }
+// The column a refused write names when Dataverse does not have it ("Could not find a property named 'x'")
+function boloMissingColumnOf(text) {
+  const t = String(text || '');
+  const m = t.match(/property\s+'([^']+)'/i) || t.match(/attribute\s+'([^']+)'/i) || t.match(/named\s+'([^']+)'/i);
+  return m && m[1] ? m[1] : '';
+}
+
+// PATCH one row; when Dataverse names a column that does not exist, drop it and try again. A busy answer (429 / 503)
+// waits the time asked for and sends again (up to 8 waits). Returns { ok, missing: [columns dropped], error }
 async function patchRowDroppingMissing(entitySet, rowId, body) {
   const bodyObj = { ...body };
   const missing = [];
-  for (let step = 0; step < 12; step += 1) {
+  let waits = 0;
+  let steps = 0;
+  while (steps < 12) {
+    await boloWaitForPause();
     let res;
     try {
       res = await fetch(apiUrl(`${entitySet}(${rowId})`), {
@@ -5618,17 +5869,207 @@ async function patchRowDroppingMissing(entitySet, rowId, body) {
       return { ok: false, missing, error: e.message || 'Network error' };
     }
     if (res.ok) return { ok: true, missing };
+    if (boloIsBusy(res.status) && waits < 8) {
+      waits += 1;
+      boloPause(boloRetryWaitMs(boloRetryAfterOf(res), waits));
+      continue;
+    }
     let errText = '';
     try { errText = await res.clone().text(); } catch (e) { /* ignore */ }
-    const m = errText.match(/property\s+'([^']+)'/i) || errText.match(/attribute\s+'([^']+)'/i) || errText.match(/named\s+'([^']+)'/i);
-    if (m && m[1] && Object.prototype.hasOwnProperty.call(bodyObj, m[1])) {
-      delete bodyObj[m[1]];
-      missing.push(m[1]);
+    const col = boloMissingColumnOf(errText);
+    if (col && Object.prototype.hasOwnProperty.call(bodyObj, col)) {
+      delete bodyObj[col];
+      missing.push(col);
+      steps += 1;
       continue;
     }
     return { ok: false, missing, error: await readApiError(res) };
   }
   return { ok: false, missing, error: 'Too many missing columns' };
+}
+
+// ---------- Saving many rows (v2.4) ----------
+// A bulk save sent one PATCH per row, so 20,000+ swab rows ran into the request limit above and left rows unsaved.
+// Rows now go 100 to a $batch request, three requests at a time. Each row is its own write (no change set), so one
+// refused row never undoes the others, and Prefer: odata.continue-on-error makes Dataverse answer for every row. A
+// busy answer waits and sends again; a column Dataverse does not have is dropped (the caller's missing list) and the
+// row sent again. If $batch itself is refused (or never answers on the first try), rows go one PATCH at a time.
+const BOLO_BATCH_SIZE = 100;
+const BOLO_BATCH_WORKERS = 3;
+const BOLO_MAX_TRIES = 8;
+let boloBatchMode = ''; // '' = not tried yet, 'batch' = works here, 'single' = one PATCH a row
+
+function boloErrorMessageOf(text, status) {
+  const t = String(text || '');
+  let msg = '';
+  const j = t.indexOf('{');
+  if (j !== -1) {
+    try {
+      const e = JSON.parse(t.slice(j).trim());
+      if (e && e.error && e.error.message) msg = String(e.error.message);
+    } catch (e) { /* not JSON */ }
+  }
+  if (!msg) msg = t.replace(/HTTP\/1\.[01][^\n]*/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
+  return `${msg ? `${msg} ` : ''}(HTTP ${status})`;
+}
+
+function boloBatchRequestBody(boundary, entitySet, jobs) {
+  const NL = '\r\n';
+  let body = '';
+  jobs.forEach(job => {
+    body += `--${boundary}${NL}Content-Type: application/http${NL}Content-Transfer-Encoding: binary${NL}${NL}`;
+    body += `PATCH ${apiUrl(`${entitySet}(${job.id})`)} HTTP/1.1${NL}Content-Type: application/json; type=entry${NL}${NL}`;
+    body += `${JSON.stringify(job.send)}${NL}`;
+  });
+  return `${body}--${boundary}--${NL}`;
+}
+
+// The answers inside a $batch response, in the order the rows were sent: [{ status, text, retryAfter }]
+function boloBatchResponseParts(text, contentType) {
+  const src = String(text || '');
+  let boundary = '';
+  const bm = /boundary=("?)([^";\s]+)\1/i.exec(String(contentType || ''));
+  if (bm) boundary = bm[2];
+  if (!boundary) {
+    const lm = /^--(batchresponse_[^\s]+?)\s*$/m.exec(src) || /^--([^\s-][^\s]*?)\s*$/m.exec(src);
+    if (lm) boundary = lm[1].replace(/--$/, '');
+  }
+  if (!boundary) return [];
+  const pieces = src.split(`--${boundary}`);
+  const parts = [];
+  for (let i = 1; i < pieces.length; i += 1) {
+    const piece = pieces[i];
+    if (piece.slice(0, 2) === '--') break;
+    const sm = /HTTP\/1\.[01]\s+(\d{3})/.exec(piece);
+    if (!sm) continue;
+    const ra = /\nRetry-After:\s*([^\r\n]+)/i.exec(piece);
+    parts.push({ status: parseInt(sm[1], 10), text: piece.slice(sm.index), retryAfter: ra ? ra[1].trim() : '' });
+  }
+  return parts;
+}
+
+// One $batch request. Resolves { parts } (the answer for each row, in order) or { whole: 'busy' | 'refused' |
+// 'noanswer', status, retryAfter, error } when the request as a whole got no row answers.
+async function boloSendBatch(entitySet, jobs) {
+  const boundary = `batch_${newGuid()}`;
+  let res;
+  try {
+    res = await fetch(apiUrl('$batch'), {
+      method: 'POST',
+      headers: { ...ODATA_HEADERS, 'Content-Type': `multipart/mixed; boundary=${boundary}`, Prefer: 'odata.continue-on-error' },
+      body: boloBatchRequestBody(boundary, entitySet, jobs)
+    });
+  } catch (e) {
+    return { whole: 'noanswer', status: 0, error: (e && e.message) || 'Network error' };
+  }
+  let text = '';
+  try { text = await res.text(); } catch (e) { /* no body */ }
+  if (boloIsBusy(res.status)) return { whole: 'busy', status: res.status, retryAfter: boloRetryAfterOf(res), error: boloErrorMessageOf(text, res.status) };
+  let ctype = '';
+  try { ctype = (res.headers && res.headers.get ? res.headers.get('Content-Type') : '') || ''; } catch (e) { /* no headers */ }
+  const parts = boloBatchResponseParts(text, ctype);
+  if (parts.length > 0) return { parts };
+  return { whole: res.ok ? 'noanswer' : 'refused', status: res.status, error: boloErrorMessageOf(text, res.status) };
+}
+
+// Save rows: jobs = [{ id, body }] (PATCH by row id, which makes the row when it is not there). opts:
+//   missing      columns Dataverse does not have ({ col: true }, shared with the caller; one found is added and left
+//                out of every later row), onMissing(col)
+//   onSaved(job), onFailed(job, error), onProgress({ saved, failed, left })
+// Resolves { saved, failed, lastError, mode }.
+async function boloSaveRows(entitySet, jobs, opts) {
+  const o = opts || {};
+  const missing = o.missing || {};
+  const queue = (jobs || []).map(j => ({ id: j.id, body: j.body, tries: 0 }));
+  const total = queue.length;
+  let saved = 0;
+  let failed = 0;
+  let lastError = '';
+  let firstTryMisses = 0;
+  const sendOf = (job) => {
+    const send = { ...job.body };
+    Object.keys(missing).forEach(k => { delete send[k]; });
+    return send;
+  };
+  const progress = () => { if (o.onProgress) o.onProgress({ saved, failed, left: Math.max(0, total - saved - failed) }); };
+  const markSaved = (job) => { saved += 1; if (o.onSaved) o.onSaved(job); };
+  const markFailed = (job, error) => {
+    failed += 1;
+    lastError = error || lastError;
+    if (o.onFailed) o.onFailed(job, error || '');
+  };
+  const noteMissing = (col) => {
+    if (!col || missing[col]) return;
+    missing[col] = true;
+    if (o.onMissing) o.onMissing(col);
+  };
+  const again = (job, error) => {
+    job.tries += 1;
+    if (job.tries >= BOLO_MAX_TRIES) markFailed(job, error);
+    else queue.push(job);
+  };
+  const sendOne = async (job) => {
+    const res = await patchRowDroppingMissing(entitySet, job.id, sendOf(job));
+    res.missing.forEach(noteMissing);
+    if (res.ok) markSaved(job);
+    else markFailed(job, res.error);
+  };
+  const worker = async () => {
+    while (queue.length > 0) {
+      await boloWaitForPause();
+      if (boloBatchMode === 'single') {
+        const job = queue.shift();
+        if (job) await sendOne(job);
+        progress();
+        continue;
+      }
+      const chunk = queue.splice(0, BOLO_BATCH_SIZE);
+      if (chunk.length === 0) continue;
+      chunk.forEach(job => { job.send = sendOf(job); });
+      const r = await boloSendBatch(entitySet, chunk);
+      if (r.parts) {
+        boloBatchMode = 'batch';
+        let waitMs = 0;
+        chunk.forEach((job, i) => {
+          const part = r.parts[i];
+          if (!part) { again(job, 'Dataverse sent no answer for this row'); return; }
+          if (part.status >= 200 && part.status < 300) { markSaved(job); return; }
+          if (boloIsBusy(part.status)) {
+            waitMs = Math.max(waitMs, boloRetryWaitMs(part.retryAfter, job.tries + 1));
+            again(job, boloErrorMessageOf(part.text, part.status));
+            return;
+          }
+          const col = boloMissingColumnOf(part.text);
+          if (col && Object.prototype.hasOwnProperty.call(job.send, col)) {
+            noteMissing(col);
+            queue.push(job);
+            return;
+          }
+          markFailed(job, boloErrorMessageOf(part.text, part.status));
+        });
+        if (waitMs > 0) boloPause(waitMs);
+      } else if (r.whole === 'busy') {
+        boloPause(boloRetryWaitMs(r.retryAfter, chunk[0].tries + 1));
+        chunk.forEach(job => again(job, r.error));
+      } else if (r.status === 401 || r.status === 403) {
+        chunk.forEach(job => markFailed(job, r.error));
+      } else if (boloBatchMode !== 'batch' && (r.whole === 'refused' || firstTryMisses >= 2)) {
+        // $batch is not taken here: one PATCH a row from now on (this page load)
+        boloBatchMode = 'single';
+        chunk.forEach(job => { queue.unshift(job); });
+      } else {
+        if (boloBatchMode !== 'batch') firstTryMisses += 1;
+        boloPause(boloRetryWaitMs('', chunk[0].tries + 1));
+        chunk.forEach(job => again(job, r.error));
+      }
+      progress();
+    }
+  };
+  const workers = [];
+  for (let i = 0; i < BOLO_BATCH_WORKERS; i += 1) workers.push(worker());
+  await Promise.all(workers);
+  progress();
+  return { saved, failed, lastError, mode: boloBatchMode };
 }
 
 // ---------- Hub config (data contract section 12) ----------
@@ -5732,7 +6173,7 @@ async function boloSaveConfig(key, obj) {
 // ---------- App manifest (data contract 12.1) ----------
 // The tables and columns this build reads and writes (logical names only, never data), saved when the app opens as
 // the Hub config row manifest|bolo so the Dataverse monitor can check them. hubSaveManifest writes only on a change.
-const BOLO_VERSION = '2.3.2';
+const BOLO_VERSION = '2.4';
 const BOLO_MANIFEST = {
   appId: 'bolo',
   app: 'Pathogen BOLO',
@@ -5757,8 +6198,8 @@ const BOLO_MANIFEST = {
     },
     {
       t: 'craa5__log_',
-      read: ['craa5__log_id', 'craa5_equipmentguid', 'craa5_area', 'craa5_lastcleaned', 'craa5_shiftdate', 'craa5_cleankind', 'craa5_completionkey', 'craa5_lastcleanedby', 'craa5_equipment', 'craa5_pathogen', 'craa5_sap'],
-      opt: ['craa5_shiftdate', 'craa5_cleankind', 'craa5_completionkey']
+      read: ['craa5__log_id', 'craa5_equipmentguid', 'craa5_area', 'craa5_lastcleaned', 'craa5_shiftdate', 'craa5_completionkey', 'craa5_lastcleanedby', 'craa5_equipment', 'craa5_pathogen', 'craa5_sap'],
+      opt: ['craa5_shiftdate', 'craa5_completionkey']
     },
     {
       t: 'craa5__facilityobservation',
@@ -5777,7 +6218,7 @@ const BOLO_MANIFEST = {
   config: [
     'PATHOGEN_BOLO_CONFIG', 'PATHOGEN_BOLO_ACCESS_LOG', 'PATHOGEN_BOLO_SUGGESTED_ACTIONS', 'PATHOGEN_BOLO_HARBORAGE_CONCERNS',
     'PATHOGEN_BOLO_USER_PROFILES_JSON', 'PATHOGEN_BOLO_EXEC_SYNOPSES', 'PATHOGEN_BOLO_YOY_BENCHMARKS',
-    'PATHOGEN_BOLO_MANAGERS_HUB_GRAPHS', AREA_ALIAS_CONFIG_KEY
+    'PATHOGEN_BOLO_MANAGERS_HUB_GRAPHS', AREA_ALIAS_CONFIG_KEY, BOLO_RULES_KEY
   ]
 };
 // hubSaveManifest's io: query / create / update on a Hub config table by its logical name (entity set = name + 's')
@@ -5815,7 +6256,7 @@ async function boloPatchConfigRow(table, id, body) {
 let boloManifestStarted = false;
 
 // The live connection: loads areas, equipment, site links and stored swab rows, saves changed rows, finds closures.
-function useSwabDataverse({ ledgerRows, setHistoricalLedger, regexRules, roomAliases, canWrite, logEvent }) {
+function useSwabDataverse({ ledgerRows, setHistoricalLedger, regexRules, roomAliases, canWrite, logEvent, rules }) {
   const [swabDv, setSwabDv] = useState({ status: 'probing', set: '', idCol: '', missingCols: [], stored: 0, queued: 0, saving: false, failed: 0, lastError: '', lastSync: '', legacy: 0 });
   const [mssAreas, setMssAreas] = useState([]);
   const [assets, setAssets] = useState([]);
@@ -5928,43 +6369,81 @@ function useSwabDataverse({ ledgerRows, setHistoricalLedger, regexRules, roomAli
   }, [zoneAreas, zoneAreasSaved, mssAreas]);
   const ctx = useMemo(() => ({ ...linkCtx, zoneAreas: effectiveZoneAreas }), [linkCtx, effectiveZoneAreas]);
 
-  // 2. Find the table and load every stored swab row into the ledger
-  useEffect(() => {
-    let alive = true;
-    const run = async () => {
+  // 2. Find the table and load every stored swab row into the ledger. The table is the shared record: every open reads
+  // it, and its rows join what this computer already holds (rows match on Sample ID + description + test, so nothing is
+  // counted twice). While a re-upload is in progress (reuploadRef) the table rows stay out of the ledger, so the Table
+  // check can show which of them the lab files bring back.
+  const tableRef = useRef(null);
+  const loadingRef = useRef(false);
+  const reuploadRef = useRef(null);
+  const [reupload, setReupload] = useState(null);
+  const loadTable = useCallback(async (why) => {
+    if (loadingRef.current) return false;
+    loadingRef.current = true;
+    try {
+      const known = tableRef.current;
+      const names = known ? [known] : SWAB_TABLE_CANDIDATES;
       let found = null;
-      for (let i = 0; i < SWAB_TABLE_CANDIDATES.length; i += 1) {
+      let probeRec = null;
+      let probeError = '';
+      for (let i = 0; i < names.length && !found; i += 1) {
         try {
-          const res = await fetch(apiUrl(`${SWAB_TABLE_CANDIDATES[i].set}?$top=1`), { headers: ODATA_HEADERS });
-          if (res.ok) { found = SWAB_TABLE_CANDIDATES[i]; break; }
-        } catch (e) { /* try the next name */ }
+          await boloWaitForPause();
+          const res = await fetch(apiUrl(`${names[i].set}?$top=1`), { headers: ODATA_HEADERS });
+          if (res.ok) {
+            found = names[i];
+            const data = await res.json();
+            probeRec = (data.value || [])[0] || null;
+          } else {
+            probeError = await readApiError(res);
+          }
+        } catch (e) { probeError = e.message || 'Network error'; }
       }
+      if (!found && known) throw new Error(probeError || 'The swab table did not answer');
       if (!found) {
-        if (alive) setSwabDv(p => ({ ...p, status: 'missing' }));
-        if (alive) logEvent('"_b_ Swab result" table not found: swab results stay on this computer only.', 'warn');
-        return;
+        const denied = /HTTP 40[13]/.test(probeError);
+        setSwabDv(p => ({ ...p, status: p.status === 'ready' ? 'ready' : (denied ? 'error' : 'missing'), loading: false, lastError: denied ? probeError : p.lastError, loadError: denied ? probeError : '' }));
+        logEvent(denied ? `The swab table could not be read (${probeError}).` : '"_b_ Swab result" table not found: swab results stay on this computer only.', 'warn');
+        return false;
       }
-      try {
-        const recs = await fetchAllPages(apiUrl(`${found.set}?$filter=statecode eq 0`));
-        if (recs.length > 0) hashColsRef.current = SWAB_COLUMNS.filter(k => Object.prototype.hasOwnProperty.call(recs[0], k));
+      tableRef.current = found;
+      setSwabDv(p => ({ ...p, set: found.set, idCol: found.id, loading: true, loaded: 0 }));
+      // Only the columns the table has (a $select naming a missing column is refused), and no row marked replaced
+      const cols = probeRec ? SWAB_COLUMNS.filter(k => Object.prototype.hasOwnProperty.call(probeRec, k)) : SWAB_COLUMNS.slice();
+      const select = probeRec ? `&$select=${[found.id].concat(cols).join(',')}` : '';
+      const live = probeRec && cols.indexOf('craa5_result') !== -1 ? " and (craa5_result ne 'replaced' or craa5_result eq null)" : '';
+      const recs = await fetchAllPages(apiUrl(`${found.set}?$filter=statecode eq 0${live}${select}`), 0, n => setSwabDv(p => ({ ...p, loaded: n })));
+      const colSource = recs[0] || probeRec;
+      if (colSource) {
+        hashColsRef.current = SWAB_COLUMNS.filter(k => Object.prototype.hasOwnProperty.call(colSource, k));
         missingRef.current = {};
         SWAB_COLUMNS.forEach(k => { if (hashColsRef.current.indexOf(k) === -1) missingRef.current[k] = true; });
-        const rulesCompiled = compileRegexSet(regexRules);
-        const loaded = [];
-        let replacedRows = 0;
-        recs.forEach((rec, i) => {
-          if (String(rec.craa5_result || '').toLowerCase() === 'replaced') { replacedRows += 1; return; }
-          const rid = hubGuid(rec[found.id]);
-          if (rid) storedIdsRef.current[rid] = true;
-          if (rid && EXAMPLE_ROW_SIGS[exampleRowSig(rec.craa5_sampleid, rec.craa5_sampledescription)]) { exampleRef.current[rid] = true; return; }
-          const row = swabRowFromRecord(rec, rulesCompiled, roomAliases, i);
-          if (!row) return;
-          const newId = swabRowId(row);
-          if (newId !== rid) legacyRef.current[rid] = newId;
-          else syncedRef.current[rid] = swabPayloadHash(rec, hashColsRef.current);
-          loaded.push(row);
-        });
-        if (!alive) return;
+      }
+      const rulesCompiled = compileRegexSet(regexRules);
+      const loaded = [];
+      const stored = {};
+      const synced = {};
+      const legacy = {};
+      const example = {};
+      recs.forEach((rec, i) => {
+        if (String(rec.craa5_result || '').toLowerCase() === 'replaced') return;
+        const rid = hubGuid(rec[found.id]);
+        if (!rid) return;
+        stored[rid] = String(rec.craa5_collectiondate || '').slice(0, 4) || '?';
+        if (EXAMPLE_ROW_SIGS[exampleRowSig(rec.craa5_sampleid, rec.craa5_sampledescription)]) { example[rid] = true; return; }
+        const row = swabRowFromRecord(rec, rulesCompiled, roomAliases, i);
+        if (!row) return;
+        const newId = swabRowId(row);
+        if (newId !== rid) legacy[rid] = newId;
+        else synced[rid] = swabPayloadHash(rec, hashColsRef.current);
+        loaded.push(row);
+      });
+      storedIdsRef.current = stored;
+      syncedRef.current = synced;
+      legacyRef.current = legacy;
+      exampleRef.current = example;
+      const apart = !!reuploadRef.current;
+      if (!apart) {
         setHistoricalLedger(prev => {
           const byKey = {};
           loaded.forEach(r => { byKey[swabRowKey(r)] = r; });
@@ -5974,110 +6453,110 @@ function useSwabDataverse({ ledgerRows, setHistoricalLedger, regexRules, roomAli
           });
           return ingestRowsWithDeduplication(withDv, loaded, 'Dataverse _b_ Swab result').ledger;
         });
-        setSwabDv(p => ({ ...p, status: 'ready', set: found.set, idCol: found.id, stored: recs.length - replacedRows, missingCols: Object.keys(missingRef.current), lastSync: new Date().toLocaleTimeString(), legacy: Object.keys(legacyRef.current).length }));
-        logEvent(`Loaded ${(recs.length - replacedRows).toLocaleString()} swab results from Dataverse (${found.set}).`, 'success');
-        if (Object.keys(exampleRef.current).length > 0) {
-          logEvent(`${Object.keys(exampleRef.current).length} stored row(s) are the v2.0 example table, not real swabs: left out, and marked replaced on the next save.`, 'warn');
-        }
-      } catch (e) {
-        if (alive) setSwabDv(p => ({ ...p, status: 'error', set: found.set, idCol: found.id, lastError: e.message }));
-        if (alive) logEvent(`Swab results could not be read from Dataverse (${e.message}).`, 'error');
       }
-    };
-    run();
-    return () => { alive = false; };
-  }, []);
+      const at = new Date().toLocaleTimeString();
+      setSwabDv(p => ({ ...p, status: 'ready', set: found.set, idCol: found.id, loading: false, loadError: '', stored: Object.keys(stored).length, missingCols: Object.keys(missingRef.current), lastLoad: at, lastSync: at, legacy: Object.keys(legacy).length }));
+      logEvent(`${why === 'reload' ? 'Read the swab table again' : 'Loaded'}: ${loaded.length.toLocaleString()} swab results from Dataverse (${found.set})${apart ? ', kept apart until the re-upload is finished' : ''}.`, 'success');
+      if (Object.keys(example).length > 0) {
+        logEvent(`${Object.keys(example).length} stored row(s) are the v2.0 example table, not real swabs: left out, and marked replaced on the next save.`, 'warn');
+      }
+      return true;
+    } catch (e) {
+      setSwabDv(p => ({ ...p, status: p.status === 'ready' ? 'ready' : 'error', loading: false, lastError: e.message, loadError: e.message }));
+      logEvent(`Swab results could not be read from Dataverse (${e.message}).`, 'error');
+      return false;
+    } finally {
+      loadingRef.current = false;
+    }
+  }, [regexRules, roomAliases, setHistoricalLedger, logEvent]);
+  const loadTableRef = useRef(loadTable);
+  useEffect(() => { loadTableRef.current = loadTable; }, [loadTable]);
+  useEffect(() => { loadTableRef.current('open'); }, []);
 
   const refsReady = refsLoaded.areas && refsLoaded.assets && refsLoaded.links && refsLoaded.zones;
 
-  // 3. Save rows that are new or changed (only for people allowed to load data, and only once areas are known)
+  // 3. Save rows that are new or changed (only for people allowed to load data, and only once areas are known).
+  // boloSaveRows sends 100 rows a request and waits when Dataverse says it is busy; a row it could not save keeps its
+  // reason (failedRef) for the Table check and is tried again by the next save.
+  const failedRef = useRef({});
   const runSync = useCallback(async () => {
-    if (swabDv.status !== 'ready' || !canWrite || !refsReady) return;
+    if (swabDv.status !== 'ready' || !canWrite || !refsReady || swabDv.loading) return;
     if (runningRef.current) { rerunRef.current = true; return; }
     runningRef.current = true;
     try {
       const dirty = [];
+      const seen = {};
       (ledgerRows || []).forEach(r => {
         // A row that held two tests is not saved: its result may belong to the other test
         if (!r || !r.date || r.needsReupload) return;
         const body = buildSwabPayload(r, ctx);
         const id = swabRowId(r);
+        if (seen[id]) return;
+        seen[id] = true;
         if (syncedRef.current[id] !== swabPayloadHash(body, hashColsRef.current)) dirty.push({ id, body });
       });
-      setSwabDv(p => ({ ...p, queued: dirty.length, saving: dirty.length > 0, failed: 0 }));
-      let failed = 0;
-      let lastError = '';
-      let done = 0;
-      const worker = async () => {
-        while (dirty.length > 0) {
-          const job = dirty.shift();
-          const send = { ...job.body };
-          Object.keys(missingRef.current).forEach(k => { delete send[k]; });
-          const res = await patchRowDroppingMissing(swabDv.set, job.id, send);
-          res.missing.forEach(k => {
-            missingRef.current[k] = true;
-            hashColsRef.current = hashColsRef.current.filter(c => c !== k);
-          });
-          if (res.ok) {
-            syncedRef.current[job.id] = swabPayloadHash(job.body, hashColsRef.current);
-            storedIdsRef.current[job.id] = true;
-            done += 1;
-          } else {
-            failed += 1;
-            lastError = res.error;
-          }
-          if ((done + failed) % 25 === 0) setSwabDv(p => ({ ...p, queued: dirty.length }));
-        }
-      };
-      await Promise.all([worker(), worker(), worker(), worker()]);
-      // v2.2 rows whose v2.3 row is now saved: marked replaced (and made inactive when allowed), so readers that ask for
-      // craa5_result eq 'positive' never count one swab twice. Nothing is deleted.
+      failedRef.current = {};
+      setSwabDv(p => ({ ...p, queued: dirty.length, saving: dirty.length > 0, failed: 0, savedNow: 0, toSave: dirty.length }));
+      const res = dirty.length === 0 ? { saved: 0, failed: 0, lastError: '' } : await boloSaveRows(swabDv.set, dirty, {
+        missing: missingRef.current,
+        onMissing: (col) => { hashColsRef.current = hashColsRef.current.filter(c => c !== col); },
+        onSaved: (job) => {
+          syncedRef.current[job.id] = swabPayloadHash(job.body, hashColsRef.current);
+          storedIdsRef.current[job.id] = String(job.body.craa5_collectiondate || '').slice(0, 4) || '?';
+        },
+        onFailed: (job, error) => { failedRef.current[job.id] = error; },
+        onProgress: (pr) => setSwabDv(p => ({ ...p, queued: pr.left, savedNow: pr.saved, failedNow: pr.failed }))
+      });
+      // v2.2 rows whose v2.3 row is now saved, and stored rows of the v2.0 example table: marked replaced, so readers
+      // that ask for craa5_result eq 'positive' never count one swab twice. Nothing is deleted.
       const oldIds = Object.keys(legacyRef.current).filter(oldId => syncedRef.current[legacyRef.current[oldId]]);
-      let replaced = 0;
-      for (let i = 0; i < oldIds.length; i += 1) {
-        const oldId = oldIds[i];
-        const res = await patchRowDroppingMissing(swabDv.set, oldId, { craa5_result: 'replaced', craa5_source: `Replaced by ${legacyRef.current[oldId]}` });
-        if (!res.ok) continue;
-        try {
-          await fetch(apiUrl(`${swabDv.set}(${oldId})`), {
-            method: 'PATCH',
-            headers: { ...ODATA_HEADERS, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ statecode: 1, statuscode: 2 })
-          });
-        } catch (e) { /* the result text already keeps it out of the positive list */ }
-        delete legacyRef.current[oldId];
-        delete storedIdsRef.current[oldId];
-        replaced += 1;
+      const replacedOld = [];
+      if (oldIds.length > 0) {
+        await boloSaveRows(swabDv.set, oldIds.map(oldId => ({ id: oldId, body: { craa5_result: 'replaced', craa5_source: `Replaced by ${legacyRef.current[oldId]}` } })), {
+          missing: missingRef.current,
+          onSaved: (job) => {
+            replacedOld.push(job.id);
+            delete legacyRef.current[job.id];
+            delete storedIdsRef.current[job.id];
+          }
+        });
+        // Made inactive too when allowed; the result text already keeps it out of every reader
+        for (let i = 0; i < replacedOld.length; i += 1) {
+          await patchRowDroppingMissing(swabDv.set, replacedOld[i], { statecode: 1, statuscode: 2 });
+        }
+        if (replacedOld.length > 0) logEvent(`${replacedOld.length} swab row(s) saved under the old key (no test) marked replaced in Dataverse.`, 'info');
       }
-      if (replaced > 0) logEvent(`${replaced} swab row(s) saved under the old key (no test) marked replaced in Dataverse.`, 'info');
       const exampleIds = Object.keys(exampleRef.current);
-      let examplesDone = 0;
-      for (let i = 0; i < exampleIds.length; i += 1) {
-        const res = await patchRowDroppingMissing(swabDv.set, exampleIds[i], { craa5_result: 'replaced', craa5_source: 'Example row from v2.0, not a real swab' });
-        if (!res.ok) continue;
-        delete exampleRef.current[exampleIds[i]];
-        delete storedIdsRef.current[exampleIds[i]];
-        examplesDone += 1;
+      if (exampleIds.length > 0) {
+        let examplesDone = 0;
+        await boloSaveRows(swabDv.set, exampleIds.map(id => ({ id, body: { craa5_result: 'replaced', craa5_source: 'Example row from v2.0, not a real swab' } })), {
+          missing: missingRef.current,
+          onSaved: (job) => {
+            examplesDone += 1;
+            delete exampleRef.current[job.id];
+            delete storedIdsRef.current[job.id];
+          }
+        });
+        if (examplesDone > 0) logEvent(`${examplesDone} example row(s) from v2.0 marked replaced in Dataverse.`, 'info');
       }
-      if (examplesDone > 0) logEvent(`${examplesDone} example row(s) from v2.0 marked replaced in Dataverse.`, 'info');
       setSwabDv(p => ({
         ...p,
         queued: 0,
         saving: false,
-        failed,
-        lastError: failed > 0 ? lastError : '',
+        failed: res.failed,
+        lastError: res.failed > 0 ? res.lastError : '',
         stored: Object.keys(storedIdsRef.current).length,
         missingCols: Object.keys(missingRef.current),
         lastSync: new Date().toLocaleTimeString(),
         legacy: Object.keys(legacyRef.current).length
       }));
-      if (done > 0) logEvent(`Saved ${done.toLocaleString()} swab result(s) to Dataverse.`, 'success');
-      if (failed > 0) logEvent(`${failed} swab result(s) not saved (${lastError}). They are retried on the next change or with Retry.`, 'error');
+      if (res.saved > 0) logEvent(`Saved ${res.saved.toLocaleString()} swab result(s) to Dataverse.`, 'success');
+      if (res.failed > 0) logEvent(`${res.failed} swab result(s) not saved (${res.lastError}). Save now in the Table check tries them again.`, 'error');
     } finally {
       runningRef.current = false;
       if (rerunRef.current) { rerunRef.current = false; window.setTimeout(() => { runSyncRef.current(); }, 500); }
     }
-  }, [swabDv.status, swabDv.set, canWrite, refsReady, ledgerRows, ctx, logEvent]);
+  }, [swabDv.status, swabDv.set, swabDv.loading, canWrite, refsReady, ledgerRows, ctx, logEvent]);
   const runSyncRef = useRef(runSync);
   useEffect(() => { runSyncRef.current = runSync; }, [runSync]);
   useEffect(() => {
@@ -6085,39 +6564,40 @@ function useSwabDataverse({ ledgerRows, setHistoricalLedger, regexRules, roomAli
     return () => window.clearTimeout(t);
   }, [runSync]);
 
-  // 4. Closures: MSS log rows with craa5_pathogen = Yes on or after the earliest open positive
+  // 4. Closures. Gerald (2026-10-23): every clean in the plant follows the presumptive process (three sanitizers, extra
+  // ppm), so every clean is a pathogen clean: any MSS log clean of the same equipment (or area) on or after the swab day
+  // closes a positive. Only positives inside the alert window are looked up; older ones are history.
+  const alertSince = alertSinceOf(rules);
   useEffect(() => {
     if (!refsReady) return undefined;
     let alive = true;
-    const open = (ledgerRows || []).filter(r => r && r.result === 'Positive' && r.date && !r.dvClosedKey);
+    const open = (ledgerRows || []).filter(r => r && r.result === 'Positive' && r.date && r.date >= alertSince && !r.dvClosedKey);
     if (open.length === 0) return undefined;
     const minDay = open.reduce((m, r) => (r.date < m ? r.date : m), open[0].date);
     const run = async () => {
-      const base = `${MSS_LOG_SET}?$filter=craa5_pathogen eq 'Yes' and craa5_lastcleaned ge ${minDay}T00:00:00Z&$select=`;
+      const base = `${MSS_LOG_SET}?$filter=craa5_lastcleaned ge ${minDay}T00:00:00Z&$select=`;
       let recs;
       try {
-        recs = await fetchAllPages(apiUrl(base + 'craa5__log_id,craa5_equipmentguid,craa5_area,craa5_lastcleaned,craa5_shiftdate,craa5_cleankind,craa5_completionkey'), 20000);
+        recs = await fetchAllPages(apiUrl(base + 'craa5__log_id,craa5_equipmentguid,craa5_area,craa5_lastcleaned,craa5_shiftdate,craa5_completionkey'), 60000);
       } catch (e) {
         try {
-          recs = await fetchAllPages(apiUrl(base + 'craa5__log_id,craa5_equipmentguid,craa5_area,craa5_lastcleaned'), 20000);
+          recs = await fetchAllPages(apiUrl(base + 'craa5__log_id,craa5_equipmentguid,craa5_area,craa5_lastcleaned'), 60000);
         } catch (e2) {
           return;
         }
       }
-      const logs = recs
-        .filter(l => !l.craa5_cleankind || String(l.craa5_cleankind).toLowerCase() === 'corrective')
-        .map(l => ({
-          key: l.craa5_completionkey || `log|${hubGuid(l.craa5__log_id)}`,
-          day: l.craa5_shiftdate || hubDayFromDateOnly(l.craa5_lastcleaned),
-          equipmentguid: hubGuid(l.craa5_equipmentguid || ''),
-          area: l.craa5_area || ''
-        }));
+      const logs = recs.map(l => ({
+        key: l.craa5_completionkey || `log|${hubGuid(l.craa5__log_id)}`,
+        day: l.craa5_shiftdate || hubDayFromDateOnly(l.craa5_lastcleaned),
+        equipmentguid: hubGuid(l.craa5_equipmentguid || ''),
+        area: l.craa5_area || ''
+      }));
       if (alive) setClosures(findSwabClosures(open, logs, ctx));
     };
     run();
     return () => { alive = false; };
-  // Re-check when the number of positives changes or links change, not on every ledger edit
-  }, [refsReady, (ledgerRows || []).length, siteLinks, effectiveZoneAreas]);
+  // Re-check when the number of positives changes, links change or the window moves, not on every ledger edit
+  }, [refsReady, (ledgerRows || []).length, siteLinks, effectiveZoneAreas, alertSince]);
 
   const saveSiteLink = useCallback(async (siteCode, link) => {
     const code = String(siteCode || '').toUpperCase();
@@ -6148,38 +6628,84 @@ function useSwabDataverse({ ledgerRows, setHistoricalLedger, regexRules, roomAli
     setZoneAreasSaved(true);
   }, []);
 
-  // Import check "Start over": every stored swab row is marked replaced (nothing is deleted), so no reader counts it.
-  // The lab files loaded next save their rows again under the same row ids, which brings each real row back with the
-  // file's reading; a stored row that no file has (a misread row from an older version) stays out.
-  const retireStoredRows = useCallback(async () => {
-    if (swabDv.status !== 'ready' || !canWrite) return { ok: false, retired: 0, failed: 0 };
-    const queue = Object.keys(storedIdsRef.current);
-    const stamp = LIVE_TODAY_DATE_KEY;
-    let retired = 0;
-    let failed = 0;
-    let lastError = '';
-    setSwabDv(p => ({ ...p, saving: true, queued: queue.length }));
-    const worker = async () => {
-      while (queue.length > 0) {
-        const id = queue.shift();
-        const res = await patchRowDroppingMissing(swabDv.set, id, { craa5_result: 'replaced', craa5_source: `Start over ${stamp}: waiting for the lab file` });
-        if (res.ok) {
-          retired += 1;
-          delete storedIdsRef.current[id];
-          delete syncedRef.current[id];
-        } else {
-          failed += 1;
-          lastError = res.error;
-        }
-        if ((retired + failed) % 25 === 0) setSwabDv(p => ({ ...p, queued: queue.length }));
-      }
-    };
-    await Promise.all([worker(), worker(), worker(), worker()]);
-    legacyRef.current = {};
-    exampleRef.current = {};
-    setSwabDv(p => ({ ...p, saving: false, queued: 0, stored: Object.keys(storedIdsRef.current).length, legacy: 0, failed, lastError: failed > 0 ? lastError : '', lastSync: new Date().toLocaleTimeString() }));
-    logEvent(`Start over: ${retired.toLocaleString()} swab row(s) in Dataverse marked replaced${failed > 0 ? `, ${failed} not changed (${lastError})` : ''}. Upload the lab files to save them again.`, failed > 0 ? 'error' : 'warn');
-    return { ok: failed === 0, retired, failed };
+  // Table check (top of the Data Manipulation tab): the table against this computer, by year. onlyTable = active table
+  // rows this computer does not hold (old-key and example rows are handled by the save and left out); notInTable =
+  // rows here the table does not have yet. During a re-upload, fromFiles = rows the files brought back that the table
+  // already had when the re-upload started.
+  const ledgerIdsRef = useRef({});
+  const tableCheck = useMemo(() => {
+    const here = {};
+    const hereByYear = {};
+    let hereN = 0;
+    let notInTable = 0;
+    (ledgerRows || []).forEach(r => {
+      if (!r || !r.date || r.needsReupload) return;
+      const id = swabRowId(r);
+      if (here[id]) return;
+      here[id] = true;
+      hereN += 1;
+      const y = r.date.slice(0, 4);
+      hereByYear[y] = (hereByYear[y] || 0) + 1;
+      if (!storedIdsRef.current[id]) notInTable += 1;
+    });
+    ledgerIdsRef.current = here;
+    const tableByYear = {};
+    const onlyTable = [];
+    let tableN = 0;
+    Object.keys(storedIdsRef.current).forEach(id => {
+      tableN += 1;
+      const y = storedIdsRef.current[id] === true ? '?' : storedIdsRef.current[id];
+      tableByYear[y] = (tableByYear[y] || 0) + 1;
+      if (!here[id] && !legacyRef.current[id] && !exampleRef.current[id]) onlyTable.push(id);
+    });
+    const session = reuploadRef.current;
+    let fromFiles = 0;
+    if (session) Object.keys(here).forEach(id => { if (session.atStart[id]) fromFiles += 1; });
+    const reasons = {};
+    Object.keys(failedRef.current).forEach(id => {
+      const why = failedRef.current[id] || '';
+      reasons[why] = (reasons[why] || 0) + 1;
+    });
+    const failReasons = Object.keys(reasons).sort((a, b) => reasons[b] - reasons[a]).slice(0, 3).map(w => ({ why: w, n: reasons[w] }));
+    return { hereN, hereByYear, tableN, tableByYear, onlyTable, notInTable, fromFiles, failReasons };
+  }, [ledgerRows, swabDv.stored, swabDv.lastSync, swabDv.lastLoad, swabDv.failed, reupload]);
+
+  // Re-upload (Table check, click to run): 1. clear this computer (the table is not touched), 2. upload every lab file:
+  // their rows are saved under the same row ids, 3. the table rows none of the files brought back are listed, and only
+  // "Mark replaced" changes them. v2.3 marked every table row replaced before the upload, and its marks raced the
+  // upload's save, so fresh rows could end up marked replaced.
+  const beginReupload = useCallback(() => {
+    const info = { since: new Date().toISOString(), atStart: { ...storedIdsRef.current } };
+    reuploadRef.current = info;
+    setReupload({ since: info.since, tableAtStart: Object.keys(info.atStart).length, marked: 0, markFailed: 0 });
+  }, []);
+  const endReupload = useCallback(() => {
+    reuploadRef.current = null;
+    setReupload(null);
+  }, []);
+  // Marks table rows replaced (never deleted), so no reader counts them. Only rows this computer does not hold: a row a
+  // file brings back while the marks go out is saved again right after.
+  const markStaleRows = useCallback(async (ids) => {
+    if (swabDv.status !== 'ready' || !canWrite) return { ok: false, marked: 0, failed: 0 };
+    const list = (ids || []).filter(id => storedIdsRef.current[id] && !ledgerIdsRef.current[id]);
+    if (list.length === 0) return { ok: true, marked: 0, failed: 0 };
+    const note = `Re-upload ${LIVE_TODAY_DATE_KEY}: in no lab file`;
+    setSwabDv(p => ({ ...p, saving: true, marking: true, queued: list.length, savedNow: 0, toSave: list.length }));
+    const res = await boloSaveRows(swabDv.set, list.map(id => ({ id, body: { craa5_result: 'replaced', craa5_source: note } })), {
+      missing: missingRef.current,
+      onSaved: (job) => {
+        delete storedIdsRef.current[job.id];
+        delete syncedRef.current[job.id];
+      },
+      onProgress: (pr) => setSwabDv(p => ({ ...p, queued: pr.left, savedNow: pr.saved, failedNow: pr.failed }))
+    });
+    const back = list.filter(id => ledgerIdsRef.current[id]);
+    back.forEach(id => { delete syncedRef.current[id]; });
+    setSwabDv(p => ({ ...p, saving: false, marking: false, queued: 0, stored: Object.keys(storedIdsRef.current).length, lastSync: new Date().toLocaleTimeString() }));
+    setReupload(p => (p ? { ...p, marked: (p.marked || 0) + res.saved, markFailed: res.failed } : p));
+    logEvent(`Re-upload: ${res.saved.toLocaleString()} swab row(s) that no lab file holds marked replaced in Dataverse${res.failed > 0 ? `, ${res.failed} not changed (${res.lastError})` : ''}.`, res.failed > 0 ? 'error' : 'warn');
+    if (back.length > 0) window.setTimeout(() => { runSyncRef.current(); }, 300);
+    return { ok: res.failed === 0, marked: res.saved, failed: res.failed };
   }, [swabDv.status, swabDv.set, canWrite, logEvent]);
 
   // Last MSS log rows for a piece (or an area when the hit has no piece)
@@ -6214,7 +6740,12 @@ function useSwabDataverse({ ledgerRows, setHistoricalLedger, regexRules, roomAli
     linkCtx: ctx,
     refsReady,
     retrySync: runSync,
-    retireStoredRows,
+    reloadTable: () => loadTableRef.current('reload'),
+    tableCheck,
+    reupload,
+    beginReupload,
+    endReupload,
+    markStaleRows,
     saveSiteLink,
     saveZoneAreas,
     fetchLogHistory
@@ -6254,32 +6785,49 @@ function SwabDvStatusChip({ swabDv, canWrite, onRetry }) {
   ), ACTIVE_UI_LANG);
 }
 
-function OpenSwabHitsPanel({ theme, darkMode, ledger, linkCtx, closures, assetsById, fetchLogHistory, refsReady, swabDv }) {
+// Open positives (v2.4): every positive of the alert window (2 months unless saved otherwise), open ones first and
+// oldest first, with days open, the owner by stage and the step it waits on. A positive is closed by any MSS log clean
+// of its equipment (or its area when the site has no equipment) on or after the swab day.
+function OpenSwabHitsPanel({ theme, darkMode, ledger, linkCtx, closures, assetsById, fetchLogHistory, refsReady, swabDv, rules }) {
   const [showClosed, setShowClosed] = useState(false);
   const [openRow, setOpenRow] = useState('');
   const [history, setHistory] = useState({});
+  const since = alertSinceOf(rules);
 
-  const rows = useMemo(() => {
+  const view = useMemo(() => {
     const list = [];
+    let olderOpen = 0;
     (ledger || []).forEach(r => {
       if (!r || r.result !== 'Positive' || !r.date) return;
       const key = swabRowKey(r);
-      const links = resolveSwabLinks(r, linkCtx);
       const closure = closures[key] || (r.dvClosedKey ? { key: r.dvClosedKey, day: r.dvClosedOn } : null);
-      list.push({ r, key, links, closure });
+      if (r.date < since) {
+        if (!closure) olderOpen += 1;
+        return;
+      }
+      const links = resolveSwabLinks(r, linkCtx);
+      const daysOpen = closure ? null : dayDiff(r.date, LIVE_TODAY_DATE_KEY);
+      const daysToClose = closure && closure.day ? dayDiff(r.date, closure.day) : null;
+      list.push({ r, key, links, closure, daysOpen, daysToClose, owner: ownerOfStage(r.stage) });
     });
-    list.sort((a, b) => String(b.r.date).localeCompare(String(a.r.date)));
-    return list;
-  }, [ledger, linkCtx, closures]);
+    // Open first, oldest first; closed after them, newest first
+    list.sort((a, b) => {
+      if (!a.closure !== !b.closure) return a.closure ? 1 : -1;
+      return a.closure ? String(b.r.date).localeCompare(String(a.r.date)) : String(a.r.date).localeCompare(String(b.r.date));
+    });
+    return { list, olderOpen };
+  }, [ledger, linkCtx, closures, since]);
+  const rows = view.list;
   const openCount = rows.filter(x => !x.closure).length;
-  const shown = rows.filter(x => showClosed || !x.closure).slice(0, 60);
+  const shown = rows.filter(x => showClosed || !x.closure).slice(0, 80);
+  const ownerWord = (o) => (o === 'Sanitation' ? tr('Sanitation', 'Sanitizacion') : (o === 'Production' ? tr('Production', 'Produccion') : '--'));
 
   const toggleHistory = async (x) => {
     if (openRow === x.key) { setOpenRow(''); return; }
     setOpenRow(x.key);
     if (history[x.key]) return;
     if (!x.links.equipmentguid && !x.links.area) {
-      setHistory(h => ({ ...h, [x.key]: { error: 'This swab site is not linked to an MSS area or equipment yet (Swab Catalog tab).' } }));
+      setHistory(h => ({ ...h, [x.key]: { error: tr('This swab site is not linked to an MSS area or equipment yet (Swab Catalog tab).', 'Este sitio de hisopo aun no esta ligado a un area de MSS ni a un equipo (pestana Catalogo de Hisopos).') } }));
       return;
     }
     setHistory(h => ({ ...h, [x.key]: { loading: true } }));
@@ -6292,39 +6840,48 @@ function OpenSwabHitsPanel({ theme, darkMode, ledger, linkCtx, closures, assetsB
   };
 
   return localizeReactTree((
-    <div className={`rounded-xl border p-4 shadow-xs ${theme.bgCard}`}>
+    <div className={`rounded-xl border p-4 shadow-xs ${theme.bgCard}`} data-open-positives="1">
       <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
         <div>
-          <h3 className={`text-sm font-black ${theme.textHeading}`}>Open Positives and Corrective Cleans</h3>
+          <h3 className={`text-sm font-black ${theme.textHeading}`}>{tr('Open positives and corrective cleans', 'Positivos abiertos y limpiezas correctivas')}</h3>
           <p className={`text-[11px] ${theme.textMuted}`}>
-            A positive is closed when the MSS log has a Pathogen = Yes clean on the same equipment (or area) on or after the swab date.
-            {!refsReady && ' Loading areas and equipment...'}
-            {swabDv.status === 'missing' && ' The swab table is not created yet, so other apps cannot see these hits.'}
+            {tr(`Positives since ${formatShortDate(since)} (the alert window), oldest open first. Any MSS log clean of the same equipment (or the same area when the site has no equipment) on or after the swab day closes one: every clean follows the presumptive process. Start-up positives belong to Sanitation, in-process positives to Production.`, `Positivos desde ${formatShortDate(since)} (la ventana de alertas), el abierto mas antiguo primero. Cualquier limpieza del registro MSS del mismo equipo (o de la misma area cuando el sitio no tiene equipo) el dia del hisopo o despues lo cierra: cada limpieza sigue el proceso presuntivo. Los positivos de arranque son de Sanitizacion y los de en proceso de Produccion.`)}
+            {!refsReady && ` ${tr('Loading areas and equipment...', 'Cargando areas y equipos...')}`}
+            {swabDv.status === 'missing' && ` ${tr('The swab table is not created yet, so other apps cannot see these hits.', 'La tabla de hisopos aun no existe, asi que otras apps no ven estos positivos.')}`}
           </p>
+          {view.olderOpen > 0 && (
+            <p className={`text-[11px] mt-0.5 ${theme.textMuted}`} data-open-older="1">
+              {view.olderOpen === 1
+                ? tr(`1 positive from before ${formatShortDate(since)} has no clean found and is not listed: it is history (calendar and graphs).`, `1 positivo de antes del ${formatShortDate(since)} no tiene limpieza encontrada y no se lista: es historial (calendario y graficas).`)
+                : tr(`${view.olderOpen} positives from before ${formatShortDate(since)} have no clean found and are not listed: they are history (calendar and graphs).`, `${view.olderOpen} positivos de antes del ${formatShortDate(since)} no tienen limpieza encontrada y no se listan: son historial (calendario y graficas).`)}
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-2">
-          <span className={`px-2 py-0.5 rounded-full text-[11px] font-black ${openCount > 0 ? 'bg-[#DC2626] text-white' : 'bg-emerald-600 text-white'}`}>
-            {openCount} open
+          <span className={`px-2 py-0.5 rounded-full text-[11px] font-black ${openCount > 0 ? 'bg-[#DC2626] text-white' : 'bg-emerald-600 text-white'}`} data-open-count={openCount}>
+            {tr(`${openCount} open`, `${openCount} abiertos`)}
           </span>
           <label className="text-[11px] font-bold flex items-center gap-1">
-            <input type="checkbox" checked={showClosed} onChange={e => setShowClosed(e.target.checked)} /> Show closed
+            <input type="checkbox" checked={showClosed} onChange={e => setShowClosed(e.target.checked)} /> {tr('Show closed', 'Mostrar cerrados')}
           </label>
         </div>
       </div>
       {shown.length === 0 ? (
-        <div className={`text-xs ${theme.textMuted}`}>{rows.length === 0 ? 'No positive results loaded.' : 'No open positives.'}</div>
+        <div className={`text-xs ${theme.textMuted}`}>{rows.length === 0 ? tr(`No positive results since ${formatShortDate(since)}.`, `No hay resultados positivos desde el ${formatShortDate(since)}.`) : tr('No open positives.', 'No hay positivos abiertos.')}</div>
       ) : (
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs border-collapse">
             <thead className={`uppercase text-[10px] font-extrabold tracking-wider ${theme.bgSubtle}`}>
               <tr>
-                <th className="py-2 px-2">Date</th>
-                <th className="py-2 px-2">Site</th>
-                <th className="py-2 px-2">Test</th>
-                <th className="py-2 px-2">MSS Area</th>
-                <th className="py-2 px-2">Equipment</th>
-                <th className="py-2 px-2">Status</th>
-                <th className="py-2 px-2 text-right">MSS Log</th>
+                <th className="py-2 px-2">{tr('Date', 'Fecha')}</th>
+                <th className="py-2 px-2 text-right">{tr('Days open', 'Dias abierto')}</th>
+                <th className="py-2 px-2">{tr('Site', 'Sitio')}</th>
+                <th className="py-2 px-2">{tr('Test', 'Prueba')}</th>
+                <th className="py-2 px-2">{tr('Owner', 'Responsable')}</th>
+                <th className="py-2 px-2">{tr('MSS area', 'Area MSS')}</th>
+                <th className="py-2 px-2">{tr('Equipment', 'Equipo')}</th>
+                <th className="py-2 px-2">{tr('Status', 'Estado')}</th>
+                <th className="py-2 px-2 text-right">{tr('MSS log', 'Registro MSS')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
@@ -6333,34 +6890,36 @@ function OpenSwabHitsPanel({ theme, darkMode, ledger, linkCtx, closures, assetsB
                 const h = history[x.key];
                 return (
                   <React.Fragment key={x.key}>
-                    <tr className={darkMode ? 'hover:bg-slate-800/50' : 'hover:bg-slate-50'}>
+                    <tr className={darkMode ? 'hover:bg-slate-800/50' : 'hover:bg-slate-50'} data-open-row={x.closure ? 'closed' : 'open'}>
                       <td className="py-1.5 px-2 font-mono whitespace-nowrap">{formatShortDate(x.r.date)}</td>
+                      <td className="py-1.5 px-2 font-mono text-right">{x.closure ? '' : x.daysOpen}</td>
                       <td className="py-1.5 px-2">
                         <div className="font-mono font-bold text-[#0072CE] dark:text-sky-300">{x.r.siteCode || '-'}</div>
                         <div className={`text-[10px] ${theme.textMuted}`}>{x.r.surface} - {x.r.description}</div>
                       </td>
-                      <td className="py-1.5 px-2 font-bold">{x.r.testCode}{x.r.stage === 'RETEST' ? ' (retest)' : ''}</td>
-                      <td className="py-1.5 px-2">{x.links.area || <span className="text-amber-600 font-bold">Not linked</span>}</td>
+                      <td className="py-1.5 px-2 font-bold whitespace-nowrap">{x.r.testCode}{x.r.stage === 'RETEST' ? tr(' (retest)', ' (re-prueba)') : ''}{x.r.overLimit ? ` (${String(x.r.rawResult || '').trim()})` : ''}</td>
+                      <td className="py-1.5 px-2 font-bold" data-open-owner={x.owner}>{ownerWord(x.owner)}</td>
+                      <td className="py-1.5 px-2">{x.links.area || <span className="text-amber-600 font-bold">{tr('Not linked', 'Sin ligar')}</span>}</td>
                       <td className="py-1.5 px-2">{asset ? `${asset.name}${asset.uid ? ` #${asset.uid}` : ''}` : (x.r.assetTag || '-')}</td>
                       <td className="py-1.5 px-2 whitespace-nowrap">
                         {x.closure
-                          ? <span className="px-2 py-0.5 rounded-full bg-emerald-600 text-white font-black text-[10px]">Closed {x.closure.day ? formatShortDate(x.closure.day) : ''}</span>
-                          : <span className="px-2 py-0.5 rounded-full bg-[#DC2626] text-white font-black text-[10px]">Open - corrective clean needed</span>}
+                          ? <span className="px-2 py-0.5 rounded-full bg-emerald-600 text-white font-black text-[10px]">{x.closure.day ? tr(`Closed ${formatShortDate(x.closure.day)}${x.daysToClose !== null && !isNaN(x.daysToClose) ? ` (${x.daysToClose} d)` : ''}`, `Cerrado ${formatShortDate(x.closure.day)}${x.daysToClose !== null && !isNaN(x.daysToClose) ? ` (${x.daysToClose} d)` : ''}`) : tr('Closed', 'Cerrado')}</span>
+                          : <span className="px-2 py-0.5 rounded-full bg-[#DC2626] text-white font-black text-[10px]">{tr('Open: waiting on a clean in the MSS log', 'Abierto: espera una limpieza en el registro MSS')}</span>}
                       </td>
                       <td className="py-1.5 px-2 text-right">
                         <button type="button" onClick={() => toggleHistory(x)} className="px-2 py-0.5 rounded bg-[#0072CE] text-white font-bold text-[10px] hover:bg-[#00468B]">
-                          {openRow === x.key ? 'Hide' : 'Last cleans'}
+                          {openRow === x.key ? tr('Hide', 'Ocultar') : tr('Last cleans', 'Ultimas limpiezas')}
                         </button>
                       </td>
                     </tr>
                     {openRow === x.key && (
                       <tr>
-                        <td colSpan={7} className={`py-2 px-3 ${theme.bgSubtle}`}>
-                          {!h || h.loading ? 'Loading MSS log...' : h.error ? <span className="text-amber-700 dark:text-amber-300 font-bold">{h.error}</span> : h.list.length === 0 ? 'No MSS log rows for this equipment / area.' : (
-                            <div className="flex flex-col gap-0.5 font-mono text-[11px]">
+                        <td colSpan={9} className={`py-2 px-3 ${theme.bgSubtle}`}>
+                          {!h || h.loading ? tr('Loading MSS log...', 'Cargando el registro MSS...') : h.error ? <span className="text-amber-700 dark:text-amber-300 font-bold">{h.error}</span> : h.list.length === 0 ? tr('No MSS log rows for this equipment / area.', 'No hay filas del registro MSS para este equipo / area.') : (
+                            <div className="flex flex-col gap-0.5 font-mono text-[11px]" data-no-translate="1">
                               {h.list.map(l => (
                                 <div key={l.id}>
-                                  {l.day} - {l.equipment || l.area} - {l.by || 'no name'}{l.pathogen === 'Yes' ? ' - PATHOGEN CLEAN' : ''}{l.day && l.day < x.r.date ? '' : ' (after swab)'}
+                                  {l.day} - {l.equipment || l.area} - {l.by || tr('no name', 'sin nombre')}{l.day && l.day < x.r.date ? '' : tr(' (after swab)', ' (despues del hisopo)')}
                                 </div>
                               ))}
                             </div>
@@ -6620,6 +7179,10 @@ export default function PathogenBoloApp() {
 
   // Master Sample Ledger (can hold 18,000+ samples from 2024-2026 in IndexedDB + memory)
   const [historicalLedger, setHistoricalLedger] = useState([]);
+  // The ledger as last drawn, for work that finishes later (a bulk upload reads files for many seconds while the swab
+  // table may load): it joins what is there at the end instead of an older copy
+  const ledgerRef = useRef(historicalLedger);
+  ledgerRef.current = historicalLedger;
   const [importReceipts, setImportReceipts] = useState(() => readStorage(STORAGE_KEYS.auditLog, []));
   useEffect(() => { writeStorage(STORAGE_KEYS.auditLog, importReceipts.slice(0, 30)); }, [importReceipts]);
   const [bulkProgress, setBulkProgress] = useState(null); // { processed, total, label }
@@ -6841,7 +7404,7 @@ export default function PathogenBoloApp() {
         logEvent(`Removed ${(loadedRows.length - savedRows.length).toLocaleString()} demo rows left by the old 18k generator.`, 'warn');
       }
       // Rows saved before v2.3 are read again with the v2.3 rules (once; the Import check shows what changed)
-      if (Array.isArray(savedRows) && savedRows.some(r => r && r.v !== 23)) {
+      if (Array.isArray(savedRows) && savedRows.some(r => r && r.v !== 23 && r.v !== LEDGER_ROW_VERSION)) {
         const cleaned = cleanSavedLedgerV23(
           savedRows,
           { ...DEFAULT_REGEX_RULES, ...(readStorage(STORAGE_KEYS.regexRules, {}) || {}) },
@@ -6853,8 +7416,16 @@ export default function PathogenBoloApp() {
         if (alive) setLedgerCleanupReport(cleaned.report);
         logEvent(`v2.3 check of the saved ledger: ${cleaned.report.removedExample} example rows removed, ${cleaned.report.mergedTests} rows with two tests marked for re-upload, ${cleaned.report.changedResult} results read again.`, 'warn');
       }
+      // v2.3 rows: ">" on APC / ATP is a fail and "est" is the number (rereadResultsV24)
+      if (Array.isArray(savedRows) && savedRows.some(r => r && r.v === 23)) {
+        const again = rereadResultsV24(savedRows);
+        savedRows = again.rows;
+        saveLedgerToIdb(savedRows);
+        if (again.changed > 0) logEvent(`v2.4 read ${again.changed.toLocaleString()} saved result(s) again (">" on APC / ATP is a fail, "est" is the number).`, 'info');
+      }
+      // Joined to what is already loaded (the swab table may have answered first), never put in its place
       if (alive && Array.isArray(savedRows) && savedRows.length > 0) {
-        setHistoricalLedger(savedRows);
+        setHistoricalLedger(prev => (prev.length === 0 ? savedRows : ingestRowsWithDeduplication(prev, savedRows, 'This computer').ledger));
         logEvent(`Restored ${savedRows.length.toLocaleString()} historical swab samples from IndexedDB ledger.`, 'success');
       }
     });
@@ -7084,9 +7655,40 @@ export default function PathogenBoloApp() {
     return buildRollupFromLedger(merged.ledger, merged.receipt);
   }, [csvText, regexRules, roomAliases, baseSiteCatalog, historicalLedger]);
 
+  // Targets and alert rules (Hub config PATHOGEN_BOLO_RULES; this computer keeps the last copy it read)
+  const [boloRules, setBoloRules] = useState(() => normalizeBoloRules(readStorage(STORAGE_KEYS.boloRules, null)));
+  const [boloRulesSaved, setBoloRulesSaved] = useState(() => {
+    const saved = readStorage(STORAGE_KEYS.boloRules, null);
+    return saved && saved.updatedAt ? { at: saved.updatedAt, by: saved.updatedBy || '' } : null;
+  });
+  useEffect(() => {
+    let alive = true;
+    boloReadConfigs().then(cfg => {
+      const raw = cfg.values[BOLO_RULES_KEY];
+      if (!raw || !alive) return;
+      try {
+        const parsed = JSON.parse(raw);
+        setBoloRules(normalizeBoloRules(parsed));
+        setBoloRulesSaved(parsed && parsed.updatedAt ? { at: parsed.updatedAt, by: parsed.updatedBy || '' } : null);
+        writeStorage(STORAGE_KEYS.boloRules, parsed);
+      } catch (e) { /* not JSON: the defaults stay */ }
+    }).catch(() => { /* no Hub config here: the defaults stay */ });
+    return () => { alive = false; };
+  }, []);
+  const saveBoloRules = useCallback(async (next) => {
+    const clean = normalizeBoloRules(next);
+    const row = { ...clean, updatedAt: new Date().toISOString(), updatedBy: msIdentity ? msIdentity.userName : '' };
+    await boloSaveConfig(BOLO_RULES_KEY, row);
+    setBoloRules(clean);
+    setBoloRulesSaved({ at: row.updatedAt, by: row.updatedBy });
+    writeStorage(STORAGE_KEYS.boloRules, row);
+    logEvent(`Targets and alert rules saved to Dataverse (${boloConfigWhere()}): pathogen ${clean.targets.pathogen}%, APC ${clean.targets.apc}%, ATP ${clean.targets.atp}%, repeat within ${clean.repeatDays} days, alerts over ${clean.alertMonths} month(s).`, 'success');
+    return clean;
+  }, [msIdentity, logEvent]);
+
   // Swab results as Dataverse rows (_b_ Swab result) + links to MSS areas, equipment and the MSS log
   const canWriteSwabs = isDevAuthorized || !!(activeUserProfile && activeUserProfile.accessControl && activeUserProfile.accessControl.canIngestData);
-  const swabLink = useSwabDataverse({ ledgerRows: parsedCsv.rows, setHistoricalLedger, regexRules, roomAliases, canWrite: canWriteSwabs, logEvent });
+  const swabLink = useSwabDataverse({ ledgerRows: parsedCsv.rows, setHistoricalLedger, regexRules, roomAliases, canWrite: canWriteSwabs, logEvent, rules: boloRules });
 
   // Handler to ingest bulk CSV text or scheduled email table rows with chunked progress + deduplication
   const ingestRawTextIntoLedger = useCallback((rawText, sourceLabel = 'Scheduled Email / Bulk CSV', mode = 'merge') => {
@@ -7120,7 +7722,8 @@ export default function PathogenBoloApp() {
     const baseRows = mode === 'replace' ? [] : (historicalLedger.length > 0 ? historicalLedger : parsedCsv.rows);
     const { ledger: nextLedger, receipt } = ingestRowsWithDeduplication(baseRows, parsed.rows, sourceLabel);
     receipt.skippedLines = parsed.skipped;
-    setHistoricalLedger(nextLedger);
+    // Rows the swab table loaded in the meantime are kept: the pasted rows join them, never take their place
+    setHistoricalLedger(prev => (mode === 'replace' || prev === historicalLedger ? nextLedger : ingestRowsWithDeduplication(prev, parsed.rows, sourceLabel).ledger));
     saveLedgerToIdb(nextLedger);
     setImportReceipts(prev => [receipt, ...prev.slice(0, 29)]);
     logEvent(
@@ -7198,16 +7801,13 @@ export default function PathogenBoloApp() {
         if (fileIdx < jobs.length) {
           window.setTimeout(processNextChunk, 12);
         } else {
-          const baseRows = historicalLedger.length > 0 ? historicalLedger : parsedCsv.rows;
-          const { ledger: nextLedger, receipt } = ingestRowsWithDeduplication(
-            baseRows,
-            parsedIncoming,
-            `Bulk Upload (${jobs.map(f => f.name).join(', ')})`
-          );
+          const label = `Bulk Upload (${jobs.map(f => f.name).join(', ')})`;
+          const base0 = ledgerRef.current;
+          const { ledger: nextLedger, receipt } = ingestRowsWithDeduplication(base0.length > 0 ? base0 : parsedCsv.rows, parsedIncoming, label);
           receipt.skippedLines = skippedLines;
           receipt.headerRows = headerRows;
           receipt.skippedFiles = skippedFiles;
-          setHistoricalLedger(nextLedger);
+          setHistoricalLedger(prev => (prev === base0 ? nextLedger : ingestRowsWithDeduplication(prev, parsedIncoming, label).ledger));
           saveLedgerToIdb(nextLedger);
           setImportReceipts(prev => [receipt, ...prev.slice(0, 29)]);
           setBulkProgress(null);
@@ -7220,20 +7820,25 @@ export default function PathogenBoloApp() {
 
       processNextChunk();
     });
-  }, [regexRules, roomAliases, historicalLedger, parsedCsv.rows, logEvent]);
+  }, [regexRules, roomAliases, parsedCsv.rows, logEvent]);
 
-  // Import check "Start over": clears the saved lab rows and the lab paste box on this computer (QA emails stay). With
-  // retireDv, the swab rows stored in Dataverse are marked replaced too (not deleted); the next upload saves the real
-  // ones again under the same row ids.
-  const startFreshLedger = useCallback((opts) => {
+  // Table check re-upload, step 1: clears the lab rows and the lab paste box on this computer (QA emails stay) and keeps
+  // the swab table's rows apart until the files are in. Nothing in Dataverse changes here: step 3 (marking the table
+  // rows no file brought back) is its own button.
+  const startReupload = useCallback(() => {
+    swabLink.beginReupload();
     setHistoricalLedger([]);
     saveLedgerToIdb([]);
     setCsvText('');
     writeStorage(LEDGER_CLEANUP_REPORT_KEY, null);
     setLedgerCleanupReport(null);
-    logEvent('Cleared the saved lab rows on this computer (Import check: Start over). Upload the lab files next.', 'warn');
-    if (opts && opts.retireDv) swabLink.retireStoredRows();
-  }, [logEvent, swabLink.retireStoredRows]);
+    logEvent('Re-upload started: the lab rows on this computer are cleared. Upload every lab file next; the swab table is not changed until you choose.', 'warn');
+  }, [logEvent, swabLink.beginReupload]);
+  // Ends the re-upload. loadBack: the table rows no file brought back join this computer again (kept, not marked).
+  const finishReupload = useCallback((loadBack) => {
+    swabLink.endReupload();
+    if (loadBack) swabLink.reloadTable();
+  }, [swabLink.endReupload, swabLink.reloadTable]);
 
   // Merge any newly discovered 0320- sites from uploaded CSVs into the catalog
   const fullSiteCatalog = useMemo(() => {
@@ -7374,48 +7979,13 @@ export default function PathogenBoloApp() {
     });
   }, [allHits, isUserPrefFilterActive, userPrefRooms, userPrefTests, selectedRoomFilter, selectedTestFilter, globalSearch]);
 
-  // --- REPEAT-OFFENDER / BOLO STREAK DETECTOR ---
-  const repeatStreaks = useMemo(() => {
-    const groups = {};
-    allHits.forEach(h => {
-      // Focus recent window or same-month streaks so multi-year random hits don't merge falsely as a single weekly streak
-      const monthBucket = (h.date || '').slice(0, 7);
-      const key = `${monthBucket}::${h.siteCode || `${h.room}::${h.surface}::${h.description}`}`;
-      if (!groups[key]) {
-        groups[key] = {
-          key,
-          siteCode: h.siteCode,
-          room: h.room,
-          surface: h.surface,
-          description: h.description,
-          assetTag: h.assetTag,
-          spot: h.spot,
-          hits: []
-        };
-      }
-      groups[key].hits.push(h);
-    });
-    const list = Object.keys(groups).map(k => {
-      const g = groups[k];
-      g.hits.sort((a, b) => String(a.date).localeCompare(String(b.date)));
-      const uniqueDates = [];
-      g.hits.forEach(x => { if (uniqueDates.indexOf(x.date) === -1) uniqueDates.push(x.date); });
-      return {
-        ...g,
-        count: g.hits.length,
-        uniqueDays: uniqueDates.length,
-        dates: uniqueDates,
-        firstDate: uniqueDates[0] || '',
-        lastDate: uniqueDates[uniqueDates.length - 1] || ''
-      };
-    });
-    return list.filter(g => g.count >= 2).sort((a, b) => b.count - a.count);
-  }, [allHits]);
+  // --- REPEAT SITES: the same site positive again within the repeat window (21 days unless saved otherwise) ---
+  const repeatStreaks = useMemo(() => findRepeatSites(allHits, boloRules.repeatDays), [allHits, boloRules.repeatDays]);
 
   // --- PLANT PRESSURE POINTS DIAGNOSTICS (WITH PERSISTENT SUGGESTED ACTIONS) ---
   const pressureAnalysis = useMemo(
-    () => computePlantPressurePoints(allHits, repeatStreaks, parsedPrompt, parsedCsv, suggestedActionsMap),
-    [allHits, repeatStreaks, parsedPrompt, parsedCsv, suggestedActionsMap]
+    () => computePlantPressurePoints(allHits, repeatStreaks, parsedPrompt, parsedCsv, suggestedActionsMap, boloRules),
+    [allHits, repeatStreaks, parsedPrompt, parsedCsv, suggestedActionsMap, boloRules]
   );
 
   // Jump to Map helper (auto-unlocks subtabs if triggered from Weekly Calendar)
@@ -8524,6 +9094,7 @@ export default function PathogenBoloApp() {
               fetchLogHistory={swabLink.fetchLogHistory}
               refsReady={swabLink.refsReady}
               swabDv={swabLink.swabDv}
+              rules={boloRules}
             />
           </div>
         )}
@@ -8561,6 +9132,7 @@ export default function PathogenBoloApp() {
             onOpenStudio={() => navigateToSubtab('studio', 'Opened 18k Bulk & Email Ingest from Overview')}
             onOpenDedup={() => navigateToSubtab('dedup', 'Opened Duplicate Checker from Overview')}
             onOpenHarborage={() => navigateToSubtab('harborage', 'Opened Harborage & Concerns from Overview')}
+            rules={boloRules}
           />
         )}
 
@@ -8579,6 +9151,7 @@ export default function PathogenBoloApp() {
             parsedPrompt={parsedPrompt}
             onOpenDataManip={() => navigateToSubtab('datamanip', 'Opened Data Manipulation Lab from Graphs Tab')}
             onLocateOnMap={locateOnMap}
+            rules={boloRules}
           />
         )}
 
@@ -8596,10 +9169,20 @@ export default function PathogenBoloApp() {
             importCheck={importCheck}
             canEdit={isAdminVerified}
             lastReceipt={importReceipts[0] || null}
-            onStartFresh={startFreshLedger}
-            onUploadFiles={handleBulkFilesUpload}
-            dvStored={swabLink.swabDv.status === 'ready' && canWriteSwabs ? swabLink.swabDv.stored : null}
-            dvSaving={!!swabLink.swabDv.saving}
+            tableCheck={{
+              swabDv: swabLink.swabDv,
+              check: swabLink.tableCheck,
+              reupload: swabLink.reupload,
+              canWrite: canWriteSwabs,
+              bulkProgress,
+              onSaveNow: swabLink.retrySync,
+              onReload: swabLink.reloadTable,
+              onStartReupload: startReupload,
+              onFinishReupload: finishReupload,
+              onMarkStale: swabLink.markStaleRows,
+              onUploadFiles: handleBulkFilesUpload
+            }}
+            rulesPanel={{ rules: boloRules, saved: boloRulesSaved, onSave: saveBoloRules }}
             onOpenGraphs={() => navigateToSubtab('graphs', 'Returned to YoY, YTD & Trend Graphs from Data Manipulation Lab')}
           />
         )}
@@ -8675,9 +9258,9 @@ export default function PathogenBoloApp() {
             importReceipts={importReceipts}
             onIngestRawText={ingestRawTextIntoLedger}
             onBulkFilesUpload={handleBulkFilesUpload}
-            // Same as Import check > Start over on this computer only (Dataverse rows are left as they are); the
-            // studio's button asks on the page first
-            onClearHistoricalLedger={() => startFreshLedger()}
+            // Same as step 1 of the Table check re-upload (the swab table is not changed); the studio's button asks on
+            // the page first
+            onClearHistoricalLedger={() => startReupload()}
             onOpenDedupChecker={() => navigateToSubtab('dedup', 'Opened Duplicate Checker from Studio')}
             onSyncConfig={() => syncConfigToDataverse()}
             syncBusy={syncBusy}
@@ -9693,9 +10276,11 @@ function MssBoloCalendarView({
     }
     roomBlocks.sort((a, b) => (b.hits.length - a.hits.length) || (b.pending - a.pending) || (b.swabs - a.swabs));
 
+    // A day with results back and some still at the lab is 'partial', never shown as clean until every result is in
     let status = 'none';
     if (isFuture) status = 'future';
     else if (dayHits.length > 0) status = 'hits';
+    else if (tally.swabs > 0 && tally.pending > 0) status = 'partial';
     else if (tally.swabs > 0) status = 'clean';
     else if (tally.pending > 0) status = 'pending';
 
@@ -9832,7 +10417,15 @@ function MssBoloCalendarView({
       return (
         <button type="button" onClick={() => setSelectedDayModal(day)} className={`${base} ${red ? 'bg-[#E4002B] text-white' : 'bg-[#FFB81C] text-slate-950'}`}>
           {day.hits.length} {tr(day.hits.length === 1 ? 'positive' : 'positives', day.hits.length === 1 ? 'positivo' : 'positivos')}
+          {day.tally.pending > 0 ? tr(` +${day.tally.pending} at lab`, ` +${day.tally.pending} en lab`) : ''}
         </button>
+      );
+    }
+    if (day.status === 'partial') {
+      return (
+        <span className={`${base} ${darkMode ? 'bg-slate-800 text-slate-200 border border-slate-600' : 'bg-slate-200 text-slate-700'}`} data-day-partial="1" title={tr(`No positives in the ${day.tally.swabs} results back; ${day.tally.pending} still at the lab`, `Sin positivos en los ${day.tally.swabs} resultados recibidos; ${day.tally.pending} siguen en el laboratorio`)}>
+          {compact ? `0/${day.tally.swabs} +${day.tally.pending}` : tr(`0 of ${day.tally.swabs}, ${day.tally.pending} at lab`, `0 de ${day.tally.swabs}, ${day.tally.pending} en lab`)}
+        </span>
       );
     }
     if (day.status === 'clean') {
@@ -9844,8 +10437,8 @@ function MssBoloCalendarView({
     }
     if (day.status === 'pending') {
       return (
-        <span className={`${base} ${darkMode ? 'bg-amber-950 text-amber-300 border border-amber-800' : 'bg-amber-100 text-amber-900'}`}>
-          {tr(`${day.tally.pending} pending`, `${day.tally.pending} pendientes`)}
+        <span className={`${base} ${darkMode ? 'bg-slate-800 text-slate-200 border border-slate-600' : 'bg-slate-200 text-slate-700'}`}>
+          {tr(`${day.tally.pending} at lab`, `${day.tally.pending} en lab`)}
         </span>
       );
     }
@@ -10066,7 +10659,7 @@ function MssBoloCalendarView({
               ) : (
                 <span className={theme.textMuted}>{tr('no finished lab swabs', 'sin hisopos terminados')}</span>
               )}
-              {t.pending > 0 && <span className={`ml-1.5 ${darkMode ? 'text-amber-300' : 'text-amber-700'}`}>{tr(`${t.pending} pending`, `${t.pending} pendientes`)}</span>}
+              {t.pending > 0 && <span className={`ml-1.5 ${theme.textMuted}`} data-week-at-lab={t.pending}>{tr(`${t.pending} still at the lab: results still coming in`, `${t.pending} siguen en el laboratorio: aun llegan resultados`)}</span>}
             </span>
             {ws.totalHits > 0 && (
               <button type="button" onClick={() => setSelectedRoomFilter('ALL')} className="text-[11px] font-black text-[#E4002B] dark:text-rose-400">
@@ -10518,8 +11111,10 @@ function DashboardView({
   onOpenDataManip,
   onOpenStudio,
   onOpenDedup,
-  onOpenHarborage
+  onOpenHarborage,
+  rules
 }) {
+  const ruleTargets = normalizeBoloRules(rules).targets;
   const [editingActionId, setEditingActionId] = useState(null);
   const [draftAction, setDraftAction] = useState({
     action: '',
@@ -10787,6 +11382,16 @@ function DashboardView({
                       </span>
                     </div>
                   </div>
+                  {card.key !== 'all' && (
+                    <div className="text-[10px] font-bold flex flex-wrap items-center gap-1.5" data-card-target={card.key}>
+                      <span>{tr(`Target ${ruleTargets[card.key].toFixed(1)}%`, `Meta ${ruleTargets[card.key].toFixed(1)}%`)}</span>
+                      {card.data.rate !== null && card.data.rate !== undefined && card.data.rate > ruleTargets[card.key] && (
+                        <span className="px-1.5 py-0.2 rounded border bg-amber-100 text-amber-900 border-amber-300 dark:bg-amber-950 dark:text-amber-200 dark:border-amber-700" data-above-target="1">
+                          {tr('above target', 'arriba de la meta')}
+                        </span>
+                      )}
+                    </div>
+                  )}
                   {/* 2. Start-Up / In-Process This Year */}
                   <div className="text-[11px] font-mono font-bold flex flex-wrap items-center justify-between gap-1 px-2 py-1 rounded border bg-black/5 dark:bg-white/5 border-slate-300/60 dark:border-slate-700">
                     <span className="whitespace-nowrap">ST: <b className="text-[#0072CE] dark:text-sky-400">{fmtPct(card.data.stRate)}</b></span>
@@ -10932,8 +11537,8 @@ function DashboardView({
                   <span>Log Harborage Concern</span>
                 </button>
               )}
-              <span className="px-2.5 py-1 rounded-full text-xs font-black bg-[#FFB81C] text-slate-950">
-                {pressureAnalysis.points.length} Active Pressure Points
+              <span className="px-2.5 py-1 rounded-full text-xs font-black bg-[#FFB81C] text-slate-950" data-alert-count={pressureAnalysis.points.length}>
+                {tr(`${pressureAnalysis.points.length} Active Pressure Points since ${formatShortDate(pressureAnalysis.alertSince)}`, `${pressureAnalysis.points.length} puntos de presion activos desde el ${formatShortDate(pressureAnalysis.alertSince)}`)}
               </span>
             </div>
           </div>
@@ -10979,7 +11584,14 @@ function DashboardView({
                     </div>
 
                     <h3 className="text-sm font-black leading-snug mb-1">{pp.title}</h3>
-                    <div className="text-[11px] font-bold text-[#0072CE] dark:text-sky-300 mb-2">{pp.subtitle}</div>
+                    <div className="text-[11px] font-bold text-[#0072CE] dark:text-sky-300 mb-2">
+                      {pp.subtitle}
+                      {pp.since && (
+                        <span className={`ml-1.5 font-mono ${theme.textMuted}`} data-alert-since={pp.since}>
+                          {tr(`Since ${formatShortDate(pp.since)}`, `Desde ${formatShortDate(pp.since)}`)}
+                        </span>
+                      )}
+                    </div>
 
                     <p className={`text-xs leading-relaxed mb-2 ${theme.textMuted}`}>
                       <b className={darkMode ? 'text-slate-200' : 'text-slate-800'}>Why it is a Pressure Point: </b>
@@ -11634,7 +12246,8 @@ function ExecutiveGraphsAndTrendsView({
   allHits,
   parsedPrompt,
   onOpenDataManip,
-  onLocateOnMap
+  onLocateOnMap,
+  rules
 }) {
   const theme = INLINE_THEME[darkMode ? 'dark' : 'light'];
   const nowMonthIdx = parseInt(LIVE_TODAY_DATE_KEY.slice(5, 7), 10) - 1;
@@ -11644,7 +12257,11 @@ function ExecutiveGraphsAndTrendsView({
   const [show2024Baseline, setShow2024Baseline] = useState(true);
   const [showRollingAvg, setShowRollingAvg] = useState(true);
   const [showTargetLine, setShowTargetLine] = useState(true);
-  const [targetThreshold, setTargetThreshold] = useState(1.2);
+  // The saved target for the results shown (Targets and alert rules, Data tab); all results combined have none
+  const targetCat = resultCategoryMode || 'pathogen';
+  const targetSaved = targetCat === 'all' ? null : normalizeBoloRules(rules).targets[targetCat];
+  const targetThreshold = typeof targetSaved === 'number' ? targetSaved : null;
+  const drawTarget = showTargetLine && targetThreshold !== null;
   const [selectedMonthIdx, setSelectedMonthIdx] = useState(() => Math.max(0, nowMonthIdx));
   const [managersHubSyncToast, setManagersHubSyncToast] = useState('');
 
@@ -11722,7 +12339,7 @@ function ExecutiveGraphsAndTrendsView({
       push(pt.tySecondary);
       push(pt.lySecondary);
     });
-    if (showTargetLine) allVals.push(targetThreshold);
+    if (drawTarget) allVals.push(targetThreshold);
     const maxVal = Math.max(2.5, ...allVals) * 1.15;
 
     return {
@@ -11735,7 +12352,7 @@ function ExecutiveGraphsAndTrendsView({
       hasAnyTY: series.some((pt) => pt.tyPrimary !== null),
       hasAnyLY: series.some((pt) => pt.lyPrimary !== null)
     };
-  }, [rawMonths, filteredMonths, metricFocus, resultCategoryMode, show2024Baseline, showTargetLine, targetThreshold]);
+  }, [rawMonths, filteredMonths, metricFocus, resultCategoryMode, show2024Baseline, drawTarget, targetThreshold]);
 
   // Preset views (no numbers in the text: the chart shows them)
   const graphRecommendations = [
@@ -12056,20 +12673,13 @@ function ExecutiveGraphsAndTrendsView({
               <span>Show 3-Month Moving Avg</span>
             </label>
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '11px', fontWeight: 700, color: theme.text, cursor: 'pointer' }}>
-              <input type="checkbox" checked={showTargetLine} onChange={(e) => setShowTargetLine(e.target.checked)} />
-              <span>Target Line ({targetThreshold.toFixed(1)}%)</span>
+              <input type="checkbox" checked={showTargetLine} onChange={(e) => setShowTargetLine(e.target.checked)} disabled={targetThreshold === null} />
+              <span data-target-line={targetThreshold === null ? '' : String(targetThreshold)}>
+                {targetThreshold === null
+                  ? tr('Target line (no target for all results combined)', 'Linea de meta (no hay meta para todos los resultados juntos)')
+                  : tr(`Target line (${targetThreshold.toFixed(1)}%, set in Targets and alert rules, Data tab)`, `Linea de meta (${targetThreshold.toFixed(1)}%, se fija en Metas y reglas de alertas, pestana de Datos)`)}
+              </span>
             </label>
-            {showTargetLine && (
-              <input
-                type="range"
-                min="0.5"
-                max="3.5"
-                step="0.1"
-                value={targetThreshold}
-                onChange={(e) => setTargetThreshold(Number(e.target.value))}
-                style={{ width: '90px', cursor: 'pointer' }}
-              />
-            )}
           </div>
 
           {/* Legend */}
@@ -12149,7 +12759,7 @@ function ExecutiveGraphsAndTrendsView({
             })}
 
             {/* Target Threshold Line */}
-            {showTargetLine && (
+            {drawTarget && (
               <g>
                 <line
                   x1={padL}
@@ -12510,6 +13120,347 @@ function ExecutiveGraphsAndTrendsView({
 // (Hub config) and drive both Tab 3 Graphs and Managers Hub exports.
 // ============================================================================
 // =======================================================================
+// TABLE CHECK (top of the Data Manipulation tab): does the shared swab table hold every row, and the re-upload steps
+// =======================================================================
+// The "_b_ Swab result" table is the record every computer and app reads; this computer's copy is only a cache. The
+// panel counts both by year, saves what is missing (Save now), reads the table again, and runs a re-upload one click
+// at a time: 1. clear this computer, 2. upload every lab file, 3. decide about the table rows no file brought back.
+function TableCheckPanel({ darkMode, theme, canEdit, canWrite, swabDv, check, reupload, bulkProgress, onSaveNow, onReload, onStartReupload, onFinishReupload, onMarkStale, onUploadFiles }) {
+  const [showYears, setShowYears] = useState(false);
+  const [showSteps, setShowSteps] = useState(false);
+  const [marking, setMarking] = useState(false);
+  const [markDone, setMarkDone] = useState(null);
+  const fileRef = useRef(null);
+  if (!swabDv) return null;
+  const c = check || { hereN: 0, tableN: 0, onlyTable: [], notInTable: 0, fromFiles: 0, hereByYear: {}, tableByYear: {}, failReasons: [] };
+  const fmt = (n) => Number(n || 0).toLocaleString();
+  const ready = swabDv.status === 'ready' && !swabDv.loading;
+  const busy = !!swabDv.saving || !!swabDv.loading || !!bulkProgress || marking;
+  const canRun = canEdit && canWrite && ready;
+
+  let tone = 'ok';
+  let line = '';
+  if (swabDv.status === 'missing') {
+    tone = 'warn';
+    line = tr('The "_b_ Swab result" table is not in Dataverse yet, so swab results stay on this computer only (table prompts, Pathogen BOLO).', 'La tabla "_b_ Swab result" aun no existe en Dataverse, asi que los resultados se quedan solo en esta computadora (prompts de tablas, Pathogen BOLO).');
+  } else if (swabDv.status === 'error') {
+    tone = 'warn';
+    line = tr(`The swab table could not be read: ${swabDv.lastError || ''}`, `No se pudo leer la tabla de hisopos: ${swabDv.lastError || ''}`);
+  } else if (swabDv.status !== 'ready' || swabDv.loading) {
+    tone = 'wait';
+    line = tr(`Reading the swab table: ${fmt(swabDv.loaded)} rows so far.`, `Leyendo la tabla de hisopos: ${fmt(swabDv.loaded)} filas hasta ahora.`);
+  } else if (swabDv.saving) {
+    tone = 'wait';
+    line = swabDv.marking
+      ? tr(`Marking table rows replaced: ${fmt(swabDv.savedNow)} of ${fmt(swabDv.toSave)}. Keep this page open.`, `Marcando filas de la tabla como reemplazadas: ${fmt(swabDv.savedNow)} de ${fmt(swabDv.toSave)}. Mantenga esta pagina abierta.`)
+      : tr(`Saving to the swab table: ${fmt(swabDv.savedNow)} of ${fmt(swabDv.toSave)} rows saved. Keep this page open until it finishes.`, `Guardando en la tabla de hisopos: ${fmt(swabDv.savedNow)} de ${fmt(swabDv.toSave)} filas guardadas. Mantenga esta pagina abierta hasta que termine.`);
+  } else if (swabDv.failed > 0) {
+    tone = 'bad';
+    line = tr(`${fmt(swabDv.failed)} rows were not saved to the swab table. Save now tries them again.`, `${fmt(swabDv.failed)} filas no se guardaron en la tabla de hisopos. Guardar ahora las intenta otra vez.`);
+  } else if (reupload) {
+    tone = 'wait';
+    line = tr('Re-upload in progress: the steps are below.', 'Volver a subir en curso: los pasos estan abajo.');
+  } else if (c.notInTable > 0) {
+    tone = 'warn';
+    line = canWrite
+      ? tr(`${fmt(c.notInTable)} rows on this computer are not in the swab table yet. Save now sends them.`, `${fmt(c.notInTable)} filas de esta computadora aun no estan en la tabla de hisopos. Guardar ahora las envia.`)
+      : tr(`${fmt(c.notInTable)} rows on this computer are not in the swab table (only people who load lab data can save them).`, `${fmt(c.notInTable)} filas de esta computadora no estan en la tabla de hisopos (solo quien carga datos del laboratorio puede guardarlas).`);
+  } else if (c.onlyTable.length > 0) {
+    tone = 'warn';
+    line = tr(`${fmt(c.onlyTable.length)} rows in the swab table are not on this computer. Read the table again to load them.`, `${fmt(c.onlyTable.length)} filas de la tabla de hisopos no estan en esta computadora. Lea la tabla otra vez para cargarlas.`);
+  } else if (c.tableN === 0) {
+    tone = 'wait';
+    line = tr('The swab table is empty and no lab rows are loaded. Upload the lab files to start.', 'La tabla de hisopos esta vacia y no hay filas del laboratorio cargadas. Suba los archivos del laboratorio para empezar.');
+  } else {
+    line = tr(`The swab table and this computer hold the same ${fmt(c.tableN)} rows. Opening the page loads them from the table, so there is nothing to re-upload.`, `La tabla de hisopos y esta computadora tienen las mismas ${fmt(c.tableN)} filas. Al abrir la pagina se cargan de la tabla, asi que no hay nada que volver a subir.`);
+  }
+  const toneCls = {
+    ok: darkMode ? 'bg-emerald-950/60 text-emerald-300 border-emerald-800' : 'bg-emerald-50 text-emerald-800 border-emerald-200',
+    warn: darkMode ? 'bg-amber-950/40 text-amber-200 border-amber-800' : 'bg-amber-50 text-amber-900 border-amber-200',
+    bad: darkMode ? 'bg-red-950/50 text-red-200 border-red-800' : 'bg-red-50 text-red-800 border-red-200',
+    wait: darkMode ? 'bg-slate-800 text-slate-200 border-slate-600' : 'bg-slate-100 text-slate-700 border-slate-300'
+  }[tone];
+  const chip = {
+    ok: tr('Table complete', 'Tabla completa'),
+    warn: tr('Needs a look', 'Necesita revision'),
+    bad: tr('Not saved', 'Sin guardar'),
+    wait: tr('Working', 'Trabajando')
+  }[tone];
+  const years = {};
+  Object.keys(c.tableByYear || {}).forEach(y => { years[y] = true; });
+  Object.keys(c.hereByYear || {}).forEach(y => { years[y] = true; });
+  const yearList = Object.keys(years).sort().reverse();
+  const stepsOpen = showSteps || !!reupload || !!markDone;
+  const btn = `px-2.5 py-1 rounded-lg text-xs font-black border ${theme.bgSubtle} disabled:opacity-50`;
+  const btnMain = 'px-2.5 py-1 rounded-lg text-xs font-black bg-[#00468B] text-white disabled:opacity-50';
+  const markAndFinish = async () => {
+    setMarking(true);
+    setMarkDone(null);
+    try {
+      const res = await onMarkStale(c.onlyTable);
+      setMarkDone(res);
+      if (res && res.ok) onFinishReupload(false);
+    } finally {
+      setMarking(false);
+    }
+  };
+  const uploadInput = (
+    <input
+      ref={fileRef}
+      type="file"
+      multiple
+      accept=".csv,.tsv,.txt"
+      className="hidden"
+      onChange={e => {
+        onUploadFiles(e.target.files);
+        e.target.value = '';
+      }}
+    />
+  );
+
+  return (
+    <section className={`rounded-2xl border shadow-xs ${theme.bgCard}`} data-table-check="1">
+      <div className="px-4 py-3 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2 min-w-0">
+          <h2 className={`text-base font-black ${theme.textHeading}`}>{tr('Table check', 'Revision de la tabla')}</h2>
+          <span className={`px-2 py-0.5 rounded-full text-[11px] font-black border ${toneCls}`}>{chip}</span>
+          <span className={`text-xs ${theme.textMuted}`}>
+            {tr(`Swab table: ${fmt(c.tableN)} rows | This computer: ${fmt(c.hereN)} rows`, `Tabla de hisopos: ${fmt(c.tableN)} filas | Esta computadora: ${fmt(c.hereN)} filas`)}
+          </span>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {canWrite && (
+            <button type="button" className={btn} disabled={!ready || busy} onClick={() => onSaveNow()} data-table-save="1">
+              {tr('Save now', 'Guardar ahora')}
+            </button>
+          )}
+          <button type="button" className={btn} disabled={busy || !!reupload || swabDv.status === 'missing'} onClick={() => onReload()} data-table-reload="1">
+            {tr('Read the table again', 'Leer la tabla otra vez')}
+          </button>
+          <button type="button" className={btn} onClick={() => setShowYears(v => !v)} aria-expanded={showYears}>
+            {showYears ? tr('Hide years', 'Ocultar anos') : tr('By year', 'Por ano')}
+          </button>
+        </div>
+      </div>
+      <p className="px-4 -mt-1 pb-3 text-sm font-semibold" data-table-line="1">{line}</p>
+      {c.failReasons.length > 0 && !swabDv.saving && (
+        <ul className="px-4 pb-3 -mt-1 space-y-0.5" data-no-translate="1">
+          {c.failReasons.map((f, i) => (
+            <li key={i} className="text-[11px] font-mono break-all">{`${fmt(f.n)} x ${f.why}`}</li>
+          ))}
+        </ul>
+      )}
+      {showYears && yearList.length > 0 && (
+        <div className="px-4 pb-3">
+          <table className="text-xs">
+            <thead>
+              <tr className={theme.textMuted}>
+                <th className="text-left pr-6 font-black">{tr('Year', 'Ano')}</th>
+                <th className="text-right pr-6 font-black">{tr('Swab table', 'Tabla de hisopos')}</th>
+                <th className="text-right font-black">{tr('This computer', 'Esta computadora')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {yearList.map(y => (
+                <tr key={y}>
+                  <td className="pr-6 font-bold">{y === '?' ? tr('No date', 'Sin fecha') : y}</td>
+                  <td className="text-right pr-6 font-mono">{fmt((c.tableByYear || {})[y])}</td>
+                  <td className="text-right font-mono">{fmt((c.hereByYear || {})[y])}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {canEdit && (
+        <div className="px-4 pb-4">
+          <div className={`rounded-xl border px-3 py-2.5 ${theme.bgSubtle}`}>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <button type="button" onClick={() => setShowSteps(v => !v)} className="text-sm font-black" aria-expanded={stepsOpen}>
+                {tr('Re-upload every lab file', 'Volver a subir cada archivo del laboratorio')}
+              </button>
+              {!reupload && (
+                <span className="flex flex-wrap items-center gap-1.5">
+                  <button type="button" className={btn} disabled={!!bulkProgress} onClick={() => { if (fileRef.current) fileRef.current.click(); }} data-table-upload="1">
+                    {tr('Upload lab files (adds to what is loaded)', 'Subir archivos del laboratorio (se suman a lo cargado)')}
+                  </button>
+                </span>
+              )}
+            </div>
+            {uploadInput}
+            {stepsOpen && (
+              <div className="mt-2 space-y-2 text-xs">
+                <p className={theme.textMuted}>
+                  {tr('Only needed when the Import check asks for it, or the numbers look wrong. Save each lab export as CSV first (Excel: File, Save As, CSV). The swab table is changed only at step 3, and only by your click.', 'Solo hace falta cuando la Revision de carga lo pide o los numeros se ven mal. Primero guarde cada exportacion del laboratorio como CSV (Excel: Archivo, Guardar como, CSV). La tabla de hisopos solo cambia en el paso 3 y solo con su clic.')}
+                </p>
+                <ol className="list-decimal pl-5 space-y-2">
+                  <li>
+                    {reupload ? (
+                      <span className="font-bold">{tr(`Done: this computer's lab rows are cleared. The swab table still holds its ${fmt(reupload.tableAtStart)} rows.`, `Listo: se borraron las filas del laboratorio de esta computadora. La tabla de hisopos sigue con sus ${fmt(reupload.tableAtStart)} filas.`)}</span>
+                    ) : (
+                      <span>
+                        {tr('Clear the lab rows on this computer (the QA emails stay):', 'Borrar las filas del laboratorio de esta computadora (los correos de QA se quedan):')}{' '}
+                        <ConfirmButton
+                          label={tr('Start re-upload', 'Empezar a volver a subir')}
+                          question={tr(`Clear the ${fmt(c.hereN)} lab rows on this computer and upload every lab file again? The swab table is not changed now.`, `Borrar las ${fmt(c.hereN)} filas del laboratorio de esta computadora y subir otra vez cada archivo? La tabla de hisopos no cambia ahora.`)}
+                          yesLabel={tr('Yes, start', 'Si, empezar')}
+                          disabled={!canRun || busy}
+                          onConfirm={onStartReupload}
+                          className="ml-1 px-2 py-0.5 rounded-lg text-[11px] font-black border border-amber-400 bg-amber-100 text-amber-900 dark:bg-amber-950 dark:text-amber-200 dark:border-amber-700 disabled:opacity-50"
+                        />
+                        {!ready && <span className={`ml-2 ${theme.textMuted}`}>{tr('(waits for the swab table to load)', '(espera a que cargue la tabla de hisopos)')}</span>}
+                      </span>
+                    )}
+                  </li>
+                  <li>
+                    {tr('Upload every lab file (pick several at once):', 'Suba cada archivo del laboratorio (puede elegir varios a la vez):')}{' '}
+                    <button type="button" className={btnMain} disabled={!reupload || !!bulkProgress} onClick={() => { if (fileRef.current) fileRef.current.click(); }} data-reupload-upload="1">
+                      {tr('Upload lab files', 'Subir archivos del laboratorio')}
+                    </button>
+                    {bulkProgress && <div className={`mt-1 font-bold ${theme.textMuted}`}>{bulkProgress.label}</div>}
+                    {reupload && c.hereN > 0 && !bulkProgress && (
+                      <div className="mt-1" data-reupload-files="1">
+                        {tr(`Your files hold ${fmt(c.hereN)} rows: ${fmt(c.fromFiles)} were already in the swab table, ${fmt(Math.max(0, c.hereN - c.fromFiles))} are new.`, `Sus archivos tienen ${fmt(c.hereN)} filas: ${fmt(c.fromFiles)} ya estaban en la tabla de hisopos y ${fmt(Math.max(0, c.hereN - c.fromFiles))} son nuevas.`)}
+                        {swabDv.saving && !swabDv.marking ? ` ${tr(`Saving: ${fmt(swabDv.savedNow)} of ${fmt(swabDv.toSave)}.`, `Guardando: ${fmt(swabDv.savedNow)} de ${fmt(swabDv.toSave)}.`)}` : ''}
+                      </div>
+                    )}
+                  </li>
+                  <li>
+                    {!reupload || c.hereN === 0 || busy ? (
+                      <span className={theme.textMuted}>{tr('When the files are in and saved: decide about the swab table rows none of your files holds.', 'Cuando los archivos esten cargados y guardados: decida que hacer con las filas de la tabla de hisopos que ningun archivo tiene.')}</span>
+                    ) : c.onlyTable.length === 0 ? (
+                      <span>
+                        <span className="font-bold">{tr('Every swab table row is in your files.', 'Cada fila de la tabla de hisopos esta en sus archivos.')}</span>{' '}
+                        <button type="button" className={btnMain} onClick={() => onFinishReupload(false)} data-reupload-finish="1">{tr('Finish', 'Terminar')}</button>
+                      </span>
+                    ) : (
+                      <span className="block space-y-1.5" data-reupload-stale="1">
+                        <span className="block font-bold">
+                          {tr(`${fmt(c.onlyTable.length)} swab table rows are in none of your files: rows an older version misread, or lab files you have not uploaded again.`, `${fmt(c.onlyTable.length)} filas de la tabla de hisopos no estan en ninguno de sus archivos: filas que una version anterior leyo mal, o archivos del laboratorio que no ha vuelto a subir.`)}
+                        </span>
+                        <span className="flex flex-wrap items-center gap-1.5">
+                          <ConfirmButton
+                            label={tr(`Mark these ${fmt(c.onlyTable.length)} rows replaced`, `Marcar estas ${fmt(c.onlyTable.length)} filas como reemplazadas`)}
+                            question={tr(`Mark ${fmt(c.onlyTable.length)} swab table rows replaced? Nothing is deleted; no app counts them after this. A later upload of a file that holds one brings it back.`, `Marcar ${fmt(c.onlyTable.length)} filas de la tabla de hisopos como reemplazadas? No se borra nada; ninguna app las cuenta despues. Si despues sube un archivo que tenga una, esa fila regresa.`)}
+                            yesLabel={tr('Yes, mark them', 'Si, marcarlas')}
+                            disabled={!canRun || busy}
+                            onConfirm={markAndFinish}
+                            className="px-2 py-0.5 rounded-lg text-[11px] font-black border border-amber-400 bg-amber-100 text-amber-900 dark:bg-amber-950 dark:text-amber-200 dark:border-amber-700 disabled:opacity-50"
+                          />
+                          <button type="button" className={btn} disabled={busy} onClick={() => onFinishReupload(true)} data-reupload-keep="1">
+                            {tr('Keep them (load them back)', 'Conservarlas (cargarlas otra vez)')}
+                          </button>
+                        </span>
+                      </span>
+                    )}
+                    {markDone && !markDone.ok && (
+                      <div className="mt-1 font-bold text-red-700 dark:text-red-300">
+                        {tr(`${fmt(markDone.failed)} rows were not marked. Try the button again.`, `${fmt(markDone.failed)} filas no se marcaron. Intente el boton otra vez.`)}
+                      </div>
+                    )}
+                  </li>
+                </ol>
+                {reupload && (
+                  <div>
+                    <button type="button" className={btn} disabled={busy} onClick={() => onFinishReupload(true)} data-reupload-cancel="1">
+                      {tr('Cancel the re-upload (load the swab table back)', 'Cancelar (cargar otra vez la tabla de hisopos)')}
+                    </button>
+                  </div>
+                )}
+                {markDone && markDone.ok && !reupload && (
+                  <div className="font-bold" data-reupload-done="1">
+                    {tr(`Re-upload finished: ${fmt(markDone.marked)} rows no file holds were marked replaced. The swab table now matches your files.`, `Volver a subir terminado: ${fmt(markDone.marked)} filas que ningun archivo tiene se marcaron como reemplazadas. La tabla de hisopos ahora coincide con sus archivos.`)}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// =======================================================================
+// TARGETS AND ALERT RULES (Data Manipulation tab): the numbers from Gerald's answers, editable, saved in Hub config
+// =======================================================================
+function RulesPanel({ darkMode, theme, canEdit, rules, saved, onSave }) {
+  const cur = normalizeBoloRules(rules);
+  const curKey = JSON.stringify(cur);
+  const toDraft = (x) => ({ pathogen: String(x.targets.pathogen), apc: String(x.targets.apc), atp: String(x.targets.atp), repeatDays: String(x.repeatDays), alertMonths: String(x.alertMonths) });
+  const [draft, setDraft] = useState(() => toDraft(cur));
+  const [msg, setMsg] = useState(null);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => { setDraft(toDraft(normalizeBoloRules(rules))); }, [curKey]);
+  const fields = [
+    { k: 'pathogen', label: tr('Pathogen target (%)', 'Meta de patogenos (%)'), help: tr('Listeria and Salmonella routine swabs', 'Hisopos de rutina de Listeria y Salmonella'), step: '0.1' },
+    { k: 'apc', label: tr('APC target (%)', 'Meta de APC (%)'), help: tr('APC swabs that fail', 'Hisopos de APC que fallan'), step: '0.1' },
+    { k: 'atp', label: tr('ATP target (%)', 'Meta de ATP (%)'), help: tr('ATP swabs that fail', 'Hisopos de ATP que fallan'), step: '0.1' },
+    { k: 'repeatDays', label: tr('Repeat window (days)', 'Ventana de repeticion (dias)'), help: tr('Two hits at one site this close together is a repeat', 'Dos positivos en un sitio con esta cercania es una repeticion'), step: '1' },
+    { k: 'alertMonths', label: tr('Alert window (months)', 'Ventana de alertas (meses)'), help: tr('Alerts and open positives look back this far', 'Las alertas y los positivos abiertos miran hasta aqui'), step: '1' }
+  ];
+  const notNumber = fields.filter(f => isNaN(parseFloat(draft[f.k])));
+  const next = normalizeBoloRules({ targets: { pathogen: draft.pathogen, apc: draft.apc, atp: draft.atp }, repeatDays: draft.repeatDays, alertMonths: draft.alertMonths });
+  const changed = notNumber.length === 0 && JSON.stringify(next) !== curKey;
+  const save = async () => {
+    setSaving(true);
+    setMsg(null);
+    try {
+      await onSave(next);
+      setMsg({ ok: true, text: tr('Saved. Every computer that opens the app uses these numbers.', 'Guardado. Cada computadora que abre la app usa estos numeros.') });
+    } catch (e) {
+      setMsg({ ok: false, text: tr(`Not saved: ${e.message}`, `No se guardo: ${e.message}`) });
+    } finally {
+      setSaving(false);
+    }
+  };
+  const input = `w-full mt-1 px-2 py-1 rounded-lg border font-mono text-sm ${darkMode ? 'bg-slate-900 border-slate-700 text-slate-100' : 'bg-white border-slate-300 text-slate-900'}`;
+  return (
+    <section className={`rounded-2xl border shadow-xs ${theme.bgCard}`} data-rules="1">
+      <div className="px-4 pt-3 pb-2">
+        <h2 className={`text-base font-black ${theme.textHeading}`}>{tr('Targets and alert rules', 'Metas y reglas de alertas')}</h2>
+        <p className={`text-xs ${theme.textMuted}`} data-rules-saved={saved && saved.at ? '1' : ''}>
+          {saved && saved.at
+            ? tr(`Saved ${String(saved.at).slice(0, 10)}${saved.by ? ` by ${saved.by}` : ''}. The graphs, the headline cards, the alerts and the open positives use these numbers.`, `Guardado el ${String(saved.at).slice(0, 10)}${saved.by ? ` por ${saved.by}` : ''}. Las graficas, las tarjetas principales, las alertas y los positivos abiertos usan estos numeros.`)
+            : tr('Not saved yet: these are the numbers from your answers (2.0% pathogen, 5% APC and ATP, two hits within 3 weeks, alerts over 2 months). Save them to share them with every computer.', 'Aun no se guardan: son los numeros de sus respuestas (2.0% patogenos, 5% APC y ATP, dos positivos en 3 semanas, alertas de 2 meses). Guardelos para compartirlos con cada computadora.')}
+        </p>
+      </div>
+      <div className="px-4 pb-3 grid grid-cols-1 sm:grid-cols-5 gap-3 text-xs">
+        {fields.map(f => (
+          <label key={f.k} className="block font-bold">
+            {f.label}
+            <input
+              type="number"
+              inputMode="decimal"
+              step={f.step}
+              min="0"
+              className={input}
+              value={draft[f.k]}
+              disabled={!canEdit || saving}
+              onChange={e => { const v = e.target.value; setDraft(d => ({ ...d, [f.k]: v })); setMsg(null); }}
+              data-rule={f.k}
+            />
+            <span className={`block mt-0.5 font-normal text-[11px] ${theme.textMuted}`}>{f.help}</span>
+          </label>
+        ))}
+      </div>
+      {canEdit && (
+        <div className="px-4 pb-4 flex flex-wrap items-center gap-2 text-xs">
+          <button type="button" onClick={save} disabled={!changed || saving} className="px-3 py-1.5 rounded-lg font-black bg-[#00468B] text-white disabled:opacity-50" data-rules-save="1">
+            {saving ? tr('Saving...', 'Guardando...') : tr('Save targets and rules', 'Guardar metas y reglas')}
+          </button>
+          {notNumber.length > 0 && <span className="font-bold text-amber-700 dark:text-amber-300">{tr('Each box needs a number.', 'Cada casilla necesita un numero.')}</span>}
+          {msg && (
+            <span className={`font-bold ${msg.ok ? 'text-emerald-700 dark:text-emerald-300' : 'text-red-700 dark:text-red-300'}`} data-rules-msg={msg.ok ? 'ok' : 'bad'}>{msg.text}</span>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// =======================================================================
 // IMPORT CHECK PANEL (top of the Data Manipulation tab)
 // =======================================================================
 // Words for each Import check item: what was found, why it matters, and what fixes it
@@ -12532,7 +13483,7 @@ function importCheckText(item) {
           `When v2.3 opened it fixed what it could: ${r.removedExample || 0} example rows removed, ${r.changedResult || 0} results read again (for example "Not Detected" is negative, a number is a count), ${r.mergedTests || 0} rows marked for re-upload, ${r.manual || 0} results set by hand kept out of the rates. Lines the older version skipped, dates it moved and columns it read out of order cannot be repaired from the saved rows.`,
           `Al abrir, v2.3 corrigio lo que pudo: ${r.removedExample || 0} filas de ejemplo quitadas, ${r.changedResult || 0} resultados leidos otra vez (por ejemplo "Not Detected" es negativo y un numero es un conteo), ${r.mergedTests || 0} filas marcadas para volver a subir, ${r.manual || 0} resultados puestos a mano fuera de los porcentajes. Las lineas que la version anterior salto, las fechas que movio y las columnas que leyo en otro orden no se pueden reparar desde las filas guardadas.`
         ),
-        fix: tr('Best: Start over below (clear the saved lab rows, then upload every lab file again).', 'Lo mejor: Empezar de nuevo abajo (borrar las filas guardadas y subir otra vez cada archivo del laboratorio).')
+        fix: tr('Best: Re-upload in the Table check above (clear this computer, then upload every lab file again).', 'Lo mejor: Volver a subir en la Revision de la tabla arriba (borrar esta computadora y subir otra vez cada archivo del laboratorio).')
       };
     case 'unread':
       return {
@@ -12560,9 +13511,9 @@ function importCheckText(item) {
       };
     case 'unknown_area':
       return {
-        title: one(tr('1 row uses an area code that is not in the room list', '1 fila usa un codigo de zona que no esta en la lista de areas'), tr(`${n} rows use an area code that is not in the room list`, `${n} filas usan un codigo de zona que no esta en la lista de areas`)),
-        body: tr('They are filed under Zone 4 / Mobile, so their room totals are off.', 'Se archivan en Zona 4 / Movil, asi que los totales por area salen mal.'),
-        fix: tr('Add each code to the room aliases (18k Bulk & Ingest tab, admin).', 'Agregue cada codigo a los alias de area (pestana 18k Bulk & Ingest, admin).')
+        title: one(tr('1 row has an area code the app cannot place in a room', '1 fila tiene un codigo de zona que la app no puede poner en un area'), tr(`${n} rows have an area code the app cannot place in a room`, `${n} filas tienen un codigo de zona que la app no puede poner en un area`)),
+        body: tr('The area code is the middle of the lab site code: in 0320-STLWJ1-066 it is STLWJ1, which the app files under WJ. The codes below have no room yet, so their swabs are counted under Zone 4 / Mobile and that room\'s numbers are off.', 'El codigo de zona es la parte de en medio del codigo de sitio del laboratorio: en 0320-STLWJ1-066 es STLWJ1, que la app pone en WJ. Los codigos de abajo aun no tienen area, asi que sus hisopos se cuentan en Zona 4 / Movil y los numeros de esa area salen mal.'),
+        fix: tr('Send the room each code belongs to, or add it to the room aliases (18k Bulk & Ingest tab, admin).', 'Envie el area de cada codigo, o agreguelo a los alias de area (pestana 18k Bulk & Ingest, admin).')
       };
     case 'guessed_test':
       return {
@@ -12630,10 +13581,21 @@ function importCheckText(item) {
         body: tr('Each one is marked replaced once its new row (Sample ID + description + test) is saved, so the other apps never count a swab twice.', 'Cada una se marca como reemplazada cuando se guarda su fila nueva (Sample ID + descripcion + prueba), asi las otras apps nunca cuentan un hisopo dos veces.'),
         fix: ''
       };
-    case 'counts':
+    case 'counts': {
+      const ind = item.apcAtp || 0;
       return {
-        title: one(tr('1 row has a number result with no pass or fail', '1 fila tiene un resultado numerico sin pasa o falla'), tr(`${n} rows have a number result with no pass or fail`, `${n} filas tienen un resultado numerico sin pasa o falla`)),
-        body: tr('Listed, but in no rate (APC and ATP limits differ by site).', 'Se listan pero no entran en ningun porcentaje (los limites de APC y ATP cambian por sitio).'),
+        title: one(tr('1 row has a number for its result', '1 fila tiene un numero como resultado'), tr(`${n.toLocaleString()} rows have a number for their result`, `${n.toLocaleString()} filas tienen un numero como resultado`)),
+        body: tr(
+          `${ind.toLocaleString()} are APC or ATP: each counts as a swab that did not fail ("est" is only the lab's wording, the number is read as written). ${(n - ind).toLocaleString()} are other tests and stay out of every rate.`,
+          `${ind.toLocaleString()} son APC o ATP: cada una cuenta como un hisopo que no fallo ("est" es solo la forma de escribir del laboratorio, el numero se lee como esta). ${(n - ind).toLocaleString()} son otras pruebas y quedan fuera de todos los porcentajes.`
+        ),
+        fix: ''
+      };
+    }
+    case 'over_limit':
+      return {
+        title: one(tr('1 APC / ATP reading with ">" or TNTC is read as a fail', '1 lectura de APC / ATP con ">" o TNTC se lee como falla'), tr(`${n.toLocaleString()} APC / ATP readings with ">" or TNTC are read as fails`, `${n.toLocaleString()} lecturas de APC / ATP con ">" o TNTC se leen como fallas`)),
+        body: tr('">" means more than the number, which is always past the threshold. They count in the APC and ATP rates and show on the calendar. The readings found are below.', '">" significa mas que el numero, que siempre pasa el limite. Cuentan en los porcentajes de APC y ATP y se ven en el calendario. Abajo estan las lecturas encontradas.'),
         fix: ''
       };
     case 'restored_paste':
@@ -12687,18 +13649,15 @@ function ConfirmButton({ label, question, yesLabel, onConfirm, disabled, classNa
   );
 }
 
-function ImportCheckPanel({ darkMode, theme, check, canEdit, lastReceipt, onStartFresh, onUploadFiles, onResetTypedYoY, dvStored, dvSaving }) {
+function ImportCheckPanel({ darkMode, theme, check, canEdit, lastReceipt, onResetTypedYoY }) {
   const [open, setOpen] = useState(() => !!check && check.verdict !== 'ok');
   const [showAllWeeks, setShowAllWeeks] = useState(false);
-  const [showStartOver, setShowStartOver] = useState(false);
-  const [retireDv, setRetireDv] = useState(true);
-  const fileRef = useRef(null);
   if (!check) return null;
 
   const verdictInfo = {
     reupload: {
       chip: tr('Re-upload recommended', 'Se recomienda volver a subir'),
-      line: tr('Some saved rows can only be fixed by loading the lab files again. The steps are in Start over.', 'Algunas filas guardadas solo se arreglan cargando otra vez los archivos del laboratorio. Los pasos estan en Empezar de nuevo.'),
+      line: tr('Some saved rows can only be fixed by loading the lab files again: Re-upload in the Table check above.', 'Algunas filas guardadas solo se arreglan cargando otra vez los archivos del laboratorio: Volver a subir en la Revision de la tabla arriba.'),
       cls: darkMode ? 'bg-amber-950/70 text-amber-200 border-amber-700' : 'bg-amber-100 text-amber-900 border-amber-300'
     },
     check: {
@@ -12733,9 +13692,6 @@ function ImportCheckPanel({ darkMode, theme, check, canEdit, lastReceipt, onStar
     if (s === 'no_lab') return tr('no lab rows', 'sin filas del laboratorio');
     return tr('no email', 'sin correo');
   };
-  const startOverOpen = showStartOver || check.verdict === 'reupload' || check.verdict === 'empty';
-  // Start over also marks the stored Dataverse swab rows replaced when the box is ticked and there are any
-  const startOverWithDv = retireDv && dvStored > 0;
 
   return (
     <section className={`rounded-2xl border shadow-xs ${theme.bgCard}`}>
@@ -12897,72 +13853,12 @@ function ImportCheckPanel({ darkMode, theme, check, canEdit, lastReceipt, onStar
             </div>
           </div>
 
-          {canEdit ? (
-            <div className={`rounded-xl border px-3 py-2.5 ${theme.bgSubtle}`}>
-              <button type="button" onClick={() => setShowStartOver(v => !v)} className="text-sm font-black" aria-expanded={startOverOpen}>
-                {tr('Start over: clear the saved lab rows and upload every file again', 'Empezar de nuevo: borrar las filas guardadas y subir otra vez cada archivo')}
-              </button>
-              {startOverOpen && (
-                <div className="mt-2 space-y-2 text-xs">
-                  <ol className="list-decimal pl-5 space-y-1">
-                    <li>{tr('Save each lab export as CSV (in Excel: File, Save As, CSV). Excel workbooks (.xlsx) are not read.', 'Guarde cada exportacion del laboratorio como CSV (en Excel: Archivo, Guardar como, CSV). Los libros de Excel (.xlsx) no se leen.')}</li>
-                    <li>
-                      {tr('Clear the saved lab rows on this computer:', 'Borre las filas guardadas en esta computadora:')}{' '}
-                      <ConfirmButton
-                        label={tr('Clear saved lab rows', 'Borrar filas guardadas')}
-                        question={startOverWithDv
-                          ? tr(`Clear all ${check.rowsTotal.toLocaleString()} saved lab rows on this computer, and mark the ${dvStored.toLocaleString()} swab rows in Dataverse replaced until the lab files are loaded again? Nothing is deleted. The QA emails stay.`, `Borrar las ${check.rowsTotal.toLocaleString()} filas guardadas en esta computadora y marcar las ${dvStored.toLocaleString()} filas de hisopos en Dataverse como reemplazadas hasta que se carguen otra vez los archivos? No se borra nada. Los correos de QA se quedan.`)
-                          : tr(`Clear all ${check.rowsTotal.toLocaleString()} saved lab rows on this computer? The QA emails stay.`, `Borrar las ${check.rowsTotal.toLocaleString()} filas guardadas en esta computadora? Los correos de QA se quedan.`)}
-                        yesLabel={startOverWithDv ? tr('Yes, clear and mark replaced', 'Si, borrar y marcar reemplazadas') : tr('Yes, clear them', 'Si, borrarlas')}
-                        disabled={!!dvSaving}
-                        onConfirm={() => onStartFresh({ retireDv: startOverWithDv })}
-                        className="ml-1 px-2 py-0.5 rounded-lg text-[11px] font-black border border-amber-400 bg-amber-100 text-amber-900 dark:bg-amber-950 dark:text-amber-200 dark:border-amber-700 disabled:opacity-50"
-                      />
-                      {dvStored > 0 && (
-                        <label className="mt-1.5 flex items-start gap-2">
-                          <input type="checkbox" className="mt-0.5" checked={retireDv} onChange={e => setRetireDv(e.target.checked)} />
-                          <span>
-                            {tr(`Also take the ${dvStored.toLocaleString()} swab rows saved in Dataverse out of the numbers (marked replaced, not deleted). The upload in step 3 brings back every row the lab files have; a misread row from an older version stays out.`, `Tambien sacar de los numeros las ${dvStored.toLocaleString()} filas de hisopos guardadas en Dataverse (marcadas como reemplazadas, no borradas). La carga del paso 3 regresa cada fila que tienen los archivos; una fila mal leida por una version anterior se queda fuera.`)}
-                          </span>
-                        </label>
-                      )}
-                      {dvSaving && (
-                        <div className={`mt-1 font-bold ${theme.textMuted}`}>{tr('Saving to Dataverse... wait for it to finish before uploading.', 'Guardando en Dataverse... espere a que termine antes de subir.')}</div>
-                      )}
-                    </li>
-                    <li>
-                      {tr('Upload every lab file (you can pick several at once):', 'Suba cada archivo del laboratorio (puede elegir varios a la vez):')}{' '}
-                      <button
-                        type="button"
-                        onClick={() => { if (fileRef.current) fileRef.current.click(); }}
-                        className="ml-1 px-2 py-0.5 rounded-lg text-[11px] font-black bg-[#00468B] text-white"
-                      >
-                        {tr('Upload lab files', 'Subir archivos del laboratorio')}
-                      </button>
-                      <input
-                        ref={fileRef}
-                        type="file"
-                        multiple
-                        accept=".csv,.tsv,.txt"
-                        className="hidden"
-                        onChange={e => {
-                          onUploadFiles(e.target.files);
-                          e.target.value = '';
-                        }}
-                      />
-                    </li>
-                    <li>{tr('Come back here: the check runs again on its own.', 'Regrese aqui: la revision corre otra vez sola.')}</li>
-                  </ol>
-                  <div className={theme.textMuted}>
-                    {tr('Rows match on Sample ID + description + test, so loading a file twice never counts a swab twice. Swab results already saved to Dataverse are updated, not doubled. Another computer keeps its own saved rows: if someone else loads lab files, they use Start over there too.', 'Las filas se enlazan por Sample ID + descripcion + prueba, asi que subir un archivo dos veces nunca cuenta un hisopo dos veces. Los resultados ya guardados en Dataverse se actualizan, no se duplican. Otra computadora guarda sus propias filas: si alguien mas carga archivos del laboratorio, tambien usa Empezar de nuevo alli.')}
-                  </div>
-                </div>
-              )}
+          {check.verdict === 'reupload' && (
+            <div className={`rounded-xl border px-3 py-2.5 text-xs font-bold ${theme.bgSubtle}`}>
+              {canEdit
+                ? tr('To load every lab file again, use Re-upload in the Table check above. The swab table is only changed at its last step, by your click.', 'Para cargar otra vez cada archivo del laboratorio, use Volver a subir en la Revision de la tabla arriba. La tabla de hisopos solo cambia en el ultimo paso, con su clic.')
+                : tr('An admin can re-upload the lab files from the Table check above.', 'Un admin puede volver a subir los archivos del laboratorio desde la Revision de la tabla arriba.')}
             </div>
-          ) : (
-            check.verdict === 'reupload' && (
-              <div className={`text-xs font-bold ${theme.textMuted}`}>{tr('An admin can clear and re-upload the lab files here.', 'Un admin puede borrar y volver a subir los archivos del laboratorio aqui.')}</div>
-            )
           )}
         </div>
       )}
@@ -12983,10 +13879,8 @@ function DataManipulationLabView({
   importCheck,
   canEdit,
   lastReceipt,
-  onStartFresh,
-  onUploadFiles,
-  dvStored,
-  dvSaving,
+  tableCheck,
+  rulesPanel,
   onOpenGraphs
 }) {
   const theme = INLINE_THEME[darkMode ? 'dark' : 'light'];
@@ -13181,18 +14075,16 @@ function DataManipulationLabView({
 
   return localizeReactTree((
     <div className="h-full overflow-y-auto p-3 sm:p-4 pb-32" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+      {tableCheck && <TableCheckPanel darkMode={darkMode} theme={appTheme} canEdit={canEdit} {...tableCheck} />}
       <ImportCheckPanel
         darkMode={darkMode}
         theme={appTheme}
         check={importCheck}
         canEdit={canEdit}
         lastReceipt={lastReceipt}
-        onStartFresh={onStartFresh}
-        onUploadFiles={onUploadFiles}
-        dvStored={dvStored}
-        dvSaving={dvSaving}
         onResetTypedYoY={() => { if (typeof onSaveYoYBenchmarks === 'function') onSaveYoYBenchmarks(null); }}
       />
+      {rulesPanel && <RulesPanel darkMode={darkMode} theme={appTheme} canEdit={canEdit} {...rulesPanel} />}
 
       {/* Mode switcher */}
       <div style={card}>
@@ -16134,7 +17026,7 @@ function UploadAndRegexStudioView({
                 {historicalLedgerCount > 0 && (
                   <ConfirmButton
                     label={tr(`Clear saved lab rows (${historicalLedgerCount.toLocaleString()})`, `Borrar filas guardadas (${historicalLedgerCount.toLocaleString()})`)}
-                    question={tr('Clear the saved lab rows and the lab paste box on this computer? The QA emails stay. To also take the swab rows in Dataverse out of the numbers, use Start over in the Import check (Data Manipulation tab).', 'Borrar las filas guardadas y la caja de texto del laboratorio en esta computadora? Los correos de QA se quedan. Para sacar tambien de los numeros las filas de hisopos en Dataverse, use Empezar de nuevo en la Revision de carga (pestana Laboratorio de Datos).')}
+                    question={tr('Clear the saved lab rows and the lab paste box on this computer and start a re-upload? The QA emails stay and the swab table in Dataverse is not changed. The Table check (Data Manipulation tab) walks through the rest.', 'Borrar las filas guardadas y la caja de texto del laboratorio en esta computadora y empezar a volver a subir? Los correos de QA se quedan y la tabla de hisopos en Dataverse no cambia. La Revision de la tabla (pestana Laboratorio de Datos) guia el resto.')}
                     yesLabel={tr(`Yes, clear ${historicalLedgerCount.toLocaleString()} rows`, `Si, borrar ${historicalLedgerCount.toLocaleString()} filas`)}
                     onConfirm={onClearHistoricalLedger}
                     className="px-3 py-2 rounded-xl text-xs font-bold border border-amber-400 text-amber-900 bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/40 dark:text-amber-200 dark:border-amber-700"
