@@ -89,6 +89,51 @@ function hubCleanKind(k) {
     return HUB_CLEAN_KINDS.indexOf(s) > -1 ? s : '';
 }
 // One clean of one piece of equipment on one shift date: the key that stops a second row (MSS log craa5_completionkey).
+// Frequencies (the MSS Calendar's codes and ranks). A clean of rank r satisfies every frequency of rank <= r.
+// A piece is done for a frequency when a satisfying clean falls in the same period as today; otherwise it is due.
+var HUB_FREQS = [
+    { code: 'D', kind: 'daily', rank: 1, flag: 'craa5_dailyclean' }, { code: 'MW', kind: 'midweek', rank: 2, flag: 'craa5_midweek' },
+    { code: 'W', kind: 'eow', rank: 3, flag: 'craa5_weeklyclean' }, { code: 'M', kind: 'monthly', rank: 4, flag: 'craa5_monthlyclean' },
+    { code: 'Q', kind: 'quarterly', rank: 5, flag: 'craa5_quarterly' }, { code: 'S', kind: 'semiannual', rank: 6, flag: 'craa5_month' },
+    { code: 'A', kind: 'annual', rank: 7, flag: 'craa5_annually' }
+];
+var HUB_KIND_RANK = { daily: 1, allergen: 1, egg: 1, pecan: 1, changeover: 1, corrective: 1, midweek: 2, eow: 3, monthly: 4, quarterly: 5, semiannual: 6, annual: 7, other: 0 };
+function hubKindRank(kind) { var k = hubCleanKind(kind); return k ? HUB_KIND_RANK[k] || 0 : 0; }
+// Rank of one MSS log row: its craa5_cleankind; old rows with no kind keep their old meaning from the flags
+// (daily also counts as mid-week, weekly 3, monthly also counts as quarterly to annual, no flags 9 = counts for everything).
+function hubLogRank(row) {
+    if (!row) return 0;
+    if (hubCleanKind(row.craa5_cleankind)) return hubKindRank(row.craa5_cleankind);
+    var yes = function (v) { return v === true || v === 1 || /^(yes|true|1)$/i.test(String(v === undefined || v === null ? '' : v)); };
+    return yes(row.craa5_monthly) ? 7 : yes(row.craa5_weekly) ? 3 : yes(row.craa5_daily) ? 2 : 9;
+}
+function hubFreqRank(code) { for (var i = 0; i < HUB_FREQS.length; i++) if (HUB_FREQS[i].code === code) return HUB_FREQS[i].rank; return 0; }
+// Period a plant day (YYYY-MM-DD) falls in, per frequency: day, Monday week, month, quarter, half year, year.
+function hubPeriodKey(code, day) {
+    var d = String(day || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return '';
+    var y = d.slice(0, 4), m = Number(d.slice(5, 7));
+    switch (code) {
+        case 'D': return d;
+        case 'MW': case 'W': return 'w' + hubWeekKey(d);
+        case 'M': return y + '-' + d.slice(5, 7);
+        case 'Q': return y + '-Q' + Math.ceil(m / 3);
+        case 'S': return y + '-H' + (m <= 6 ? 1 : 2);
+        case 'A': return y;
+    }
+    return '';
+}
+// doneDays = finished cleans as [{ day, kind }] or [{ day, rank }] (rank from hubLogRank for MSS log rows).
+// True when one of rank >= the frequency is in today's period. Which days and weeks owe a job is the reader's call (section 7).
+function hubFreqDone(code, doneDays, today) {
+    var need = hubFreqRank(code), p = hubPeriodKey(code, today);
+    if (!need || !p) return false;
+    for (var i = 0; i < (doneDays || []).length; i++) {
+        var x = doneDays[i];
+        if (x && (x.rank !== undefined ? x.rank : hubKindRank(x.kind)) >= need && hubPeriodKey(code, x.day) === p) return true;
+    }
+    return false;
+}
 function hubCompletionKey(assetGuid, shiftDate, kind) {
     var g = hubGuid(assetGuid), k = hubCleanKind(kind);
     return g && /^\d{4}-\d{2}-\d{2}$/.test(String(shiftDate)) && k ? g + '|' + shiftDate + '|' + k : '';
@@ -125,17 +170,19 @@ function hubSetLang(l) { try { window.localStorage.setItem(HUB_LANG_KEY, l === '
 var HUB_ACC = { a: 225, e: 233, i: 237, o: 243, u: 250, n: 241, A: 193, E: 201, I: 205, O: 211, U: 218, N: 209, '?': 191, '!': 161, w: 252 };
 function hubDecodeEs(s) { return String(s).replace(/%([aeiounAEIOUN?!w%])/g, function (m, c) { return c === '%' ? '%' : String.fromCharCode(HUB_ACC[c]); }); }
 // The shared words (data-contract.md section 9). An app's own word list adds to these; it never gives one of these another Spanish.
+// Mexican plant Spanish (es-MX), usted form: computadora, celular, tomar, presionar / dar clic, llenar; never vosotros,
+// ordenador, movil, coger, pulsar, rellenar.
 var HUB_ES = {
     'Planned': 'Planeado', 'Started': 'En proceso', 'Done': 'Terminado', 'Skipped': 'Omitido', 'Overdue': 'Atrasado', 'At risk': 'En riesgo',
-    'Daily': 'Diaria', 'Midweek 72h': 'Media semana 72h', 'End of week': 'Fin de semana', 'EOW': 'FDS', 'Allergen': 'Al%ergeno', 'Egg allergen': 'Al%ergeno huevo', 'Pecan allergen': 'Al%ergeno nuez pecana',
+    'Daily': 'Diaria', 'Midweek 72h': 'Media semana 72h', 'End of week': 'Fin de semana', 'EOW': 'Fin de semana', 'Allergen': 'Al%ergeno', 'Egg allergen': 'Al%ergeno huevo', 'Pecan allergen': 'Al%ergeno nuez pecana',
     'Changeover': 'Cambio de producto', 'Monthly': 'Mensual', 'Quarterly': 'Trimestral', 'Semiannual': 'Semestral', 'Annual': 'Anual',
     'Corrective': 'Correctiva', 'Other': 'Otra',
-    'Present': 'Presente', 'Late': 'Lleg%o tarde', 'Sick': 'Enfermo', 'PTO': 'Vacaciones (PTO)', 'Left early': 'Sali%o temprano',
-    'No call': 'Falta sin aviso', 'Loaned': 'Prestado', 'Training': 'Entrenamiento',
+    'Present': 'Presente', 'Late': 'Retardo', 'Sick': 'Enfermo', 'PTO': 'Vacaciones (PTO)', 'Left early': 'Sali%o temprano',
+    'No call': 'Falta sin aviso', 'Loaned': 'Prestado', 'Training': 'Capacitaci%on',
     'Sanitor': 'Sanitizador', 'Lead': 'L%ider', 'Supervisor': 'Supervisor', 'Manager': 'Gerente',
     'Loading': 'Cargando', 'Ready': 'Listo', 'Nothing here yet': 'Todav%ia no hay datos', 'Table missing': 'Falta la tabla',
     'No access': 'Sin acceso', 'Could not load': 'No se pudo cargar',
-    'Area': '%Area', 'Room': 'Sala', 'Line': 'L%inea', 'Equipment': 'Equipo', 'Shift': 'Turno', 'Crew': 'Cuadrilla', 'Team': 'Grupo',
+    'Area': '%Area', 'Room': 'Cuarto', 'Line': 'L%inea', 'Equipment': 'Equipo', 'Shift': 'Turno', 'Crew': 'Cuadrilla', 'Team': 'Grupo',
     'Clean': 'Limpieza', 'Run': 'Corrida', 'Headcount': 'Personal', 'Minutes': 'Minutos', 'Standard': 'Est%andar', 'Pace': 'Ritmo',
     'On time': 'A tiempo', 'Labor cost': 'Costo de mano de obra', 'Swab': 'Hisopo', 'Pathogen': 'Pat%ogeno', 'Work order': 'Orden de trabajo',
     'Skip code': 'C%odigo de omisi%on', 'High five': 'Reconocimiento', 'Sign-off': 'Aprobaci%on', 'Help': 'Ayuda', 'Print': 'Imprimir'
@@ -174,9 +221,9 @@ var HUB_APP_IDS = ['ganttly', 'shiftstart', 'prodsched', 'msscalendar', 'msslog'
 // Own names: some pages already declare HUB_CONFIG_TABLE.
 var HUB_CONFIG_TABLES = ['craa5__e_hubconfig', 'craa5__0_hubconfig'];
 var HUB_MANIFEST_TABLE = HUB_CONFIG_TABLES[0];
-function hubNameList(a) {
+function hubNameList(a, keepCase) {
     var out = [], seen = {};
-    (a || []).forEach(function (x) { var v = String(x === undefined || x === null ? '' : x).trim().toLowerCase(); if (v && !seen[v]) { seen[v] = 1; out.push(v); } });
+    (a || []).forEach(function (x) { var v = String(x === undefined || x === null ? '' : x).trim(); if (!keepCase) v = v.toLowerCase(); if (v && !seen[v]) { seen[v] = 1; out.push(v); } });
     return out;
 }
 // The manifest as stored: fixed key order, sorted lists, so the same app build always gives the same text and hash.
@@ -186,7 +233,7 @@ function hubManifest(m, nowIso) {
         var name = String(t.t || '').trim().toLowerCase();
         return { t: name, names: hubNameList(t.names && t.names.length ? t.names : [name]), read: hubNameList(t.read).sort(), write: hubNameList(t.write).sort(), opt: hubNameList(t.opt).sort() };
     }).filter(function (t) { return !!t.t; }).sort(function (a, b) { return a.t < b.t ? -1 : a.t > b.t ? 1 : 0; });
-    var out = { m: 1, appId: hubCanon(m.appId), app: String(m.app || ''), version: String(m.version || ''), contract: HUB_CONTRACT_VERSION, tables: tables, config: hubNameList(m.config).sort() };
+    var out = { m: 1, appId: hubCanon(m.appId), app: String(m.app || ''), version: String(m.version || ''), contract: HUB_CONTRACT_VERSION, tables: tables, config: hubNameList(m.config, true).sort() };   // hubconfig keys keep their case: they match exactly
     out.hash = hubIdFromKey(JSON.stringify(out)).slice(0, 8);
     out.savedAt = nowIso || new Date().toISOString();
     return out;
