@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.53, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.54, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -44,7 +44,7 @@ These are the keys that join the apps. When a column holds one of these keys, it
 | **Shift** | Shift key = `shiftDate|crew`, e.g. `2026-10-20|C` (`hubShiftKey`) | The live board: `craa5_shiftboard.craa5_slotstart` + `craa5_crew` | `craa5_shiftdate` (YYYY-MM-DD) + `craa5_shiftcode` | "Tue Oct 20, C shift" |
 | **Run** | `craa5__aa_prd_schd.craa5__aa_prd_schdid` | Production Scheduler | `craa5_runid` when stored elsewhere | Product + start time |
 | **Clean window** | `craa5_cleanplan.craa5_plankey`, e.g. `w|<run before>|<run after>` | Production Scheduler (Clean Plan) | `craa5_plankey` | Line + clean kind + start |
-| **Completion** (one clean of one piece) | Completion key = `assetGuid|shiftDate|cleanKind` (`hubCompletionKey`) | Written once to the MSS log (section 6.3) | `craa5_completionkey` | Equipment + clean kind + shift date |
+| **Completion** (one clean of one piece) | Completion key = `assetGuid|shiftDate|cleanKind` (`hubCompletionKey`) | Written to the MSS log (section 6.3); other people's separate entry for the same clean gets `key|2` .. `key|9` | `craa5_completionkey` | Equipment + clean kind + shift date. **Count a clean once by the base key** (the key with a trailing `|2`..`|9` removed, `mlwBaseKey`); labor minutes of all entries add up |
 | **Week** | Monday of the plant week, YYYY-MM-DD (`hubWeekKey`) | Computed | `craa5_weekkey` | "Week of Oct 19" |
 
 Matching names: two names are the same when `hubCanon` (lower-case letters and digits only) gives the same text. A name that matches no area is shown as unmatched. It is never matched by "contains" or by nearest spelling. Old spellings ("WJ" for Waterjet, "Cook Rm") go in an alias list kept by the app that reads them. The chemical hub's `_c_ Area alias` is the model.
@@ -182,7 +182,7 @@ One row = one piece of equipment, one clean, one shift date. The rules (from the
 
 1. **Only when a piece is marked Done** (in Ganttly, piece by piece), or entered by hand in MSS Log Input or the Calendar. An area at 100% in Shift Start is a status for the Teams post. It writes nothing to the log. **Anyone on the crew may mark a piece Done** (Gerald, Q2); `craa5_markedby` records who pressed it.
 2. **No equipment id, no row.** `craa5_equipmentguid` = the asset GUID is required.
-3. Row id = `hubLogIdOf(completionKey)`, and `craa5_completionkey` = `hubCompletionKey(asset, shiftDate, kind)`. Before creating, read by that key. If it exists, update it. Never rely on a per-browser "already sent" list.
+3. Row id = `hubLogIdOf(completionKey)`, and `craa5_completionkey` = `hubCompletionKey(asset, shiftDate, kind)`. Before creating, read by that key. If it exists with the same people (any order or case), it is the same clean (`already`). If it exists with different people (a second crew, or the night shift of the same plant day), save a separate entry with key `key|2` (up to `|9`) and id `hubLogIdOf(key|n)`, so no names or minutes are lost (Gerald, 2026-10-23: duplicates beat missed entries). Never rely on a per-browser "already sent" list. **Readers count cleans by the base key** (`mlwBaseKey`, or `equipment|shiftdate|kind`), never by the raw key, and add the minutes of every entry.
 4. `craa5_lastcleaned` = `hubDateOnlyUtc(shiftDate)`. `craa5_shiftdate` = shiftDate, `craa5_shiftcode` = crew.
 5. `craa5_cleankind` = the kind from 6.2. The flags are set from it.
 6. `craa5_sap` = the real SAP order number, or `auto-<kind>` (e.g. `auto-eow`). `craa5_sapw` = the piece's work area code. `craa5_uid` keeps its current meaning (the SAP code) and is **not** reused as a key. It is the table's primary name column, so writers should still fill it with the SAP code (the same value as `craa5_sapw`), or the row shows blank in forms and views.
@@ -194,7 +194,7 @@ One row = one piece of equipment, one clean, one shift date. The rules (from the
 12. `craa5_allergenclean`: try the text `Yes` first, then `true` (a Yes/No column); drop the column only if neither fits. Readers count `Yes`, `true` or `1` as done.
 13. Checks: MSS Log Input's Check tab flags more than 24 labor hours on one piece (`hours_high`).
 
-The block that does all of this is MSS LOG WRITE v1.3 ([mss-log-write.js](/mnt/project-files/mss-log-input/mss-log-write.js), commit 200f922 on PR #40). Every log writer pastes it unchanged.
+The block that does all of this is MSS LOG WRITE v1.4 ([mss-log-write.js](/mnt/project-files/mss-log-input/mss-log-write.js), commit 5fcab26 on PR #40): `mlwWrite` returns `entry`, `separate` and the key and id it used; `mlwUndo(api, guid, day, kind, {key} or {names})` undoes one entry (the first without options); text codes `saved_separate`, `second_entry`. Every log writer pastes it unchanged.
 
 **Transition (until Ganttly logs piece by piece):** Shift Start may keep logging an area at 100%, only that clean's pieces, behind its switch `SHIFT_START_LOGS_MSS`, dated by `hubShiftDate`. Those rows should use the same completion key and row id as above, so Ganttly's later row for the same piece updates them instead of adding a second. The switch goes off when Ganttly's per-piece logging is live.
 
@@ -389,7 +389,7 @@ Each block is pasted unchanged into every app that uses it. Its owner changes it
 |---|---|---|---|
 | HUB SHARED v1.1 | [hub-shared.js](/mnt/project-files/ecosystem-contract/hub-shared.js) | this thread | every hub app |
 | MSS MANPOWER v1.1 | (in MSS Log Input, PR #40) | MSS log input thread | MSS Log Input, Production Scheduler (shift hours from Work Shifts) |
-| MSS LOG WRITE v1.3 | [mss-log-write.js](/mnt/project-files/mss-log-input/mss-log-write.js) | MSS log input thread | every MSS log writer: Ganttly, MSS Log Input, MSS Calendar (section 6.3) |
+| MSS LOG WRITE v1.4 | [mss-log-write.js](/mnt/project-files/mss-log-input/mss-log-write.js) | MSS log input thread | every MSS log writer: Ganttly, MSS Log Input, MSS Calendar (section 6.3) |
 | ASSIGN SPLIT v1.0 | [assign-split.js](/mnt/project-files/ganttly-overhaul/assign-split.js), tests [assign-split.test.js](/mnt/project-files/ganttly-overhaul/test/assign-split.test.js) | Ganttly thread | Ganttly v1.5, Shift Start v0.0012+ (the even split for `_g_ Assignment`; rules in [shared-assignment.md](/mnt/project-files/ganttly-overhaul/shared-assignment.md)) |
 
 ---
@@ -441,6 +441,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.54 (2026-10-23)** MSS LOG WRITE v1.4 (PR #40, 5fcab26): a clean already logged by other people is saved as its own entry `key|2`..`key|9` instead of being dropped. Readers count cleans by the base key and add every entry's minutes. MSS Log Input's manpower panel reads the Scheduler's staff rows (f14234e).
 - **1.0.53 (2026-10-23)** BOLO map pin marker: description prefix `(PATHOGEN BOLO - ` or `(HARBORAGE CONCERN - `; Map tool shows those rows read only.
 - **1.0.52 (2026-10-23)** Pathogen BOLO 2.5: may create its own pin rows in `craa5__facilityobservation` (never edits Map tool rows); `PATHOGEN_BOLO_RULES` gains `closeDays` (default 7, positive Overdue after it).
 - **1.0.51 (2026-10-23)** Monitor printout: real names `craa5_gassignment` and `craa5_employeenote` (probe first); `_e_ Hub config` has no Config key column yet (apps fall back to the old table until it is added, `table-prompts.md` part 8); `craa5_manifestjson` optional on hubconfig; `craa5_roleid` is probably a lookup (read the formatted value); room is not a join key; the SAP work area pair is one way only (Equipment `craa5_workareacode` is found in `craa5_aa_ms_assets.craa5_title`, not the reverse); `craa5_mssresourcechemicalstandard` and `craa5_sanitationheadcountshiftrosterledger` listed as unclaimed (no app uses them); plain `craa5_shifttask` is not the Shift task table; config key `MONITOR_HISTORY` (monitor, daily counts only).
