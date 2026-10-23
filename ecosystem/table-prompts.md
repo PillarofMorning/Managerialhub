@@ -1,6 +1,6 @@
 # Tables and columns for data contract 1.0
 
-**From 1.0.60 the Dataverse monitor builds these prompts for you** (Gerald's ruling: apps never build tables; the monitor is the one table builder). This file stays as the reference until the monitor shows the same steps.
+**From 1.0.62 the Dataverse monitor shows these prompts for you** (Gerald's ruling: only you build tables; apps list what they need and the monitor reads, shows and tests it). This file stays as the reference until the monitor shows the same steps.
 
 **You do not create the data contract itself.** `data-contract.md` is the rulebook the apps follow; it is not a table. This file is the only part you build in Dataverse.
 

@@ -54,7 +54,7 @@ ok(H.hubColSpec({ type: 'choice', options: ['day', ' night ', ''], 'default': 'd
 ok(H.hubManifest({ appId: 'x', tables: [{ t: 'craa5__log_' }] }).tables[0], { t: 'craa5__log_', names: ['craa5__log_'], read: [], write: [], opt: [] });
 ok(H.hubManifest({ appId: 'x', tables: [{ t: 'craa5__t_skill', label: ' _t_ Skill ', 'new': true, owner: 'ORG', primary: { n: 'craa5_Name', len: 200 }, cols: { craa5_SkillKey: { type: 'text', len: 100 }, craa5_bad: 'lookup' } }] }).tables[0],
    { t: 'craa5__t_skill', names: ['craa5__t_skill'], read: [], write: [], opt: [], cols: { craa5_skillkey: { type: 'text', len: 100 } }, label: '_t_ Skill', 'new': true, owner: 'org', primary: { n: 'craa5_name', len: 200 } });
-ok(H.hubManifest({ appId: 'x' }).contract, '1.2');
+ok(H.hubManifest({ appId: 'x' }).contract, '1.3'); ok(H.hubManifest({ appId: 'x', tables: [{ t: 'a', prompt: ' Create table x ' }] }).tables[0].prompt, 'Create table x'); ok(H.hubManifest({ appId: 'x', tables: [{ t: 'a', prompt: new Array(2100).join('y') }] }).tables[0].prompt.length, 2000);
 var man = { appId: 'Ganttly', app: 'Ganttly', version: '2.0.0', config: ['ganttly_settings'],
     tables: [{ t: 'craa5_cleancheckoff', read: ['craa5_status', 'craa5_assetguid', 'craa5_status'], write: ['craa5_status'], opt: ['craa5_shiftdate'] }, { t: 'craa5_aa_assets', names: ['craa5_aa_assets'], read: ['craa5_midweek'] }] };
 var m1 = H.hubManifest(man, '2026-10-21T17:00:00Z'), m2 = H.hubManifest(JSON.parse(JSON.stringify(man)), '2026-10-22T09:00:00Z');

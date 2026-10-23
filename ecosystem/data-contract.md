@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.61, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.62, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -24,7 +24,7 @@ Changes go through this thread. An app thread that needs a new key, column, stat
 7. **Plant time.** Every day, shift and week is read on the America/Chicago clock (section 5). Never use the UTC day.
 8. **Every word in English and Spanish (es-MX)**, with the shared words in section 9. Apps stay 7-bit ASCII (GEMINI.md), so Spanish accents are written as % codes. One exception: the Dataverse monitor, an admin tool, is English only (Gerald, 2026-10-22).
 9. **No pop-ups.** Power Apps pages silently block `window.confirm`, `alert` and `prompt`, so a button that relies on one does nothing. Ask for confirmation on the page itself (for example a second "Yes, do it" button) and show messages on the page.
-10. **Apps never build tables** (Gerald, 2026-10-23). No app creates or changes a Dataverse table, column, key or choice, and no app carries a table-creation prompt, setup wizard or "create this table" screen. An app reads and writes **rows** only. It declares what it needs in its manifest (`manifest|<appId>` in Hub config, section 12.1; with HUB SHARED v1.2 also each column's type in `cols`, and for a table still to make `new`, `label`, `owner` and `primary`). `contract.json` `colTypes` decides each type; a manifest type that disagrees shows as a conflict and nothing is built. The **Dataverse monitor** is the one table builder: from the manifests and `contract.json` it writes the Copilot prompts, the columns to add or remove, and the type fixes for Gerald. An app that finds a table or column missing says so on the page ("not made yet, see the Dataverse monitor") and keeps working without it.
+10. **Only Gerald builds tables** (Gerald, 2026-10-23). No app and no tool, the Dataverse monitor included, creates or changes a Dataverse table, column, key or choice, and no app shows a table-creation wizard or "create this table" screen. An app reads and writes **rows** only. It declares what it needs in its manifest (`manifest|<appId>` in Hub config, section 12.1; with HUB SHARED v1.3 each column's type and length in `cols`, for a table still to make `new`, `label`, `owner` and `primary`, and its recommended Copilot `prompt`, at most 2,000 characters). `contract.json` `colTypes` decides each type; a manifest type that disagrees shows as a conflict. The **Dataverse monitor** is the one place that reads, shows and tests what the apps need: it lists the tables and columns to make, shows each prompt, and checks types against Dataverse. Gerald builds from its prompts. An app that finds a table or column missing says so on the page ("not made yet, see the Dataverse monitor") and keeps working without it.
 11. **Headcount planning lives only in the Sanitation director** (Gerald, 2026-10-23). How many people a shift or crew needs, crew sizing, vacation cover and crew-builder what-ifs are worked out only in the director app. Other apps remove their own headcount or team builders and, where they show the number, read the director's. The daily board (who is here today, which team cleans what) stays in Shift Start and Ganttly: that is assignment, not headcount planning. Migration: section 12.3.
 
 ---
@@ -377,7 +377,7 @@ Each app says in its own code which tables and columns it uses, and saves that l
 
 - **Where:** Hub config (`craa5__e_hubconfig`, else the old `craa5__0_hubconfig`), `craa5_configkey` = `manifest|<appId>`, name "<App> manifest". JSON in the new table's `craa5_configjson`; on the old table in `craa5_manifestjson`. `hubSaveManifest` picks the first that reads.
 - **appIds:** `ganttly`, `shiftstart`, `prodsched`, `msscalendar`, `msslog`, `pbed`, `bolo`, `managerhub`, `chemicals`, `mapsubmit`, `monitor`, `training`, `director` (Sanitation objectives director).
-- **What the app writes:** `{ appId, app, version, tables: [{ t, names, read, write, opt, cols?, label?, new?, owner?, primary? }], config }` (the build fields from HUB SHARED v1.2, ground rule 10). `t` is the table's logical name, `names` the names the app tries in order (prefixed first), `read`/`write` the columns, `opt` the columns it works without (the monitor shows them as "not yet", not "missing"), `config` the hubconfig keys it writes. Logical names only, never data or people.
+- **What the app writes:** `{ appId, app, version, tables: [{ t, names, read, write, opt, cols?, label?, new?, owner?, primary? }], config }` (the build fields from HUB SHARED v1.3: also `prompt`, ground rule 10). `t` is the table's logical name, `names` the names the app tries in order (prefixed first), `read`/`write` the columns, `opt` the columns it works without (the monitor shows them as "not yet", not "missing"), `config` the hubconfig keys it writes. Logical names only, never data or people.
 - **What gets stored:** `hubManifest()` adds `m: 1`, `contract` (the version of the pasted HUB SHARED block, e.g. 1.1, not this document's version), a `hash` and `savedAt`, and sorts every list.
 - **When:** call `hubSaveManifest(io, manifest)` once after the app loads. It reads the row (one small read), writes only when the hash changed, never blocks the app and never shows an error. `io` is the app's own query / create / update (Ganttly: `swQuery` + `swWriter`).
 - **Who reads it:** the Dataverse monitor. It reports "Ganttly 2.0.0 (saved <date>) needs X, missing Y", and builds the one-table Copilot prompts and click-steps for what is missing.
@@ -393,10 +393,10 @@ Each block is pasted unchanged into every app that uses it. Its owner changes it
 
 | Block | File | Owner | Pasted by |
 |---|---|---|---|
-| HUB SHARED v1.2 | [hub-shared.js](/mnt/project-files/ecosystem-contract/hub-shared.js) | this thread | every hub app |
+| HUB SHARED v1.3 | [hub-shared.js](/mnt/project-files/ecosystem-contract/hub-shared.js) | this thread | every hub app |
 | MSS MANPOWER v1.1 | (in MSS Log Input, PR #40) | MSS log input thread | MSS Log Input, Production Scheduler, Sanitation director (shift hours from Work Shifts) |
 | MSS LOG WRITE v1.4 | [mss-log-write.js](/mnt/project-files/mss-log-input/mss-log-write.js) | MSS log input thread | every MSS log writer: Ganttly, MSS Log Input, MSS Calendar (section 6.3) |
-| HUB SHARED v1.2 note | 1.2 keeps the manifest build fields (`cols`, `label`, `new`, `owner`, `primary`) for ground rule 10. Apps on 1.1 keep working; re-paste at the next version. | | |
+| HUB SHARED v1.3 note | 1.2 kept the manifest build fields (`cols`, `label`, `new`, `owner`, `primary`); 1.3 adds `prompt`. Apps on 1.1 or 1.2 keep working; re-paste 1.3 at the next version. | | |
 | ASSIGN SPLIT v1.0 | [assign-split.js](/mnt/project-files/ganttly-overhaul/assign-split.js), tests [assign-split.test.js](/mnt/project-files/ganttly-overhaul/test/assign-split.test.js) | Ganttly thread | Ganttly v1.5, Shift Start v0.0012+ (the even split for `_g_ Assignment`; rules in [shared-assignment.md](/mnt/project-files/ganttly-overhaul/shared-assignment.md)) |
 
 
@@ -404,7 +404,7 @@ Each block is pasted unchanged into every app that uses it. Its owner changes it
 
 Each thread does this in its next version. Nothing is deleted from Dataverse; only app code changes.
 
-- **Table building (rule 10).** Remove every create-table or add-column prompt, setup wizard, "make this table" screen and any code that calls the Dataverse metadata API to create or change a table, column, key or choice. Keep the read-only checks ("is this column there?") and show missing ones as "not made yet". Move the column types into the app's manifest (`tables[].cols`, plus `new`, `label`, `owner` and `primary` for a table still to make) so the monitor can build it. Prompts already in `table-prompts.md` and other threads' prompt files stay valid until the monitor shows the same.
+- **Table building (rule 10).** Remove every setup wizard, "make this table" screen and any code that calls the Dataverse metadata API to create or change a table, column, key or choice. Keep the read-only checks ("is this column there?") and show missing ones as "not made yet". Put the column types and lengths in the app's manifest (`tables[].cols`, plus `new`, `label`, `owner`, `primary` and the recommended Copilot `prompt` for a table still to make). The monitor shows them and Gerald builds. Prompts already in `table-prompts.md` and other threads' prompt files stay valid until the monitor shows the same.
 - **Headcount (rule 11).** The Sanitation director takes over crew sizing, heads needed per shift, vacation cover and crew-builder what-ifs, and writes the shift tasks (`_e_ Shift task`) once it is made.
   - **Production Scheduler:** keep publishing the clean plan (windows, scope, day and week rows: the work). Keep writing `staff` rows only until the director shows heads needed per shift; then stop and remove the Crew plan tab. `PRODSCHED_CREWPLAN` settings move to `director_settings`.
   - **MSS Log Input:** remove the manpower plan and its setup (`MSS_LOG_MANPOWER_SETUP`); its fixed posts become `_e_ Shift task` rows through the director. The MSS MANPOWER block stays only for shift hours if other code needs them.
@@ -415,7 +415,7 @@ Each thread does this in its next version. Nothing is deleted from Dataverse; on
 
 ## 13. New tables and columns in this version
 
-The Dataverse monitor builds the prompts and click-steps (ground rule 10), from `contract.json` (`colTypes` per table, `new` / `label` / `primary` for tables to make) and the apps' manifests. `table-prompts.md` stays as the reference until the monitor's builder covers it.
+The Dataverse monitor shows the prompts and click-steps and Gerald builds (ground rule 10), from `contract.json` (`colTypes` per table, `new` / `label` / `primary` for tables to make) and the apps' manifests. `table-prompts.md` stays as the reference until the monitor's builder covers it.
 
 | What | Why | Who creates it |
 |---|---|---|
@@ -460,6 +460,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.62 (2026-10-23)** Gerald's correction: ground rule 10 is now "only Gerald builds tables". The Dataverse monitor never writes Dataverse either; it reads, shows and tests what apps need, and Gerald builds from its prompts. HUB SHARED v1.3: manifests also keep each table's recommended Copilot `prompt` (2,000 characters max; 123 checks). `MONITOR_BUILD_LOG` is legacy.
 - **1.0.61 (2026-10-23)** `craa5_schedulechange` is optional (proposed, not missing). `contract.json` column types add `image` and `file` for existing picture and file columns (contract and monitor only; manifests cannot declare them in HUB SHARED v1.2).
 - **1.0.60 (2026-10-23)** Gerald's ruling: ground rule 10 (apps never build tables; the Dataverse monitor is the only table builder, from manifests and `contract.json`) and ground rule 11 (headcount planning only in the Sanitation director). Migration in 12.3. HUB SHARED v1.2: manifests keep `cols` ({column: {type, len, label, options, min, max, precision, default}}; types text, memo, int, decimal, money, yesno, date, datetime, choice, guid), `label`, `new`, `owner`, `primary` (the monitor thread's shape; 121 checks). `contract.json` gains `buildRule`, `columnTypes`, per-table `colTypes` (the contract decides types), `new` tables, and config key `MONITOR_BUILD_LOG`. Heads needed per shift moves to the director (Scheduler staff rows until then); `MSS_LOG_MANPOWER_SETUP` and `PRODSCHED_CREWPLAN` retiring.
 - **1.0.59 (2026-10-23)** `craa5__aa_role` (pay roles) is live, read by PBED, Ganttly, Manager hub and the director to name `craa5_roleid` when only the id comes back. The hub role choice is never a pay role. Security roles list updated.
