@@ -1,6 +1,6 @@
 # Clean Plan reader guide (craa5_cleanplan)
 
-Written by the Production Scheduler ("hub - production schedule" v4.7.1). No other app writes this table. Ganttly, Shift Start, the MSS Calendar, PBED and the Manager hub only read it. This guide wins over section 6.5 of the data contract on any detail.
+Written by the Production Scheduler ("hub - production schedule" v4.8). No other app writes this table. Ganttly, Shift Start, the MSS Calendar, PBED and the Manager hub only read it. This guide wins over section 6.5 of the data contract on any detail.
 
 All date-times are UTC. Read only active rows (`statecode eq 0`). The line key in `craa5_linekey` is the Scheduler's `canonLine(area, line)`, which is the same as `hubLineKey`: lowercase letters and digits only, for example `ibl4`, `highspeed1`.
 
@@ -126,18 +126,18 @@ Settings and tasks: Hub config key `PRODSCHED_CREWPLAN` holds `{v: 1, share, vac
 - **Highspeed and Custard:** never scheduled together (`apart` alerts). Minimal dailies, then an End of Week clean that includes the kettles, silo, sifter and dough room.
 - **Dough room, silo and sifter:** start 5 h before the line by default (Gerald said 4 to 6 h). This is set per supporting area in Cleaning Times.
 
-## 8. Copilot prompt for the new column
+## 8. Tables and columns this page needs (v4.8)
 
-Paste this into the Dataverse Copilot table editor on the Production Schedule table (`craa5__aa_prd_schd`):
+Apps no longer make or change Dataverse tables (data contract 1.0.60, ground rule 10). The Production Scheduler saves the tables and columns it uses, with each column's type, to Hub config as `manifest|prodsched` every time it opens. The **Dataverse monitor** reads that list and builds the prompts and click-steps for anything missing. The prompts that used to be here now come from the monitor, and [table-prompts.md](/mnt/project-files/ecosystem-contract/table-prompts.md) stays the reference until the monitor shows the same.
 
-> Add one column to the Production Schedule table: "Clean Override", Single line of text, maximum length 200, not required, schema name craa5_cleanoverride. It holds the scheduling department's approved change to the clean after a run, as text like "skip|Name|reason" or "midweek|Name|reason". Do not make it a lookup or a choice column.
+Still to make, from that list:
 
-After adding it, open the Production Scheduler, go to Data Check, click Refresh Dataverse & Test All Columns, and check that "Clean Override" shows as found. The same Data Check > Columns list shows any Clean Plan column that is still missing.
+- `craa5_cleanoverride` on the Production Schedule table (`craa5__aa_prd_schd`): text, 200, label "Clean Override". It holds the scheduling department's approved change to the clean after a run (section 5).
+- `_e_ Shift task` (`craa5__e_shifttask`): its column types are in [contract.json](/mnt/project-files/ecosystem-contract/contract.json). The Sanitation director becomes its writer (ground rule 11). Until it exists the Crew plan keeps its tasks in Hub config `PRODSCHED_CREWPLAN`.
+- `Schedule Change` (`craa5_schedulechange`), only if the email inbox for change requests is wanted.
 
-## 9. Copilot prompt for the Shift task table (Phase 3)
+After the monitor has added one, open the Production Scheduler, go to Data Check > Tables and columns, press Refresh Dataverse & Test All Columns, and check it shows as found.
 
-Paste this into the Dataverse Copilot table generator (under 2,000 characters):
+## 9. Heads per shift move to the Sanitation director
 
-> Create a table named "Shift task" with schema prefix craa5__e_, Organization ownership. Primary column "Name" (single line of text, 100). Columns: "Task key" craa5_taskkey (single line of text, 100, the shift and task name, for example night|trash); "Shift" craa5_shift (single line of text, 10: day, night or both); "Days" craa5_days (single line of text, 7, one digit per day Sunday to Saturday, 1 = on, for example 0111110); "Heads" craa5_heads (whole number); "Minutes" craa5_minutes (whole number, minutes per shift, blank = the whole shift); "Area" craa5_area (single line of text, 100, the MSS area name if it has one); "Active" craa5_active (yes/no, default yes); "Sort order" craa5_sortorder (whole number). No lookup or choice columns.
-
-Until it exists, the Crew plan keeps the tasks in Hub config `PRODSCHED_CREWPLAN`. Once it is made, open the Crew plan tab, unlock the page, press Edit tasks and then Save tasks once: the tasks are written as rows of the new table.
+Headcount planning lives only in the Sanitation director (ground rule 11). The Scheduler keeps publishing the clean plan: windows, scopes, alerts, day and week rows. It keeps writing `staff` rows (section 6a) only until the director shows heads needed per shift. Then the Crew plan tab and the staff rows come out of the Scheduler, and readers such as MSS Log Input read the director's number instead.
