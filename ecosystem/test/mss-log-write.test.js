@@ -12,7 +12,7 @@ function load(hub) {
     const ctx = { console, Intl, Date, JSON, Math, Object, Array, String, Number, Promise, Error, isNaN, isFinite, RegExp, encodeURIComponent, parseInt };
     ctx.window = { localStorage: { getItem: k => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); } } };
     vm.createContext(ctx);
-    vm.runInContext((hub || HUB) + '\n' + MLW + '\n;globalThis.__x = { MLW_KINDS, hubLogIdOf, hubCompletionKey, mlwKind, mlwBuildRow, mlwWrite, mlwRetryQueue, mlwQueueCount, mlwUndo, mlwCheckRow, mlwApi, mlwSay, mlwKindLabel, mlwMissing };', ctx);
+    vm.runInContext((hub || HUB) + '\n' + MLW + '\n;globalThis.__x = { MLW_KINDS, hubLogIdOf, hubCompletionKey, mlwKind, mlwBuildRow, mlwWrite, mlwRetryQueue, mlwQueueCount, mlwUndo, mlwCheckRow, mlwApi, mlwSay, mlwKindLabel, mlwMissing, mlwBaseKey, mlwEntryOf, mlwNameSet, mlwPlace, MLW_VERSION };', ctx);
     return ctx.__x;
 }
 const eq = (a, b, msg) => assert.deepStrictEqual(JSON.parse(JSON.stringify(a)), b, msg);
@@ -343,3 +343,136 @@ test('egg / pecan with an old HUB SHARED (1.0) stop with old_shared instead of a
     eq(b.problems, ['old_shared']);
     assert.ok(m.mlwBuildRow(base, NOW).ok);
 });
+
+// ---------- v1.4: a second clean by other people is its own entry, never dropped ----------
+const KEY = G + '|2026-10-20|daily';
+const night = Object.assign({}, base, { cleanedBy: 'Rosa Diaz / Juan Ruiz', crew: 'D', minutes: 60, source: 'Log input' });
+
+test('v1.4: the same clean by other people is saved as a second entry (key|2), not "already"', async () => {
+    const m = load();
+    assert.strictEqual(m.MLW_VERSION, '1.4');
+    const api = mockApi();
+    const a = await m.mlwWrite(api, base, { now: NOW });
+    eq([a.status, a.entry, a.separate, a.key], ['saved', 1, false, KEY]);
+    const b = await m.mlwWrite(api, night, { now: NOW });
+    eq([b.status, b.entry, b.separate, b.key], ['saved', 2, true, KEY + '|2']);
+    assert.strictEqual(b.id, m.hubLogIdOf(KEY + '|2'));
+    assert.strictEqual(api.rows.length, 2);
+    const second = api.rows.find(r => r.craa5__log_id === b.id);
+    eq([second.craa5_completionkey, second.craa5_lastcleanedby, second.craa5_laborminutes, second.craa5_shiftdate, second.craa5_cleankind], [KEY + '|2', 'Rosa Diaz / Juan Ruiz', 60, '2026-10-20', 'daily']);
+    assert.strictEqual(api.rows.find(r => r.craa5__log_id === a.id).craa5_lastcleanedby, 'Ana Lopez / Luis Perez', 'the first entry is untouched');
+    // a retry of either entry, from any device, adds nothing
+    const again = await load().mlwWrite(api, night, { now: NOW });
+    eq([again.status, again.entry, again.key], ['already', 2, KEY + '|2']);
+    assert.strictEqual((await load().mlwWrite(api, base, { now: NOW })).status, 'already');
+    // a third crew gets |3
+    const c = await m.mlwWrite(api, Object.assign({}, base, { cleanedBy: 'Eva Soto' }), { now: NOW });
+    eq([c.status, c.entry, c.key], ['saved', 3, KEY + '|3']);
+    assert.strictEqual(api.rows.length, 3);
+});
+
+test('v1.4: the same people in another order, case or spacing is the same clean', async () => {
+    const m = load();
+    const api = mockApi();
+    await m.mlwWrite(api, base, { now: NOW });
+    const r = await m.mlwWrite(api, Object.assign({}, base, { cleanedBy: 'luis  perez, ANA LOPEZ' }), { now: NOW });
+    assert.strictEqual(r.status, 'already');
+    assert.strictEqual(api.rows.length, 1);
+    assert.strictEqual(m.mlwNameSet('Luis Perez / Ana Lopez'), m.mlwNameSet(['ana lopez', 'LUIS PEREZ']));
+});
+
+test('v1.4: base key and entry number', () => {
+    const m = load();
+    eq([m.mlwBaseKey(KEY), m.mlwBaseKey(KEY + '|2'), m.mlwBaseKey(KEY + '|9'), m.mlwEntryOf(KEY), m.mlwEntryOf(KEY + '|3'), m.mlwEntryOf(''), m.mlwEntryOf(null)], [KEY, KEY, KEY, 1, 3, 1, 1]);
+});
+
+test('v1.4: two devices racing with different people -> both kept (the second becomes |2)', async () => {
+    const m = load();
+    const api = mockApi();
+    const first = m.mlwBuildRow(base, NOW);
+    api.rows.push(Object.assign({ statecode: 0 }, first.row, { craa5__log_id: first.id }));
+    const q = api.query; let blind = 1;
+    api.query = async (t, o) => (blind-- > 0 ? [] : q(t, o));   // the first read happened before the other device saved
+    const r = await m.mlwWrite(api, night, { now: NOW });
+    api.query = q;
+    eq([r.status, r.entry], ['saved', 2]);
+    assert.strictEqual(api.rows.length, 2);
+    assert.strictEqual(m.mlwQueueCount(), 0);
+});
+
+test('v1.4: undo takes off only the entry asked for; without opts the first entry (as before)', async () => {
+    const m = load();
+    const api = mockApi();
+    const a = await m.mlwWrite(api, base, { now: NOW });
+    const b = await m.mlwWrite(api, night, { now: NOW });
+    const byKey = await m.mlwUndo(api, G, '2026-10-20', 'daily', { key: b.key });
+    eq([byKey.status, byKey.key], ['undone', KEY + '|2']);
+    eq(api.rows.map(r => [r.craa5__log_id === a.id ? 'a' : 'b', r.statecode]), [['a', 0], ['b', 1]]);
+    // done again by the same people: their entry comes back, the first entry is not touched
+    const back = await m.mlwWrite(api, night, { now: NOW });
+    eq([back.status, back.entry], ['saved', 2]);
+    eq(api.rows.map(r => r.statecode), [0, 0]);
+    const byNames = await m.mlwUndo(api, G, '2026-10-20', 'daily', { names: 'Juan Ruiz / Rosa Diaz' });
+    eq([byNames.status, byNames.key], ['undone', KEY + '|2']);
+    assert.strictEqual((await m.mlwUndo(api, G, '2026-10-20', 'daily', { names: 'Nadie Mas' })).status, 'failed');
+    const plain = await m.mlwUndo(api, G, '2026-10-20', 'daily');
+    eq([plain.status, plain.key], ['undone', KEY]);
+    eq(api.rows.map(r => r.statecode), [1, 1]);
+});
+
+test('v1.4: an undone first entry is reused by other people, but not when those people already have a later entry', async () => {
+    const m = load();
+    const api = mockApi();
+    await m.mlwWrite(api, base, { now: NOW });
+    await m.mlwWrite(api, night, { now: NOW });
+    await m.mlwUndo(api, G, '2026-10-20', 'daily');   // the first entry (Ana / Luis) taken off
+    assert.strictEqual((await m.mlwWrite(api, night, { now: NOW })).status, 'already', 'Rosa / Juan are still logged as entry 2');
+    eq(api.rows.map(r => r.statecode), [1, 0]);
+    const eva = await m.mlwWrite(api, Object.assign({}, base, { cleanedBy: 'Eva Soto' }), { now: NOW });
+    eq([eva.status, eva.entry], ['saved', 1]);
+    assert.strictEqual(api.rows.length, 2);
+    eq(api.rows.map(r => [r.statecode, r.craa5_lastcleanedby]), [[0, 'Eva Soto'], [0, 'Rosa Diaz / Juan Ruiz']]);
+});
+
+test('v1.4: a second entry that fails waits in the queue and is placed again by the retry', async () => {
+    const m = load();
+    const api = mockApi();
+    await m.mlwWrite(api, base, { now: NOW });
+    api.createFail = 1;
+    assert.strictEqual((await m.mlwWrite(api, night, { now: NOW })).status, 'queued');
+    assert.strictEqual(m.mlwQueueCount(), 1);
+    const res = await m.mlwRetryQueue(api);
+    eq([res.saved, res.left], [1, 0]);
+    assert.strictEqual(api.rows.length, 2);
+    assert.ok(api.rows.some(r => r.craa5_completionkey === KEY + '|2'));
+    eq((await m.mlwRetryQueue(api)).left, 0);
+});
+
+test('v1.4: before the completion key column exists, a second entry is still its own row (by its fixed id)', async () => {
+    const m = load();
+    const oldCols = ['craa5__log_id', 'statecode', 'craa5_equipmentguid', 'craa5_equipment', 'craa5_room', 'craa5_area', 'craa5_sap', 'craa5_lastcleaned', 'craa5_lastcleanedby', 'craa5_hoursworked', 'craa5_pathogen', 'craa5_daily', 'craa5_weekly', 'craa5_monthly', 'craa5_sapw', 'craa5_allergenclean'];
+    const api = mockApi({ cols: oldCols });
+    assert.strictEqual((await m.mlwWrite(api, base, { now: NOW })).status, 'saved');
+    const b = await m.mlwWrite(api, night, { now: NOW });
+    eq([b.status, b.entry], ['saved', 2]);
+    assert.strictEqual((await m.mlwWrite(api, night, { now: NOW })).status, 'already');
+    assert.strictEqual(api.rows.length, 2);
+});
+
+test('v1.4: no Read rights -> the fixed id still guards; a second crew cannot be told apart and reports "already"', async () => {
+    const m = load();
+    const api = mockApi();
+    await m.mlwWrite(api, base, { now: NOW });
+    api.queryFail = 'Principal user is missing prvReadcraa5__log_ privilege';
+    const r = await m.mlwWrite(api, night, { now: NOW });
+    assert.strictEqual(r.status, 'already');
+    assert.strictEqual(api.rows.length, 1);
+});
+
+test('v1.4: Spanish for the new codes', () => {
+    const m = load();
+    assert.ok(/segundo registro/i.test(m.mlwSay('saved_separate', 'es')));
+    assert.ok(/Segundo registro/.test(m.mlwSay('second_entry', 'es')));
+    assert.ok(/d\u00eda/.test(m.mlwSay('second_entry', 'es')));
+});
+
