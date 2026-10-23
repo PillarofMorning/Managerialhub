@@ -14,7 +14,7 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 
 const LOGO_URL = "";
 const BRAND = { blue: '#0072CE', blueDark: '#00468B', blueSoft: '#E6F1FB', yellow: '#FFB81C', yellowSoft: '#FFF6E0', red: '#E4002B', redSoft: '#FDE8EC' };
-const MONITOR_VERSION = 'v3.2';
+const MONITOR_VERSION = 'v3.2.1';
 
 const ORG_LANG_KEY = 'stillwell_org_lang_v1';
 const ORG_THEME_KEY = 'stillwell_org_dark_v1';
@@ -2028,8 +2028,10 @@ function dvGuessType(col) {
 function dvTypeWord(spec) {
   if (!spec) return 'unknown';
   const b = BUILD_TYPES[spec.type];
-  return (b ? b.word : spec.type) + (spec.len ? ' (' + spec.len + ')' : '');
+  return (b ? b.word : spec.type) + (spec.len ? ' (' + spec.len + ')' : '') + (dvHasPlaces(spec) ? ' (' + spec.precision + ' decimal places)' : '');
 }
+// Decimal places only matter for decimal and currency columns, and only when someone said how many.
+function dvHasPlaces(spec) { return !!spec && (spec.type === 'decimal' || spec.type === 'money') && typeof spec.precision === 'number' && spec.precision >= 0; }
 
 // A name the builder may make: a plain craa5 column. Lookup forms (_x_value) and annotations never are.
 function dvBuildable(c) { return /^craa5_[a-z0-9_]*[a-z0-9]$/.test(String(c || '')) && !/_value$/.test(c); }
@@ -2061,6 +2063,7 @@ function dvBuildWants(tables, apps) {
     if (mt.prompt) (w.prompts = w.prompts || []).push({ app: a.appId, text: mt.prompt });
     if (!w.owner && mt.owner) w.owner = mt.owner;
     if (!w.primary && mt.primary) w.primary = mt.primary;
+    else if (w.primary && mt.primary && !w.primary.label && mt.primary.label && String(w.primary.n || '').toLowerCase() === mt.primary.n) w.primary = Object.assign({}, w.primary, { label: mt.primary.label });
     const who = a.appId + (a.fromScan ? ' (scan)' : '');
     (mt.opt || []).filter(dvBuildable).forEach(c => { if (!w.named[c]) w.optOnly[c] = true; });
     mt.read.concat(mt.write).filter(dvBuildable).forEach(c => { delete w.optOnly[c]; });
@@ -2071,7 +2074,14 @@ function dvBuildWants(tables, apps) {
       const have = w.types[c];
       if (!have) { w.types[c] = Object.assign({}, want, { source: a.appId }); return; }
       if (have.type !== want.type) w.conflicts.push({ col: c, have: dvTypeWord(have) + ' from ' + have.source, want: dvTypeWord(want) + ' from ' + a.appId });
-      else if (!have.len && want.len && have.source !== 'contract') have.len = want.len;
+      else if (dvHasPlaces(have) && dvHasPlaces(want) && have.precision !== want.precision) w.conflicts.push({ col: c, have: dvTypeWord(have) + ' from ' + have.source, want: dvTypeWord(want) + ' from ' + a.appId });
+      else {
+        if (!have.len && want.len && have.source !== 'contract') have.len = want.len;
+        // Names, decimal places and choices an app adds where the contract is silent (the contract still decides the type).
+        if (!have.label && want.label) have.label = want.label;
+        if (!dvHasPlaces(have) && dvHasPlaces(want)) have.precision = want.precision;
+        if (!have.options && want.options) have.options = want.options;
+      }
     });
   }));
   return out;
@@ -2087,10 +2097,17 @@ async function dvReadColumnDetails(conn, logical) {
     const n = String(a.LogicalName || '').toLowerCase();
     if (n) cols[n] = { type: String(a.AttributeType || ''), custom: a.IsCustomAttribute === true, helper: !!a.AttributeOf };
   });
-  const extra = [['StringAttributeMetadata', 'MaxLength', 'maxLen'], ['MemoAttributeMetadata', 'MaxLength', 'maxLen'], ['DateTimeAttributeMetadata', 'Format', 'format']];
+  // Each row: metadata type, the property read, where it lands. A currency column that follows the currency (PrecisionSource not 0) has no places of its own to judge.
+  const extra = [['StringAttributeMetadata', 'MaxLength', 'maxLen'], ['MemoAttributeMetadata', 'MaxLength', 'maxLen'], ['DateTimeAttributeMetadata', 'Format', 'format'], ['DecimalAttributeMetadata', 'Precision', 'precision'], ['MoneyAttributeMetadata', 'Precision,PrecisionSource', 'precision']];
   for (let i = 0; i < extra.length; i++) {
     const r = await dvFetchJson(conn, base + '/Microsoft.Dynamics.CRM.' + extra[i][0] + '?$select=LogicalName,' + extra[i][1]);
-    if (r.ok) (r.json.value || []).forEach(a => { const n = String(a.LogicalName || '').toLowerCase(); if (cols[n]) cols[n][extra[i][2]] = a[extra[i][1]]; });
+    if (r.ok) (r.json.value || []).forEach(a => {
+      const n = String(a.LogicalName || '').toLowerCase();
+      if (!cols[n]) return;
+      const prop = extra[i][1].split(',')[0];
+      if (extra[i][0] === 'MoneyAttributeMetadata') { if (a.PrecisionSource === 0) cols[n].precision = a.Precision; else cols[n].followsCurrency = true; }
+      else cols[n][extra[i][2]] = a[prop];
+    });
   }
   return { ok: true, cols, err: '' };
 }
@@ -2130,13 +2147,20 @@ function dvBuildPlan(wants, found, details, manifestApps) {
       }
       if (!spec || !BUILD_TYPES[spec.type]) return;
       const b = BUILD_TYPES[spec.type];
-      if (have.type !== b.attr || (b.format && have.format && have.format !== b.format && spec.source === 'contract')) {
+      // Date only versus Date and time is judged for every typed source (an app's type counts as much as the contract's).
+      if (have.type !== b.attr || (b.format && have.format && have.format !== b.format)) {
         items.push({ kind: 'type', t: w.t, as: f.name, col: c, spec, text: 'is ' + have.type + (have.format ? ' ' + have.format : '') + ', should be ' + dvTypeWord(spec) + ' (' + spec.source + ')' });
         return;
       }
       const wantLen = spec.len || b.len;
       if ((spec.type === 'text' || spec.type === 'memo' || spec.type === 'guid') && spec.len && have.maxLen && have.maxLen < wantLen) {
         items.push({ kind: 'short', t: w.t, as: f.name, col: c, spec, have: have.maxLen, text: 'holds ' + have.maxLen + ', needs ' + wantLen });
+      }
+      // Too few decimal places rounds every saved value; more than needed is harmless.
+      if (dvHasPlaces(spec)) {
+        if (have.followsCurrency) items.push({ kind: 'unread', t: w.t, col: c, text: 'follows the currency\'s decimals, so its places cannot be read; the app needs ' + spec.precision + ' (set the column to ' + spec.precision + ' decimal places)' });
+        else if (typeof have.precision !== 'number' && have.type === 'Decimal') items.push({ kind: 'unread', t: w.t, col: c, text: 'decimal places could not be read; the app needs ' + spec.precision });
+        else if (typeof have.precision === 'number' && have.precision < spec.precision) items.push({ kind: 'precision', t: w.t, as: f.name, col: c, spec, have: have.precision, text: 'keeps ' + have.precision + ' decimal places, needs ' + spec.precision + ' (' + spec.source + ')' });
       }
     });
     // Unused: only judged when every app that uses the table has saved its list, or a name would be missed.
@@ -2151,7 +2175,7 @@ function dvBuildPlan(wants, found, details, manifestApps) {
   });
   return items;
 }
-const BUILD_KIND_WORDS = { table: 'Table to make', column: 'Column to add', short: 'Text too short', type: 'Wrong type', conflict: 'Type conflict', unused: 'Not used', unread: 'Could not read' };
+const BUILD_KIND_WORDS = { table: 'Table to make', column: 'Column to add', short: 'Text too short', precision: 'Too few decimal places', type: 'Wrong type', conflict: 'Type conflict', unused: 'Not used', unread: 'Could not read' };
 
 // ---------------------------------------------------------------------------
 // Part 2: prompts and steps for Gerald. The monitor never creates or changes
@@ -2169,6 +2193,7 @@ function dvColPhrase(col, spec) {
   const t = s.type;
   let how = (BUILD_TYPES[t] ? BUILD_TYPES[t].word : 'Single line of text').toLowerCase();
   if (t === 'text' || t === 'guid' || t === 'memo') how += ', max ' + (s.len || (BUILD_TYPES[t] || BUILD_TYPES.text).len) + ' characters';
+  if (dvHasPlaces(s)) how += ', ' + s.precision + ' decimal places';
   if (t === 'int' && (s.min != null || s.max != null)) how += ', ' + (s.min != null ? s.min : '') + ' to ' + (s.max != null ? s.max : '');
   if (t === 'yesno' && s['default'] != null) how += ', default ' + (s['default'] ? 'yes' : 'no');
   if (t === 'choice' && s.options && s.options.length) how += ': ' + s.options.join(' / ');
@@ -2191,6 +2216,13 @@ function dvTablePrompt(item) {
     if ((head + body + piece + '.' + tail).length <= 2000) { body += piece; inPrompt.push(c.col); } else byHand.push(c);
   });
   return { text: head + body + (body ? '.' : '') + tail, inPrompt, byHand, guessed };
+}
+// Steps to widen a column that exists (Dataverse lets text length and decimal places grow, never shrink).
+function dvChangeSteps(table, col, spec, kind) {
+  const name = (spec && spec.label) || dvPrettyCol(col);
+  if (kind === 'short') return 'Tables - ' + table + ' - Columns - ' + name + ' (' + col + ') - Edit: set Maximum character count to ' + ((spec && spec.len) || '') + '.';
+  if (kind === 'precision') return 'Tables - ' + table + ' - Columns - ' + name + ' (' + col + ') - Edit: set Precision to ' + (spec ? spec.precision : '') + ' decimal places.';
+  return '';
 }
 // Steps to add one column by hand (Copilot cannot edit an existing table well).
 function dvColumnSteps(table, col, spec) {
@@ -3537,6 +3569,7 @@ export default function DataverseOrganizerApp(props) {
                       <span style={{ color: textSub }}>{' ' + b.text}</span>
                       {b.kind === 'column' && i === buildItems.filter(x => x.t === t).findIndex(x => x.kind === 'column') && (b.appPrompts || []).map((ap, k) => <div key={'ap' + k} style={{ margin: '2px 0 6px' }}><button type="button" onClick={() => copyText(ap.text, 'the prompt')} style={{ ...btn(true, '#059669'), padding: '3px 10px', fontSize: '12px' }}>{'Copy ' + ap.app + "'s prompt for this table (" + ap.text.length + ' chars)'}</button></div>)}
                       {b.kind === 'column' && <span>{' '}<button type="button" onClick={() => copyText(dvColumnSteps(b.as || b.t, b.col, b.spec), 'the steps')} style={{ ...btn(false), padding: '3px 10px', fontSize: '12px' }}>Copy steps</button></span>}
+                      {(b.kind === 'short' || b.kind === 'precision') && <span>{' '}<button type="button" onClick={() => copyText(dvChangeSteps(b.as || b.t, b.col, b.spec, b.kind), 'the steps')} style={{ ...btn(false), padding: '3px 10px', fontSize: '12px' }}>Copy steps</button></span>}
                       {b.kind === 'table' && <span>{' '}<button type="button" onClick={() => setBuildOpen(buildOpen === b.t ? '' : b.t)} style={{ ...btn(false), padding: '3px 10px', fontSize: '12px' }}>{buildOpen === b.t ? 'Hide prompt' : 'Show prompt'}</button></span>}
                       {b.kind === 'table' && buildOpen === b.t && (() => {
                         const pr = dvTablePrompt(b);
