@@ -1,6 +1,6 @@
 # Clean Plan reader guide (craa5_cleanplan)
 
-Written by the Production Scheduler ("hub - production schedule" v4.6). No other app writes this table. Ganttly, Shift Start, the MSS Calendar, PBED and the Manager hub only read it. This guide wins over section 6.5 of the data contract on any detail.
+Written by the Production Scheduler ("hub - production schedule" v4.7). No other app writes this table. Ganttly, Shift Start, the MSS Calendar, PBED and the Manager hub only read it. This guide wins over section 6.5 of the data contract on any detail.
 
 All date-times are UTC. Read only active rows (`statecode eq 0`). The line key in `craa5_linekey` is the Scheduler's `canonLine(area, line)`, which is the same as `hubLineKey`: lowercase letters and digits only, for example `ibl4`, `highspeed1`.
 
@@ -15,6 +15,7 @@ All date-times are UTC. Read only active rows (`statecode eq 0`). The line key i
 | `scope` | `s|<line>|<kind>|<part>` | clean kind of a line (split in parts) | both `2000-01-01T00:00:00Z` (outside every week) |
 | `config` | `config` | (one row) | `2000-01-01T00:00:00Z` |
 | `configpart` | `c|1` ... `c|n` | part of the shared settings when they are too long for one row | `2000-01-01T00:00:00Z` |
+| `staff` | `f|YYYY-MM-DD|<crew>` (crew letter A-D; `day` or `night` when the shift has no crew letter; `|HH` added when a crew has two shifts starting that day) | sanitation shift, by the day it starts | the shift starts / ends |
 
 **When a week is safe to read.** Every week has a `k|Monday` row. Use the week's windows, days and alerts only when that row's `craa5_status` is `done`. While it says `writing`, a publish is still in progress. If no week row exists, the week has not been published yet, so fall back to your own rule and say so on screen.
 
@@ -101,7 +102,21 @@ v4.6 adds a pinned clean start as an optional last field in plant time: `pin|<wh
 
 These have not changed from v4.0. Day rows: `craa5_cleankind` is `due`, `stretch`, `covered`, `none` or `unplanned`, and `craa5_status` is `ran`, `idle` or `unplanned`. Their details are `{v, prod, len, kind, weekOn, planned, job, lines, areaId}`. The config row holds the shared cleaning settings, which now include the skip words per area (`skipMidweek`, `skipDaily`). When the settings are longer than 1,900 characters, the config row's details are only `{v: 2, tz, at, parts, hash}`, and the settings JSON is split across the `configpart` rows `c|1` to `c|<parts>` (raw text, joined in order). Only the Scheduler reads these rows; other apps can skip both.
 
-## 7. Clean rules this plan follows (v4.6, rules stamp `...|mw72last|scope1|dskip1|link1|pin1|night1`)
+## 6a. Staff rows (the crew plan, v4.7)
+
+One row per sanitation shift, written with the week it starts in (read it only when that week's `k|Monday` row says `done`, like the windows). The shifts come from Work Shifts (`craa5_workshift`, read with the MSS MANPOWER rules), and the people on a crew are the active sanitation employees whose Shift is that crew letter. When no shift hours are known, no staff rows are written.
+
+- `craa5_day`: the shift date (the day it starts). `craa5_minutes`: all the person-minutes of the shift (line cleans + tasks + MSS pieces + whole-shift tasks).
+- `craa5_status`: `ok` (enough people), `short` (needs more than the crew has) or `nocrew` (crew size not known).
+- `craa5_details`: `{v: 1, rules, crew, shift: day|night, start: "HH:MM", hours, share, need, clean, fixed, onCrew, used, work: {line, tasks, mss, fixed}, atOnce, peak: {hour, heads}, over: [[fromHour, toHour, extraHeads]], mss: {jobs, overdue}, cleans, tasks: [[name, heads, minutes or null]], vac}`.
+  - `need` = heads the shift needs = `clean` + `fixed`. `clean` = the work (line + tasks with minutes + MSS) / (shift minutes x `share`), or the most people the overlapping line cleans need at once (`atOnce`), whichever is more, rounded up. `fixed` = people on whole-shift tasks.
+  - `used` = % of the crew's hours the work fills (null without a crew size). `over` = the hours where more people are needed than the crew has (the bottlenecks). `vac` = the vacation cover the crew plan adds per crew (a reader sizing a crew uses its busiest shift `need` + `vac`).
+- MSS pieces in `work.mss`: pieces due by frequency (data contract section 7, `hubFreqDone`), outside every line's clean scope for Daily and weekly pieces, plus every monthly, quarterly, 6-month and annual piece. A long-period piece is given one week of its period, spread evenly among the weeks still to come. Overdue pieces (last period missed too) go into this week first unless the shared setting Ignore overdue is on.
+- **MSS Log Input:** read these rows for its manpower panel instead of working the heads out again, so both screens show the same number.
+
+Settings and tasks: Hub config key `PRODSCHED_CREWPLAN` holds `{v: 1, share, vacation, ignoreOverdue, tasks?, at}` (`tasks` only while the Shift task table does not exist). The tasks live in the new table `craa5__e_shifttask` once Gerald makes it (prompt in section 9).
+
+## 7. Clean rules this plan follows (v4.7, rules stamp `...|mw72last|scope1|dskip1|link1|pin1|night1|staff1`)
 
 - **IBL4:** at most 72 run hours. The midweek clean goes in the last stop before the 72 h mark that is long enough. If none is long enough, it goes in the longest stop before the mark. If there is no stop before the mark, the first stop after it gets the clean, and an `over72` alert is written. The midweek clean covers everything except caseout, dry clean and freezer pieces (skip words, editable in Cleaning Times).
 - **IBL5 and waterjet:** a Daily clean every night. It covers every PIC item but leaves out the floors, the shadow boards and anything on caseout (Gerald, 23 Oct). These are the default Daily skip words, editable per line in Cleaning Times; left-out pieces carry the word in `leftOutBy`.
@@ -118,3 +133,11 @@ Paste this into the Dataverse Copilot table editor on the Production Schedule ta
 > Add one column to the Production Schedule table: "Clean Override", Single line of text, maximum length 200, not required, schema name craa5_cleanoverride. It holds the scheduling department's approved change to the clean after a run, as text like "skip|Name|reason" or "midweek|Name|reason". Do not make it a lookup or a choice column.
 
 After adding it, open the Production Scheduler, go to Data Check, click Refresh Dataverse & Test All Columns, and check that "Clean Override" shows as found. The same Data Check > Columns list shows any Clean Plan column that is still missing.
+
+## 9. Copilot prompt for the Shift task table (Phase 3)
+
+Paste this into the Dataverse Copilot table generator (under 2,000 characters):
+
+> Create a table named "Shift task" with schema prefix craa5__e_, Organization ownership. Primary column "Name" (single line of text, 100). Columns: "Task key" craa5_taskkey (single line of text, 100, the shift and task name, for example night|trash); "Shift" craa5_shift (single line of text, 10: day, night or both); "Days" craa5_days (single line of text, 7, one digit per day Sunday to Saturday, 1 = on, for example 0111110); "Heads" craa5_heads (whole number); "Minutes" craa5_minutes (whole number, minutes per shift, blank = the whole shift); "Area" craa5_area (single line of text, 100, the MSS area name if it has one); "Active" craa5_active (yes/no, default yes); "Sort order" craa5_sortorder (whole number). No lookup or choice columns.
+
+Until it exists, the Crew plan keeps the tasks in Hub config `PRODSCHED_CREWPLAN`. Once it is made, open the Crew plan tab, unlock the page, press Edit tasks and then Save tasks once: the tasks are written as rows of the new table.
