@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.45, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.46, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -418,13 +418,14 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 - **Q5.** Answered 2026-10-21: labor rate by role, not per person (pay stays private and rates forecast better).
 - **Q6.** Partly answered 2026-10-21: one Spanish-speaking lead looked and said it is okay. More checks welcome.
 - **Q7.** Answered 2026-10-21: keep obstacles, handovers and personnel notes; they move to tables (section 11).
-- **Q8.** Answered in part 2026-10-21: `craa5_allergenclean` says an allergen clean was done. Egg and pecan are split into separate cleans with different times (kinds `egg`, `pecan`; Equipment columns in part 7). Still open: the column's type (Yes/No or text). The log block keeps sending `Yes` and drops it if refused.
-- **Q9.** Is the hourly rate in `_e_ Labor rate` the plain wage or a loaded rate (with benefits and taxes)? Apps use it as entered and say which on screen; if you want loaded cost, enter loaded rates.
+- **Q8.** Answered in part 2026-10-21: `craa5_allergenclean` says an allergen clean was done. Egg and pecan are split into separate cleans with different times (kinds `egg`, `pecan`; Equipment columns in part 7). Type closed by default 2026-10-23 (Gerald's passive mode): the log block sends `Yes` and drops the column if Dataverse refuses it; readers count `Yes`, `true` or `1` as done.
+- **Q9.** Closed by default 2026-10-23: plain wage. The rates Gerald entered ($19 / $21 / $24 / $20) are hourly pay, so cost screens say "wage cost" (Spanish "costo de salario"). If he later enters loaded rates, the label changes to "loaded labor cost"; nothing else does.
 
 ---
 
 ## 15. Change log
 
+- **1.0.46 (2026-10-23)** Gerald moved to passive mode (follow the plan, use sensible defaults, say which). Q9 closed as plain wage (the rates entered are hourly pay; screens say "wage cost"). Q8 closed: send `Yes`, readers accept Yes / true / 1.
 - **1.0.45 (2026-10-23)** `_e_ Labor rate` is live (Gerald's export, 5 pay roles: sanitation tech 1-3, Adm, Int; no Sanitor or All row). Labor cost uses the employee's pay role `craa5_roleid`, falling back to `sanitation tech 2`, then Sanitor, then All. Projected and planned cost use `sanitation tech 2`. Same as PBED v1.7 (PR #31).
 - **1.0.44 (2026-10-23)** Spanish rule: "móvil" is banned only for a phone (use celular); the adjective stays (Promedio móvil, Zona 4 / Móvil). `craa5_shiftlog` writers stay Shift Start and MSS Log Input: Ganttly's archive log row goes away with its fallback archive.
 - **1.0.43 (2026-10-23)** Shift Start is the only writer of `craa5_shiftarchive` and its shift log row; Ganttly drops its 4-hour fallback archive (Shift Start has a close-out button and archives overdue boards itself). Ganttly's Employee `craa5_remarks` and Shift board `craa5_updatesjson` writes stay as column owners.
