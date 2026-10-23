@@ -1,5 +1,7 @@
 # Tables and columns for data contract 1.0
 
+**From 1.0.60 the Dataverse monitor builds these prompts for you** (Gerald's ruling: apps never build tables; the monitor is the one table builder). This file stays as the reference until the monitor shows the same steps.
+
 **You do not create the data contract itself.** `data-contract.md` is the rulebook the apps follow; it is not a table. This file is the only part you build in Dataverse.
 
 These are the Dataverse changes from `data-contract.md` section 13 that this thread owns. Most are a few columns added to tables you already have. There is one small new table. No lookups. Every column is optional, so nothing breaks while they are missing. Apps check for each column and use it once it is there.

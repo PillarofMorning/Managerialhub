@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.59, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.60, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -24,6 +24,8 @@ Changes go through this thread. An app thread that needs a new key, column, stat
 7. **Plant time.** Every day, shift and week is read on the America/Chicago clock (section 5). Never use the UTC day.
 8. **Every word in English and Spanish (es-MX)**, with the shared words in section 9. Apps stay 7-bit ASCII (GEMINI.md), so Spanish accents are written as % codes. One exception: the Dataverse monitor, an admin tool, is English only (Gerald, 2026-10-22).
 9. **No pop-ups.** Power Apps pages silently block `window.confirm`, `alert` and `prompt`, so a button that relies on one does nothing. Ask for confirmation on the page itself (for example a second "Yes, do it" button) and show messages on the page.
+10. **Apps never build tables** (Gerald, 2026-10-23). No app creates or changes a Dataverse table, column, key or choice, and no app carries a table-creation prompt, setup wizard or "create this table" screen. An app reads and writes **rows** only. It declares what it needs in its manifest (`manifest|<appId>` in Hub config, section 12.1; with HUB SHARED v1.2 also each column's type in `cols`, and for a table still to make `new`, `label`, `owner` and `primary`). `contract.json` `colTypes` decides each type; a manifest type that disagrees shows as a conflict and nothing is built. The **Dataverse monitor** is the one table builder: from the manifests and `contract.json` it writes the Copilot prompts, the columns to add or remove, and the type fixes for Gerald. An app that finds a table or column missing says so on the page ("not made yet, see the Dataverse monitor") and keeps working without it.
+11. **Headcount planning lives only in the Sanitation director** (Gerald, 2026-10-23). How many people a shift or crew needs, crew sizing, vacation cover and crew-builder what-ifs are worked out only in the director app. Other apps remove their own headcount or team builders and, where they show the number, read the director's. The daily board (who is here today, which team cleans what) stays in Shift Start and Ganttly: that is assignment, not headcount planning. Migration: section 12.3.
 
 ---
 
@@ -116,7 +118,7 @@ Time loss log keeps the column names it was created with: `craa5_assetguid` hold
 | `craa5__e_hubconfig` Hub config (shared settings and app manifests) | proposed (Gerald making it 2026-10-22) | Each app writes only its own `craa5_configkey` rows | The same app; keys in section 12 | Organization-owned. Replaces `craa5__0_hubconfig` (User-owned, Config json only 100 characters), which apps read second until the new one exists. |
 | `craa5__sani_schedule_` | live | MSS Calendar | MSS Calendar |
 | `craa5_mss_useraccesslog`, `craa5_useraccesslog` | **missing** (not in Dataverse; logging is optional) | MSS apps, Shift Start | Dataverse monitor |
-| `craa5__t_skill` (one row per skill; key `craa5_skillkey` = exact area name or `SYS-xxx`), `craa5__t_skilllevel` (one row per person per skill; key `craa5_levelkey` = `employeeguid|skillkey`, row id `hubIdFromKey`; level 0-3), `craa5__t_trainingevent` (append-only history) | **proposed** (Training matrix thread) | Training page only | Manager hub, Ganttly People, Shift Start Assign |
+| `craa5__t_skill` (one row per skill; key `craa5_skillkey` = exact area name or `SYS-xxx`), `craa5__t_skilllevel` (one row per person per skill; key `craa5_levelkey` = `employeeguid|skillkey`, row id `hubIdFromKey`; level 0-3), `craa5__t_trainingevent` (append-only history) | **to make: the Dataverse monitor builds it** from `manifest|training` (ground rule 10) | Training page only | Manager hub, Ganttly People, Shift Start Assign |
 | `craa5__0_*` (asset, employee, mssarea, prodweek, saporder, shiftarchive, shiftboard, shiftlog, shiftplan) | **abandoned** | nobody | nobody (`craa5__0_hubconfig` is the one exception and stays) |
 | `craa5_sanitationshiftreport` | legacy (exists, 0 rows) | nobody new | Ganttly (old read) |
 | `craa5_mss_shift_capacity`, `craa5_mss_quality_verifications`, `craa5_mss_downtime_events`, `craa5_mss_cost_model`, `craa5_mss_capex_lifecycle`, `craa5_pathogen_bolo_sample`, `craa5_pathogen_bolo_harborage`, `craa5_quickload_assets` | **absent** (not in Dataverse, 2026-10-21) | nobody | Remove the code that reads them |
@@ -269,7 +271,7 @@ Every app computes these the same way, from the same table, with the `hub-shared
 | **Unused wage** | Scheduled wage (on-the-clock hours x each person's rate) minus logged wage (Labor cost) minus fixed-post wage. Rates as in Labor cost | MSS log, labor rate, staff rows | Sanitation director |
 | **Projected hours (year out)** | Labeled "projected", never mixed with actuals. Wherever the Scheduler has published staff rows, those win | Clean plan staff rows, Work Shifts | Sanitation director |
 | **Labor cost** | Labor minutes / 60 x the hourly rate for the person's pay role on the shift date. Pay role = the employee's `craa5_roleid`, matched to `_e_ Labor rate` `craa5_role` trimmed and in any case. Rate = newest row with Effective from on or before the shift date (undated rows not used). A person with no pay role, or a role with no row, uses `sanitation tech 2`, then `Sanitor`, then `All` (Gerald, 2026-10-23: "when in doubt assume tech 2"). An MSS log row's minutes are shared equally among its `craa5_employeeguids`, each at their own rate. With no row at all, cost shows "no rate set". | MSS log + labor rate | `hubLaborCost` |
-| **Heads needed per shift** | People a sanitation shift needs = clean heads + fixed heads. Clean heads = the shift's work (line cleans + shift tasks with minutes + MSS pieces due by frequency) / (shift minutes x share), or the most people overlapping line cleans need at once, whichever is more, rounded up. Fixed heads = people on whole-shift tasks. Crew size to cover = busiest shift + vacation cover. Only the Production Scheduler works it out (clean plan `staff` rows, reader guide section 6a); every other screen (MSS Log Input manpower panel, Shift Start, Manager hub) reads those rows and shows "no crew plan yet" without them. | Clean plan, Work Shifts, Employees, Shift task, MSS log | Scheduler only |
+| **Heads needed per shift** | People a sanitation shift needs = clean heads + fixed heads. Clean heads = the shift's work (line cleans + shift tasks with minutes + MSS pieces due by frequency) / (shift minutes x share), or the most people overlapping line cleans need at once, whichever is more, rounded up. Fixed heads = people on whole-shift tasks. Crew size to cover = busiest shift + vacation cover. Worked out only by the **Sanitation director** (ground rule 11, from 1.0.60). Until the director has it, the Production Scheduler's clean plan `staff` rows stand in (reader guide section 6a); every other screen reads the director's number, or those rows meanwhile, and shows "no crew plan yet" without either. | Clean plan, Work Shifts, Employees, Shift task, MSS log | Sanitation director (Scheduler staff rows until migrated) |
 | **Projected clean cost** | Planned, not actual: labor + chemical for a line's clean from the standards. Labor = standard labor minutes (`craa5_hoursrequired` and its kind columns) / 60 x the `_e_ Labor rate` row (role `sanitation tech 2`, else `Sanitor`, else `All`, and the screen names the role used; newest Effective from on or before the plant day; undated rows not used; no default, "no rate set"). Chemical = gallons per clean (`_c_ Chemical standard`, newest Valid from on or before the plant day) x price per gallon (price per container / gallons per container). Always labeled "projected", never added to actual cost. | Equipment, labor rate, chemical standard, chemical | |
 | **Due by frequency** | A piece is done for a frequency (D, MW, W, M, Q, S, A) when a finished clean of equal or higher rank falls in **the same period as today**: plant day, Monday week (MW and W), calendar month, quarter, half year (S, flag `craa5_month`), year. Otherwise it is due. Ranks: daily / allergen / egg / pecan / changeover / corrective 1, midweek 2, eow 3, monthly 4, quarterly 5, semiannual 6, annual 7. Old log rows with no clean kind rank by their flags (`hubLogRank`: monthly 7, weekly 3, daily 2, no flags 9 = counts for everything). Which periods owe a job is the reader's call, the same way as the MSS Calendar: Daily only on days the line ran or the Clean Plan marks due, a Saturday + Sunday stretch is one job done by a clean on either day, and a week the Clean Plan marks idle owes no MW / W job (neither done nor missed). A monthly or longer piece is planned in one week of its period (a week belongs to the period its Monday is in). **Overdue** (by frequency) = the period before was missed too; with no readable MSS log nothing is overdue. | MSS log + Equipment flags + Clean Plan | `hubLogRank`, `hubPeriodKey`, `hubFreqDone` |
 | **Weekly cost recap** | Labor cost summed by week key, line key and clean kind | MSS log | `hubWeekKey` |
@@ -375,7 +377,7 @@ Each app says in its own code which tables and columns it uses, and saves that l
 
 - **Where:** Hub config (`craa5__e_hubconfig`, else the old `craa5__0_hubconfig`), `craa5_configkey` = `manifest|<appId>`, name "<App> manifest". JSON in the new table's `craa5_configjson`; on the old table in `craa5_manifestjson`. `hubSaveManifest` picks the first that reads.
 - **appIds:** `ganttly`, `shiftstart`, `prodsched`, `msscalendar`, `msslog`, `pbed`, `bolo`, `managerhub`, `chemicals`, `mapsubmit`, `monitor`, `training`, `director` (Sanitation objectives director).
-- **What the app writes:** `{ appId, app, version, tables: [{ t, names, read, write, opt }], config }`. `t` is the table's logical name, `names` the names the app tries in order (prefixed first), `read`/`write` the columns, `opt` the columns it works without (the monitor shows them as "not yet", not "missing"), `config` the hubconfig keys it writes. Logical names only, never data or people.
+- **What the app writes:** `{ appId, app, version, tables: [{ t, names, read, write, opt, cols?, label?, new?, owner?, primary? }], config }` (the build fields from HUB SHARED v1.2, ground rule 10). `t` is the table's logical name, `names` the names the app tries in order (prefixed first), `read`/`write` the columns, `opt` the columns it works without (the monitor shows them as "not yet", not "missing"), `config` the hubconfig keys it writes. Logical names only, never data or people.
 - **What gets stored:** `hubManifest()` adds `m: 1`, `contract` (the version of the pasted HUB SHARED block, e.g. 1.1, not this document's version), a `hash` and `savedAt`, and sorts every list.
 - **When:** call `hubSaveManifest(io, manifest)` once after the app loads. It reads the row (one small read), writes only when the hash changed, never blocks the app and never shows an error. `io` is the app's own query / create / update (Ganttly: `swQuery` + `swWriter`).
 - **Who reads it:** the Dataverse monitor. It reports "Ganttly 2.0.0 (saved <date>) needs X, missing Y", and builds the one-table Copilot prompts and click-steps for what is missing.
@@ -391,16 +393,29 @@ Each block is pasted unchanged into every app that uses it. Its owner changes it
 
 | Block | File | Owner | Pasted by |
 |---|---|---|---|
-| HUB SHARED v1.1 | [hub-shared.js](/mnt/project-files/ecosystem-contract/hub-shared.js) | this thread | every hub app |
+| HUB SHARED v1.2 | [hub-shared.js](/mnt/project-files/ecosystem-contract/hub-shared.js) | this thread | every hub app |
 | MSS MANPOWER v1.1 | (in MSS Log Input, PR #40) | MSS log input thread | MSS Log Input, Production Scheduler, Sanitation director (shift hours from Work Shifts) |
 | MSS LOG WRITE v1.4 | [mss-log-write.js](/mnt/project-files/mss-log-input/mss-log-write.js) | MSS log input thread | every MSS log writer: Ganttly, MSS Log Input, MSS Calendar (section 6.3) |
+| HUB SHARED v1.2 note | 1.2 keeps the manifest build fields (`cols`, `label`, `new`, `owner`, `primary`) for ground rule 10. Apps on 1.1 keep working; re-paste at the next version. | | |
 | ASSIGN SPLIT v1.0 | [assign-split.js](/mnt/project-files/ganttly-overhaul/assign-split.js), tests [assign-split.test.js](/mnt/project-files/ganttly-overhaul/test/assign-split.test.js) | Ganttly thread | Ganttly v1.5, Shift Start v0.0012+ (the even split for `_g_ Assignment`; rules in [shared-assignment.md](/mnt/project-files/ganttly-overhaul/shared-assignment.md)) |
+
+
+### 12.3 Migration for ground rules 10 and 11 (1.0.60)
+
+Each thread does this in its next version. Nothing is deleted from Dataverse; only app code changes.
+
+- **Table building (rule 10).** Remove every create-table or add-column prompt, setup wizard, "make this table" screen and any code that calls the Dataverse metadata API to create or change a table, column, key or choice. Keep the read-only checks ("is this column there?") and show missing ones as "not made yet". Move the column types into the app's manifest (`tables[].cols`, plus `new`, `label`, `owner` and `primary` for a table still to make) so the monitor can build it. Prompts already in `table-prompts.md` and other threads' prompt files stay valid until the monitor shows the same.
+- **Headcount (rule 11).** The Sanitation director takes over crew sizing, heads needed per shift, vacation cover and crew-builder what-ifs, and writes the shift tasks (`_e_ Shift task`) once it is made.
+  - **Production Scheduler:** keep publishing the clean plan (windows, scope, day and week rows: the work). Keep writing `staff` rows only until the director shows heads needed per shift; then stop and remove the Crew plan tab. `PRODSCHED_CREWPLAN` settings move to `director_settings`.
+  - **MSS Log Input:** remove the manpower plan and its setup (`MSS_LOG_MANPOWER_SETUP`); its fixed posts become `_e_ Shift task` rows through the director. The MSS MANPOWER block stays only for shift hours if other code needs them.
+  - **Manager hub, PBED, Shift Start, Ganttly, Training:** remove any headcount or crew-size planner; show the director's number where a screen needs it. PBED keeps the weekend clean plan's people per job (that is assignment).
+- **Hub config.** Apps keep writing only their own settings keys and `manifest|<appId>`.
 
 ---
 
 ## 13. New tables and columns in this version
 
-Prompts and click-steps: `table-prompts.md`.
+The Dataverse monitor builds the prompts and click-steps (ground rule 10), from `contract.json` (`colTypes` per table, `new` / `label` / `primary` for tables to make) and the apps' manifests. `table-prompts.md` stays as the reference until the monitor's builder covers it.
 
 | What | Why | Who creates it |
 |---|---|---|
@@ -445,6 +460,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.60 (2026-10-23)** Gerald's ruling: ground rule 10 (apps never build tables; the Dataverse monitor is the only table builder, from manifests and `contract.json`) and ground rule 11 (headcount planning only in the Sanitation director). Migration in 12.3. HUB SHARED v1.2: manifests keep `cols` ({column: {type, len, label, options, min, max, precision, default}}; types text, memo, int, decimal, money, yesno, date, datetime, choice, guid), `label`, `new`, `owner`, `primary` (the monitor thread's shape; 121 checks). `contract.json` gains `buildRule`, `columnTypes`, per-table `colTypes` (the contract decides types), `new` tables, and config key `MONITOR_BUILD_LOG`. Heads needed per shift moves to the director (Scheduler staff rows until then); `MSS_LOG_MANPOWER_SETUP` and `PRODSCHED_CREWPLAN` retiring.
 - **1.0.59 (2026-10-23)** `craa5__aa_role` (pay roles) is live, read by PBED, Ganttly, Manager hub and the director to name `craa5_roleid` when only the id comes back. The hub role choice is never a pay role. Security roles list updated.
 - **1.0.58 (2026-10-23)** BOLO v2.5 (PR #37): early v2.4 map pins keep an older id and are updated in place; readers find BOLO pins by the description prefix only.
 - **1.0.57 (2026-10-23)** Sanitation director page on draft PR #44: reads Employees, Work Shifts, clean plan (published weeks only), Equipment, MSS log, shift board and archive, labor rate, `PRODSCHED_CREWPLAN`; writes only `director_settings` and `manifest|director`; pastes HUB SHARED v1.1 and MSS MANPOWER v1.1.

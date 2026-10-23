@@ -1,10 +1,10 @@
-/* ============================== START HUB SHARED v1.1 ============================== */
+/* ============================== START HUB SHARED v1.2 ============================== */
 // The ecosystem data contract in code (ecosystem/data-contract.md). Paste this whole block into every hub app, unchanged,
 // and use these helpers instead of local copies, so every app builds the same keys, dates and numbers.
 // Plain ES5 and 7-bit ASCII on purpose: it runs in every Power Apps page and passes the GEMINI.md ASCII check.
 // Change it only through the contract (bump HUB_CONTRACT_VERSION and say what changed in the contract's change log).
 
-var HUB_CONTRACT_VERSION = '1.1';
+var HUB_CONTRACT_VERSION = '1.2';
 var HUB_TZ = 'America/Chicago';              // the plant's clock: every plant day and shift date is read on it
 
 // ---------- keys ----------
@@ -227,11 +227,39 @@ function hubNameList(a, keepCase) {
     return out;
 }
 // The manifest as stored: fixed key order, sorted lists, so the same app build always gives the same text and hash.
+// What an app needs built, declared in its manifest (ground rule 10: apps never create or change tables; the
+// Dataverse monitor builds them). Per table, all optional: cols { column: { type, len, label, options, min, max,
+// precision, default } }, label (display name), new (true = a table still to make), owner ('org' or 'user'),
+// primary { n, len, label }. type = text|memo|int|decimal|money|yesno|date|datetime|choice|guid (guid = text 100,
+// never a lookup). contract.json colTypes decides; a manifest type that disagrees is shown as a conflict.
+var HUB_COL_TYPES = ['text', 'memo', 'int', 'decimal', 'money', 'yesno', 'date', 'datetime', 'choice', 'guid'];
+function hubNum(v) { var n = Number(v); return v === '' || v === null || v === undefined || isNaN(n) ? undefined : n; }
+function hubColSpec(c) {
+    c = typeof c === 'string' ? { type: c } : (c || {});
+    var type = String(c.type || '').trim().toLowerCase();
+    if (HUB_COL_TYPES.indexOf(type) < 0) return null;
+    var o = { type: type }, k;
+    var nums = { len: hubNum(c.len), min: hubNum(c.min), max: hubNum(c.max), precision: hubNum(c.precision) };
+    for (k in nums) if (nums[k] !== undefined) o[k] = nums[k];
+    if (c.label) o.label = String(c.label).trim();
+    if (c.options && c.options.length) o.options = c.options.map(function (x) { return String(x).trim(); }).filter(function (x) { return !!x; });
+    if (c['default'] !== undefined && c['default'] !== null && c['default'] !== '') o['default'] = typeof c['default'] === 'boolean' || typeof c['default'] === 'number' ? c['default'] : String(c['default']);
+    return o;
+}
 function hubManifest(m, nowIso) {
     m = m || {};
     var tables = (m.tables || []).map(function (t) {
         var name = String(t.t || '').trim().toLowerCase();
-        return { t: name, names: hubNameList(t.names && t.names.length ? t.names : [name]), read: hubNameList(t.read).sort(), write: hubNameList(t.write).sort(), opt: hubNameList(t.opt).sort() };
+        var out = { t: name, names: hubNameList(t.names && t.names.length ? t.names : [name]), read: hubNameList(t.read).sort(), write: hubNameList(t.write).sort(), opt: hubNameList(t.opt).sort() };
+        var cols = {}, n = 0;
+        Object.keys(t.cols || {}).sort().forEach(function (c) { var k = String(c).trim().toLowerCase(), v = hubColSpec(t.cols[c]); if (k && v) { cols[k] = v; n++; } });
+        if (n) out.cols = cols;
+        if (t.label) out.label = String(t.label).trim();
+        if (t['new'] === true) out['new'] = true;
+        var ow = String(t.owner || '').trim().toLowerCase();
+        if (ow === 'org' || ow === 'user') out.owner = ow;
+        if (t.primary && t.primary.n) { out.primary = { n: String(t.primary.n).trim().toLowerCase() }; if (hubNum(t.primary.len) !== undefined) out.primary.len = hubNum(t.primary.len); if (t.primary.label) out.primary.label = String(t.primary.label).trim(); }
+        return out;
     }).filter(function (t) { return !!t.t; }).sort(function (a, b) { return a.t < b.t ? -1 : a.t > b.t ? 1 : 0; });
     var out = { m: 1, appId: hubCanon(m.appId), app: String(m.app || ''), version: String(m.version || ''), contract: HUB_CONTRACT_VERSION, tables: tables, config: hubNameList(m.config, true).sort() };   // hubconfig keys keep their case: they match exactly
     out.hash = hubIdFromKey(JSON.stringify(out)).slice(0, 8);
@@ -276,4 +304,4 @@ function hubSaveManifest(io, m) {
         }, fail);
     } catch (e) { return Promise.resolve('failed: ' + String(e && e.message || e)); }
 }
-/* ============================== END HUB SHARED v1.1 ============================== */
+/* ============================== END HUB SHARED v1.2 ============================== */
