@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.40, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.41, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -109,8 +109,8 @@ Time loss log keeps the column names it was created with: `craa5_assetguid` hold
 | `craa5__m_employeenote` Manager notes on people | live | Manager hub | Manager hub, manager role only. Sensitive: User-owned, never shown to peers, never in exports or the repo. Key `craa5_employeeguid`. |
 | `craa5__e_shifttask` Shift tasks (mandatory work with no clean minutes: trash, admin, chemical clerk, janitorial, steam pits) | **proposed, not approved** (Scheduler game plan, https://claude.ai/artifact/Cmr1VxEDcNhNZDxyxuFVg7) | Production Scheduler (Crew plan) | MSS Log Input, Shift Start, Ganttly, Manager hub | Organization-owned. Key `craa5_taskkey` (`night|trash`); `craa5_shift` day / night / both; `craa5_days` 7 digits Sun..Sat; `craa5_minutes` per shift, blank = whole shift. Replaces the fixed posts in `MSS_LOG_MANPOWER_SETUP` only if Gerald chooses one manpower engine. |
 | `craa5__g_assignment` Equipment to people, per shift | proposed (Gerald made it 2026-10-22; name to confirm) | **Shift Start** and **Ganttly**, both (pinned beats auto; higher `craa5_rev` wins between pinned saves) | Shift Start, Ganttly, Manager hub | Organization-owned. Key `<shift date>|<crew>|<equipment guid>|<kind>`, row id `hubIdFromKey('asg|' + key)`. Spec: `/mnt/project-files/ganttly-overhaul/shared-assignment.md`. |
-| `craa5__g_obstacle`, `craa5__g_handover` Floor obstacles and crew handovers | proposed | Ganttly | Ganttly | Organization-owned. Keys `craa5_obstaclekey` / `craa5_handoverkey`; area, equipment and shift date as in section 2. Prompts: `/mnt/project-files/ganttly-overhaul/g-tables-prompts.md`. |
-| `craa5__g_personnelnote` Floor notes on people (high fives, incidents, coaching) | proposed | Ganttly | Ganttly (writer's own notes), Manager hub (managers read all) | **Sensitive**: User-owned; floor users Create + User-level Read/Write, managers Organization Read. Never shown to peers, exported or in the repo. Separate from `craa5__m_employeenote`. Replaces the `craa5_remarks` JSON on the Employee row. Key `craa5_employeeguid`. |
+| `craa5__g_obstacle`, `craa5__g_handover` Floor obstacles and crew handovers | proposed; used by Ganttly 1.4 | Ganttly | Ganttly | Organization-owned. Keys `craa5_obstaclekey` / `craa5_handoverkey`; area, equipment and shift date as in section 2. Prompts: `/mnt/project-files/ganttly-overhaul/g-tables-prompts.md`. |
+| `craa5__g_personnelnote` Floor notes on people (high fives, incidents, coaching) | proposed; used by Ganttly 1.4 (incidents and coaching no longer go to Employee `craa5_remarks`) | Ganttly | Ganttly (writer's own notes), Manager hub (managers read all) | **Sensitive**: User-owned; floor users Create + User-level Read/Write, managers Organization Read. Never shown to peers, exported or in the repo. Separate from `craa5__m_employeenote`. Replaces the `craa5_remarks` JSON on the Employee row. Key `craa5_employeeguid`. |
 | `craa5__c_*` chemical tables (14 in contract.json, taken from the chemical hub's own spec file chemical-ordering/contract/c-tables.json, with full columns; 11 live, Chemical alias and Sanitation budget proposed, Chemical standard unknown) | live | Chemical hub | Chemical hub; Manager hub for cost. User/team-owned with Organization-level Read. The old chem log's employee, shift and equipment columns stay as text as written. |
 | `craa5_dailyproduction` | live | (import) | Chemical hub, cost per pound |
 | `craa5__e_hubconfig` Hub config (shared settings and app manifests) | proposed (Gerald making it 2026-10-22) | Each app writes only its own `craa5_configkey` rows | The same app; keys in section 12 | Organization-owned. Replaces `craa5__0_hubconfig` (User-owned, Config json only 100 characters), which apps read second until the new one exists. |
@@ -425,6 +425,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.41 (2026-10-23)** Ganttly 1.4 (PR #32) uses the three `_g_` tables, saves `manifest|ganttly`, and reads egg / pecan flags and minutes. The tables stay "proposed" until the monitor sees them in Dataverse.
 - **1.0.40 (2026-10-23)** BOLO v2.4 (Gerald's answers): any clean after a swab hit closes it; open hits only inside the alert window; `>` / TNTC readings are positive, EST is wording; count is a pass in APC and ATP rates only; new key `PATHOGEN_BOLO_RULES`.
 - **1.0.39 (2026-10-23)** Due by frequency: `hubLogRank` ranks old log rows by their flags; which days and weeks owe a job follows the MSS Calendar (due days, weekend stretch, idle weeks). 110 checks.
 - **1.0.38 (2026-10-23)** Section 7: Due by frequency, the MSS Calendar's period rule, now shared in `hub-shared.js` (`HUB_FREQS`, `hubKindRank`, `hubPeriodKey`, `hubFreqDone`; 105 checks) so the Scheduler and others reuse it instead of writing a second one.
