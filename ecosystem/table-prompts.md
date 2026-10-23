@@ -108,6 +108,8 @@ Primary column: Config name (text 200), schema craa5_configname.
 Columns: Config key (text 200, schema craa5_configkey), Config json (multiple lines of text, maximum 1048576 characters, schema craa5_configjson).
 ```
 
+**Still to do (monitor, 2026-10-23): the table exists but has no Config key column.** Open _e_ Hub config > **New** > **Column**: Display name `Config key`, schema name `craa5_configkey`, Single line of text, max 200. Until it exists, every app keeps using the old hubconfig.
+
 Then check before adding any rows:
 1. The three schema names are exactly `craa5_configname`, `craa5_configkey`, `craa5_configjson`.
 2. Config json > Advanced options > Maximum character count = **1048576**. If Copilot set less, delete that column (the new table has nothing depending on it yet) and add it again by hand with 1048576.
