@@ -2,7 +2,13 @@
  * [PERSISTENT MEMORY & APP REGISTRATION BLOCK]
  * APP NAME:        Shift Start & Roster Allocation Hub
  * PHASE ID:        P2.1 (Ref: _00 - list of apps - defined how to integrate - link to masterplan)
- * CURRENT VERSION: v0.0016 (2026-10-23: Step 2, the one hand-off to Ganttly is the shift board row (paste Ganttly v1.6.1 first). The five ganttly_*
+ * CURRENT VERSION: v0.0017 (2026-10-23: saves line up with Ganttly (paste Ganttly v1.6.2 first). A chip beside Save says whether the screen is the saved
+ *                  board (Saved 1:26 PM, save 7 / Not saved / Not saved yet / Saved on this device only / someone saved a newer board); opening another
+ *                  board or closing the page with unsaved changes asks first; the "Someone else saved this board" question compares save counts,
+ *                  not the row's modified time (Ganttly's check-offs moved it, so it came up when nobody had saved); another board no longer inherits
+ *                  the last one's equipment progress and clean picks; a production room with no one on it is flagged (Ganttly plans only rooms with
+ *                  people) and Update Teams shows how many pieces Ganttly finished in each room)
+ *                  v0.0016 (2026-10-23: Step 2, the one hand-off to Ganttly is the shift board row (paste Ganttly v1.6.1 first). The five ganttly_*
  *                  browser copies are no longer written or read and are removed on open; a clean type picked by hand lives only in the board and
  *                  lasts that shift; each attendance group on the board carries the contract's code (sick, pto, late, left_early))
  *                  v0.0015 (2026-10-23: a changeover clean now lists the Daily pieces and keys them as kind changeover, so it is logged
@@ -2406,6 +2412,7 @@ type ShiftBoard = {
     error?: string; claim?: { id: string; by: string; at: string } | null; log?: { at: string; by: string; what: string }[];
     updates?: BoardUpdates;
     recordId?: string; modifiedOn?: string;
+    unsynced?: boolean;   // set on the copy kept on this device when Dataverse refused the save; never written to the row
 };
 type TableState = 'unknown' | 'ok' | 'missing' | 'error';
 const TABLE_STATE: Record<string, TableState> = {};
@@ -2741,7 +2748,7 @@ function parseBoardRow(r: any, table: string = BOARD_TABLE): ShiftBoard | null {
 const fullSelect = (_table: string): string[] => [];
 // The fields every shift table shares, for a create or update
 function boardData(b: ShiftBoard, withUpdates: boolean): any {
-    const clean: any = { ...b }; delete clean.recordId; delete clean.modifiedOn; delete clean.updates;
+    const clean: any = { ...b }; delete clean.recordId; delete clean.modifiedOn; delete clean.updates; delete clean.unsynced;
     const bName = boardName(b);
     const d: any = {
         craa5_title: bName, craa5_boardjson: JSON.stringify(clean), craa5_status: b.status, craa5_crew: b.crew, craa5_team: b.team,
@@ -2859,6 +2866,58 @@ const readBoardByName = async (props: any, name: string): Promise<ShiftBoard | n
     return readLocalLiveBoards(true).find(b => boardName(b) === name) || null;
 };
 const boardModifiedOn = (props: any, id: string) => recordModifiedOn(props, BOARD_TABLE, id);
+// How many times Shift Start has saved a board row, and by whom. Ganttly writes craa5_updatesjson on the same row (every piece it starts or finishes),
+// which moves modifiedon, so modifiedon cannot tell another person's Shift Start save from a Ganttly check-off; the save count can.
+async function boardSaveInfo(props: any, id: string): Promise<{ count: number | null; by: string; at: string }> {
+    const none = { count: null as number | null, by: '', at: '' };
+    if (!id || String(id).indexOf('local_') === 0) return none;
+    try {
+        const rows = await tableQuery(props, BOARD_TABLE, `${BOARD_TABLE}id eq ${id}`, [BOARD_TABLE + 'id', 'craa5_savecount', 'craa5_lastsavedby', 'modifiedon'], 1);
+        const r = rows[0];
+        if (!r) return none;
+        const raw = getField(r, 'craa5_savecount'), n = Number(raw);
+        return { count: raw === undefined || raw === null || raw === '' || !isFinite(n) ? null : n, by: String(getField(r, 'craa5_lastsavedby') || ''), at: String(getField(r, 'modifiedon') || '') };
+    } catch (e) { return none; }
+}
+// One board save, named: the record, how many times it was saved and when. Two reads of the same save give the same key.
+const boardKeyOf = (b: ShiftBoard | null): string => b ? [b.recordId || '', b.saveCount || 0, b.savedAt || ''].join('|') : '';
+// What a Save sends, boiled down to the parts a person can change, as one text. Empty values are left out (a room that holds {} and a room
+// that is not in the map compare equal) and people in a room are sorted. The screen is compared with itself as it stood when the board was
+// loaded or last saved, so values a load fills in on its own never count as a change.
+function boardSig(st: any): string {
+    st = st || {};
+    const keep = (m: any, f: (v: any) => any) => {
+        const out: any = {};
+        Object.keys(m || {}).sort().forEach(k => { const v = f(m[k]); if (v !== undefined && v !== null && v !== '') out[k] = v; });
+        return out;
+    };
+    const names = (a: any) => (Array.isArray(a) && a.length ? a.map(String).sort() : undefined);
+    return JSON.stringify({
+        a: keep(st.areaAssignments, v => String(v || '') || undefined),
+        p: keep(st.assignments, names),
+        d: keep(st.areaDetails, d => {
+            if (!d) return undefined;
+            const o: any = {};
+            if (d.currentStatus) o.s = String(d.currentStatus);
+            if (d.futureNotes) o.n = String(d.futureNotes);
+            if (d.subcategoryNotes) o.c = String(d.subcategoryNotes);
+            if (d.cleanType) o.t = String(d.cleanType);
+            if (d.isFinished) o.f = 1;
+            if (d.userSetInclude) o.i = d.includeInUpdate ? 1 : 2;
+            return Object.keys(o).length ? o : undefined;
+        }),
+        g: keep(st.subcatProgress, v => {
+            if (!v) return undefined;
+            const o: any = {};
+            if (names(v.done)) o.d = names(v.done);
+            if (names(v.inProg)) o.p = names(v.inProg);
+            if (v.callout) o.c = String(v.callout);
+            return Object.keys(o).length ? o : undefined;
+        }),
+        s: keep(st.sanitationProgress, v => (Number(v) > 0 ? Number(v) : undefined)),
+        t: keep(st.cleanTypesByArea, v => (v ? String(v) : undefined)),
+    });
+}
 async function readLiveBoards(props: any): Promise<ShiftBoard[]> {
     const nowMs = Date.now();
     const rawLocal = readLocalLiveBoards();
@@ -2900,7 +2959,7 @@ async function writeBoard(props: any, b: ShiftBoard, reactivate: boolean = false
     if (reactivate) { data.statecode = 0; data.statuscode = 1; }
     const w = BOARD_STORE === 'missing' ? { ok: false, id: '', error: `Table ${BOARD_TABLE} is not created in Dataverse yet`, refused: [] as string[] } : await tableWrite(props, BOARD_TABLE, b.recordId || '', data);
     if (!w.ok) {
-        const localSaved: ShiftBoard = { ...b, kind: 'live', recordId: b.recordId || `local_${Date.now()}` };
+        const localSaved: ShiftBoard = { ...b, kind: 'live', recordId: b.recordId || `local_${Date.now()}`, unsynced: true };
         saveLocalLiveBoard(localSaved);
         LIVE_BOARDS = LIVE_BOARDS.filter(x => x.recordId !== localSaved.recordId && boardName(x) !== boardName(b)).concat(localSaved.status === 'live' ? [localSaved] : []);
         return { ok: false, board: localSaved, error: w.error, refused: w.refused };
@@ -3431,6 +3490,23 @@ async function readProgress(props: any, shiftDate: string, fromMs: number): Prom
         const rows = await tableQuery(props, CHECKOFF_TABLE, `modifiedon ge ${odataDate(fromMs)}`, ['craa5_equipmentguid', 'craa5_status'], 5000, 'modifiedon desc');
         rows.forEach((r: any) => { const g = hubGuid(getField(r, 'craa5_equipmentguid')); if (g && String(getField(r, 'craa5_status') || '').toLowerCase() === 'started') out.started.add(g); });
     } catch (e) { /* progress is only shown, never needed */ }
+    return out;
+}
+// Ganttly's progress per room, read only: the MSS log rows written for this shift date (one per finished piece) with the area each belongs to and when it was logged.
+// Shown on the room cards of Update Teams; the stages and subcategories typed there do not use it.
+type AreaDoneRead = { at: number; rows: { area: string; at: number }[] };
+async function readAreaDone(props: any, shiftDate: string): Promise<AreaDoneRead> {
+    const out: AreaDoneRead = { at: Date.now(), rows: [] };
+    for (const f of [`statecode eq 0 and craa5_lastcleaned eq ${shiftDate}`, `statecode eq 0 and craa5_lastcleaned ge ${shiftDate}T00:00:00Z and craa5_lastcleaned le ${shiftDate}T23:59:59Z`]) {
+        try {
+            const rows = await tableQuery(props, MSS_LOG_TABLE, f, ['craa5_area', 'createdon'], 5000, 'createdon desc');
+            rows.forEach((r: any) => {
+                const area = String(getField(r, 'craa5_area') || '').trim();
+                if (area) out.rows.push({ area, at: new Date(String(getField(r, 'createdon') || '')).getTime() || 0 });
+            });
+            break;
+        } catch (e) { /* try the next date style */ }
+    }
     return out;
 }
 // Saves one row with its fixed id: update when it is there, create when it is not (a create that finds it already made becomes an update).
@@ -7936,6 +8012,14 @@ export function MainComponent(props: any) {
     const [busyLabel, setBusyLabel] = useState("Loading shift...");
     const [taskStatus, setTaskStatus] = useState<TaskStatus | null>(null);                        // how the last read of the saved assignments went
     const [boardNote, setBoardNote] = useState<{ tone: 'ok' | 'none'; text: string } | null>(null);   // how the board got its contents
+    // Is the screen the saved board? (Ganttly and the other apps read only the saved board row.) Worked out further down, where the board is known.
+    const [handedOff, setHandedOff] = useState(false);                                                  // the board was handed off and closed: saving again reopens it
+    const [newerSave, setNewerSave] = useState<{ n: number; by: string; at: string } | null>(null);     // another save of this board, newer than the one this screen holds
+    const [, setBaseTick] = useState(0);
+    const baseRef = useRef<{ key: string; sig: string; sup: string } | null>(null);                    // the screen as it stood when the saved board was loaded or last saved
+    const ownSaveKey = useRef('');                                                                      // key of the board this screen just saved
+    const leaveGuardRef = useRef<{ ask: boolean; text: string }>({ ask: false, text: '' });            // set on every render; reopenBoard asks before it throws unsaved changes away
+    const [ganttlyDone, setGanttlyDone] = useState<AreaDoneRead | null>(null);                         // pieces Ganttly finished tonight, per area, from the MSS log
 
     // [clockCrew, upNextCrew, and allKnownEmps lifted to top]
     const steps = [tx("Leads", "Lideres"), tx("Areas", "Cuartos"), tx("Assign Areas", "Asignar Cuartos"), tx("Assign Employees", "Asignar Personal"), tx("Update Teams", "Actualizar Turno"), tx("Equipment & Finish", "Equipo y Cierre")];
@@ -8070,12 +8154,17 @@ export function MainComponent(props: any) {
     const resetBoard = useCallback(() => {
             setPresetsApplied(false); setHasAutoAssignedEveryday(false); setPrdApplied(false); setPrd(PRD_IDLE); prdInFlight.current = ""; prdSeq.current++; setRememberedTried(false); setRememberedLog(null); setBoardFresh(false); setPresetRecords([]); setBoardNote(null); setPresetsReady(false); setSaveSuccess(false); setSaveWarning(""); setSubmissionError(null);
     setSelectedLeadIds(new Set()); setSelectedAreaIds(new Set()); setAreaAssignments({}); setAssignments({}); setAreaDetails({}); setEmployeeStartTimes({}); setCustomLeads([]); setCustomAreas([]); setCustomEmployees([]); setCurrentStep(0); setSanitationProgress({});
+    // Progress and hand picks live in the board only (v0.0016), so another board must not inherit the last one's
+    setSubcatProgress({}); setCleanTypesByArea({}); setHandedOff(false); setNewerSave(null);
     }, []);
 
     // Opens a board afresh: the shift is worked out again, the saved rows are read again, and the board is rebuilt from them.
     // supId null (with auto on) lets the default pick choose the supervisor on shift.
     // opts.crew / opts.next say which crew the board is about and whether it is that crew's next shift; without them the person's own crew decides.
     const reopenBoard = useCallback(async (supId: string | null, auto: boolean, opts?: { crew: string; next: boolean }) => {
+        // Opening another board (or this one again) throws away what is on the screen: ask first when it holds changes that were never saved.
+        const guard = leaveGuardRef.current;
+        if (guard.ask && !(await askConfirm(guard.text, tx('Leave without saving', 'Salir sin guardar')))) return;
         const seq = ++reopenSeq.current;
         setDisableAutoLogin(!auto); resetBoard(); setSelectedSupervisorId(supId);
         const slots = GLOBAL_DATA_CACHE?.slots || [];
@@ -9317,6 +9406,112 @@ const todayShifts: DayChip[] = (() => {
     if (fullAccess) recentArchives.forEach(x => { const nb = parseBoardName(x.name); if (!nb.slotStart || !(boss || nameIs(nb.team))) return; add({ key: 'archive ' + x.name, kind: 'archive', crew: nb.crew, team: nb.team, slotStart: nb.slotStart, open: () => { readRecordById(propsRef.current, ARCHIVE_TABLE, x.id).then(b => { if (b) setViewerBoard(b); else setSubmissionError('That archived shift could not be read.'); }).catch(() => setSubmissionError('That archived shift could not be read.')); } }); });
     return out.sort((a, b) => a.slotStart - b.slotStart);
 })();
+// ---- Is what is on the screen the saved board? (live boards only) ----
+// Ganttly and every other app read the shift board row, and the row changes only when Save is pressed. The chip next to Save, the banner and the
+// "Leave without saving" question all come from here. The screen is compared with itself as it stood when the saved board was loaded or last saved
+// (baseRef), so a load that fills things in by itself never counts as a change.
+const savedLive = boardMode === 'live' && selectedSupervisorId && activeSupervisorObj ? ownLiveBoard(activeSupervisorObj) : null;
+const savedKey = boardKeyOf(savedLive);
+const savedOnDeviceOnly = !!savedLive && (String(savedLive.recordId || '').indexOf('local_') === 0 || !!savedLive.unsynced);   // a refused update keeps the real record id, so the copy carries a flag
+const screenSig = useMemo(() => boardSig({ areaAssignments, assignments, areaDetails, subcatProgress, sanitationProgress, cleanTypesByArea }), [areaAssignments, assignments, areaDetails, subcatProgress, sanitationProgress, cleanTypesByArea]);
+useEffect(() => {
+    if (boardMode !== 'live' || !selectedSupervisorId || !presetsApplied) { baseRef.current = null; return; }
+    if (isLoading) return;
+    const b = baseRef.current;
+    if (b && b.sup === selectedSupervisorId && b.key === savedKey) return;
+    // First look at this board after it was loaded, or right after this screen saved it: the screen is what was saved.
+    // A saved key this screen did not make means someone else saved since: the old baseline stays, so the chip can say so.
+    if (!b || b.sup !== selectedSupervisorId || savedKey === ownSaveKey.current) {
+        baseRef.current = { key: savedKey, sig: screenSig, sup: selectedSupervisorId };
+        setNewerSave(null);
+        setBaseTick(n => n + 1);
+    }
+}, [boardMode, selectedSupervisorId, presetsApplied, isLoading, savedKey, screenSig]);
+// Another save of this board, newer than the one this screen holds, found by a small read of the row's save count every minute (and when the tab comes back into view)
+useEffect(() => {
+    if (boardMode !== 'live' || !presetsApplied || !savedLive || !savedLive.recordId || savedOnDeviceOnly) return;
+    const id = String(savedLive.recordId), mine = savedLive.saveCount || 0;
+    let off = false;
+    const check = () => {
+        if (document.hidden) return;
+        boardSaveInfo(propsRef.current, id).then(info => { if (!off) setNewerSave(info.count !== null && info.count > mine ? { n: info.count, by: info.by, at: '' } : null); }).catch(() => {});
+    };
+    const t = window.setInterval(check, 60000);
+    document.addEventListener('visibilitychange', check);
+    return () => { off = true; window.clearInterval(t); document.removeEventListener('visibilitychange', check); };
+// eslint-disable-next-line react-hooks/exhaustive-deps
+}, [boardMode, presetsApplied, savedKey, savedOnDeviceOnly]);
+let saveKind: 'none' | 'saved' | 'dirty' | 'new' | 'local' | 'newer' = 'none', saveChanged = false;
+if (boardMode === 'live' && selectedSupervisorId && presetsApplied && !isLoading && access.can && !handedOff && baseRef.current && baseRef.current.sup === selectedSupervisorId) {
+    saveChanged = baseRef.current.sig !== screenSig;
+    if (!savedLive) saveKind = Object.keys(areaAssignments).length ? 'new' : 'none';
+    else if (savedOnDeviceOnly) saveKind = 'local';
+    else if (baseRef.current.key !== savedKey || newerSave) saveKind = 'newer';
+    else saveKind = saveChanged ? 'dirty' : 'saved';
+}
+const savedAtMs = savedLive && savedLive.savedAt ? new Date(savedLive.savedAt).getTime() : 0;
+const savedWhen = savedAtMs ? clockTime(savedAtMs) : '';
+const savedByWho = newerSave ? (newerSave.by || '') : (savedLive && savedLive.savedBy) || '';   // a newer save found by the poll names only its own author, never the author of the save held here
+const savedCountNow = newerSave ? newerSave.n : (savedLive && savedLive.saveCount) || 0;
+const leaveUnsaved = saveKind === 'dirty' || saveKind === 'local' || (saveKind === 'newer' && saveChanged);   // a board kept on this device only is lost on reload: Dataverse's copy wins
+leaveGuardRef.current = {
+    ask: leaveUnsaved,
+    text: tx("This board has changes that were never saved. Ganttly and the other apps only see the saved board.\n\nLeave without saving? Cancel, then press Save Progress.",
+        "Este tablero tiene cambios que no se han guardado. Ganttly y las demas apps solo ven el tablero guardado.\n\nSalir sin guardar? Cancele y presione Guardar Avance."),
+};
+// Closing the page with changes that were never saved: the browser asks first
+useEffect(() => {
+    if (!leaveUnsaved) return;
+    const h = (e: any) => { e.preventDefault(); e.returnValue = ''; return ''; };
+    window.addEventListener('beforeunload', h);
+    return () => window.removeEventListener('beforeunload', h);
+}, [leaveUnsaved]);
+// What the chip beside Save and the banner under the tabs say (null when there is nothing to say)
+const saveStamp = savedWhen ? `${savedWhen}${savedCountNow ? ` (${tx('save', 'guardado')} ${savedCountNow})` : ''}` : '';
+const saveWho = savedByWho || tx('Someone else', 'Otra persona');
+const saveChip: { tone: 'ok' | 'warn'; text: string; title: string } | null =
+    saveKind === 'saved' ? { tone: 'ok', text: tx(`Saved ${saveStamp}`, `Guardado ${saveStamp}`).trim(),
+        title: tx(`Ganttly and the other apps see this board${savedByWho ? `, saved by ${savedByWho}` : ''}.`, `Ganttly y las demas apps ven este tablero${savedByWho ? `, guardado por ${savedByWho}` : ''}.`) }
+    : saveKind === 'dirty' ? { tone: 'warn', text: tx('Not saved', 'Sin guardar'),
+        title: tx(`This screen has changes that were never saved. Ganttly and the other apps still see the board saved ${saveStamp || 'earlier'}. Press Save Progress.`, `Esta pantalla tiene cambios sin guardar. Ganttly y las demas apps aun ven el tablero guardado ${saveStamp || 'antes'}. Presione Guardar Avance.`) }
+    : saveKind === 'new' ? { tone: 'warn', text: tx('Not saved yet', 'Aun sin guardar'),
+        title: tx('No board is saved for this shift, so Ganttly and the other apps see nothing of it. Press Save Progress.', 'No hay tablero guardado de este turno, asi que Ganttly y las demas apps no ven nada. Presione Guardar Avance.') }
+    : saveKind === 'local' ? { tone: 'warn', text: tx('Saved on this device only', 'Guardado solo en este dispositivo'),
+        title: tx('Dataverse did not take the last save, so Ganttly and the other apps cannot see this board. Press Save Progress to try again.', 'Dataverse no recibio el ultimo guardado, asi que Ganttly y las demas apps no ven este tablero. Presione Guardar Avance para intentar de nuevo.') }
+    : saveKind === 'newer' ? { tone: 'warn', text: tx(`${saveWho} saved a newer board${savedCountNow ? ` (save ${savedCountNow})` : ''}`, `${saveWho} guardo un tablero mas nuevo${savedCountNow ? ` (guardado ${savedCountNow})` : ''}`),
+        title: tx('This screen was loaded from an older save. Reload shows their board; Save Progress replaces it with this screen.', 'Esta pantalla se cargo de un guardado anterior. Recargar muestra su tablero; Guardar Avance lo reemplaza con esta pantalla.') }
+    : null;
+// The banner is for the cases where the other apps see nothing or the wrong board; a plain "Not saved" stays a chip
+const saveBanner: string = saveKind === 'new' ? tx('This shift is not saved yet. Ganttly and the other apps see nothing of it until you press Save Progress.', 'Este turno aun no esta guardado. Ganttly y las demas apps no ven nada de el hasta que presione Guardar Avance.')
+    : saveKind === 'local' ? tx('This board is saved on this device only. Dataverse did not take the save, so Ganttly and the other apps cannot see it.', 'Este tablero esta guardado solo en este dispositivo. Dataverse no recibio el guardado, asi que Ganttly y las demas apps no lo ven.')
+    : saveKind === 'newer' ? tx(`${saveWho} saved a newer board${savedCountNow ? ` (save ${savedCountNow})` : ''} after this screen loaded it. Reload to see theirs, or save to replace it with this screen.`, `${saveWho} guardo un tablero mas nuevo${savedCountNow ? ` (guardado ${savedCountNow})` : ''} despues de que esta pantalla lo cargo. Recargue para ver el suyo, o guarde para reemplazarlo con esta pantalla.`)
+    : '';
+// Ganttly's progress, read only: the MSS log rows for this shift date (one per finished piece), counted per room on Update Teams. Read every minute while that tab is open.
+const ganttlyShiftDate = boardMode === 'live' && selectedSupervisorId && presetsApplied && currentStep === 4 ? hubShiftDate((savedLive && savedLive.slotStart) || boardSlotNow().start) : '';
+useEffect(() => {
+    if (!ganttlyShiftDate) return;
+    let off = false;
+    const load = () => { if (document.hidden) return; readAreaDone(propsRef.current, ganttlyShiftDate).then(r => { if (!off) setGanttlyDone(r); }).catch(() => {}); };
+    load();
+    const t = window.setInterval(load, 60000);
+    document.addEventListener('visibilitychange', load);
+    return () => { off = true; window.clearInterval(t); document.removeEventListener('visibilitychange', load); };
+// eslint-disable-next-line react-hooks/exhaustive-deps
+}, [ganttlyShiftDate]);
+const ganttlyByRoom = useMemo(() => {
+    const out: Record<string, { n: number; last: number }> = {};
+    if (!ganttlyDone || !ganttlyShiftDate) return out;
+    Object.keys(areaAssignments).forEach(aid => {
+        const nm = renderSafe(getField(areaMap.get(aid), 'craa5_area'));
+        if (!nm) return;
+        let n = 0, last = 0;
+        ganttlyDone.rows.forEach(r => { if (hubSameName(r.area, nm)) { n++; if (r.at > last) last = r.at; } });
+        if (n) out[aid] = { n, last };
+    });
+    return out;
+// eslint-disable-next-line react-hooks/exhaustive-deps
+}, [ganttlyDone, ganttlyShiftDate, areaAssignments, areaMap]);
+
 // Who opened which board (kept once an hour for each person and board)
 useEffect(() => {
     if (isLoading || !selectedSupervisorId || !activeSupervisorObj || !presetsApplied) return;
@@ -9430,7 +9625,7 @@ const importBoardJson = (rawJson: string): { ok: boolean; message: string } => {
 const handleSubmission = async (): Promise<boolean> => {
     if (boardMode === 'next') { await handleSavePreset(); return false; }
     if (!access.can) { setSubmissionError(`View only: ${access.why}. Nothing was saved.`); return false; }
-    setBusyLabel("Updating Dataverse..."); setIsLoading(true); setSaveSuccess(false); setSaveWarning(""); setSubmissionError(null);
+    setBusyLabel("Updating Dataverse..."); setIsLoading(true); setSaveSuccess(false); setSaveWarning(""); setSubmissionError(null); setHandedOff(false);
     if ((BOARD_STORE === 'missing' || BOARD_STORE === 'error') && isColumnError(BOARD_ERROR, BOARD_TABLE)) setTableState(BOARD_TABLE, 'unknown', '');
     const supervisor = supervisors.find(s => getField(s, 'craa5__aa_employeeid') === selectedSupervisorId);
     // Rows carry the letter of the crew the board draws from (the letter the employee table uses); the supervisor's own letter or the work shift stand in when there is none.
@@ -9615,9 +9810,20 @@ const handleSubmission = async (): Promise<boolean> => {
             if (!await askConfirm(`This shift was already handed off${base.archivedAt ? ` at ${clockTime(new Date(base.archivedAt).getTime())}` : ''}${base.archivedBy ? ` by ${base.archivedBy}` : ''}.\n\nSave anyway? The shift is reopened; when it is archived again, its archive is updated with this board.`)) return false;
             base = { ...base, reopened: true, status: 'live' }; reactivate = true;
         }
-        if (base && base.recordId && base.modifiedOn && !reactivate && BOARD_STORE === 'ok') {
-            const mo = await boardModifiedOn(propsRef.current, base.recordId);
-            if (mo && mo !== base.modifiedOn && !await askConfirm(`Someone else saved this shift board at ${clockTime(new Date(mo).getTime())}, after it was loaded here.\n\nOverwrite it with the board on this screen? (Cancel, then refresh, to see their changes first.)`)) return false;
+        if (base && base.recordId && !reactivate && BOARD_STORE === 'ok' && String(base.recordId).indexOf('local_') !== 0) {
+            // Another Shift Start save of this board since this screen loaded it. Judged by the save count, not by modifiedon: Ganttly writes its piece
+            // progress onto the same row, which moves modifiedon and used to raise this question when nobody else had saved.
+            const info = await boardSaveInfo(propsRef.current, base.recordId);
+            let theirs = info.count !== null && info.count > (base.saveCount || 0), theirsBy = info.by, theirsAt = info.at, theirsN = info.count || 0;
+            if (info.count === null) {   // the table keeps no save count: the board itself holds it
+                const cur = await readRecordById(propsRef.current, BOARD_TABLE, base.recordId);
+                if (cur && (cur.saveCount || 0) > (base.saveCount || 0)) { theirs = true; theirsBy = cur.savedBy || ''; theirsAt = cur.savedAt || ''; theirsN = cur.saveCount || 0; }
+            }
+            if (theirs) {
+                const when = theirsAt && new Date(theirsAt).getTime() ? clockTime(new Date(theirsAt).getTime()) : '';
+                if (!await askConfirm(tx(`${theirsBy || 'Someone else'} saved this shift board${when ? ` at ${when}` : ''} (save ${theirsN}), after it was loaded here.\n\nOverwrite it with the board on this screen? Cancel, then press Reload, to see their changes first.`,
+                    `${theirsBy || 'Otra persona'} guardo este tablero${when ? ` a las ${when}` : ''} (guardado ${theirsN}) despues de cargarlo aqui.\n\nSobrescribirlo con el tablero de esta pantalla? Cancele y presione Recargar para ver primero sus cambios.`))) return false;
+            }
         }
         let board: ShiftBoard = {
             v: 1, kind: 'live', crew: boardShift, team: supNameRaw, supervisorEmail: supEmail, slotStart: base ? base.slotStart : slot.start, slotEnd: base ? boardEndOf(base) : slot.end,
@@ -9654,8 +9860,12 @@ const handleSubmission = async (): Promise<boolean> => {
         if (w.ok) {
             savedBoard = { ...w.board, modifiedOn: await boardModifiedOn(propsRef.current, w.board.recordId || '') };
             LIVE_BOARDS = LIVE_BOARDS.filter(b => b.recordId !== savedBoard!.recordId).concat([savedBoard]);
+            ownSaveKey.current = boardKeyOf(savedBoard);   // the screen made this save, so the "Not saved" check starts again from it
             const userRefused = (w.refused || []).filter(c => c !== 'craa5_title' && c !== 'craa5_name');
             if (userRefused.length) setSaveWarning(`Saved to the shift board without ${userRefused.join(', ')} (the table does not have ${userRefused.length === 1 ? 'that column' : 'those columns'} yet).`);
+            // Ganttly plans only rooms that have people on them: say which production rooms were saved empty
+            const emptyRooms = Object.keys(areaAssignments).filter(aid => isProductionArea(areaMap.get(aid)) && !isAreaFinished(aid) && !(assignments[aid] || []).length).map(aid => renderSafe(getField(areaMap.get(aid), 'craa5_area'))).filter(Boolean);
+            if (emptyRooms.length) setSaveWarning(prev => `${prev ? prev + ' ' : ''}${tx(`No one is assigned to ${emptyRooms.join(', ')}. Ganttly does not plan a room with no one on it: assign people, then save again.`, `Nadie esta asignado a ${emptyRooms.join(', ')}. Ganttly no planea un cuarto sin personal: asigne personal y guarde de nuevo.`)}`);
             if (wApi) {
                 setTimeout(async () => {
                     try {
@@ -9684,6 +9894,7 @@ const handleSubmission = async (): Promise<boolean> => {
             }
         } else {
             savedBoard = { ...w.board, modifiedOn: nowIso };
+            ownSaveKey.current = boardKeyOf(savedBoard);   // kept on this device only: the chip says so instead of "Saved"
             if (wApi) {
                 for (let i = 0; i < taskPayloads.length; i += 6) {
                     const batch = taskPayloads.slice(i, i + 6);
@@ -9750,6 +9961,7 @@ const handleHandoff = async () => {
     try {
         const r = await archiveBoard(propsRef.current, b, myName, 'handoff');
         if (r.ok) {
+            setHandedOff(true);   // the board is closed now: the "Not saved" check is off until the next save reopens it
             const afterRecords = mergeBoardRows((presetRecords || []).filter((x: any) => !isLiveBoardRow(x) && !rowBelongsTo(x, sup)));
             setPresetRecords(afterRecords);
             if (GLOBAL_DATA_CACHE) {
@@ -10325,9 +10537,22 @@ else if (currentStep === 4) {
                                                                 >
                                                                     {subState.cleanMeta.label}
                                                                 </button>
-                                                                <span className="text-[10px] font-bold px-1.5 py-0.2 rounded bg-slate-100 text-slate-600 border border-slate-200">
-                                                                    {tx("HC:", "Pers:")} {hc}
-                                                                </span>
+                                                                {hc === 0 ? (
+                                                                    <span className="text-[10px] font-bold px-1.5 py-0.2 rounded border" style={{ background: BRAND.yellowSoft, color: '#8A5A00', borderColor: BRAND.yellow }}
+                                                                        title={tx("No one is assigned to this room, so Ganttly does not plan its pieces. Assign people on Assign Employees, then press Save Progress.", "Nadie esta asignado a este cuarto, asi que Ganttly no planea sus piezas. Asigne personal en Asignar Personal y luego presione Guardar Avance.")}>
+                                                                        {tx("HC: 0 - no one assigned", "Pers: 0 - nadie asignado")}
+                                                                    </span>
+                                                                ) : (
+                                                                    <span className="text-[10px] font-bold px-1.5 py-0.2 rounded bg-slate-100 text-slate-600 border border-slate-200">
+                                                                        {tx("HC:", "Pers:")} {hc}
+                                                                    </span>
+                                                                )}
+                                                                {ganttlyByRoom[aid] && (
+                                                                    <span className="text-[10px] font-bold px-1.5 py-0.2 rounded border" style={{ background: '#ECFDF5', color: '#065F46', borderColor: '#A7F3D0' }}
+                                                                        title={tx("Pieces Ganttly has logged as finished tonight (from the MSS log). Shown here only; the stages above are typed by you.", "Piezas que Ganttly registro como terminadas esta noche (del registro MSS). Solo se muestran aqui; las etapas de arriba las captura usted.")}>
+                                                                        {tx(`Ganttly: ${ganttlyByRoom[aid].n} ${ganttlyByRoom[aid].n === 1 ? 'piece' : 'pieces'} done`, `Ganttly: ${ganttlyByRoom[aid].n} ${ganttlyByRoom[aid].n === 1 ? 'pieza terminada' : 'piezas terminadas'}`)}{ganttlyByRoom[aid].last ? tx(`, last ${clockTime(ganttlyByRoom[aid].last)}`, `, la ultima a las ${clockTime(ganttlyByRoom[aid].last)}`) : ''}
+                                                                    </span>
+                                                                )}
                                                                 {!isDone && roomEf && (
                                                                     <span className="inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded text-[10px] font-bold bg-[#E6F1FB] text-[#00468B] border border-[#0072CE]/20" title={tx("Estimated finish time (adjusted by Type of Clean, stage, and subcategories)", "Hora estimada de termino (ajustada por Tipo de Limpieza, etapa y equipos)")}>
                                                                         ETA ~{roomEf.timeStr} ({subState.remHours}h)
@@ -11096,6 +11321,12 @@ return (
                                     </Button>
                                 )}
                                 {!access.can && <span title={access.why} className="max-w-[320px] truncate bg-slate-100 border border-slate-300 rounded-lg px-2.5 py-1 text-[11px] text-slate-700 font-semibold">{tx("View only", "Solo lectura")} - {access.why}</span>}
+                                {saveChip && (
+                                    <span role="status" title={saveChip.title} className="max-w-[230px] rounded-lg border px-2.5 py-1 text-[11px] font-bold leading-tight"
+                                        style={saveChip.tone === 'ok' ? { background: isDark ? '#064E3B' : '#ECFDF5', color: isDark ? '#A7F3D0' : '#065F46', borderColor: isDark ? '#059669' : '#A7F3D0' } : { background: isDark ? '#422006' : BRAND.yellowSoft, color: isDark ? '#FDE68A' : '#8A5A00', borderColor: BRAND.yellow }}>
+                                        {saveChip.text}
+                                    </span>
+                                )}
                                 <Button appearance="primary" size="small" disabled={!access.can} onClick={() => { handleSubmission(); }} title={tx("Save personnel and shift progress to Dataverse", "Guardar personal y avance del turno en Dataverse")}>
                                     {boardMode === 'next' ? tx('Save Setup', 'Guardar Plan') : tx('Save Progress', 'Guardar Avance')}
                                 </Button>
@@ -11239,7 +11470,9 @@ return (
                         </div>
                         <AuthBox
                             users={allEmployees}
-                            onLogin={(u: any) => {
+                            onLogin={async (u: any) => {
+                                // Switching profile starts over, so the board on the screen goes: ask first when it holds changes that were never saved
+                                if (leaveGuardRef.current.ask && !(await askConfirm(leaveGuardRef.current.text, tx('Leave without saving', 'Salir sin guardar')))) return;
                                 const uResolved = withCalculatedRole(u);
                                 const uNm = formatFullName(getField(uResolved, 'craa5_name')) || 'User';
                                 const uEm = getEmployeeEmail(uResolved) || msUser?.email || uNm;
@@ -11265,6 +11498,14 @@ return (
             {viewerBoard && <ShiftViewer board={viewerBoard} onClose={() => setViewerBoard(null)} />}
             {showBoards && <ShiftBoardsPanel hostProps={propsRef.current} by={String(msUser?.name || 'Full Access')} byEmail={myEmail} slots={GLOBAL_DATA_CACHE?.slots || []} onClose={() => setShowBoards(false)} onChanged={() => { readLiveBoards(propsRef.current).then(() => setPresetRecords(p => mergeBoardRows(p))).catch(() => {}); }} />}
             {archiveNotice && <div role="status" style={{ position: 'fixed', right: 16, bottom: 16, zIndex: 900, maxWidth: 520, padding: '10px 14px', borderRadius: 10, fontSize: 12, fontWeight: 600, boxShadow: '0 8px 24px rgba(0,0,0,0.18)', background: archiveNotice.tone === 'ok' ? (isDark ? '#064E3B' : '#ECFDF5') : (isDark ? '#422006' : BRAND.yellowSoft), color: archiveNotice.tone === 'ok' ? (isDark ? '#A7F3D0' : '#065F46') : (isDark ? '#FDE68A' : '#8A5A00'), border: `1px solid ${archiveNotice.tone === 'ok' ? '#059669' : BRAND.yellow}`, display: 'flex', gap: 10, alignItems: 'flex-start' }}><span style={{ flex: 1 }}>{archiveNotice.text}</span><button type="button" onClick={() => setArchiveNotice(null)} aria-label="Dismiss" style={{ border: 'none', background: 'none', cursor: 'pointer', fontWeight: 800, color: 'inherit' }}>{tx("Dismiss", "Cerrar")}</button></div>}
+            {saveBanner && (
+                <div role="status" className="shrink-0 px-4 py-1.5 text-[12px] font-semibold flex items-center gap-2 flex-wrap border-b"
+                    style={{ background: isDark ? '#422006' : BRAND.yellowSoft, color: isDark ? '#FDE68A' : '#8A5A00', borderColor: BRAND.yellow }}>
+                    <span className="flex-1 min-w-[200px]">{saveBanner}</span>
+                    {saveKind === 'newer' && <Button size="small" appearance="secondary" onClick={() => chooseMode(false)}>{tx("Reload", "Recargar")}</Button>}
+                    <Button size="small" appearance="primary" disabled={!access.can} onClick={() => { handleSubmission(); }}>{tx("Save Progress", "Guardar Avance")}</Button>
+                </div>
+            )}
             <main style={{ flex: 1, minHeight: 0, maxWidth: '100%', overflow: "hidden", display: "flex", flexDirection: "column", position: 'relative' }}> {SC} </main>
         </div>
     </FluentProvider>
