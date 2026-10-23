@@ -1,6 +1,6 @@
 # Clean Plan reader guide (craa5_cleanplan)
 
-Written by the Production Scheduler ("hub - production schedule" v4.5). No other app writes this table. Ganttly, Shift Start, the MSS Calendar, PBED and the Manager hub only read it. This guide wins over section 6.5 of the data contract on any detail.
+Written by the Production Scheduler ("hub - production schedule" v4.6). No other app writes this table. Ganttly, Shift Start, the MSS Calendar, PBED and the Manager hub only read it. This guide wins over section 6.5 of the data contract on any detail.
 
 All date-times are UTC. Read only active rows (`statecode eq 0`). The line key in `craa5_linekey` is the Scheduler's `canonLine(area, line)`, which is the same as `hubLineKey`: lowercase letters and digits only, for example `ibl4`, `highspeed1`.
 
@@ -42,8 +42,15 @@ The row id (`craa5_cleanplanid`) never changes for a given plan key, so it is sa
   prev: { id, code, item, allergen, type, crumb }, next: { ... } | null, allergen,
   need:  { basis, work, floor, manual, pieces, weekly, midweek, crumb, noDaily, sapOrder },
   crew:  { assumed, heads }, cleanStart, cleanEnd, shortMin, spareMin,
-  maint: [[start, end], ...], area, line, areaId }
+  maint: [[start, end], ...], area, line, areaId,
+  pin:   { at, by } | null,                              (v4.6)
+  after: { mode: "apart" | "together", line, at } | null, (v4.6)
+  order: 1 }                                              (v4.6)
 ```
+
+- `pin` (v4.6): scheduling pinned this clean's start. `cleanStart` already uses it, so readers only show "pinned by".
+- `after` (v4.6): the clean was moved because of a linked line. `apart` means it waits for that line's clean to end at `at` (the two are never cleaned at the same time). `together` means it starts with that line's clean, as one job. `cleanStart` already includes the move.
+- `order` (v4.6): this line's place in the day's clean order (1 = first). It is the Manager hub line order unless scheduling set an order for that day. Ganttly can use it to hand out cleans in order.
 
 - `cleanStart` / `cleanEnd`: the planned clean slot inside the stop.
 - `scope`: which pieces the clean covers. See section 3. It is null for changeovers and for cleans that are not worked out from equipment.
@@ -88,16 +95,18 @@ The new optional column `craa5_cleanoverride` is on the production run table (`c
 - `midweek|<who>|<why>`: the IBL4 midweek clean goes in the stop after this run, even if the 72 h mark is later.
 - `skip|<who>|<why>`: no midweek clean in the stop after this run. Scheduling approved going past 72 h. The `over72` alert then shows as `approved`, with who and why.
 
-Readers do not need this column. Its effect is already in the windows and alerts. Until the column exists, the Scheduler keeps overrides in that browser only, and Data Check > Columns lists the column as missing.
+v4.6 adds a pinned clean start as an optional last field in plant time: `pin|<who>|<why>|2026-10-24T22:30` (a pin only), or `midweek|<who>|<why>|2026-10-24T22:30`. Readers do not need this column. Its effect is already in the windows and alerts. Until the column exists, the Scheduler keeps overrides in that browser only, and Data Check > Columns lists the column as missing.
 
 ## 6. Day rows and the config row
 
 These have not changed from v4.0. Day rows: `craa5_cleankind` is `due`, `stretch`, `covered`, `none` or `unplanned`, and `craa5_status` is `ran`, `idle` or `unplanned`. Their details are `{v, prod, len, kind, weekOn, planned, job, lines, areaId}`. The config row holds the shared cleaning settings, which now include the skip words per area (`skipMidweek`, `skipDaily`). When the settings are longer than 1,900 characters, the config row's details are only `{v: 2, tz, at, parts, hash}`, and the settings JSON is split across the `configpart` rows `c|1` to `c|<parts>` (raw text, joined in order). Only the Scheduler reads these rows; other apps can skip both.
 
-## 7. Clean rules this plan follows (v4.5, rules stamp `...|mw72last|scope1|dskip1`)
+## 7. Clean rules this plan follows (v4.6, rules stamp `...|mw72last|scope1|dskip1|link1|pin1|night1`)
 
 - **IBL4:** at most 72 run hours. The midweek clean goes in the last stop before the 72 h mark that is long enough. If none is long enough, it goes in the longest stop before the mark. If there is no stop before the mark, the first stop after it gets the clean, and an `over72` alert is written. The midweek clean covers everything except caseout, dry clean and freezer pieces (skip words, editable in Cleaning Times).
 - **IBL5 and waterjet:** a Daily clean every night. It covers every PIC item but leaves out the floors, the shadow boards and anything on caseout (Gerald, 23 Oct). These are the default Daily skip words, editable per line in Cleaning Times; left-out pieces carry the word in `leftOutBy`.
+- **Night stops:** a stop counts for the day it starts on. A line that runs days gets its Daily clean in each night stop. Before v4.6, every other night could be missed.
+- **Linked lines:** IBL5 and Waterjet are never cleaned at the same time by default. When their cleans meet, the line lower in that day's clean order waits for the other to end. Scheduling can add pairs, either never at the same time or as one job, on the Clean Plan tab. These pairs are shared settings.
 - **Every line:** an End of Week clean when production ends for the week, usually Saturday or Sunday.
 - **Highspeed and Custard:** never scheduled together (`apart` alerts). Minimal dailies, then an End of Week clean that includes the kettles, silo, sifter and dough room.
 - **Dough room, silo and sifter:** start 5 h before the line by default (Gerald said 4 to 6 h). This is set per supporting area in Cleaning Times.
