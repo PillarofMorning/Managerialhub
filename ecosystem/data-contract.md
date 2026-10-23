@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.42, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.43, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -425,6 +425,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.43 (2026-10-23)** Shift Start is the only writer of `craa5_shiftarchive` and its shift log row; Ganttly drops its 4-hour fallback archive (Shift Start has a close-out button and archives overdue boards itself). Ganttly's Employee `craa5_remarks` and Shift board `craa5_updatesjson` writes stay as column owners.
 - **1.0.42 (2026-10-23)** Spanish set to Mexican plant usage: Room = Cuarto, EOW = Fin de semana (not FDS), Training = Capacitación, Late = Retardo; Spain words listed as never-use (section 9). `hub-shared.js` 113 checks.
 - **1.0.41 (2026-10-23)** Ganttly 1.4 (PR #32) uses the three `_g_` tables, saves `manifest|ganttly`, and reads egg / pecan flags and minutes. The tables stay "proposed" until the monitor sees them in Dataverse.
 - **1.0.40 (2026-10-23)** BOLO v2.4 (Gerald's answers): any clean after a swab hit closes it; open hits only inside the alert window; `>` / TNTC readings are positive, EST is wording; count is a pass in APC and ATP rates only; new key `PATHOGEN_BOLO_RULES`.
