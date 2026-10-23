@@ -2,7 +2,9 @@
  * [PERSISTENT MEMORY & APP REGISTRATION BLOCK]
  * APP NAME:        Shift Start & Roster Allocation Hub
  * PHASE ID:        P2.1 (Ref: _00 - list of apps - defined how to integrate - link to masterplan)
- * CURRENT VERSION: v0.0011 (2026-10-23: Equipment splits a room's pieces evenly by minutes on its own (once, when nobody has
+ * CURRENT VERSION: v0.0012 (2026-10-23: the even split is the shared ASSIGN SPLIT v1.0 (same answer as Ganttly; pieces nobody is on
+ *                  are placed, placed ones stay, clean step sets the order); split rows save as source auto, a reorder pins only the moved piece)
+ *                  v0.0011 (2026-10-23: Equipment splits a room's pieces evenly by minutes on its own (once, when nobody has
  *                  placed them; Split evenly buttons for the board and per room); ^ / v set each person's cleaning order (craa5_order))
  *                  v0.0010 (2026-10-23: Equipment reads craa5_aa_assets itself when the quick load brought only per-area totals
  *                  (no piece ids), so pieces show the way they do in Ganttly)
@@ -330,6 +332,107 @@ function hubSaveManifest(io, m) {
     } catch (e) { return Promise.resolve('failed: ' + String(e && e.message || e)); }
 }
 /* ============================== END HUB SHARED v1.1 ============================== */
+/* ============================== START ASSIGN SPLIT v1.0 ============================== */
+// Who cleans which piece in one room. Shared by Shift Start and Ganttly so both screens show the same answer
+// (table and saving rules: /mnt/project-files/ganttly-overhaul/shared-assignment.md). Paste this whole block unchanged
+// into both apps. It needs nothing else. Plain ES5 and 7-bit ASCII on purpose. Change it only in this file and bump
+// ASG_SPLIT_VERSION, then both apps re-paste it.
+// Gerald, 2026-10-23: "i would like it to auto 'assign' and attempt to do so evenly. they should be able to be reordered
+// for 'completion'."
+//
+// asgSplit({ members, pieces, resplit }) -> { placed, load, count, unplaced }
+//   members: [{ guid, picOnly }]  the room's crew. picOnly = Tech 3 / inspector: takes PIC pieces only.
+//   pieces:  [{ key, name, minutes, heads, pic, offsetMins, subcategory, priority, people, order, pinned, done }]
+//            key = the _g_ Assignment key. minutes = one person's minutes on it. heads = people it needs (blank = 1).
+//            pic = a PIC piece. offsetMins = minutes before or after the room's start (support pieces start early).
+//            subcategory = the Equipment subcategory text; its first number is the clean step ("1 - PIC" = step 1).
+//            priority = the Equipment priority (1 first, blank last). people, order, pinned = the saved row or the screen's
+//            change. done = finished this shift (its MSS log row is there).
+//   resplit: true when a person presses "Split evenly": every piece that is not pinned or done is split again.
+//   placed:   { key: { people: [guid], order: n, kept: bool, changed: bool } } for every piece that has people.
+//             changed = people or order differ from what was passed in, so only those rows need saving.
+//   load:     { guid: minutes } and count: { guid: pieces } per member, after the split.
+//   unplaced: [key] pieces nobody in the room can take (a lead places them by hand).
+// Rules:
+//   1. Kept as they are: pinned pieces, done pieces, and (unless resplit) pieces whose people are all still in the room.
+//      Kept pieces count toward their people's minutes.
+//   2. Every other piece, longest first, goes to the member with the fewest minutes so far, then the fewest pieces, then
+//      the lowest guid (so both apps break a tie the same way). heads 2 = the two lightest members, and so on (fewer when
+//      the room has fewer). A PIC piece goes to picOnly members when the room has any, else to anyone. Any other piece
+//      goes to members who are not picOnly; when there are none it is unplaced.
+//   3. Cleaning order: kept pieces keep theirs. New pieces are numbered after each person's last number: earliest start
+//      first (offsetMins), then the clean step, then priority, then name. A piece two people share gets one number, after both people's last.
+var ASG_SPLIT_VERSION = '1.0';
+function asgSplitNum(v, dflt) { var n = Number(v); return v === null || v === undefined || v === '' || !isFinite(n) ? dflt : n; }
+function asgSplitStep(sub) { var m = String(sub === undefined || sub === null ? '' : sub).match(/\d+/); return m ? parseInt(m[0], 10) : 0; }
+function asgSplitGuid(v) { return String(v === undefined || v === null ? '' : v).replace(/[{}]/g, '').trim().toLowerCase(); }
+function asgSplit(input) {
+    input = input || {};
+    var members = [], isMember = {}, picOnly = {};
+    (input.members || []).forEach(function (m) {
+        var g = asgSplitGuid(m && m.guid);
+        if (!g || isMember[g]) return;
+        isMember[g] = true;
+        picOnly[g] = !!(m && m.picOnly);
+        members.push(g);
+    });
+    var load = {}, count = {}, last = {};
+    members.forEach(function (g) { load[g] = 0; count[g] = 0; last[g] = 0; });
+    var placed = {}, unplaced = [], fresh = [], newPeople = {};
+    var samePeople = function (a, b) {
+        if (a.length !== b.length) return false;
+        var x = a.slice().sort(), y = b.slice().sort();
+        for (var i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+        return true;
+    };
+    var pieces = (input.pieces || []).filter(function (p) { return p && p.key; }).map(function (p, i) {
+        var people = [];
+        (p.people || []).forEach(function (v) { var g = asgSplitGuid(v); if (g && people.indexOf(g) === -1) people.push(g); });
+        return {
+            key: String(p.key), name: String(p.name || '').toLowerCase(), minutes: Math.max(0, asgSplitNum(p.minutes, 0)),
+            heads: Math.max(1, Math.floor(asgSplitNum(p.heads, 1))), pic: !!p.pic, offsetMins: asgSplitNum(p.offsetMins, 0), step: asgSplitStep(p.subcategory),
+            priority: asgSplitNum(p.priority, Infinity), people: people, order: Math.max(0, Math.floor(asgSplitNum(p.order, 0))),
+            pinned: !!p.pinned, done: !!p.done, idx: i
+        };
+    });
+    // 1. Kept pieces
+    pieces.forEach(function (p) {
+        var allIn = p.people.length > 0 && p.people.every(function (g) { return isMember[g]; });
+        var keep = p.people.length > 0 && (p.pinned || p.done || (!input.resplit && allIn));
+        if (!keep) { if (!p.done) fresh.push(p); return; }   // a done piece nobody was on is left alone
+        placed[p.key] = { people: p.people.slice(), order: p.order, kept: true, changed: false };
+        p.people.forEach(function (g) {
+            if (!isMember[g]) return;
+            load[g] += p.minutes; count[g] += 1;
+            if (p.order > last[g]) last[g] = p.order;
+        });
+    });
+    // 2. Who: longest first, to the lightest eligible members
+    var byLoad = function (a, b) { return load[a] - load[b] || count[a] - count[b] || (a < b ? -1 : a > b ? 1 : 0); };
+    var anyPicOnly = members.some(function (g) { return picOnly[g]; });
+    fresh.slice().sort(function (a, b) {
+        return b.minutes - a.minutes || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+    }).forEach(function (p) {
+        var pool = members.filter(function (g) { return p.pic ? (!anyPicOnly || picOnly[g]) : !picOnly[g]; });
+        if (!pool.length) { unplaced.push(p.key); return; }
+        var who = pool.sort(byLoad).slice(0, Math.min(p.heads, pool.length));
+        who.forEach(function (g) { load[g] += p.minutes; count[g] += 1; });
+        newPeople[p.key] = who;
+    });
+    // 3. Cleaning order for the new pieces
+    fresh.filter(function (p) { return !!newPeople[p.key]; }).sort(function (a, b) {
+        return a.offsetMins - b.offsetMins || a.step - b.step || (a.priority === b.priority ? 0 : a.priority < b.priority ? -1 : 1) ||
+            (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+    }).forEach(function (p) {
+        var who = newPeople[p.key], n = 0;
+        who.forEach(function (g) { if (last[g] + 1 > n) n = last[g] + 1; });
+        who.forEach(function (g) { last[g] = n; });
+        placed[p.key] = { people: who, order: n, kept: false, changed: !samePeople(who, p.people) || n !== p.order };
+    });
+    unplaced.sort();
+    return { placed: placed, load: load, count: count, unplaced: unplaced };
+}
+/* =============================== END ASSIGN SPLIT v1.0 =============================== */
 
 // ============================================================================
 // SHIFT START - Supervisor Hub
@@ -3358,7 +3461,7 @@ async function writeAssignment(props: any, row: any, exists: boolean): Promise<s
 
 type AsgPerson = { id: string; name: string };
 type AsgRoom = { areaId: string; name: string; cleanType: string; leadId: string; people: AsgPerson[] };
-type AsgPiece = { key: string; guid: string; name: string; room: string; area: string; areaId: string; kind: string; minutes: number | null; row: AsgRow | null };
+type AsgPiece = { key: string; guid: string; name: string; room: string; area: string; areaId: string; kind: string; minutes: number | null; row: AsgRow | null; heads?: number; pic?: boolean; sub?: string };
 type AsgEdit = { people: string[]; pinned: boolean; order?: number };
 type EquipmentAssignProps = {
     hostProps: any; rooms: AsgRoom[]; assets: any[]; shiftDate: string; crew: string; slotStartMs: number; boardId: string;
@@ -3421,6 +3524,9 @@ function EquipmentAssignPanel({ hostProps, rooms, assets, shiftDate, crew, slotS
                     name: String(a.craa5_equipmentidentifier || a.craa5_ValidationName || a.craa5_validationname || a.craa5_equipment || a.craa5_name || getField(a, 'craa5_equipmentidentifier') || getField(a, 'craa5_equipment') || 'Equipment').trim(),
                     room: String(a.craa5_roomname || a.craa5_room || getField(a, 'craa5_roomname') || room.name).trim(),
                     minutes: row?.minutes ?? hubStdMinutes(a.craa5_hoursrequired ?? getField(a, 'craa5_hoursrequired')),
+                    heads: Number(a.craa5_heads ?? getField(a, 'craa5_heads')) || 1,
+                    sub: String(a.craa5_subcategory ?? getField(a, 'craa5_subcategory') ?? ''),
+                    pic: /^1\s*[-_]?\s*pic\b/.test(normText(a.craa5_subcategory ?? getField(a, 'craa5_subcategory'))),
                 });
             });
             rows.forEach(r => {
@@ -3448,41 +3554,39 @@ function EquipmentAssignPanel({ hostProps, rooms, assets, shiftDate, crew, slotS
         setPicked('');
     };
     // Completion order inside one person's list: the piece swaps places with its neighbour, and the whole list is numbered 1, 2, 3...
-    // A reordered list is set by a person, so Ganttly keeps it.
+    // The moved piece is pinned (Ganttly keeps it); the others only get their new number.
     const reorder = (lanePieces: AsgPiece[], idx: number, dir: -1 | 1) => {
         const j = idx + dir;
         if (!editable || j < 0 || j >= lanePieces.length) return;
         const next = lanePieces.slice(); const t = next[idx]; next[idx] = next[j]; next[j] = t;
         setEdits(prev => {
             const out = { ...prev };
-            next.forEach((x, i) => { out[x.key] = { people: peopleOf(x), pinned: true, order: i + 1 }; });
+            next.forEach((x, i) => { out[x.key] = { people: peopleOf(x), pinned: x === lanePieces[idx] ? true : pinnedOf(x), order: i + 1 }; });
             return out;
         });
     };
-    // Even split of a room: pieces nobody set by hand (and not done) go one by one, longest first, to whoever has the fewest minutes so far
-    // (then the fewest pieces). Pieces set by a person and done pieces stay where they are and count toward that person's minutes.
-    // Each person's list is then numbered in the equipment list's order. Nothing is saved until Save equipment.
-    const splitRoom = (room: AsgRoom, prev: Record<string, AsgEdit>): Record<string, AsgEdit> => {
-        const ids = room.people.map(x => hubGuid(x.id)).filter(Boolean), list = piecesByRoom[room.areaId] || [];
-        if (!ids.length || !list.length) return prev;
-        const pOf = (x: AsgPiece) => prev[x.key] ? prev[x.key].people : (x.row ? x.row.people : []);
-        const pinOf = (x: AsgPiece) => prev[x.key] ? prev[x.key].pinned : !!x.row?.pinned;
-        const mins: Record<string, number> = {}, cnt: Record<string, number> = {};
-        ids.forEach(i => { mins[i] = 0; cnt[i] = 0; });
-        list.filter(x => pinOf(x) || isDone(x)).forEach(x => { const g = pOf(x).find(i => ids.indexOf(i) >= 0); if (g) { mins[g] += x.minutes || 0; cnt[g]++; } });
-        const free = list.filter(x => !pinOf(x) && !isDone(x)).sort((a, b) => (b.minutes || 0) - (a.minutes || 0));
-        const next = { ...prev };
-        free.forEach(x => {
-            const g = ids.reduce((best, i) => (mins[i] < mins[best] || (mins[i] === mins[best] && cnt[i] < cnt[best])) ? i : best, ids[0]);
-            mins[g] += x.minutes || 0; cnt[g]++;
-            next[x.key] = { people: [g], pinned: false };
+    // Even split of a room: the shared ASSIGN SPLIT (same answer as Ganttly). Pinned and done pieces stay; the rest go longest first
+    // to whoever has the fewest minutes. resplit (the Split evenly buttons) also redoes pieces placed earlier but not pinned.
+    // Only pieces whose people or order change become edits; nothing is saved until Save equipment.
+    const splitRoom = (room: AsgRoom, prev: Record<string, AsgEdit>, resplit: boolean): Record<string, AsgEdit> => {
+        const list = piecesByRoom[room.areaId] || [];
+        if (!room.people.length || !list.length) return prev;
+        const res = asgSplit({
+            resplit,
+            members: room.people.map(x => ({ guid: hubGuid(x.id), picOnly: false })),
+            pieces: list.map(x => {
+                const e = prev[x.key];
+                return { key: x.key, name: x.name, minutes: x.minutes || 0, heads: x.heads || 1, pic: !!x.pic, subcategory: x.sub || '', offsetMins: 0, priority: null,
+                    people: e ? e.people : (x.row ? x.row.people : []), order: e ? (e.order || 0) : (x.row ? x.row.order : 0), pinned: e ? e.pinned : !!x.row?.pinned, done: isDone(x) };
+            }),
         });
-        ids.forEach(g => { let n = 0; list.forEach(x => { if ((next[x.key] ? next[x.key].people : pOf(x)).indexOf(g) < 0) return; n++; if (free.indexOf(x) >= 0) next[x.key] = { ...next[x.key], order: n }; }); });
+        const next = { ...prev };
+        Object.keys(res.placed).forEach(k => { const pl = res.placed[k]; if (pl.changed) next[k] = { people: pl.people, pinned: false, order: pl.order }; });
         return next;
     };
     const splitEvenly = (only?: AsgRoom) => {
         if (!editable) return;
-        setEdits(prev => (only ? [only] : shown).reduce((acc, r) => splitRoom(r, acc), prev));
+        setEdits(prev => (only ? [only] : shown).reduce((acc, r) => splitRoom(r, acc, true), prev));
         setPicked('');
     };
     const backToAuto = (key: string) => { const p = findPiece(key); if (!p || !editable) return; setEdits(prev => ({ ...prev, [key]: { people: peopleOf(p), pinned: false } })); setPicked(''); };
@@ -3509,7 +3613,7 @@ function EquipmentAssignPanel({ hostProps, rooms, assets, shiftDate, crew, slotS
                 const row: any = {
                     id, craa5_assignmentkey: key, craa5_equipmentguid: p.guid, craa5_equipment: p.name.slice(0, 200), craa5_area: p.area.slice(0, 100), craa5_room: p.room.slice(0, 100),
                     craa5_boardid: boardId, craa5_shiftdate: shiftDate, craa5_crew: hubCrew(crew), craa5_team: hubGuid(room?.leadId || ''), craa5_cleankind: p.kind,
-                    craa5_employeeguids: hubGuidList(e.people), craa5_employees: names.slice(0, 400), craa5_pinned: e.pinned, craa5_source: 'shiftstart',
+                    craa5_employeeguids: hubGuidList(e.people), craa5_employees: names.slice(0, 400), craa5_pinned: e.pinned, craa5_source: e.pinned ? 'shiftstart' : 'auto',
                     craa5_updatedby: me.slice(0, 200), craa5_rev: (now ? now.rev : readRev) + 1,
                 };
                 if (p.minutes && !now?.minutes) row.craa5_plannedminutes = Math.round(p.minutes);
@@ -3531,8 +3635,8 @@ function EquipmentAssignPanel({ hostProps, rooms, assets, shiftDate, crew, slotS
     };
 
     const isDone = (p: AsgPiece) => prog.logIds.has(hubLogIdOf(hubCompletionKey(p.guid, shiftDate, p.kind)));
-    // Auto split: a room with people whose pieces nobody has placed yet (no saved row, no change on screen) is split evenly once,
-    // as soon as the shared list has been read. The split shows as unsaved changes; Save equipment shares it with Ganttly.
+    // Auto split: once the shared list has been read, each room with people places its pieces that nobody is on yet
+    // (pieces already placed stay). The split shows as unsaved changes; Save equipment shares it with Ganttly.
     const autoSplitDone = useRef<Set<string>>(new Set());
     useEffect(() => {
         if (!editable || read?.state !== 'ok') return;
@@ -3540,10 +3644,10 @@ function EquipmentAssignPanel({ hostProps, rooms, assets, shiftDate, crew, slotS
             const k = `${shiftDate}|${crew}|${r.areaId}`, list = piecesByRoom[r.areaId] || [];
             if (autoSplitDone.current.has(k) || !r.people.length || !list.length) return false;
             autoSplitDone.current.add(k);
-            return list.every(x => !edits[x.key] && !(x.row && x.row.people.length));
+            return list.some(x => !edits[x.key] && !(x.row && x.row.people.length) && !isDone(x));
         });
         if (!todo.length) return;
-        setEdits(prev => todo.reduce((acc, r) => splitRoom(r, acc), prev));
+        setEdits(prev => todo.reduce((acc, r) => splitRoom(r, acc, false), prev));
         setNote({ tone: 'ok', text: tx(`Split evenly by minutes: ${todo.map(r => r.name).join(', ')}. Move or reorder pieces if needed, then Save equipment to share it with Ganttly.`, `Repartido parejo por minutos: ${todo.map(r => r.name).join(', ')}. Mueve o reordena piezas si hace falta y luego Guardar equipo para compartirlo con Ganttly.`) });
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [read, piecesByRoom, editable]);
