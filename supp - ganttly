@@ -2,7 +2,7 @@
  * [PERSISTENT MEMORY & APP REGISTRATION BLOCK]
  * APP NAME:        Floor Ganttly
  * PHASE ID:        P3.1 (Ref: _00 - list of apps - defined how to integrate - link to masterplan)
- * CURRENT VERSION: v1.3.3 (says when this sign-in cannot read Dataverse, with Dataverse's own words; WJ1 = plan line "wj")
+ * CURRENT VERSION: v1.4 (Phase 2: obstacles, handovers and personnel notes in the _g_ tables; egg / pecan allergen cleans; manifest for the Dataverse monitor)
  * FOLDER STATUS:   Root Workspace
  * REPO SOURCE:     P3.1 - supp - ganttly
  * 
@@ -18,6 +18,9 @@
  * - craa5_cleanplan (craa5_cleanplans)                      | Role: Read-Only (the Production Scheduler is its only writer)
  * - craa5_cleancheckoff (craa5_cleancheckoffs)              | Role: Read + Write (Start / Done / Undo, live progress)
  * - craa5__log_ (MSS log)                                   | Role: Write through MSS LOG WRITE (one row per piece, shift date, kind)
+ * - craa5__g_obstacle, craa5__g_handover                   | Role: Read + Write (Ganttly only; floor obstacles, crew handovers)
+ * - craa5__g_personnelnote (User-owned, sensitive)         | Role: Read own + Write (managers read all); incidents never on the Employee row
+ * - craa5__e_hubconfig (else craa5__0_hubconfig)           | Role: Write own row 'manifest|ganttly' (the tables this build uses)
  * 
  * UPSTREAM INPUTS:
  * - P2.1 - shift start: Dispatched worker roster & line assignments
@@ -122,13 +125,13 @@ const AlertTriangle = (props) => <svg {...IconProps} {...props}><path d="m21.73 
 const X = (props) => <svg {...IconProps} {...props}><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>;
 const Trash = Trash2;
 
-/* ============================== START HUB SHARED v1.0 ============================== */
+/* ============================== START HUB SHARED v1.1 ============================== */
 // The ecosystem data contract in code (ecosystem/data-contract.md). Paste this whole block into every hub app, unchanged,
 // and use these helpers instead of local copies, so every app builds the same keys, dates and numbers.
 // Plain ES5 and 7-bit ASCII on purpose: it runs in every Power Apps page and passes the GEMINI.md ASCII check.
 // Change it only through the contract (bump HUB_CONTRACT_VERSION and say what changed in the contract's change log).
 
-var HUB_CONTRACT_VERSION = '1.0';
+var HUB_CONTRACT_VERSION = '1.1';
 var HUB_TZ = 'America/Chicago';              // the plant's clock: every plant day and shift date is read on it
 
 // ---------- keys ----------
@@ -205,7 +208,7 @@ function hubWeekKey(day) {
 
 // ---------- cleans and completions ----------
 // What kind of clean a completion was. The Clean Plan (Production Scheduler) uses its own words; hubCleanKind maps them.
-var HUB_CLEAN_KINDS = ['daily', 'midweek', 'eow', 'allergen', 'changeover', 'monthly', 'quarterly', 'semiannual', 'annual', 'corrective', 'other'];
+var HUB_CLEAN_KINDS = ['daily', 'midweek', 'eow', 'allergen', 'egg', 'pecan', 'changeover', 'monthly', 'quarterly', 'semiannual', 'annual', 'corrective', 'other'];
 var HUB_PLAN_KIND_MAP = { full: 'daily', weekly: 'eow', midweek: 'midweek', allergen: 'allergen', changeover: 'changeover' };
 function hubCleanKind(k) {
     var s = String(k || '').toLowerCase().trim();
@@ -213,6 +216,51 @@ function hubCleanKind(k) {
     return HUB_CLEAN_KINDS.indexOf(s) > -1 ? s : '';
 }
 // One clean of one piece of equipment on one shift date: the key that stops a second row (MSS log craa5_completionkey).
+// Frequencies (the MSS Calendar's codes and ranks). A clean of rank r satisfies every frequency of rank <= r.
+// A piece is done for a frequency when a satisfying clean falls in the same period as today; otherwise it is due.
+var HUB_FREQS = [
+    { code: 'D', kind: 'daily', rank: 1, flag: 'craa5_dailyclean' }, { code: 'MW', kind: 'midweek', rank: 2, flag: 'craa5_midweek' },
+    { code: 'W', kind: 'eow', rank: 3, flag: 'craa5_weeklyclean' }, { code: 'M', kind: 'monthly', rank: 4, flag: 'craa5_monthlyclean' },
+    { code: 'Q', kind: 'quarterly', rank: 5, flag: 'craa5_quarterly' }, { code: 'S', kind: 'semiannual', rank: 6, flag: 'craa5_month' },
+    { code: 'A', kind: 'annual', rank: 7, flag: 'craa5_annually' }
+];
+var HUB_KIND_RANK = { daily: 1, allergen: 1, egg: 1, pecan: 1, changeover: 1, corrective: 1, midweek: 2, eow: 3, monthly: 4, quarterly: 5, semiannual: 6, annual: 7, other: 0 };
+function hubKindRank(kind) { var k = hubCleanKind(kind); return k ? HUB_KIND_RANK[k] || 0 : 0; }
+// Rank of one MSS log row: its craa5_cleankind; old rows with no kind keep their old meaning from the flags
+// (daily also counts as mid-week, weekly 3, monthly also counts as quarterly to annual, no flags 9 = counts for everything).
+function hubLogRank(row) {
+    if (!row) return 0;
+    if (hubCleanKind(row.craa5_cleankind)) return hubKindRank(row.craa5_cleankind);
+    var yes = function (v) { return v === true || v === 1 || /^(yes|true|1)$/i.test(String(v === undefined || v === null ? '' : v)); };
+    return yes(row.craa5_monthly) ? 7 : yes(row.craa5_weekly) ? 3 : yes(row.craa5_daily) ? 2 : 9;
+}
+function hubFreqRank(code) { for (var i = 0; i < HUB_FREQS.length; i++) if (HUB_FREQS[i].code === code) return HUB_FREQS[i].rank; return 0; }
+// Period a plant day (YYYY-MM-DD) falls in, per frequency: day, Monday week, month, quarter, half year, year.
+function hubPeriodKey(code, day) {
+    var d = String(day || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return '';
+    var y = d.slice(0, 4), m = Number(d.slice(5, 7));
+    switch (code) {
+        case 'D': return d;
+        case 'MW': case 'W': return 'w' + hubWeekKey(d);
+        case 'M': return y + '-' + d.slice(5, 7);
+        case 'Q': return y + '-Q' + Math.ceil(m / 3);
+        case 'S': return y + '-H' + (m <= 6 ? 1 : 2);
+        case 'A': return y;
+    }
+    return '';
+}
+// doneDays = finished cleans as [{ day, kind }] or [{ day, rank }] (rank from hubLogRank for MSS log rows).
+// True when one of rank >= the frequency is in today's period. Which days and weeks owe a job is the reader's call (section 7).
+function hubFreqDone(code, doneDays, today) {
+    var need = hubFreqRank(code), p = hubPeriodKey(code, today);
+    if (!need || !p) return false;
+    for (var i = 0; i < (doneDays || []).length; i++) {
+        var x = doneDays[i];
+        if (x && (x.rank !== undefined ? x.rank : hubKindRank(x.kind)) >= need && hubPeriodKey(code, x.day) === p) return true;
+    }
+    return false;
+}
 function hubCompletionKey(assetGuid, shiftDate, kind) {
     var g = hubGuid(assetGuid), k = hubCleanKind(kind);
     return g && /^\d{4}-\d{2}-\d{2}$/.test(String(shiftDate)) && k ? g + '|' + shiftDate + '|' + k : '';
@@ -251,7 +299,7 @@ function hubDecodeEs(s) { return String(s).replace(/%([aeiounAEIOUN?!w%])/g, fun
 // The shared words (data-contract.md section 9). An app's own word list adds to these; it never gives one of these another Spanish.
 var HUB_ES = {
     'Planned': 'Planeado', 'Started': 'En proceso', 'Done': 'Terminado', 'Skipped': 'Omitido', 'Overdue': 'Atrasado', 'At risk': 'En riesgo',
-    'Daily': 'Diaria', 'Midweek 72h': 'Media semana 72h', 'End of week': 'Fin de semana', 'EOW': 'FDS', 'Allergen': 'Al%ergeno',
+    'Daily': 'Diaria', 'Midweek 72h': 'Media semana 72h', 'End of week': 'Fin de semana', 'EOW': 'FDS', 'Allergen': 'Al%ergeno', 'Egg allergen': 'Al%ergeno huevo', 'Pecan allergen': 'Al%ergeno nuez pecana',
     'Changeover': 'Cambio de producto', 'Monthly': 'Mensual', 'Quarterly': 'Trimestral', 'Semiannual': 'Semestral', 'Annual': 'Anual',
     'Corrective': 'Correctiva', 'Other': 'Otra',
     'Present': 'Presente', 'Late': 'Lleg%o tarde', 'Sick': 'Enfermo', 'PTO': 'Vacaciones (PTO)', 'Left early': 'Sali%o temprano',
@@ -285,12 +333,80 @@ var HUB_COLORS = {
 // Status colors mean one thing in every app. Red is only for overdue, a failed save and a positive swab.
 var HUB_STATUS_COLORS = { done: '#059669', started: '#0072CE', planned: '#64748B', overdue: '#DC2626', atrisk: '#D97706', skipped: '#D97706' };
 var HUB_BRAND_RED = '#E4002B';            // the logo only, never a status
-/* ============================== END HUB SHARED v1.0 ============================== */
+// ---------- app manifest (self-check for the Dataverse monitor) ----------
+// Each app declares the tables and columns it reads and writes (logical names only, never data) and saves that list
+// once per change in craa5__0_hubconfig, key 'manifest|' + appId. The Dataverse monitor reads every manifest| row and
+// checks it against Dataverse (missing tables / columns) and contract.json (owners, statuses). Contract section 12.1.
+//   m = { appId: 'ganttly', app: 'Ganttly', version: '2.0.0',
+//         tables: [ { t: 'craa5_cleancheckoff', names: ['craa5_cleancheckoff'], read: [cols], write: [cols], opt: [cols] } ],
+//         config: ['ganttly_settings'] }
+//   names = table names the app tries, in order (default [t]); opt = columns the app works without (shown as "not yet").
+var HUB_APP_IDS = ['ganttly', 'shiftstart', 'prodsched', 'msscalendar', 'msslog', 'pbed', 'bolo', 'managerhub', 'chemicals', 'mapsubmit', 'monitor', 'training'];
+// Shared settings table: the new _e_ Hub config first (Organization-owned, big craa5_configjson), the old _0_ one second.
+// Own names: some pages already declare HUB_CONFIG_TABLE.
+var HUB_CONFIG_TABLES = ['craa5__e_hubconfig', 'craa5__0_hubconfig'];
+var HUB_MANIFEST_TABLE = HUB_CONFIG_TABLES[0];
+function hubNameList(a, keepCase) {
+    var out = [], seen = {};
+    (a || []).forEach(function (x) { var v = String(x === undefined || x === null ? '' : x).trim(); if (!keepCase) v = v.toLowerCase(); if (v && !seen[v]) { seen[v] = 1; out.push(v); } });
+    return out;
+}
+// The manifest as stored: fixed key order, sorted lists, so the same app build always gives the same text and hash.
+function hubManifest(m, nowIso) {
+    m = m || {};
+    var tables = (m.tables || []).map(function (t) {
+        var name = String(t.t || '').trim().toLowerCase();
+        return { t: name, names: hubNameList(t.names && t.names.length ? t.names : [name]), read: hubNameList(t.read).sort(), write: hubNameList(t.write).sort(), opt: hubNameList(t.opt).sort() };
+    }).filter(function (t) { return !!t.t; }).sort(function (a, b) { return a.t < b.t ? -1 : a.t > b.t ? 1 : 0; });
+    var out = { m: 1, appId: hubCanon(m.appId), app: String(m.app || ''), version: String(m.version || ''), contract: HUB_CONTRACT_VERSION, tables: tables, config: hubNameList(m.config, true).sort() };   // hubconfig keys keep their case: they match exactly
+    out.hash = hubIdFromKey(JSON.stringify(out)).slice(0, 8);
+    out.savedAt = nowIso || new Date().toISOString();
+    return out;
+}
+function hubManifestKey(appId) { return 'manifest|' + hubCanon(appId); }
+// io = { query(table, { select, filter, top }) -> Promise of rows (or { rows }), create(table, body), update(table, id, body) }
+// (Ganttly: swQuery + swWriter). Never rejects and never blocks the app: resolves 'same', 'saved' or 'failed: why'.
+// Where it goes, first that reads: _e_ Hub config craa5_configjson; old _0_ hubconfig craa5_manifestjson (its
+// craa5_configjson holds only 100 characters); old _0_ hubconfig craa5_configjson.
+var HUB_MANIFEST_COL = 'craa5_manifestjson';
+// Every hubconfig JSON value: read Manifest json first (old table), then Config json.
+function hubConfigJsonOf(row) { return row ? String(row[HUB_MANIFEST_COL] || row.craa5_configjson || '') : ''; }
+function hubSaveManifest(io, m) {
+    try {
+        var man = hubManifest(m), key = hubManifestKey(man.appId);
+        if (!man.appId) return Promise.resolve('failed: no appId');
+        var fail = function (e) { return 'failed: ' + String(e && e.message || e); };
+        var spots = [[HUB_CONFIG_TABLES[0], 'craa5_configjson', []], [HUB_CONFIG_TABLES[1], HUB_MANIFEST_COL, ['craa5_configjson']], [HUB_CONFIG_TABLES[1], 'craa5_configjson', []]];
+        var read = function (i) {
+            if (i >= spots.length) return Promise.reject(new Error('no hub config table'));
+            var sp = spots[i], idCol = sp[0] + 'id';
+            return Promise.resolve(io.query(sp[0], { select: [idCol, sp[1]].concat(sp[2]), filter: "craa5_configkey eq '" + key + "' and statecode eq 0", top: 5 })).then(function (res) {
+                var rows = res && res.rows !== undefined ? res.rows : res;
+                if (!rows) throw new Error(res && res.err || 'read failed');
+                return { rows: rows, table: sp[0], col: sp[1], idCol: idCol };
+            }).then(null, function (e) { return i + 1 < spots.length ? read(i + 1) : Promise.reject(e); });
+        };
+        return read(0).then(function (r) {
+            var body = { craa5_configkey: key, craa5_configname: (man.app || man.appId) + ' manifest' };
+            body[r.col] = JSON.stringify(man);
+            var row = r.rows[0];
+            if (row) {
+                var old = {}; try { old = JSON.parse(row[r.col] || '{}'); } catch (e) {}
+                if (old && old.hash === man.hash) return 'same';
+                return Promise.resolve(io.update(r.table, hubGuid(row[r.idCol]), body)).then(function () { return 'saved'; }, fail);
+            }
+            var create = {}; for (var k in body) create[k] = body[k];
+            create[r.idCol] = hubIdFromKey('hubconfig|' + key);      // fixed id: two people opening at once still make one row
+            return Promise.resolve(io.create(r.table, create)).then(function () { return 'saved'; }, fail);
+        }, fail);
+    } catch (e) { return Promise.resolve('failed: ' + String(e && e.message || e)); }
+}
+/* ============================== END HUB SHARED v1.1 ============================== */
 
-/* ============================== START MSS LOG WRITE v1.1 ============================== */
+/* ============================== START MSS LOG WRITE v1.2 ============================== */
 // The one place in the ecosystem that builds and saves a finished clean in the MSS log (craa5__log_), by the rule in the data
 // contract, section 6.3. Paste it unchanged into every app that logs a clean (Ganttly, MSS Log Input, MSS Calendar), right after
-// the HUB SHARED block, which it needs (hubGuid, hubShiftDate, hubCompletionKey, hubLogIdOf, hubCleanKind, hubCrew, ...).
+// the HUB SHARED block (1.1 or later), which it needs (hubGuid, hubShiftDate, hubCompletionKey, hubLogIdOf, hubCleanKind, hubCrew, ...).
 // 7-bit ASCII and ES5 apart from async/await (every host compiles that). Change it only with the contract (6.2 and 6.3) and bump MLW_VERSION.
 //
 //   - One row = one piece of equipment, one clean, one shift date, saved only when someone marked that piece done (or typed it in).
@@ -309,7 +425,7 @@ var HUB_BRAND_RED = '#E4002B';            // the logo only, never a status
 // The host passes an api with query(table, { select, filter, top }) -> rows, create(table, body) and update(table, id, body);
 // mlwApi(xrm, dataApi) builds one from Xrm.WebApi or the page's dataApi.
 
-var MLW_VERSION = '1.1';
+var MLW_VERSION = '1.2';
 var MLW_TABLE = 'craa5__log_';
 var MLW_ID = 'craa5__log_id';
 var MLW_QUEUE_KEY = 'mss_log_write_queue_v1';
@@ -323,6 +439,8 @@ var MLW_KINDS = {
     midweek: { d: 1, w: 0, m: 0, en: 'Midweek 72h' },
     eow: { d: 1, w: 1, m: 0, en: 'End of week' },
     allergen: { d: 1, w: 0, m: 0, en: 'Allergen' },
+    egg: { d: 1, w: 0, m: 0, en: 'Egg allergen' },
+    pecan: { d: 1, w: 0, m: 0, en: 'Pecan allergen' },
     changeover: { d: 1, w: 0, m: 0, en: 'Changeover' },
     monthly: { d: 1, w: 1, m: 1, en: 'Monthly' },
     quarterly: { d: 1, w: 1, m: 1, en: 'Quarterly' },
@@ -340,6 +458,7 @@ var MLW_TEXT = {
     no_equipment: ['No equipment ID. Pick the equipment first.', 'Sin ID de equipo. Elija el equipo primero.'],
     bad_equipment: ['The equipment ID is not valid.', 'El ID de equipo no es v%alido.'],
     no_kind: ['Which clean was this? (daily, midweek, end of week ...)', '%?Qu%e limpieza fue? (diaria, media semana, fin de semana ...)'],
+    old_shared: ['This app has an old HUB SHARED block. Paste HUB SHARED 1.1 or later.', 'Esta app tiene un bloque HUB SHARED viejo. Pegue HUB SHARED 1.1 o posterior.'],
     no_day: ['No shift date.', 'Falta la fecha del turno.'],
     future_day: ['The date is in the future.', 'La fecha es futura.'],
     no_names: ['Who cleaned it? Add at least one name.', '%?Qui%en lo limpi%o? Agregue al menos un nombre.'],
@@ -368,6 +487,8 @@ function mlwKind(raw) {
     if (/^(q|qtr|quarter|3m)$/.test(s)) return 'quarterly';
     if (/^(6m|6-month|6month|sa|semi-annual)$/.test(s)) return 'semiannual';
     if (/^(a|y|yr|year|yearly|annually)$/.test(s)) return 'annual';
+    if (/^(egg|eggs|eggallergen|allergenegg|eggclean|huevo|alergenohuevo)$/.test(s)) return 'egg';
+    if (/^(pecan|pecans|pecanallergen|allergenpecan|pecanclean|nuez|pecana|nuezpecana|alergenonuez|alergenonuezpecana)$/.test(s)) return 'pecan';
     if (/^(allergenclean|allergenchangeover)$/.test(s)) return 'allergen';
     if (/^(pathogen|swab|reclean|re-clean)$/.test(s)) return 'corrective';
     if (/^(as-needed|asneeded|perrun|per-run)$/.test(s)) return 'other';
@@ -396,6 +517,7 @@ function mlwBuildRow(entry, now) {
     if (!rawGuid) problems.push('no_equipment'); else if (!guid) problems.push('bad_equipment');
     var kind = mlwKind(e.kind);
     if (!kind) problems.push('no_kind');
+    else if (!hubCleanKind(kind)) problems.push('old_shared');   // egg / pecan need HUB SHARED 1.1 or later
     var day = mlwDay(e.shiftDate) || (e.slotStart ? hubShiftDate(e.slotStart) : '');
     if (!day) problems.push('no_day');
     else if (day > hubAddDays(hubPlantDay(now || Date.now()), 1)) problems.push('future_day');
@@ -438,7 +560,7 @@ function mlwBuildRow(entry, now) {
     };
     var f = mlwFlags(kind);
     row.craa5_daily = f.craa5_daily; row.craa5_weekly = f.craa5_weekly; row.craa5_monthly = f.craa5_monthly;
-    if (kind === 'allergen') row.craa5_allergenclean = 'Yes';   // text Yes / No like craa5_pathogen; dropped if the column is another type
+    if (kind === 'allergen' || kind === 'egg' || kind === 'pecan') row.craa5_allergenclean = 'Yes';   // text Yes / No like craa5_pathogen; dropped if the column is another type
     return { ok: problems.length === 0, row: row, id: hubLogIdOf(key), key: key, kind: kind, day: day, problems: problems, warnings: warnings };
 }
 
@@ -611,7 +733,7 @@ function mlwApi(xrm, dataApi) {
     };
     return null;
 }
-/* ============================== END MSS LOG WRITE v1.1 ============================== */
+/* ============================== END MSS LOG WRITE v1.2 ============================== */
 
 // ============================================================================
 // SECTION 2: OBJECT-ORIENTED DOMAIN MODELS 
@@ -4914,11 +5036,13 @@ const CPL_TOP = 2000;
 const CPL_READ_MS = 5 * 60000;         // read again every 5 minutes while Ganttly is open
 const CPL_SCOPE_COLS = ['id', 'name', 'area', 'room', 'mins', 'heads', 'offsetMins', 'leftOutBy'];
 // Clean kind -> the equipment yes/no column that lists its pieces when the plan has no scope rows for it ([] = every piece).
-const CPL_KIND_COLS = { daily: ['craa5_dailyclean'], midweek: ['craa5_midweek'], eow: [], allergen: [], changeover: ['craa5_dailyclean'] };
+const CPL_KIND_COLS = { daily: ['craa5_dailyclean'], midweek: ['craa5_midweek'], eow: [], allergen: [], egg: ['craa5_eggallergen'], pecan: ['craa5_pecanallergen'], changeover: ['craa5_dailyclean'] };
 // The words people see for a planned clean (English; Spanish from HUB_ES through tr / hubT).
-const CPL_KIND_LABEL = { daily: 'Daily', midweek: 'Midweek 72h', eow: 'End of week', allergen: 'Allergen', changeover: 'Changeover' };
+const CPL_KIND_LABEL = { daily: 'Daily', midweek: 'Midweek 72h', eow: 'End of week', allergen: 'Allergen', egg: 'Egg allergen', pecan: 'Pecan allergen', changeover: 'Changeover' };
 // Clean kind colors on clocks and Gantts (data contract 10).
-const CPL_KIND_COLOR = { daily: '#0072CE', midweek: '#D97706', eow: '#00468B', allergen: '#7C3AED', changeover: '#64748B' };
+const CPL_KIND_COLOR = { daily: '#0072CE', midweek: '#D97706', eow: '#00468B', allergen: '#7C3AED', egg: '#7C3AED', pecan: '#7C3AED', changeover: '#64748B' };
+// Allergen cleans (data contract 6.2): the old combined one, and egg and pecan once the Scheduler splits them.
+const CPL_ALLERGEN_KINDS = ['allergen', 'egg', 'pecan'];
 function cplMs(v) { if (v === null || v === undefined || v === '') return NaN; const t = typeof v === 'number' ? v : Date.parse(v); return isNaN(t) ? NaN : t; }
 function cplJson(v) { if (v && typeof v === 'object') return v; try { const o = JSON.parse(String(v || '')); return o && typeof o === 'object' ? o : null; } catch (e) { return null; } }
 function cplErrKind(e) {
@@ -5117,6 +5241,200 @@ function cplAlertsIn(plan, fromMs, toMs) {
         return a.end > fromMs - 86400000 && a.start < toMs;
     }).sort(function(a, b) { return b.start - a.start; });
 }
+// ============================================================================
+// FLOOR TABLES (_g_): obstacles, handovers, personnel notes
+// [!] ARCHITECTURE NOTE: data contract 3.3 and 11 (Q7). Ganttly is the only writer. These used to live only in one browser
+// (ganttly_obstacle_logs, ganttly_shift_handovers, ganttly_personnel_records), so the next computer never saw them. Prompts:
+// ganttly-overhaul/g-tables-prompts.md. Plain text keys, no lookups; a row is never deleted (statecode 1). Row id =
+// hubIdFromKey('ganttly|' + key), so a retry or a second computer updates the same row. A table that is not made yet is said
+// so on the page and the entry stays on this computer, as before. Personnel notes are User-owned and sensitive: a writer
+// reads back only their own, managers read all, and incidents never go on the Employee row (everyone can read that row).
+// ============================================================================
+const GT_SPECS = {
+    obstacle: { label: '_g_ Obstacle', names: ['craa5__g_obstacle', 'craa5_g_obstacle', 'craa5__g_obstacles'], key: 'craa5_obstaclekey', when: 'craa5_startedat',
+        cols: ['craa5_startedat', 'craa5_shiftdate', 'craa5_crew', 'craa5_scope', 'craa5_area', 'craa5_equipmentguid', 'craa5_equipment', 'craa5_category', 'craa5_note', 'craa5_minutes', 'craa5_setuprequired', 'craa5_setupchecks', 'craa5_signedby', 'craa5_signedat', 'craa5_status', 'craa5_resolvedat', 'craa5_resolvedby', 'craa5_loggedby'] },
+    handover: { label: '_g_ Handover', names: ['craa5__g_handover', 'craa5_g_handover', 'craa5__g_handovers'], key: 'craa5_handoverkey', when: 'craa5_handedat',
+        cols: ['craa5_handedat', 'craa5_shiftdate', 'craa5_fromcrew', 'craa5_tocrew', 'craa5_pieces', 'craa5_equipmentguids', 'craa5_areas', 'craa5_notes', 'craa5_handedby'] },
+    note: { label: '_g_ Personnel Note', names: ['craa5__g_personnelnote', 'craa5_g_personnelnote', 'craa5__g_personnelnotes'], key: 'craa5_notekey', when: 'craa5_notedat',
+        cols: ['craa5_employeeguid', 'craa5_employee', 'craa5_kind', 'craa5_tag', 'craa5_note', 'craa5_severity', 'craa5_area', 'craa5_shiftdate', 'craa5_crew', 'craa5_notedat', 'craa5_givenby', 'craa5_givenbyguid'] }
+};
+const GT_RETRY_MS = 10 * 60000;           // a table found missing is looked for again after this
+const GT_READ_MS = 5 * 60000;             // obstacles and notes are read again this often
+const GT_OBSTACLE_DAYS = 14;              // obstacles read back this far (an active one is read whatever its age)
+const GT_NOTE_DAYS = 120;                 // personnel notes read back this far
+// kind -> { status: 'found' | 'missing' | 'denied' | 'error', table, at, err, missing: { column: true } }
+const GT_STATE = {};
+// This computer's short tag for new keys (two computers pressing in the same second still make two rows).
+function gtDevice() {
+    try {
+        let d = window.localStorage.getItem('ganttly_device_v1');
+        if (!d) { d = Math.random().toString(36).slice(2, 6); window.localStorage.setItem('ganttly_device_v1', d); }
+        return d;
+    } catch (e) { return 'x'; }
+}
+function gtKey(prefix, parts, ms) { return [prefix].concat(parts || []).concat([Math.floor((Number(ms) || Date.now()) / 1000).toString(36), gtDevice()]).join('|').slice(0, 100); }
+// Which of the table's names exists: one tiny read per name. Kept until the page reloads; 'missing' is looked at again later.
+function gtFind(dataApi, kind) {
+    const spec = GT_SPECS[kind], st = GT_STATE[kind];
+    if (st && (st.status === 'found' || Date.now() - st.at < GT_RETRY_MS)) return Promise.resolve(st);
+    let i = 0, lastErr = '', denied = false;
+    const next = function() {
+        if (i >= spec.names.length) {
+            GT_STATE[kind] = { status: denied ? 'denied' : lastErr && !/table|gone/.test(swClassify(lastErr)) ? 'error' : 'missing', table: '', at: Date.now(), err: lastErr, missing: {} };
+            return Promise.resolve(GT_STATE[kind]);
+        }
+        const t = spec.names[i++];
+        return swQuery(dataApi, t, { select: [t + 'id'], top: 1 }).then(function(res) {
+            if (res.rows !== null) { GT_STATE[kind] = { status: 'found', table: t, at: Date.now(), err: '', missing: {} }; return GT_STATE[kind]; }
+            const k = swClassify(res.err);
+            if (k === 'denied') denied = true;
+            if (k !== 'table' && k !== 'gone' && k !== 'denied') lastErr = res.err;
+            return next();
+        });
+    };
+    return next();
+}
+// Save one row by its key: create the fixed-id row, else (already there) update it. Most saves are new rows, so create goes
+// first. Columns the table refuses are left out (said in st.missing).
+// -> { ok: true } or { ok: false, status, err }. Never throws.
+function gtSave(dataApi, kind, key, fields) {
+    const spec = GT_SPECS[kind], w = swWriter(dataApi);
+    if (!w) return Promise.resolve({ ok: false, status: 'error', err: 'No Dataverse connection' });
+    return gtFind(dataApi, kind).then(function(st) {
+        if (st.status !== 'found') return { ok: false, status: st.status, err: st.err };
+        const rid = hubIdFromKey('ganttly|' + key);
+        const body = {};
+        body[spec.key] = String(key).slice(0, 100);
+        Object.keys(fields || {}).forEach(function(c) { if (!st.missing[c] && fields[c] !== undefined) body[c] = fields[c]; });
+        let op = 'create', tries = 0;
+        const go = function() {
+            if (tries++ > 8) return Promise.resolve({ ok: false, status: 'error', err: 'Too many tries' });
+            let p;
+            try { p = op === 'create' ? w.create(st.table, Object.assign({}, body, { [st.table + 'id']: rid })) : w.update(st.table, rid, body); } catch (e0) { p = Promise.reject(e0); }
+            return Promise.resolve(p).then(function() { return { ok: true }; }, function(e) {
+                const msg = swErrText(e), k = swClassify(msg), named = swNamedColumns(msg, Object.keys(body));
+                const gone = k === 'gone' || /with id\s*=?\s*\{?[0-9a-f-]{36}\}?\s*does not exist/i.test(msg) || !!(e && (e.errorCode === 2147746065 || e.status === 404));
+                if (op === 'update' && gone && !named.length) { op = 'create'; return go(); }
+                if (op === 'create' && k === 'duplicate') { op = 'update'; return go(); }
+                const opt = named.filter(function(c) { return c !== spec.key; });
+                if ((k === 'column' || opt.length) && opt.length) { opt.forEach(function(c) { st.missing[c] = true; delete body[c]; }); return go(); }
+                return { ok: false, status: k === 'denied' ? 'denied' : 'error', err: msg };
+            });
+        };
+        return go();
+    });
+}
+// Active rows whose time column is after sinceMs (plus extraFilter OR'd in). -> { rows } or { rows: null, status, err }.
+function gtRead(dataApi, kind, sinceMs, extraFilter, top) {
+    const spec = GT_SPECS[kind];
+    return gtFind(dataApi, kind).then(function(st) {
+        if (st.status !== 'found') return { rows: null, status: st.status, err: st.err };
+        const since = spec.when + ' ge ' + new Date(sinceMs).toISOString();
+        const sel = [st.table + 'id', spec.key].concat(spec.cols.filter(function(c) { return !st.missing[c]; }));
+        return swQuery(dataApi, st.table, { select: sel, filter: 'statecode eq 0 and (' + since + (extraFilter ? ' or ' + extraFilter : '') + ')', orderBy: spec.when + ' desc', top: top || 500 }).then(function(res) {
+            if (res.rows !== null) return { rows: res.rows };
+            // A column named in the select that the table lacks: left out, read again once.
+            const named = swNamedColumns(res.err, sel);
+            if (named.length) { named.forEach(function(c) { st.missing[c] = true; }); return gtRead(dataApi, kind, sinceMs, extraFilter, top); }
+            return { rows: null, status: swClassify(res.err) === 'denied' ? 'denied' : 'error', err: res.err };
+        });
+    });
+}
+// A table row -> the obstacle record the Downtime & Obstacles tab already shows.
+function gtObstacleOf(r) {
+    let setup = null;
+    try { setup = r.craa5_setupchecks ? JSON.parse(r.craa5_setupchecks) : null; } catch (e) { setup = null; }
+    const yes = r.craa5_setuprequired === true || /^(true|yes|1)$/i.test(String(r.craa5_setuprequired || ''));
+    const at = r.craa5_startedat || r.createdon || '';
+    const scope = String(r.craa5_scope || 'global');
+    const d = new Date(at);
+    return {
+        id: String(r.craa5_obstaclekey || ''),
+        datetime: at,
+        dateFormatted: isNaN(d.getTime()) ? '' : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
+        scope: scope,
+        targetId: scope === 'equipment' ? hubGuid(r.craa5_equipmentguid) || String(r.craa5_equipment || '') : scope === 'area' ? String(r.craa5_area || '') : 'GLOBAL',
+        targetName: scope === 'equipment' ? String(r.craa5_equipment || '') : scope === 'area' ? String(r.craa5_area || '') : 'Plant-wide / Global Shift',
+        targetArea: scope === 'global' ? 'Global' : String(r.craa5_area || ''),
+        category: String(r.craa5_category || ''),
+        text: String(r.craa5_note || ''),
+        duration: Number(r.craa5_minutes) || 0,
+        properSetupRequired: yes,
+        properSetup: yes ? Object.assign({ belts: false, clamps: false, reassembly: false, swabbed: false }, setup || {}, { signedBy: String(r.craa5_signedby || ''), signedAt: r.craa5_signedat || null }) : null,
+        status: String(r.craa5_status || 'active').toLowerCase() === 'resolved' ? 'resolved' : 'active',
+        loggedBy: String(r.craa5_loggedby || ''),
+        shared: true
+    };
+}
+// The obstacle record -> the table's columns (shift date and crew from the shift it was logged in).
+function gtObstacleRow(o, facts, by) {
+    const ps = o.properSetup || null;
+    return {
+        craa5_startedat: o.datetime || new Date().toISOString(),
+        craa5_shiftdate: facts && facts.slotStart ? hubShiftDate(facts.slotStart) : '',
+        craa5_crew: facts ? facts.crew || '' : '',
+        craa5_scope: o.scope || 'global',
+        craa5_area: o.scope === 'global' ? '' : String(o.targetArea || o.targetName || '').slice(0, 100),
+        craa5_equipmentguid: o.scope === 'equipment' && hubIsGuid(o.targetId) ? hubGuid(o.targetId) : '',
+        craa5_equipment: o.scope === 'equipment' ? String(o.targetName || '').slice(0, 200) : '',
+        craa5_category: String(o.category || '').slice(0, 100),
+        craa5_note: String(o.text || '').slice(0, 4000),
+        craa5_minutes: Math.round(Number(o.duration) || 0),
+        craa5_setuprequired: !!o.properSetupRequired,
+        craa5_setupchecks: ps ? JSON.stringify({ belts: !!ps.belts, clamps: !!ps.clamps, reassembly: !!ps.reassembly, swabbed: !!ps.swabbed }) : '',
+        craa5_signedby: ps ? String(ps.signedBy || '').slice(0, 200) : '',
+        craa5_signedat: ps && ps.signedAt ? ps.signedAt : null,
+        craa5_status: o.status === 'resolved' ? 'resolved' : 'active',
+        craa5_resolvedat: o.status === 'resolved' ? (o.resolvedAt || new Date().toISOString()) : null,
+        craa5_resolvedby: o.status === 'resolved' ? String(o.resolvedBy || by || '').slice(0, 200) : '',
+        craa5_loggedby: String(o.loggedBy || by || '').slice(0, 200)
+    };
+}
+// A personnel note row -> the remark Ganttly keeps per employee ({ highFives, logs }).
+function gtRemarkOf(r) {
+    const kind = String(r.craa5_kind || '').toLowerCase();
+    const at = r.craa5_notedat || r.createdon || '';
+    const d = new Date(at);
+    return {
+        id: String(r.craa5_notekey || ''),
+        datetime: at,
+        dateFormatted: isNaN(d.getTime()) ? '' : d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
+        type: kind === 'highfive' ? 'highfive' : 'incident',
+        givenBy: String(r.craa5_givenby || ''),
+        tag: String(r.craa5_tag || ''),
+        text: String(r.craa5_note || ''),
+        severity: String(r.craa5_severity || (kind === 'highfive' ? 'positive' : 'coaching')),
+        supervisor: String(r.craa5_givenby || ''),
+        area: String(r.craa5_area || ''),
+        employeeName: String(r.craa5_employee || ''),
+        shared: true
+    };
+}
+// The tables and columns this build uses (data contract 12.1): saved once per change to Hub config 'manifest|ganttly',
+// where the Dataverse monitor checks them. Logical names only.
+const GANTTLY_MANIFEST = {
+    appId: 'ganttly', app: 'Ganttly', version: '1.4.0',
+    tables: [
+        { t: 'craa5_aa_assets', names: ['craa5_aa_assets', 'craa5_aa_asset'], read: ['craa5_aa_assetsid', 'craa5_equipmentidentifier', 'craa5_areaname', 'craa5_roomname', 'craa5_workareacode', 'craa5_subcategory', 'craa5_hoursrequired', 'craa5_minalrg', 'craa5_eggminutes', 'craa5_pecanminutes', 'craa5_heads', 'craa5_priority', 'craa5_supportedline', 'craa5_cleanoffsetmins', 'craa5_dailyclean', 'craa5_midweek', 'craa5_weeklyclean', 'craa5_monthlyclean', 'craa5_month', 'craa5_quarterly', 'craa5_annually', 'craa5_eggallergen', 'craa5_pecanallergen'], write: [], opt: ['craa5_eggminutes', 'craa5_pecanminutes', 'craa5_eggallergen', 'craa5_pecanallergen', 'craa5_supportedline', 'craa5_cleanoffsetmins', 'craa5_priority'] },
+        { t: 'craa5__aa_employee', names: ['craa5__aa_employee', 'craa5_aa_employee'], read: ['craa5__aa_employeeid', 'craa5_name', 'craa5_shift', 'craa5_role', 'craa5_email', 'craa5_remarks', 'craa5_remarkcategory'], write: ['craa5_remarks', 'craa5_remarkcategory'], opt: ['craa5_remarks', 'craa5_remarkcategory'] },
+        { t: 'craa5_aa_mss_area', names: ['craa5_aa_mss_area'], read: ['craa5_aa_mss_areaid', 'craa5_area', 'craa5_parentroom', 'craa5_production', 'craa5_runsproduct', 'craa5_supportingoffset', 'craa5_cleanoffsetmins'], write: [], opt: ['craa5_supportingoffset', 'craa5_cleanoffsetmins'] },
+        { t: 'craa5_workshift', names: ['craa5_workshift'], read: ['craa5_workshiftid', 'craa5_shiftcode', 'craa5_dayname', 'craa5_daynumber'], write: [], opt: [] },
+        { t: 'craa5_linepriority', names: LINE_PRIORITY_TABLES, read: ['craa5_linepriority', 'craa5_priority'], write: [], opt: [] },
+        { t: 'craa5__aa_prd_schd', names: PROD_TABLES, read: ['craa5__aa_prd_schdid', 'craa5_area', 'craa5_line', 'craa5_product', 'craa5_datestarttime', 'craa5_dateendtime', 'craa5_allergen'], write: [], opt: ['craa5_allergen'] },
+        { t: 'craa5_cleanplan', names: [CPL_TABLE], read: CPL_COLS_ALL, write: [], opt: CPL_COLS_ALL.filter(function(c) { return CPL_COLS_REQ.indexOf(c) < 0; }) },
+        { t: 'craa5_cleancheckoff', names: [CHECKOFF_SPEC.table].concat(CHECKOFF_SPEC.tables), read: CHECKOFF_SPEC.cols.map(function(c) { return c.logical; }), write: CHECKOFF_SPEC.cols.map(function(c) { return c.logical; }), opt: CHECKOFF_SPEC.cols.filter(function(c) { return !c.required; }).map(function(c) { return c.logical; }) },
+        { t: 'craa5__log_', names: ['craa5__log_'], read: ['craa5_equipmentguid', 'craa5_lastcleaned', 'craa5_sap', 'craa5_daily', 'craa5_weekly', 'craa5_monthly', 'craa5_completionkey', 'craa5_cleankind', 'craa5_shiftdate'], write: ['craa5_equipmentguid', 'craa5_completionkey', 'craa5_shiftdate', 'craa5_shiftcode', 'craa5_cleankind', 'craa5_laborminutes', 'craa5_employeeguids', 'craa5_markedby', 'craa5_source', 'craa5_doneat', 'craa5_plankey', 'craa5_linekey', 'craa5_lastcleaned', 'craa5_lastcleanedby', 'craa5_hoursworked', 'craa5_sap', 'craa5_sapw', 'craa5_uid', 'craa5_pathogen', 'craa5_allergenclean', 'craa5_daily', 'craa5_weekly', 'craa5_monthly'], opt: ['craa5_completionkey', 'craa5_shiftdate', 'craa5_shiftcode', 'craa5_cleankind', 'craa5_laborminutes', 'craa5_employeeguids', 'craa5_markedby', 'craa5_source', 'craa5_doneat', 'craa5_plankey', 'craa5_linekey', 'craa5_allergenclean'] },
+        { t: 'craa5_shiftboard', names: [GB_BOARD_TABLE], read: ['craa5_boardjson', 'craa5_updatesjson'], write: ['craa5_updatesjson'], opt: ['craa5_updatesjson'] },
+        { t: 'craa5_shiftplan', names: [GB_PLAN_TABLE], read: ['craa5_boardjson'], write: [], opt: [] },
+        { t: 'craa5_shiftarchive', names: [GB_ARCHIVE_TABLE], read: ['craa5_boardjson', 'craa5_updatesjson', 'craa5_slotstart'], write: ['craa5_title', 'craa5_boardjson', 'craa5_updatesjson', 'craa5_team', 'craa5_crew', 'craa5_slotstart', 'craa5_slotend', 'craa5_sourceboardid', 'craa5_status', 'craa5_archivedon', 'craa5_archivedby', 'craa5_savecount', 'craa5_lastsavedby', 'craa5_retiredon'], opt: ['craa5_updatesjson', 'craa5_team', 'craa5_crew', 'craa5_slotend', 'craa5_sourceboardid', 'craa5_status', 'craa5_archivedon', 'craa5_archivedby', 'craa5_savecount', 'craa5_lastsavedby', 'craa5_retiredon'] },
+        { t: 'craa5_shiftlog', names: [GB_LOG_TABLE], read: [], write: ['craa5_title', 'craa5_action', 'craa5_app', 'craa5_at', 'craa5_board', 'craa5_boardid', 'craa5_crew', 'craa5_details', 'craa5_source', 'craa5_summary', 'craa5_team', 'craa5_user', 'craa5_useremail'], opt: ['craa5_action', 'craa5_app', 'craa5_at', 'craa5_board', 'craa5_boardid', 'craa5_crew', 'craa5_details', 'craa5_source', 'craa5_summary', 'craa5_team', 'craa5_user', 'craa5_useremail'] },
+        { t: 'craa5_taskassignment', names: ['craa5_taskassignment'], read: TASK_ROW_FIELDS, write: [], opt: [] },
+        { t: 'craa5__g_obstacle', names: GT_SPECS.obstacle.names, read: [GT_SPECS.obstacle.key].concat(GT_SPECS.obstacle.cols), write: [GT_SPECS.obstacle.key].concat(GT_SPECS.obstacle.cols), opt: GT_SPECS.obstacle.cols },
+        { t: 'craa5__g_handover', names: GT_SPECS.handover.names, read: [], write: [GT_SPECS.handover.key].concat(GT_SPECS.handover.cols), opt: GT_SPECS.handover.cols },
+        { t: 'craa5__g_personnelnote', names: GT_SPECS.note.names, read: [GT_SPECS.note.key].concat(GT_SPECS.note.cols), write: [GT_SPECS.note.key].concat(GT_SPECS.note.cols), opt: GT_SPECS.note.cols }
+    ],
+    config: []   // ganttly_settings moves here later (data contract 11); nothing written to Hub config yet but this manifest
+};
 // ============================================================================
 // TYPE OF CLEAN
 // ============================================================================
@@ -6932,7 +7250,7 @@ export default function App(props) {
         const dateFormatted = now.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }) + ' ' + now.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 
         const newRemark = {
-            id: record.id || ('rem_' + Date.now()),
+            id: record.id || gtKey('pn', [hubGuid(employeeId)], now.getTime()),   // the _g_ Personnel Note key (FLOOR TABLES)
             datetime: record.datetime || record.timestamp || now.toISOString(),
             dateFormatted: record.dateFormatted || dateFormatted,
             type: record.type, // 'highfive' or 'incident'
@@ -6945,16 +7263,16 @@ export default function App(props) {
             employeeName: record.employeeName || ''
         };
 
-        let updatedLogs = [];
-        let highFivesCount = 0;
+        // The logs as they stand now (a state updater may run later, so the save below never waits on it).
+        const updatedLogs = [newRemark].concat(((personnelRecords && personnelRecords[employeeId]) || { logs: [] }).logs || []);
         setPersonnelRecords(function(prev) {
             const existing = prev[employeeId] || { highFives: 0, logs: [] };
             const isHf = record.type === 'highfive';
-            updatedLogs = [newRemark].concat(existing.logs || []);
-            highFivesCount = updatedLogs.filter(function(r) { return r.type === 'highfive'; }).length;
+            const logs = [newRemark].concat((existing.logs || []).filter(function(x) { return x.id !== newRemark.id; }));
+            const highFivesCount = logs.filter(function(r) { return r.type === 'highfive'; }).length;
             const updated = {
                 highFives: highFivesCount,
-                logs: updatedLogs,
+                logs: logs,
                 category: isHf ? ('High Five: ' + newRemark.tag) : ('Incident: ' + newRemark.tag)
             };
             const next = Object.assign({}, prev, { [employeeId]: updated });
@@ -6968,16 +7286,35 @@ export default function App(props) {
         );
 
         const isHf = record.type === 'highfive';
-        const category = isHf 
-            ? ('High Five: ' + (newRemark.tag || 'recognition'))
-            : ('Incident: ' + (newRemark.tag || record.severity || 'coaching'));
-
+        const cleanId = String(employeeId).replace(/[{}]/g, '').toLowerCase();
+        // The note itself goes to _g_ Personnel Note (User-owned: the writer and managers read it).
+        const facts = doneLogFacts(newRemark.area || '', null, Date.parse(newRemark.datetime) || Date.now());
+        gtSave(props.dataApi, 'note', newRemark.id, {
+            craa5_employeeguid: cleanId,
+            craa5_employee: String(newRemark.employeeName || '').slice(0, 200),
+            craa5_kind: isHf ? 'highfive' : (newRemark.severity === 'coaching' ? 'coaching' : 'incident'),
+            craa5_tag: String(newRemark.tag || '').slice(0, 100),
+            craa5_note: String(newRemark.text || '').slice(0, 4000),
+            craa5_severity: String(newRemark.severity || '').slice(0, 20),
+            craa5_area: String(newRemark.area || '').slice(0, 100),
+            craa5_shiftdate: hubShiftDate(facts.slotStart),
+            craa5_crew: facts.crew || '',
+            craa5_notedat: newRemark.datetime,
+            craa5_givenby: String(newRemark.givenBy || '').slice(0, 200),
+            craa5_givenbyguid: effectiveSupervisorInfo && hubIsGuid(effectiveSupervisorInfo.empId) ? hubGuid(effectiveSupervisorInfo.empId) : ''
+        }).then(function(res) {
+            noteGt('note');
+            const say = gtSaveSay('note', res);
+            if (say) setPersonnelToast(say);
+        });
+        // Incidents and coaching never go on the Employee row: everyone who can read Employee would see them (data contract 3.3).
+        if (!isHf) return;
+        const category = 'High Five: ' + (newRemark.tag || 'recognition');
         const payload = {
-            craa5_remarks: JSON.stringify(updatedLogs.slice(0, 50)),
+            craa5_remarks: JSON.stringify(updatedLogs.filter(function(r) { return r.type === 'highfive'; }).slice(0, 50)),
             craa5_remarkcategory: category
         };
 
-        const cleanId = String(employeeId).replace(/[{}]/g, '').toLowerCase();
         gbRecordRemark(props.dataApi, { id: newRemark.id, employeeId: cleanId, employeeName: newRemark.employeeName, type: newRemark.type, tag: newRemark.tag, text: newRemark.text, givenBy: newRemark.givenBy, area: newRemark.area, at: newRemark.datetime });   // also onto the live Shift Start board
 
         try {
@@ -7580,6 +7917,8 @@ export default function App(props) {
                             subcategory: String(a['craa5_subcategory@OData.Community.Display.V1.FormattedValue'] || a.craa5_subcategory || a.craa5_Subcategory || '').trim(),
                             minutesRequired: parseFloat(a.craa5_hoursrequired) || 0,
                             allergenMins: parseFloat(a.craa5_MINALRG || a.craa5_minalrg) || 0,
+                            eggMins: parseFloat(a.craa5_eggminutes) || 0,      // blank or 0 = use the allergen minutes (data contract 3.1)
+                            pecanMins: parseFloat(a.craa5_pecanminutes) || 0,
                             pbMins: 0,
                             flags: ynCols.filter(function(k) { return yesNoValue(a[k]) === true; }),
                             heads: parseInt(a.craa5_heads || a.craa5_Heads, 10) || 1,
@@ -7823,11 +8162,23 @@ export default function App(props) {
         if (!cleanPlan || !asset) return null;
         return cplNextDueMs(cleanPlan, cplRoomOf(String(asset.area || asset.room || '')), asset.id, doneMs);
     };
-    // Allergen clean mode: the room's own tick on Setup, or an allergen clean in the published plan.
-    const roomAllergenOn = function(area) {
-        if (roomAllergen[area]) return true;
-        const rc = roomPlan(area);
-        return !!(rc && rc.w && rc.kind === 'allergen');
+    // Allergen clean mode: the room's own tick on Setup, its own pick of the egg / pecan column, or an allergen clean (allergen, egg,
+    // pecan) in the published plan. roomAllergenKind says which one ('' = none).
+    const roomAllergenKind = function(area) {
+        const own = roomCleanType[String(area)];
+        if (own === 'craa5_eggallergen') return 'egg';
+        if (own === 'craa5_pecanallergen') return 'pecan';
+        const rc = own ? null : roomPlan(area);
+        if (rc && rc.w && CPL_ALLERGEN_KINDS.indexOf(rc.kind) > -1) return rc.kind;
+        return roomAllergen[area] ? 'allergen' : '';
+    };
+    const roomAllergenOn = function(area) { return !!roomAllergenKind(area); };
+    // A piece's minutes for that allergen: its egg / pecan minutes, else the allergen minutes (craa5_minalrg).
+    const allergenMinsFor = function(a, kind) {
+        if (!a) return 0;
+        if (kind === 'egg' && a.eggMins > 0) return a.eggMins;
+        if (kind === 'pecan' && a.pecanMins > 0) return a.pecanMins;
+        return a.allergenMins || 0;
     };
     // What to say about the clean plan read: null when it is fine.
     const cleanPlanNote = function() {
@@ -7909,6 +8260,135 @@ export default function App(props) {
         try { Object.keys(window.localStorage).forEach(function(k) { if (k.indexOf('itp_autolog_v1_') === 0) window.localStorage.removeItem(k); }); } catch (e) { /* storage off */ }
     }, [isLoading]);
     const planAlerts = useMemo(function() { return cplAlertsIn(cleanPlan, globalStartMs, globalStartMs + planHorizonMins * 60000); }, [cleanPlan, globalStartMs, planHorizonMins]);
+
+    // ---- Manifest (data contract 12.1): the tables this build uses, saved once for the Dataverse monitor; never blocks or shows an error ----
+    useEffect(function() {
+        if (isLoading || !IS_CURRENT) return;
+        const w = swWriter(props.dataApi);
+        if (!w) return;
+        hubSaveManifest({ query: function(t, q) { return swQuery(props.dataApi, t, q); }, create: w.create, update: w.update }, GANTTLY_MANIFEST);
+    }, [isLoading]);
+
+    // ---- Floor tables (FLOOR TABLES): obstacles, handovers and personnel notes shared through the _g_ tables ----
+    // gtStatus: what the last look at each table found ('found', 'missing', 'denied', 'error'; absent = not looked yet).
+    const [gtStatus, setGtStatus] = useState({});
+    const noteGt = function(kind) { const st = GT_STATE[kind]; if (st) setGtStatus(function(prev) { return prev[kind] === st.status ? prev : Object.assign({}, prev, { [kind]: st.status }); }); };
+    const gtWho = function() { return (effectiveSupervisorInfo && effectiveSupervisorInfo.name) || (detectedMsUser && detectedMsUser.userName) || ''; };
+    // What a save that did not reach the table means for the person who pressed it.
+    const gtSaveSay = function(kind, res) {
+        if (res && res.ok) return '';
+        const name = GT_SPECS[kind].label;
+        if (res && res.status === 'missing') return tr('Kept on this computer only: the ' + name + ' table is not made yet.', 'Guardado solo en esta computadora: la tabla ' + name + ' aun no existe.');
+        if (res && res.status === 'denied') return tr('Kept on this computer only: no permission to save to ' + name + '.', 'Guardado solo en esta computadora: sin permiso para guardar en ' + name + '.');
+        return tr('Kept on this computer only: ' + name + ' could not be saved. ', 'Guardado solo en esta computadora: no se pudo guardar en ' + name + '. ') + String((res && res.err) || '').slice(0, 120);
+    };
+    const saveObstacle = function(o, extra) {
+        const facts = doneLogFacts('', null, Date.parse(o.datetime) || Date.now());
+        const fields = Object.assign(gtObstacleRow(o, facts, gtWho()), extra || {});
+        return gtSave(props.dataApi, 'obstacle', o.id, fields).then(function(res) {
+            noteGt('obstacle');
+            if (res.ok && !extra) setObstacleLogs(function(prev) { return prev.map(function(x) { return x.id === o.id ? Object.assign({}, x, { shared: true }) : x; }); });
+            return res;
+        });
+    };
+    // Obstacles from every computer: active ones whatever their age, others from the last GT_OBSTACLE_DAYS days. A shared obstacle
+    // no longer returned (set inactive, or old and resolved) drops off this list; one never saved stays.
+    const loadObstacles = function() {
+        return gtRead(props.dataApi, 'obstacle', Date.now() - GT_OBSTACLE_DAYS * 86400000, "craa5_status eq 'active'", 300).then(function(res) {
+            noteGt('obstacle');
+            if (!res.rows) return;
+            const shared = res.rows.map(gtObstacleOf).filter(function(o) { return !!o.id; });
+            const byId = {};
+            shared.forEach(function(o) { byId[o.id] = o; });
+            setObstacleLogs(function(prev) {
+                const local = prev.filter(function(o) { return !byId[o.id] && !o.shared; });
+                const next = shared.concat(local).sort(function(a, b) { return (Date.parse(b.datetime) || 0) - (Date.parse(a.datetime) || 0); });
+                const sig = function(list) { return list.map(function(o) { return o.id + ':' + o.status + ':' + (o.properSetup ? JSON.stringify(o.properSetup) : ''); }).join(','); };
+                if (sig(next) === sig(prev)) return prev;
+                try { localStorage.setItem('ganttly_obstacle_logs', JSON.stringify(next)); } catch (e) {}
+                return next;
+            });
+        });
+    };
+    // Personnel notes this account may read (its own; a manager reads all), added to each person's high fives and notes.
+    const loadNotes = function() {
+        return gtRead(props.dataApi, 'note', Date.now() - GT_NOTE_DAYS * 86400000, '', 2000).then(function(res) {
+            noteGt('note');
+            if (!res.rows || !res.rows.length) return;
+            setPersonnelRecords(function(prev) {
+                const keyOf = {};
+                Object.keys(prev).forEach(function(k) { keyOf[hubGuid(k)] = k; });
+                const next = Object.assign({}, prev);
+                let changed = false;
+                res.rows.forEach(function(r) {
+                    const g = hubGuid(r.craa5_employeeguid);
+                    if (!hubIsGuid(g)) return;
+                    const k = keyOf[g] || g;
+                    const cur = next[k] || { highFives: 0, logs: [] };
+                    const rem = gtRemarkOf(r);
+                    if ((cur.logs || []).some(function(x) { return x.id === rem.id; })) return;
+                    const logs = [rem].concat(cur.logs || []).sort(function(a, b) { return (Date.parse(b.datetime) || 0) - (Date.parse(a.datetime) || 0); });
+                    next[k] = Object.assign({}, cur, { logs: logs, highFives: logs.filter(function(x) { return x.type === 'highfive'; }).length });
+                    keyOf[g] = k;
+                    changed = true;
+                });
+                if (!changed) return prev;
+                try { localStorage.setItem('ganttly_personnel_records', JSON.stringify(next)); } catch (e) {}
+                return next;
+            });
+        });
+    };
+    const loadFloorRef = useRef(null);
+    loadFloorRef.current = function() { loadObstacles(); loadNotes(); };
+    useEffect(function() {
+        if (isLoading) return undefined;
+        loadFloorRef.current();
+        const t = setInterval(function() { loadFloorRef.current(); }, GT_READ_MS);
+        return function() { clearInterval(t); };
+    }, [isLoading, props.dataApi]);
+    // A shared obstacle logged or resolved on another computer moves this computer's Gantt too (the same downtime id).
+    useEffect(function() {
+        const shared = obstacleLogs.filter(function(o) { return o.shared; });
+        if (!shared.length) return;
+        const label = function(o) { return 'Obstacle: ' + o.category + ' - ' + String(o.text || '').slice(0, 30); };
+        const at = function(o) { const d = new Date(o.datetime); return isNaN(d.getTime()) ? new Date().toISOString().slice(0, 16) : d.toISOString().slice(0, 16); };
+        setDowntimes(function(prev) {
+            let next = prev.filter(function(d) { return !shared.some(function(o) { return o.id === d.id && o.status !== 'active'; }); });
+            shared.forEach(function(o) {
+                if (o.status === 'active' && o.scope === 'global' && !next.some(function(d) { return d.id === o.id; })) next = next.concat([{ id: o.id, dateTimeStr: at(o), duration: o.duration, label: label(o), isCustom: true }]);
+            });
+            return next.length === prev.length && next.every(function(d, i) { return d === prev[i]; }) ? prev : next;
+        });
+        setTargetDowntimes(function(prev) {
+            let next = prev.filter(function(d) { return !shared.some(function(o) { return o.id === d.id && o.status !== 'active'; }); });
+            shared.forEach(function(o) {
+                if (o.status === 'active' && o.scope !== 'global' && !next.some(function(d) { return d.id === o.id; })) next = next.concat([{ id: o.id, type: o.scope === 'area' ? 'room' : 'equipment', targetId: o.targetId, dateTimeStr: at(o), duration: o.duration, label: label(o) }]);
+            });
+            return next.length === prev.length && next.every(function(d, i) { return d === prev[i]; }) ? prev : next;
+        });
+    }, [obstacleLogs]);
+    // A handover: who passed which pieces to which crew, from the shift it was handed in.
+    const saveHandover = function(h, tasks) {
+        const facts = doneLogFacts('', null, Date.parse(h.timestamp) || Date.now());
+        const guids = [], areas = [];
+        (tasks || []).forEach(function(t) {
+            const g = hubGuid(t.parentId || t.id);
+            if (hubIsGuid(g)) guids.push(g);
+            const a = String(t.originalArea || t.area || '').trim();
+            if (a && areas.indexOf(a) < 0) areas.push(a);
+        });
+        return gtSave(props.dataApi, 'handover', h.id, {
+            craa5_handedat: h.timestamp,
+            craa5_shiftdate: hubShiftDate(facts.slotStart),
+            craa5_fromcrew: String(h.outgoingCrew || facts.crew || ''),
+            craa5_tocrew: String(h.incomingCrew || ''),
+            craa5_pieces: Number(h.count) || 0,
+            craa5_equipmentguids: hubGuidList(guids),
+            craa5_areas: areas.join('; ').slice(0, 2000),
+            craa5_notes: String(h.notes || '').slice(0, 4000),
+            craa5_handedby: String(h.supervisor || gtWho()).slice(0, 200)
+        }).then(function(res) { noteGt('handover'); return res; });
+    };
 
     // ---- Type of clean (see TYPE OF CLEAN) ----
     const cleanTypeLabel = function(k) { return cleanTypeLabels[k] || CLEAN_TYPE_LABELS[k] || humanizeColumn(k); };
@@ -8415,7 +8895,8 @@ export default function App(props) {
             if (r.labels.indexOf(label) === -1) r.labels.push(label);
             r.support = r.labels.every(function(lb) { return !!supportRooms[lb]; });
             r.priority = Math.min(r.priority, roomPriority[label] || 2);
-            const mins = roomAllergenOn(label) && a.allergenMins > 0 ? a.allergenMins : (Number(a.minutesRequired) || 0);
+            const alrgMins = roomAllergenOn(label) ? allergenMinsFor(a, roomAllergenKind(label)) : 0;
+            const mins = alrgMins > 0 ? alrgMins : (Number(a.minutesRequired) || 0);
             r.work += mins;
             if ((a.kind || taskKind(a)) === 'pic') r.picWork += mins;
         });
@@ -10028,7 +10509,8 @@ export default function App(props) {
             if (rPri < vRoom.priority) vRoom.priority = rPri;
 
             const ssDone = isDoneInShiftStart(rawT, area);
-            const t = new Equipment(rawT, roomAllergenOn(area), pbMode);
+            const alrgKind = roomAllergenKind(area);
+            const t = new Equipment(alrgKind === 'egg' || alrgKind === 'pecan' ? Object.assign({}, rawT, { allergenMins: allergenMinsFor(rawT, alrgKind) }) : rawT, !!alrgKind, pbMode);
             t.isComplete = ssDone;
             if (ssDone) {
                 t.status = 'done';
@@ -17526,7 +18008,8 @@ export default function App(props) {
                     const dateFormatted = now.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + now.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 
                     const newObs = {
-                        id: 'obs_' + Date.now(),
+                        id: gtKey('obs', [], now.getTime()),   // the _g_ Obstacle key (FLOOR TABLES)
+                        loggedBy: gtWho(),
                         datetime: now.toISOString(),
                         dateFormatted: dateFormatted,
                         scope: obstacleScope,
@@ -17554,6 +18037,7 @@ export default function App(props) {
                         try { localStorage.setItem('ganttly_obstacle_logs', JSON.stringify(next)); } catch (e) {}
                         return next;
                     });
+                    saveObstacle(newObs).then(function(res) { const say = gtSaveSay('obstacle', res); if (say) setPersonnelToast(say); });
 
                     // Push into Ganttly downtime engine to shift schedule
                     const dtTimeStr = now.toISOString().slice(0, 16);
@@ -17586,40 +18070,45 @@ export default function App(props) {
                     setObstacleSelectedTarget(null);
                     setObstacleProperSetup(false);
                     setObstacleSetupItems({ belts: false, clamps: false, reassembly: false, swabbed: false });
-                    setPersonnelToast('Downtime & obstacle logged for ' + targetObj.name + ' (' + dur + 'm)!');
+                    setPersonnelToast(tr('Downtime & obstacle logged for ', 'Paro y obstaculo registrado para ') + targetObj.name + ' (' + dur + 'm)');
                 };
 
                 const handleToggleSetupItem = function(obsId, key) {
+                    const cur = obstacleLogs.find(function(item) { return item.id === obsId && item.properSetup; });
+                    if (!cur) return;
+                    const updatedSetup = Object.assign({}, cur.properSetup);
+                    updatedSetup[key] = !updatedSetup[key];
+                    const changed = Object.assign({}, cur, { properSetup: updatedSetup });
                     setObstacleLogs(function(prev) {
-                        const next = prev.map(function(item) {
-                            if (item.id === obsId && item.properSetup) {
-                                const updatedSetup = Object.assign({}, item.properSetup);
-                                updatedSetup[key] = !updatedSetup[key];
-                                return Object.assign({}, item, { properSetup: updatedSetup });
-                            }
-                            return item;
-                        });
+                        const next = prev.map(function(item) { return item.id === obsId ? Object.assign({}, item, { properSetup: updatedSetup }) : item; });
                         try { localStorage.setItem('ganttly_obstacle_logs', JSON.stringify(next)); } catch (e) {}
                         return next;
                     });
+                    saveObstacle(changed).then(function(res) { const say = gtSaveSay('obstacle', res); if (say) setPersonnelToast(say); });
                 };
 
                 const handleResolveObstacle = function(obsId) {
+                    const cur = obstacleLogs.find(function(item) { return item.id === obsId; });
+                    const resolved = { status: 'resolved', resolvedAt: new Date().toISOString(), resolvedBy: gtWho() };
                     setObstacleLogs(function(prev) {
                         const next = prev.map(function(item) {
-                            if (item.id === obsId) return Object.assign({}, item, { status: 'resolved' });
+                            if (item.id === obsId) return Object.assign({}, item, resolved);
                             return item;
                         });
                         try { localStorage.setItem('ganttly_obstacle_logs', JSON.stringify(next)); } catch (e) {}
                         return next;
                     });
+                    if (cur) saveObstacle(Object.assign({}, cur, resolved)).then(function(res) { const say = gtSaveSay('obstacle', res); if (say) setPersonnelToast(say); });
                     // Remove from timeline downtime
                     setDowntimes(function(prev) { return prev.filter(function(d) { return d.id !== obsId; }); });
                     setTargetDowntimes(function(prev) { return prev.filter(function(d) { return d.id !== obsId; }); });
-                    setPersonnelToast('Obstacle resolved & timeline cleared');
+                    setPersonnelToast(tr('Obstacle resolved & timeline cleared', 'Obstaculo resuelto y linea de tiempo liberada'));
                 };
 
                 const handleDeleteObstacle = function(obsId) {
+                    // A shared obstacle is set inactive in the table (never deleted), so every computer drops it.
+                    const cur = obstacleLogs.find(function(item) { return item.id === obsId; });
+                    if (cur && cur.shared) saveObstacle(cur, { statecode: 1, statuscode: 2 }).then(function(res) { const say = gtSaveSay('obstacle', res); if (say) setPersonnelToast(say); });
                     setObstacleLogs(function(prev) {
                         const next = prev.filter(function(item) { return item.id !== obsId; });
                         try { localStorage.setItem('ganttly_obstacle_logs', JSON.stringify(next)); } catch (e) {}
@@ -17658,9 +18147,16 @@ export default function App(props) {
                                     </div>
                                 </div>
 
-                                <div className="flex items-center gap-3">
+                                <div className="flex flex-wrap items-center gap-3">
                                     <span className="text-xs font-bold text-slate-500">
                                         Total Logged: <strong>{obstacleLogs.length}</strong>
+                                    </span>
+                                    <span data-gt-status={gtStatus.obstacle || 'unknown'} className={`text-[10px] font-bold rounded-full border px-2 py-0.5 ${gtStatus.obstacle === 'found' ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : gtStatus.obstacle ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-slate-200 bg-slate-50 text-slate-500'}`} title={tr('Obstacles are shared through the _g_ Obstacle table (craa5__g_obstacle), read every 5 minutes.', 'Los obstaculos se comparten en la tabla _g_ Obstacle (craa5__g_obstacle), leida cada 5 minutos.')}>
+                                        {gtStatus.obstacle === 'found' ? tr('Shared with every computer', 'Compartido con todas las computadoras')
+                                            : gtStatus.obstacle === 'missing' ? tr('This computer only: the _g_ Obstacle table is not made yet', 'Solo esta computadora: la tabla _g_ Obstacle aun no existe')
+                                            : gtStatus.obstacle === 'denied' ? tr('This computer only: no permission on _g_ Obstacle', 'Solo esta computadora: sin permiso en _g_ Obstacle')
+                                            : gtStatus.obstacle ? tr('This computer only: _g_ Obstacle could not be read', 'Solo esta computadora: no se pudo leer _g_ Obstacle')
+                                            : tr('Checking the _g_ Obstacle table...', 'Revisando la tabla _g_ Obstacle...')}
                                     </span>
                                 </div>
                             </div>
@@ -22520,8 +23016,9 @@ export default function App(props) {
                                 <button
                                     type="button"
                                     onClick={function() {
+                                        const hoFacts = doneLogFacts('', null, Date.now());
                                         const newHandover = {
-                                            id: 'ho_' + Date.now(),
+                                            id: gtKey('ho', [hubShiftDate(hoFacts.slotStart), handoverModal.outgoingCrew, handoverModal.incomingCrew], Date.now()),   // the _g_ Handover key
                                             timestamp: new Date().toISOString(),
                                             dateFormatted: new Date().toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }) + ' ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
                                             outgoingCrew: handoverModal.outgoingCrew,
@@ -22537,6 +23034,7 @@ export default function App(props) {
                                             try { localStorage.setItem('ganttly_shift_handovers', JSON.stringify(next)); } catch (e) {}
                                             return next;
                                         });
+                                        saveHandover(newHandover, handoverModal.tasks).then(function(res) { const say = gtSaveSay('handover', res); if (say) setPersonnelToast(say); });
 
                                         // Re-assign tasks to target shift crew
                                         handoverModal.tasks.forEach(function(t) {
