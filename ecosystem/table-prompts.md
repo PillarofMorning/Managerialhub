@@ -45,7 +45,7 @@ The Midweek column (`craa5_midweek`) already exists. Set it to **Yes** on every 
 
 If the table itself does not exist yet, ask the Ganttly thread for its full prompt. These four columns will be in it.
 
-## Part 4. New table: _e_ Labor rate (`craa5__e_laborrate`)
+## Part 4. New table: _e_ Labor rate (`craa5__e_laborrate`) (done 2026-10-23)
 
 Copilot makes one table per prompt and does best with short ones. Power Apps > **Tables** > **New table** > **Start with Copilot**, paste, check the names, **Save and exit**. Choose **Organization** ownership if it asks.
 
@@ -57,7 +57,7 @@ Columns: Role (text, 50), Hourly rate (currency), Effective from (date only), No
 
 If a column comes out with another name, rename its display name or add it by hand (New > Column).
 
-What goes in it: one row per role, e.g. Name "Sanitor 2026", Role `Sanitor`, Hourly rate, Effective from `2026-01-01`. Use Role `All` for a single plant-wide rate. When a rate changes, add a new row with the new date. Do not edit the old one, so past weeks keep their cost. Apps use the newest row whose Effective from is on or before the shift date.
+What goes in it: one row per pay role. Role must be spelled the same as the employee's `craa5_roleid` (case does not matter): `sanitation tech 1`, `sanitation tech 2`, `sanitation tech 3`, `Adm`, `Int`. Anyone with no pay role, or a role with no row, is costed at `sanitation tech 2`, and planned cost always uses `sanitation tech 2`. When a rate changes, add a new row with the new date. Do not edit the old one, so past weeks keep their cost. Apps use the newest row whose Effective from is on or before the shift date.
 
 ## Part 5. Map observations (`craa5__facilityobservation`): 2 columns
 
