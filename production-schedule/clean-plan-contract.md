@@ -1,6 +1,6 @@
 # Clean Plan reader guide (craa5_cleanplan)
 
-Written by the Production Scheduler ("hub - production schedule" v4.8.1). No other app writes this table. Ganttly, Shift Start, the MSS Calendar, PBED and the Manager hub only read it. This guide wins over section 6.5 of the data contract on any detail.
+Written by the Production Scheduler ("hub - production schedule" v4.8.2). No other app writes this table. Ganttly, Shift Start, the MSS Calendar, PBED and the Manager hub only read it. This guide wins over section 6.5 of the data contract on any detail.
 
 All date-times are UTC. Read only active rows (`statecode eq 0`). The line key in `craa5_linekey` is the Scheduler's `canonLine(area, line)`, which is the same as `hubLineKey`: lowercase letters and digits only, for example `ibl4`, `highspeed1`.
 
