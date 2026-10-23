@@ -200,6 +200,7 @@ Also give both roles **Read** on `systemuser` (the apps read who is signed in). 
 | `craa5__g_obstacle` (when made) | Read, Create, Write | Read, Create, Write |
 | `craa5__g_handover` (when made) | Read, Create, Write | Read, Create, Write |
 | `craa5__g_personnelnote` (when made) | Create, plus Read and Write at **User** level (own notes only) | Read, Create, Write |
+| `craa5__aa_role` | Read | Read |
 | `craa5__e_shifttask` (when made) | Read | Read, Create, Write |
 
 Chemical clerks: the chemical thread keeps its own clerk checklist (usage log Create and Write). Give a clerk the Hub floor role plus that.
