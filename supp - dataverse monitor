@@ -14,7 +14,7 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 
 const LOGO_URL = "";
 const BRAND = { blue: '#0072CE', blueDark: '#00468B', blueSoft: '#E6F1FB', yellow: '#FFB81C', yellowSoft: '#FFF6E0', red: '#E4002B', redSoft: '#FDE8EC' };
-const MONITOR_VERSION = 'v2.8';
+const MONITOR_VERSION = 'v2.8.1';
 
 const ORG_LANG_KEY = 'stillwell_org_lang_v1';
 const ORG_THEME_KEY = 'stillwell_org_dark_v1';
@@ -962,6 +962,7 @@ async function dvReadMeta(conn, logical, wantCols) {
       if (Array.isArray(r.json.Attributes) && r.json.Attributes.length > 0) {
         out.cols = new Set(r.json.Attributes.map(a => String(a && a.LogicalName || '').toLowerCase()).filter(Boolean));
         out.colSource = 'metadata';
+        out.types = dvAttrTypes(r.json.Attributes);
       }
       return out;
     }
@@ -984,6 +985,7 @@ async function dvReadMeta(conn, logical, wantCols) {
           ObjectTypeCode: md.ObjectTypeCode || null
         };
         const names = dvAttrNames(md.Attributes);
+        out.types = dvAttrTypes(md.Attributes);
         // An empty answer to a non-empty ask is more likely a client quirk than a table with none of its columns: leave columns unchecked.
         if (names && !(names.length === 0 && asked.length > 0)) {
           out.cols = new Set(names);
@@ -1013,6 +1015,25 @@ function dvAttrNames(attrs) {
     if (!Array.isArray(list)) return null;
     return list.map(a => String((a && (a.LogicalName || a.logicalName)) || '').toLowerCase()).filter(Boolean);
   } catch (e) { return null; }
+}
+
+// Column types by name ('Boolean', 'Integer', 'Decimal', 'String', ...). Xrm gives a number, the Web API a word.
+const ATTR_TYPE_CODES = { 0: 'Boolean', 1: 'Customer', 2: 'DateTime', 3: 'Decimal', 4: 'Double', 5: 'Integer', 6: 'Lookup', 7: 'Memo', 8: 'Money', 9: 'Owner', 10: 'PartyList', 11: 'Picklist', 12: 'State', 13: 'Status', 14: 'String', 15: 'Uniqueidentifier', 18: 'BigInt' };
+function dvAttrTypes(attrs) {
+  const out = {};
+  try {
+    let list = null;
+    if (!attrs) return out;
+    if (typeof attrs.getAll === 'function') list = attrs.getAll();
+    else if (Array.isArray(attrs)) list = attrs;
+    else if (attrs._collection && typeof attrs._collection === 'object') list = Object.keys(attrs._collection).map(k => attrs._collection[k]);
+    (list || []).forEach(a => {
+      const n = String((a && (a.LogicalName || a.logicalName)) || '').toLowerCase();
+      const t = a && (a.AttributeType != null ? a.AttributeType : a.attributeType);
+      if (n && t != null) out[n] = typeof t === 'number' ? (ATTR_TYPE_CODES[t] || String(t)) : String(t);
+    });
+  } catch (e) {}
+  return out;
 }
 
 // How many rows the table holds (active and inactive). Tries each route; the most useful refusal wins.
@@ -1630,18 +1651,58 @@ async function dvReadAllRows(conn, logical, select, limit) {
   } catch (e) { return { ok: false, rows, err: dvErrText(e) }; }
 }
 
+// Turns a value into what the target column takes. { ok, v }. A save with the wrong kind of value fails in Dataverse
+// (error 0x80048d19), so every value is converted here first, or the row is left out and counted.
+const TYPE_WORDS = { Boolean: 'Yes/No', Integer: 'Whole number', BigInt: 'Whole number', Decimal: 'Decimal', Double: 'Float', Money: 'Currency', String: 'Text', Memo: 'Multiline text', Picklist: 'Choice', DateTime: 'Date', Lookup: 'Lookup' };
+function dvConvertValue(v, type) {
+  const num = typeof v === 'number' ? v : (typeof v === 'string' && v.trim() !== '' && isFinite(Number(v)) ? Number(v) : NaN);
+  switch (type) {
+    case 'Boolean':
+      if (typeof v === 'boolean') return { ok: true, v };
+      if (isFinite(num)) return { ok: true, v: num > 0 };
+      if (/^(yes|true|si|y)$/i.test(String(v).trim())) return { ok: true, v: true };
+      if (/^(no|false|n)$/i.test(String(v).trim())) return { ok: true, v: false };
+      return { ok: false };
+    case 'Integer': case 'BigInt':
+      if (typeof v === 'boolean') return { ok: false };
+      return isFinite(num) ? { ok: true, v: Math.round(num) } : { ok: false };
+    case 'Decimal': case 'Double': case 'Money':
+      if (typeof v === 'boolean') return { ok: false };
+      return isFinite(num) ? { ok: true, v: num } : { ok: false };
+    case 'String': case 'Memo':
+      return { ok: true, v: typeof v === 'boolean' ? (v ? 'Yes' : 'No') : String(v) };
+    case 'Picklist':
+      return isFinite(num) && Math.round(num) === num ? { ok: true, v: num } : { ok: false };
+    case undefined: case '':
+      return { ok: true, v };
+    default:
+      return typeof v === 'object' ? { ok: false } : { ok: true, v };
+  }
+}
+
 // Copy one column's value into other columns on the same rows. Plan first (no writes), then run.
-function dvPlanCopy(rows, idCol, from, to) {
+// types: { column: AttributeType } when known; values are converted to each target's type.
+function dvPlanCopy(rows, idCol, from, to, types) {
+  const ty = types || {};
   const changes = [];
   let skippedBlank = 0;
+  let cannot = 0;
   rows.forEach(r => {
     const v = r[from];
     if (v === null || v === undefined || v === '') { skippedBlank++; return; }
     const body = {};
-    to.forEach(c => { if (r[c] !== v) body[c] = v; });
+    let bad = false;
+    to.forEach(c => {
+      const cv = dvConvertValue(v, ty[c]);
+      if (!cv.ok) { bad = true; return; }
+      if (r[c] !== cv.v) body[c] = cv.v;
+    });
+    if (bad) { cannot++; return; }
     if (Object.keys(body).length) changes.push({ id: r[idCol], body });
   });
-  return { total: rows.length, changes, skippedBlank };
+  // A number into a Yes/No column only says "has minutes"; say so on the page.
+  const toFlag = to.filter(c => ty[c] === 'Boolean' && ty[from] && ty[from] !== 'Boolean');
+  return { total: rows.length, changes, skippedBlank, cannot, types: ty, toFlag };
 }
 async function dvRunCopy(conn, logical, plan, onProgress) {
   let done = 0;
@@ -1678,9 +1739,9 @@ async function dvReadRoles(conn, userId) {
   if (!pr.ok) return { state: dvClassify(pr.err) === 'denied' ? 'denied' : 'unknown', roles: [], mine: [], err: pr.err };
   const privById = {};
   (pr.json.value || []).forEach(p => { const x = dvParsePrivName(p.name); if (x) privById[String(p.privilegeid).toLowerCase()] = x; });
-  const rr = await dvFetchJson(conn, 'roles?$select=name,roleid&$filter=_parentroleid_value eq null&$orderby=name');
+  const rr = await dvFetchJson(conn, 'roles?$select=name,roleid,ismanaged&$filter=_parentroleid_value eq null&$orderby=name');
   if (!rr.ok) return { state: dvClassify(rr.err) === 'denied' ? 'denied' : 'unknown', roles: [], mine: [], err: rr.err };
-  const roles = (rr.json.value || []).map(r => ({ id: String(r.roleid), name: String(r.name || ''), privs: {}, err: '' }));
+  const roles = (rr.json.value || []).map(r => ({ id: String(r.roleid), name: String(r.name || ''), managed: r.ismanaged === true, privs: {}, err: '' }));
   await dvRunPool(roles, async role => {
     const res = await dvFetchJson(conn, 'RetrieveRolePrivilegesRole(RoleId=' + role.id + ')');
     if (!res.ok) { role.err = res.err; return; }
@@ -1702,17 +1763,19 @@ async function dvReadRoles(conn, userId) {
 
 // Roles Dataverse makes by itself. They get rights on new tables automatically (or are for support staff), so they
 // say nothing about whether the hub's own users can open a table and are left out of the findings.
-const BUILTIN_ROLES = ['support user', 'delegate', 'service reader', 'service writer', 'system administrator', 'system customizer', 'environment maker', 'app opener', 'service deleted', 'common data service role'];
-function dvIsBuiltinRole(name) { return BUILTIN_ROLES.indexOf(String(name || '').trim().toLowerCase()) !== -1; }
+// A managed role came with Dataverse or an installed solution; roles Gerald makes are unmanaged.
+const BUILTIN_ROLES = ['support user', 'delegate', 'service reader', 'service writer', 'service deleter', 'async ingestion', 'system administrator', 'system customizer', 'environment maker', 'app opener', 'common data service role'];
+// Basic User is managed too, but it is the role most staff get, so it always counts.
+function dvIsBuiltinRole(name, managed) { if (String(name || '').trim().toLowerCase() === 'basic user') return false; return managed === true || BUILTIN_ROLES.indexOf(String(name || '').trim().toLowerCase()) !== -1; }
 
 // The roles (not built in) that give rights on at least one hub table: [{ name, tables }].
 function dvHubRoles(roles) {
-  return roles.filter(r => !dvIsBuiltinRole(r.name) && Object.keys(r.privs).length).map(r => ({ name: r.name, tables: Object.keys(r.privs).length }));
+  return roles.filter(r => !dvIsBuiltinRole(r.name, r.managed) && Object.keys(r.privs).length).map(r => ({ name: r.name, tables: Object.keys(r.privs).length }));
 }
 
 // What the role levels mean for the apps. tables: [{ logicalName, resolved, ownership }]. Built-in roles do not count.
 function dvRoleFindings(allRoles, tables) {
-  const roles = allRoles.filter(r => !dvIsBuiltinRole(r.name));
+  const roles = allRoles.filter(r => !dvIsBuiltinRole(r.name, r.managed));
   const out = [];
   tables.forEach(t => {
     const name = t.resolved || t.logicalName;
@@ -2151,11 +2214,18 @@ export default function DataverseOrganizerApp(props) {
     setDiscovered(list);
     // App manifests: what each app says it needs, saved by the app itself in Hub config.
     const read = await dvReadHubConfigRows(conn, '');
-    const manRows = read.rows.filter(r => { const k = String(r.craa5_configkey || ''); return k.indexOf(MANIFEST_PREFIX) === 0 || k.indexOf(SCAN_PREFIX) === 0; });
+    // While apps move to the new table, also read the old one: its app lists still count until the app saves in the new one.
+    const old = read.state === 'ok' && read.table !== 'craa5__0_hubconfig' ? await dvReadHubConfigRows(conn, '', ['craa5__0_hubconfig']) : null;
+    const isMan = r => { const k = String(r.craa5_configkey || ''); return k.indexOf(MANIFEST_PREFIX) === 0 || k.indexOf(SCAN_PREFIX) === 0; };
+    const newManRows = read.rows.filter(isMan);
+    const newKeys = new Set(newManRows.map(r => String(r.craa5_configkey)));
+    const oldManRows = old && old.state === 'ok' ? old.rows.filter(r => isMan(r) && !newKeys.has(String(r.craa5_configkey))) : [];
+    const manRows = newManRows.concat(oldManRows);
     const cache = {};
     const apps = [];
     for (let i = 0; i < manRows.length; i++) {
       const man = dvParseManifest(manRows[i]);
+      man.inTable = i < newManRows.length ? read.table : 'craa5__0_hubconfig';
       man.check = man.error || man.stub ? null : await dvCheckManifest(conn, man, cache, ECOSYSTEM_TABLES);
       apps.push(man);
     }
@@ -2171,10 +2241,7 @@ export default function DataverseOrganizerApp(props) {
     const hub = read.state === 'ok' ? dvCheckHubConfig(read.rows, maxLen, apps, mMaxLen) : null;
     // While apps move to the new table, also look at the old one (keys only, for the move list).
     let oldKeys = null;
-    if (read.state === 'ok' && read.table !== 'craa5__0_hubconfig') {
-      const old = await dvReadHubConfigRows(conn, '', ['craa5__0_hubconfig']);
-      if (old.state === 'ok') oldKeys = old.rows.map(r => String(r.craa5_configkey || '').trim() || String(r.craa5_configname || '').trim()).filter(Boolean);
-    }
+    if (old && old.state === 'ok') oldKeys = old.rows.map(r => String(r.craa5_configkey || '').trim() || String(r.craa5_configname || '').trim()).filter(Boolean);
     // The new Hub config table is skipped when it has no Config key column; say so plainly.
     let newNeedsKey = false;
     if (read.table !== 'craa5__e_hubconfig') {
@@ -2308,7 +2375,8 @@ export default function DataverseOrganizerApp(props) {
         ownership: manifests.ownership || 'unknown',
         warnings: manifests.hub.rows.filter(x => x.warnings.length && !x.issues.length).map(x => x.key + ': ' + x.warnings.join(',')),
         problems: manifests.hub.rows.filter(x => x.issues.length).map(x => (x.key || '(blank key, name "' + x.name + '")') + ': ' + x.issues.join(',') + ' (' + x.len + ' chars' + (x.mLen ? ', manifestjson ' + x.mLen : '') + ')').concat(manifests.hub.claims.map(c => c.appId + ' writes ' + c.key + ': ' + (c.issue === 'otherapp' ? 'belongs to ' + c.owner : 'not in contract'))),
-        notSavedYet: manifests.hub.expected.filter(e => e.state === 'notyet').map(e => e.key),
+        notSavedYet: manifests.hub.expected.filter(e => e.state === 'notyet' && !(manifests.oldKeys && manifests.oldKeys.indexOf(e.key) !== -1)).map(e => e.key),
+        onlyOnOldTable: manifests.oldKeys ? manifests.hub.expected.filter(e => e.state === 'notyet' && manifests.oldKeys.indexOf(e.key) !== -1).map(e => e.key) : undefined,
         notInContract: manifests.hub.unlisted,
         largest: manifests.hub.rows.slice().sort((a, b) => b.len - a.len).slice(0, 3).map(x => (x.key || 'name "' + x.name + '"') + ' ' + x.len)
       }),
@@ -2318,7 +2386,7 @@ export default function DataverseOrganizerApp(props) {
         manifestJsonMaxLength: manifests.mMaxLen,
         hubConfigOwnership: manifests.ownership || 'unknown',
         apps: manifests.apps.map(a => ({
-          app: a.app, appId: a.appId, version: a.version, hubShared: a.contract, savedAt: a.savedAt, error: a.error || undefined, source: a.source || undefined, pointerOnly: a.stub ? a.pointer : undefined,
+          app: a.app, appId: a.appId, version: a.version, savedIn: a.inTable, hubShared: a.contract, savedAt: a.savedAt, error: a.error || undefined, source: a.source || undefined, pointerOnly: a.stub ? a.pointer : undefined,
           problems: a.check ? a.check.tables.filter(t => t.state !== 'found' || t.missingRead.length || t.missingWrite.length || t.contractNotes.length).map(t => t.t + (t.state !== 'found' ? ': ' + t.state : '') + (t.missingWrite.length ? ' write-missing ' + t.missingWrite.join(',') : '') + (t.missingRead.length ? ' read-missing ' + t.missingRead.join(',') : '') + (t.contractNotes.length ? ' contract ' + t.contractNotes.join(',') + (t.notAllowed ? ' (' + t.notAllowed.join(',') + ')' : '') : '')) : [],
           notYet: a.check ? a.check.tables.filter(t => t.notYet.length).map(t => t.t + ' ' + t.notYet.join(',')) : []
         }))
@@ -2330,7 +2398,7 @@ export default function DataverseOrganizerApp(props) {
         findings: roleData.findings.map(f => f.table + ': ' + f.kind + (f.roles ? ' (' + f.roles.join(', ') + ')' : ''))
       }),
       keyChecks: !keyResults ? 'not run (press Check keys)' : keyResults.filter(k => k.bad || k.err || k.targetEmpty || (k.notMade && k.notMade.length)).map(k => k.from + '.' + k.col + ' -> ' + k.to + '.' + k.toCol + ': ' + (k.notMade && k.notMade.length ? 'column not made yet: ' + k.notMade.join(', ') : (k.err ? 'error ' + k.err : k.bad + ' of ' + k.rows + ' rows not found (' + k.badDistinct + ' distinct)' + (k.examples && k.examples.length ? ', e.g. ' + k.examples.map(x => '"' + x + '"').join(', ') : '') + (k.lookup || k.toLookup ? ', lookup (display names compared)' : '') + (dvKeyLooksLikeSamples(k) ? ', maybe Copilot sample rows' : '') + (k.targetEmpty ? ', target empty' : '') + (k.capped ? ', first 20000 rows' : '')))),
-      lookupRoleNames: keyResults ? keyResults.filter(k => (k.lookup || k.toLookup) && k.lookupValues).map(k => (k.lookup ? k.from + '.' + k.col : k.to + '.' + k.toCol) + ' (lookup) carries: ' + k.lookupValues.join(', ')) : undefined,
+      lookupRoleNames: keyResults ? Array.from(new Set(keyResults.filter(k => (k.lookup || k.toLookup) && k.lookupValues).map(k => (k.lookup ? k.from + '.' + k.col : k.to + '.' + k.toCol) + ' (lookup) carries: ' + k.lookupValues.join(', ')))) : undefined,
       appHealth: ECOSYSTEM_APPS.map(a => a.name + ': ' + appHealth[a.id].tone + ' - ' + appHealth[a.id].reasons.join('; ')),
       history: history.days.length ? history.days.slice(-7).map(d => d.d + ' problems ' + d.p + ' red ' + d.r + ' app-list ' + d.m + (d.k != null ? ' keys ' + d.k : '')) : 'none saved yet',
       tablesNotOnList: unclaimed ? unclaimed.map(d => d.logicalName) : 'could not list (no Web API address)',
@@ -2392,7 +2460,7 @@ export default function DataverseOrganizerApp(props) {
     const idCol = (meta.meta && meta.meta.PrimaryIdAttribute) || table + 'id';
     const read = await dvReadAllRows(conn, table, [idCol, from].concat(to));
     if (!read.ok) { setCopyPlan({ err: read.err }); setCopyBusy(''); return; }
-    setCopyPlan(Object.assign(dvPlanCopy(read.rows, idCol, from, to), { table, from, to }));
+    setCopyPlan(Object.assign(dvPlanCopy(read.rows, idCol, from, to, meta.types || {}), { table, from, to }));
     setCopyBusy('');
   }, [conn, copyTable, copyFrom, copyTo, L]);
   const runCopy = useCallback(async () => {
@@ -2429,7 +2497,7 @@ export default function DataverseOrganizerApp(props) {
     d.tables = found;
     d.findings = d.state === 'ok' ? dvRoleFindings(d.roles, found) : [];
     d.hubRoles = d.state === 'ok' ? dvHubRoles(d.roles) : [];
-    d.builtin = d.state === 'ok' ? d.roles.filter(r => dvIsBuiltinRole(r.name)).map(r => r.name) : [];
+    d.builtin = d.state === 'ok' ? d.roles.filter(r => dvIsBuiltinRole(r.name, r.managed)).map(r => r.name) : [];
     setRoleData(d);
     setRoleBusy(false);
   }, [conn, msUser, tableResults]);
@@ -3128,6 +3196,9 @@ export default function DataverseOrganizerApp(props) {
           {copyPlan && copyPlan.changes && (
             <div style={{ fontSize: '13px', marginTop: '10px' }}>
               {copyPlan.total + L(' rows read. ', ' filas leidas. ') + copyPlan.changes.length + L(' will change. ', ' van a cambiar. ') + copyPlan.skippedBlank + L(' skipped because ', ' se saltan porque ') + copyPlan.from + L(' is blank.', ' esta vacia.')}
+              {copyPlan.cannot > 0 && <span style={{ color: TONES.amber.fg }}>{' ' + copyPlan.cannot + ' left out because the value does not fit the target column.'}</span>}
+              {Object.keys(copyPlan.types || {}).length > 0 && <div style={{ fontSize: '12px', color: textSub, marginTop: '4px' }}>{'Column types: ' + [copyPlan.from].concat(copyPlan.to).map(c => c + ' ' + (TYPE_WORDS[copyPlan.types[c]] || copyPlan.types[c] || 'unknown')).join(', ') + '.'}</div>}
+              {copyPlan.toFlag && copyPlan.toFlag.length > 0 && <div style={{ fontSize: '12px', color: TONES.amber.fg, marginTop: '4px' }}>{copyPlan.toFlag.join(' and ') + (copyPlan.toFlag.length > 1 ? ' are' : ' is') + ' Yes/No, so it will be set to Yes where ' + copyPlan.from + ' is above 0 and No where it is 0. To copy the minutes themselves, copy into Whole number columns instead (for example craa5_eggminutes and craa5_pecanminutes).'}</div>}
               {copyPlan.changes.length === 0 && <span style={{ color: TONES.green.fg }}>{L(' Nothing to copy: the columns already match.', ' Nada que copiar: las columnas ya coinciden.')}</span>}
             </div>
           )}
@@ -3167,14 +3238,14 @@ export default function DataverseOrganizerApp(props) {
                   <thead>
                     <tr>
                       <th style={{ textAlign: 'left', padding: '4px 6px', borderBottom: '1px solid ' + borderCol, position: 'sticky', left: 0, background: bgCard }}>Table</th>
-                      {roleData.roles.filter(r => !dvIsBuiltinRole(r.name)).map(r => <th key={r.id} style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol, whiteSpace: 'nowrap', color: roleData.mine.indexOf(r.name) !== -1 ? '#60a5fa' : textMain }}>{r.name}</th>)}
+                      {roleData.roles.filter(r => !dvIsBuiltinRole(r.name, r.managed)).map(r => <th key={r.id} style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol, whiteSpace: 'nowrap', color: roleData.mine.indexOf(r.name) !== -1 ? '#60a5fa' : textMain }}>{r.name}</th>)}
                     </tr>
                   </thead>
                   <tbody>
                     {roleData.tables.map(t => (
                       <tr key={t.resolved}>
                         <td style={{ padding: '3px 6px', borderBottom: '1px solid ' + borderCol, fontFamily: 'Consolas, monospace', position: 'sticky', left: 0, background: bgCard, whiteSpace: 'nowrap' }}>{t.resolved}</td>
-                        {roleData.roles.filter(r => !dvIsBuiltinRole(r.name)).map(r => {
+                        {roleData.roles.filter(r => !dvIsBuiltinRole(r.name, r.managed)).map(r => {
                           const p = r.privs[t.resolved] || {};
                           const txt = ['Read', 'Write', 'Create'].filter(op => p[op]).map(op => op[0] + ':' + p[op]).join(' ');
                           return <td key={r.id} style={{ padding: '3px 6px', borderBottom: '1px solid ' + borderCol, whiteSpace: 'nowrap', color: txt ? textMain : textSub }}>{txt || '-'}</td>;
