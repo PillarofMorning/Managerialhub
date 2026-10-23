@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.64, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.65, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -105,7 +105,7 @@ Time loss log keeps the column names it was created with: `craa5_assetguid` hold
 | `craa5__facilityobservation` Map problems and pins | live | Map submission tool (owner). **Pathogen BOLO** creates its own pin rows only (a positive or harborage concern), row id `hubIdFromKey('bolo|' + swab key)`, and never edits a Map tool row. BOLO rows are marked by `craa5__description` starting `(PATHOGEN BOLO - ` or `(HARBORAGE CONCERN - ` (keep these exact); the Map tool shows them read only. A few early pins (BOLO v2.4) carry an older id, so readers find BOLO pins by the prefix, never by computing the id | Pathogen BOLO, Manager hub |
 | `craa5___maps` Floor maps | live | Map submission tool | Pathogen BOLO |
 | `craa5_pathogenboloswabcatalog0320` Swab sites | live | Pathogen BOLO | Pathogen BOLO, Ganttly, Map tool |
-| `craa5__b_swabresult` Swab results (columns in contract.json; one row per sample, description and test; open hit = `craa5_result` positive, `craa5_closedkey` blank, `statecode` 0, and `craa5_collectiondate` within the alert window (`alertMonths` in Hub config key `PATHOGEN_BOLO_RULES`, default 2 months; older positives are history). A hit is closed by **any** MSS log row on the same equipment (or area, when the site has no equipment) with a shift date on or after the collection date: every clean follows the presumptive process (Gerald, 2026-10-23)) | **proposed** (BOLO v2.4, PR #37) | Pathogen BOLO | Manager hub, Ganttly, MSS Calendar |
+| `craa5__b_swabresult` Swab results (columns in contract.json; one row per sample, description and test; open hit = `craa5_result` positive, `craa5_closedkey` blank, `statecode` 0, and `craa5_collectiondate` within the alert window (`alertMonths` in Hub config key `PATHOGEN_BOLO_RULES`, default 2 months; older positives are history). A hit is closed by **any** MSS log row on the same equipment (or area, when the site has no equipment) with a shift date on or after the collection date: every clean follows the presumptive process (Gerald, 2026-10-23)) | live (entity set `craa5__b_swabresults`; BOLO v2.5, PR #37) | Pathogen BOLO | Manager hub, Ganttly, MSS Calendar |
 | `craa5__supervisor_todo` | live | Manager hub | Manager hub |
 | `craa5__m_formtemplate`, `craa5__m_quicktask` (both User-owned; quick tasks are a personal list on purpose) | live | Manager hub | Manager hub |
 | `craa5__m_employeenote` Manager notes on people | live; **real name `craa5_employeenote`** (monitor 2026-10-23), probe it first | Manager hub | Manager hub, manager role only. Sensitive: User-owned, never shown to peers, never in exports or the repo. Key `craa5_employeeguid`. |
@@ -460,6 +460,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.65 (2026-10-23)** `_b_ Swab result` is live (entity set `craa5__b_swabresults`, 20,000+ rows) with colTypes for it and the swab catalog; dates (`craa5_collectiondate`, `craa5_closedon`) stay text plant days and `craa5_result` / `craa5_test` / `craa5_stage` stay text, never choice. `_e_ Hub config` gains `noBuildCols` [`craa5_manifestjson`] (old table only; never add it to the new one). BOLO finished 12.3 (v2.5.2, HUB SHARED v1.3).
 - **1.0.64 (2026-10-23)** Sanitation director v1.1 (PR #44, 1e86e2e) works out heads needed per shift and publishes Hub config `DIRECTOR_HEADS` (guide /mnt/project-files/sanitation-director/director-heads.md); it writes `_e_ Shift task` (the Scheduler no longer does) and owns the MSS MANPOWER block. The Scheduler can stop writing `staff` rows and remove its Crew plan tab once Gerald pastes director v1.1.
 - **1.0.63 (2026-10-23)** MSS Log Input done with 12.3 (PR #40, d6d1f4d): manpower plan removed (`MSS_LOG_MANPOWER_SETUP` no longer written; its row stays for the director to read), MSS MANPOWER block has its own file and is pasted only by the Scheduler and the director. Skip codes live only in Hub config `MSS_SKIP_CODES`, so `craa5_mss_skipcode` is optional with no writer and MSS Log Input no longer writes `craa5_mss_useraccesslog`. `craa5__log_` colType `craa5_sapw` text 100.
 - **1.0.62 (2026-10-23)** Gerald's correction: ground rule 10 is now "only Gerald builds tables". The Dataverse monitor never writes Dataverse either; it reads, shows and tests what apps need, and Gerald builds from its prompts. HUB SHARED v1.3: manifests also keep each table's recommended Copilot `prompt` (2,000 characters max; 123 checks). `MONITOR_BUILD_LOG` is legacy.
