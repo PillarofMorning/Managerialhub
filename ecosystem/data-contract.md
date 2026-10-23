@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.47, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.48, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -70,7 +70,7 @@ Ownership: User-owned tables need **Organization-level Read** on every hub secur
 | `craa5__aa_employee` Employees | live | Manager hub (People page) and admin. **Ganttly** writes only `craa5_remarks` / `craa5_remarkcategory` (high fives). | Everyone | Leavers: `statecode` = inactive, never a browser list. Role `craa5_role`: 256000000 Sanitor, 256000001 Lead, 256000002 Supervisor (hub role). Pay role `craa5_roleid` (text) names the `_e_ Labor rate` role. |
 | `craa5__aa_leadershipteam` | live | Admin | Shift Start | Lead/supervisor team names |
 | `craa5_workshift` Shift hours | live | Admin | Shift Start, Ganttly, Scheduler, Manager hub | Crew letter + weekday + start/end hour |
-| `craa5_linepriority` | live | Manager hub, Scheduler | Ganttly | |
+| `craa5_linepriority` | live | Manager hub, Scheduler | Ganttly, Scheduler (default clean order, v4.6) | |
 | `craa5_changeover_rule` Run rules | live | **Production Scheduler** | PBED | The clean rules per line (section 6.1) live here and nowhere else |
 | `craa5_skumaster` | live | Production Scheduler | Production Scheduler | |
 | `_e_ Labor rate` (`craa5__e_laborrate`) | live | Gerald by hand (admin); apps never write | Manager hub, PBED, Ganttly People, director views | The only place a labor rate lives (section 7). One row per pay role in `craa5_role` (text): `sanitation tech 1`, `sanitation tech 2`, `sanitation tech 3`, `Adm`, `Int` |
@@ -232,13 +232,13 @@ Written only by the Production Scheduler. **The full reader guide is the Schedul
 | `craa5_plankey` | Window: `w|<run before id>|<run after id or "last">`, or `o|<run>|<run>` for runs that overlap. Day: `d|<line key>|YYYY-MM-DD`. Week: `k|<Monday>`. Config: `config`. Scope: `s|<line>|<kind>|<part>` (start/end 2000-01-01). Alert: `a|over72|<line>|<runId>`, `a|noeow|<line>|<Monday>`, `a|apart|<runIdA>|<runIdB>` |
 | `craa5_linekey` | The line key (`hubLineKey`); day rows hold the MSS area key; week rows hold `*` |
 | `craa5_start` / `craa5_end` | Window: when the line stops (end of the run before) / when the next run starts (open stops: where the plan ends). Day: plant midnight to next midnight. Week: Monday midnight to next Monday |
-| `craa5_day` | The plant day, YYYY-MM-DD (window: the day the stop starts) |
+| `craa5_day` | The plant day, YYYY-MM-DD (window: the day the stop starts; a night stop counts for the day it starts on) |
 | `craa5_cleankind` | Window: `allergen`, `weekly` (EOW), `midweek`, `full` (daily), `changeover`, `none` (map with `hubCleanKind`). Day: `due`, `stretch`, `covered`, `none`, `unplanned` |
 | `craa5_minutes` | Window: minutes the clean takes with the crew on shift. Day: minutes of production that day |
 | `craa5_status` | Window: `ok`, `tight`, `short`, `overlap`, `nocrew`, `none`. Day: `ran`, `idle`, `unplanned`. Week: `writing`, `done`. Alert: `open`, `approved` (the alert's kind is in `craa5_cleankind`) |
 | `craa5_area`, `craa5_line`, `craa5_mssareaguid` | Area as the runs spell it, line number (window rows), MSS area id |
 | `craa5_reason` | One plain sentence: why this clean, how long, what is short |
-| `craa5_details` | JSON. Window rows: `{v, stop, open, gapMin, idle, prev, next, allergen, need: {basis, work, floor, manual, pieces, weekly, midweek, crumb, noDaily, sapOrder}, crew: {assumed, heads}, cleanStart, cleanEnd, shortMin, spareMin, maint: [[start, end]...], area, line, areaId}`, now `v: 2`, adding `scope {key, parts, hash, pieces, left}`, `run72 {hours, limit, overBy, by, mode}` and `support [{area, off, start, end, ready, mins, late}]`. Over 1,900 characters, fields drop in this order: maint, crew, need, support. `cleanStart`/`cleanEnd` are the planned clean slot inside the stop. `prev`/`next` are short run summaries. Day rows: `{v, prod, len, kind, weekOn, planned, job, lines, areaId}`. Scope rows: `{v, line, kind, part, parts, hash, cols, pieces: [[assetId, name, area, room, mins, heads, offsetMins, leftOutBy]]}`. Config row: the shared cleaning settings |
+| `craa5_details` | JSON. Window rows: `{v, stop, open, gapMin, idle, prev, next, allergen, need: {basis, work, floor, manual, pieces, weekly, midweek, crumb, noDaily, sapOrder}, crew: {assumed, heads}, cleanStart, cleanEnd, shortMin, spareMin, maint: [[start, end]...], area, line, areaId}`, now `v: 2`, adding `scope {key, parts, hash, pieces, left}`, `run72 {hours, limit, overBy, by, mode}`, `support [{area, off, start, end, ready, mins, late}]`, and (Scheduler v4.6, optional) `pin {at, by}` (start pinned by scheduling), `after {mode: apart|together, line, at}` (moved because of a linked line) and `order` (the line's place in that day's clean order, 1 = first). `cleanStart` already includes any pin or move. Over 1,900 characters, fields drop in this order: maint, crew, need, support. `cleanStart`/`cleanEnd` are the planned clean slot inside the stop. `prev`/`next` are short run summaries. Day rows: `{v, prod, len, kind, weekOn, planned, job, lines, areaId}`. Scope rows: `{v, line, kind, part, parts, hash, cols, pieces: [[assetId, name, area, room, mins, heads, offsetMins, leftOutBy]]}`. Config row: the shared cleaning settings, which may hold `links: [{a, b, mode}]` (line-key prefixes; default IBL5 apart from Waterjet) and `order: {YYYY-MM-DD: [line keys]}` (a day's own clean order; otherwise `craa5_linepriority`) |
 | `craa5_cleanplanname`, `craa5_name`, `craa5_contenthash`, `craa5_publishbatch` | Label for people; change fingerprint; which publish wrote it. Not for logic |
 
 For PBED's weekend: the stop is the `window` row whose `craa5_start` falls in the weekend; restart = its `craa5_end`, except on an open stop; the clean slot = `details.cleanStart`/`cleanEnd`; status = `craa5_status`.
@@ -393,7 +393,7 @@ Prompts and click-steps: `table-prompts.md`.
 | 4 optional columns on `craa5_cleancheckoff` (shift date, clean kind, completion key, employee guids) | Join live progress to the log and record who is on each piece | Gerald, part 3 |
 | `_e_ Labor rate` table | Made 2026-10-23 with 5 pay roles | done |
 | 4 columns on `craa5_aa_assets`: Egg clean, Egg clean minutes, Pecan clean, Pecan clean minutes | Egg and pecan allergen cleans have different pieces and times (Q8) | Gerald, part 7 |
-| `craa5_cleanoverride` text on `craa5__aa_prd_schd` | IBL4 72 h override (Scheduler thread): `midweek|who|why`, `skip|who|why`, proposed `pin|who|why|HH:MM` | Scheduler thread's prompt |
+| `craa5_cleanoverride` text on `craa5__aa_prd_schd` | IBL4 72 h override (Scheduler thread): `midweek|who|why`, `skip|who|why`, `pin|who|why|YYYY-MM-DDTHH:MM` (plant time, built in v4.6) | Scheduler thread's prompt |
 | `_e_ Shift task` table | Mandatory shift tasks (proposed, not approved) | Scheduler game plan's prompt |
 | `_b_ Swab result` | Swab results as rows (BOLO thread) | BOLO thread's prompt, keys per section 2 |
 | `_g_ Assignment` | Equipment to people, shared by Shift Start and Ganttly | Ganttly thread's prompt, `/mnt/project-files/ganttly-overhaul/shared-assignment.md` (made 2026-10-22) |
@@ -429,6 +429,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.48 (2026-10-23)** Section 6.5 follows Scheduler v4.6 (PR #39, b35d8e9): window details gain optional `pin`, `after`, `order`; config row may hold `links` and `order`; override pin is `pin|who|why|YYYY-MM-DDTHH:MM`; Scheduler reads `craa5_linepriority` as the default clean order; a night stop counts for the day it starts on (more Daily windows for IBL5 and Waterjet). Built under Gerald's passive mode; he reviews at the end.
 - **1.0.47 (2026-10-23)** Section 6.3 follows MSS LOG WRITE v1.3 (PR #40, 200f922): names need two letters (`not_a_name`), `craa5_allergenclean` tries `Yes` then `true`, Check tab flags over 24 labor hours on a piece (`hours_high`). MSS Log Input now uses `hub_lang` / `hub_theme`.
 - **1.0.46 (2026-10-23)** Gerald moved to passive mode (follow the plan, use sensible defaults, say which). Q9 closed as plain wage (the rates entered are hourly pay; screens say "wage cost"). Q8 closed: send `Yes`, readers accept Yes / true / 1.
 - **1.0.45 (2026-10-23)** `_e_ Labor rate` is live (Gerald's export, 5 pay roles: sanitation tech 1-3, Adm, Int; no Sanitor or All row). Labor cost uses the employee's pay role `craa5_roleid`, falling back to `sanitation tech 2`, then Sanitor, then All. Projected and planned cost use `sanitation tech 2`. Same as PBED v1.7 (PR #31).
