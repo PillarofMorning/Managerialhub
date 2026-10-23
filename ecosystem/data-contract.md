@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.60, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.61, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -83,7 +83,7 @@ Ownership: User-owned tables need **Organization-level Read** on every hub secur
 |---|---|---|---|---|
 | 1. Runs (week+) | `craa5__aa_prd_schd` | live | **Production Scheduler** only | Ganttly, Shift Start, MSS Calendar, PBED, Manager hub |
 | 1b. Clean plan | `craa5_cleanplan` (Org-owned) | live | **Production Scheduler** only | Ganttly, Shift Start, MSS Calendar, PBED, Manager hub |
-| 1c. Schedule change requests | `craa5_schedulechange` | live | Production Scheduler | Production Scheduler |
+| 1c. Schedule change requests | `craa5_schedulechange` | proposed, optional (only for the schedule-change email inbox; the Scheduler works without it) | Production Scheduler | Production Scheduler |
 | 2. Crew board, live shift | `craa5_shiftboard` | live | **Shift Start** writes `craa5_boardjson` and the board columns. **Ganttly** writes only `craa5_updatesjson`. | Ganttly, Manager hub, PBED |
 | 2b. Next shift setup | `craa5_shiftplan` | live | Shift Start | Shift Start, Ganttly, PBED |
 | 2c. Past shifts | `craa5_shiftarchive` | live | Shift Start (when a shift is closed) | Manager hub, Ganttly, metrics |
@@ -460,6 +460,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.61 (2026-10-23)** `craa5_schedulechange` is optional (proposed, not missing). `contract.json` column types add `image` and `file` for existing picture and file columns (contract and monitor only; manifests cannot declare them in HUB SHARED v1.2).
 - **1.0.60 (2026-10-23)** Gerald's ruling: ground rule 10 (apps never build tables; the Dataverse monitor is the only table builder, from manifests and `contract.json`) and ground rule 11 (headcount planning only in the Sanitation director). Migration in 12.3. HUB SHARED v1.2: manifests keep `cols` ({column: {type, len, label, options, min, max, precision, default}}; types text, memo, int, decimal, money, yesno, date, datetime, choice, guid), `label`, `new`, `owner`, `primary` (the monitor thread's shape; 121 checks). `contract.json` gains `buildRule`, `columnTypes`, per-table `colTypes` (the contract decides types), `new` tables, and config key `MONITOR_BUILD_LOG`. Heads needed per shift moves to the director (Scheduler staff rows until then); `MSS_LOG_MANPOWER_SETUP` and `PRODSCHED_CREWPLAN` retiring.
 - **1.0.59 (2026-10-23)** `craa5__aa_role` (pay roles) is live, read by PBED, Ganttly, Manager hub and the director to name `craa5_roleid` when only the id comes back. The hub role choice is never a pay role. Security roles list updated.
 - **1.0.58 (2026-10-23)** BOLO v2.5 (PR #37): early v2.4 map pins keep an older id and are updated in place; readers find BOLO pins by the description prefix only.
