@@ -12,9 +12,9 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 // Strict 7-bit ASCII build.
 // ============================================================================
 
-const LOGO_URL = ""; // the logo image is left out of the public repo; the copy in project files has it
+const LOGO_URL = "";
 const BRAND = { blue: '#0072CE', blueDark: '#00468B', blueSoft: '#E6F1FB', yellow: '#FFB81C', yellowSoft: '#FFF6E0', red: '#E4002B', redSoft: '#FDE8EC' };
-const MONITOR_VERSION = 'v2.7';
+const MONITOR_VERSION = 'v2.8';
 
 const ORG_LANG_KEY = 'stillwell_org_lang_v1';
 const ORG_THEME_KEY = 'stillwell_org_dark_v1';
@@ -1695,8 +1695,19 @@ async function dvReadRoles(conn, userId) {
   return { state: 'ok', roles: roles.filter(r => Object.keys(r.privs).length || r.err), mine, err: '' };
 }
 
-// What the role levels mean for the apps. tables: [{ logicalName, resolved, ownership }].
-function dvRoleFindings(roles, tables) {
+// Roles Dataverse makes by itself. They get rights on new tables automatically (or are for support staff), so they
+// say nothing about whether the hub's own users can open a table and are left out of the findings.
+const BUILTIN_ROLES = ['support user', 'delegate', 'service reader', 'service writer', 'system administrator', 'system customizer', 'environment maker', 'app opener', 'service deleted', 'common data service role'];
+function dvIsBuiltinRole(name) { return BUILTIN_ROLES.indexOf(String(name || '').trim().toLowerCase()) !== -1; }
+
+// The roles (not built in) that give rights on at least one hub table: [{ name, tables }].
+function dvHubRoles(roles) {
+  return roles.filter(r => !dvIsBuiltinRole(r.name) && Object.keys(r.privs).length).map(r => ({ name: r.name, tables: Object.keys(r.privs).length }));
+}
+
+// What the role levels mean for the apps. tables: [{ logicalName, resolved, ownership }]. Built-in roles do not count.
+function dvRoleFindings(allRoles, tables) {
+  const roles = allRoles.filter(r => !dvIsBuiltinRole(r.name));
   const out = [];
   tables.forEach(t => {
     const name = t.resolved || t.logicalName;
@@ -1715,6 +1726,9 @@ function dvRoleFindings(roles, tables) {
 // Cross-app keys: for each contract key "this column must match that table's
 // column", counts rows whose value is not found there. Counts only, no values.
 // ---------------------------------------------------------------------------
+// A few unmatched rows, each with its own value, in a table made by the Copilot table maker: most likely the sample rows it adds.
+function dvKeyLooksLikeSamples(k) { return k.bad > 0 && k.bad <= 10 && k.badDistinct === k.bad; }
+
 const KEY_EXACT_KINDS = ['equipment', 'employee', 'employees', 'areaguid', 'user'];
 function dvKeyCanon(kind, v) {
   const s = String(v == null ? '' : v).trim().toLowerCase();
@@ -1733,9 +1747,26 @@ function dvKeyPlan(tables, results) {
     const rFrom = results[t.logicalName];
     const rTo = results[m[1]];
     if (!rFrom || rFrom.state !== 'found' || !rTo || rTo.state !== 'found') return;
-    plan.push({ from: t.logicalName, fromAs: rFrom.resolvedName || t.logicalName, col: k.column, to: m[1], toAs: rTo.resolvedName || m[1], toCol: m[2], kind: k.kind });
+    const notMade = [];
+    if (dvColNotMade(rFrom, k.column)) notMade.push((rFrom.resolvedName || t.logicalName) + '.' + k.column);
+    if (dvColNotMade(rTo, m[2])) notMade.push((rTo.resolvedName || m[1]) + '.' + m[2]);
+    plan.push({ notMade, from: t.logicalName, fromAs: rFrom.resolvedName || t.logicalName, col: k.column, to: m[1], toAs: rTo.resolvedName || m[1], toCol: m[2], kind: k.kind });
   }));
   return plan;
+}
+
+// True only when the table's full column list was read and the column is not on it.
+function dvColNotMade(r, col) {
+  if (r.cols && r.cols[col] === 'missing') return true;
+  return !!(r.allCols && r.allCols.length && r.allCols.indexOf(String(col).toLowerCase()) === -1);
+}
+
+// Up to 3 unmatched values are shown, only for kinds that name places and things (never people or free text),
+// and never from the tables that hold names, emails or notes.
+const KEY_EXAMPLE_KINDS = ['area', 'room', 'item', 'sapw', 'vendor', 'line', 'location', 'cart', 'sapcart', 'equipment', 'areaguid', 'skill', 'skilllevel', 'swabsite', 'payrole', 'crew'];
+const KEY_NO_EXAMPLE_TABLES = /personnelnote|employeenote|accesslog|access_log/;
+function dvKeyExamplesAllowed(p) {
+  return KEY_EXAMPLE_KINDS.indexOf(p.kind) !== -1 && !KEY_NO_EXAMPLE_TABLES.test(p.from + ' ' + p.fromAs);
 }
 
 async function dvKeyCheck(conn, plan, limit, onProgress) {
@@ -1745,6 +1776,7 @@ async function dvKeyCheck(conn, plan, limit, onProgress) {
   for (let i = 0; i < plan.length; i++) {
     const p = plan[i];
     if (onProgress) onProgress(i + 1, plan.length);
+    if (p.notMade && p.notMade.length) { out.push(Object.assign({}, p, { err: '' })); continue; }
     const [a, b] = await Promise.all([readCol(p.fromAs, p.col), readCol(p.toAs, p.toCol)]);
     if (!a.ok || !b.ok) { out.push(Object.assign({}, p, { err: (a.ok ? b.err : a.err) || 'could not read' })); continue; }
     const target = new Set();
@@ -1752,15 +1784,107 @@ async function dvKeyCheck(conn, plan, limit, onProgress) {
     let blank = 0;
     let bad = 0;
     const badDistinct = new Set();
+    const examples = [];
+    const showEx = dvKeyExamplesAllowed(p);
     a.rows.forEach(r => {
-      const parts = String(r[p.col] == null ? '' : r[p.col]).split(';').map(v => dvKeyCanon(p.kind, v)).filter(Boolean);
-      if (!parts.length) { blank++; return; }
-      const miss = parts.filter(v => !target.has(v));
-      if (miss.length) { bad++; miss.forEach(v => badDistinct.add(v)); }
+      const raw = String(r[p.col] == null ? '' : r[p.col]).split(';').map(v => v.trim()).filter(v => dvKeyCanon(p.kind, v));
+      if (!raw.length) { blank++; return; }
+      const miss = raw.filter(v => !target.has(dvKeyCanon(p.kind, v)));
+      if (miss.length) {
+        bad++;
+        miss.forEach(v => {
+          const c = dvKeyCanon(p.kind, v);
+          if (showEx && !badDistinct.has(c) && examples.length < 3) examples.push(v.length > 40 ? v.slice(0, 40) + '...' : v);
+          badDistinct.add(c);
+        });
+      }
     });
-    out.push(Object.assign({}, p, { rows: a.rows.length, blank, bad, badDistinct: badDistinct.size, capped: a.rows.length >= (limit || 20000), targetEmpty: target.size === 0, err: '' }));
+    out.push(Object.assign({}, p, { rows: a.rows.length, blank, bad, badDistinct: badDistinct.size, examples, capped: a.rows.length >= (limit || 20000), targetEmpty: target.size === 0, err: '' }));
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// App health and daily history. One dot per app from its tables, its saved
+// app list (manifest) and the key checks; one summary per day kept in Hub
+// config (key MONITOR_HISTORY) so the trend shows. Counts only, never values.
+// ---------------------------------------------------------------------------
+const HISTORY_KEY = 'MONITOR_HISTORY';
+const HISTORY_DAYS = 60;
+if (!HUB_CONFIG_KEYS.some(k => k.key === HISTORY_KEY)) {
+  HUB_CONFIG_KEYS.push({ key: HISTORY_KEY, app: 'monitor', otherWriters: [], status: 'live', note: 'Dataverse monitor: one summary per day (counts only).' });
+}
+
+// The manifest saved by this app (contract id -> app name -> card id), or null.
+function dvAppManifest(apps, cardId) {
+  return (apps || []).find(a => !a.fromScan && appIdOf(APP_WRITER_NAMES[a.appId] || a.appId) === cardId)
+    || (apps || []).find(a => a.fromScan && appIdOf(APP_WRITER_NAMES[a.appId] || a.appId) === cardId) || null;
+}
+
+// { tone: 'green'|'amber'|'red'|'gray', reasons: [text] }. Red: a table the app needs is missing, or its own
+// list names a table or written column that is not there. Amber: anything else that needs a look.
+function dvAppHealth(cardId, appTables, verdicts, man, keyResults) {
+  const reasons = [];
+  let tone = 'green';
+  const bump = t => { if (t === 'red' || (t === 'amber' && tone === 'green')) tone = t; };
+  if (!appTables.some(t => verdicts[t.logicalName] && verdicts[t.logicalName].code !== 'notscanned')) return { tone: 'gray', reasons: ['not checked yet'] };
+  const bad = appTables.filter(t => NOT_PROBLEMS.indexOf(verdicts[t.logicalName].code) === -1);
+  const redT = bad.filter(t => verdicts[t.logicalName].tone === 'red');
+  if (redT.length) { bump('red'); reasons.push(redT.length + ' table(s) missing or broken'); }
+  if (bad.length > redT.length) { bump('amber'); reasons.push((bad.length - redT.length) + ' table(s) need a look'); }
+  if (man && man.error) { bump('amber'); reasons.push('saved app list cannot be read'); }
+  if (man && man.check) {
+    const gone = man.check.tables.filter(t => t.state !== 'found');
+    const wMiss = man.check.tables.reduce((n, t) => n + t.missingWrite.length, 0);
+    const rMiss = man.check.tables.reduce((n, t) => n + t.missingRead.length, 0);
+    const notes = man.check.tables.filter(t => t.contractNotes.length).length;
+    if (gone.length) { bump('red'); reasons.push(gone.length + ' table(s) in its list not found'); }
+    if (wMiss) { bump('red'); reasons.push(wMiss + ' column(s) it saves to are missing'); }
+    if (rMiss) { bump('amber'); reasons.push(rMiss + ' column(s) it reads are missing'); }
+    if (notes) { bump('amber'); reasons.push(notes + ' table(s) differ from the contract'); }
+  }
+  if (keyResults) {
+    const names = {};
+    appTables.forEach(t => { if (t.writers.map(appIdOf).indexOf(cardId) !== -1) names[t.logicalName] = true; });
+    const kb = keyResults.filter(k => names[k.from] && !k.err && !(k.notMade && k.notMade.length) && k.bad > 0);
+    if (kb.length) { bump('amber'); reasons.push(kb.length + ' key column(s) with values not found'); }
+  }
+  if (!reasons.length) reasons.push(man ? 'all good' : 'tables good (no saved app list yet)');
+  return { tone, reasons };
+}
+
+function dvLocalDay(d) {
+  const x = d || new Date();
+  return x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0') + '-' + String(x.getDate()).padStart(2, '0');
+}
+
+// Reads the saved history from the Hub config rows already read. Resolves to { row, days: [] }.
+function dvReadHistory(rows) {
+  const row = (rows || []).find(r => String(r.craa5_configkey || '') === HISTORY_KEY) || null;
+  if (!row) return { row: null, days: [] };
+  const text = String(row.craa5_manifestjson || '').trim() || String(row.craa5_configjson || '').trim();
+  try {
+    const j = JSON.parse(text);
+    return { row, days: Array.isArray(j.days) ? j.days.filter(x => x && typeof x.d === 'string') : [] };
+  } catch (e) { return { row, days: [] }; }
+}
+
+// Puts today's counts in (replacing today's earlier entry, keeping fields not given) and keeps the last 60 days.
+function dvMergeHistory(days, entry) {
+  const list = (days || []).filter(x => x.d !== entry.d);
+  const prev = (days || []).find(x => x.d === entry.d) || {};
+  const merged = Object.assign({}, prev);
+  Object.keys(entry).forEach(k => { if (entry[k] !== undefined) merged[k] = entry[k]; });
+  return list.concat([merged]).sort((a, b) => a.d.localeCompare(b.d)).slice(-HISTORY_DAYS);
+}
+
+// Saves the history row. New table: the list in Config json. Old table: the list in Manifest json, a pointer in Config json.
+async function dvSaveHistory(conn, hubTable, row, days, manifestCol) {
+  const list = JSON.stringify({ m: 1, days });
+  const body = manifestCol === true
+    ? { craa5_configkey: HISTORY_KEY, craa5_configname: 'Dataverse monitor history', craa5_configjson: JSON.stringify({ m: 1, in: 'craa5_manifestjson' }), craa5_manifestjson: list }
+    : { craa5_configkey: HISTORY_KEY, craa5_configname: 'Dataverse monitor history', craa5_configjson: list };
+  return dvWriteRow(conn, hubTable, hubTable + 's', row ? row[hubTable + 'id'] : '', body);
 }
 
 
@@ -1826,6 +1950,38 @@ const TONES = {
   purple: { bg: '#4c1d95', fg: '#ddd6fe' },
   gray: { bg: '#334155', fg: '#e2e8f0' }
 };
+
+// The last 14 daily summaries as small bars (tables that need a look; the red part is missing or broken).
+function HistoryPanel({ days, note, bgCard, borderCol, textSub }) {
+  const list = (days || []).slice(-14);
+  const max = Math.max(1, ...list.map(d => d.p || 0));
+  const last = list[list.length - 1];
+  const weekAgo = list.length > 1 ? list[Math.max(0, list.length - 8)] : null;
+  return (
+    <div style={{ background: bgCard, padding: '14px 16px', borderRadius: '8px', border: '1px solid ' + borderCol, marginBottom: '16px' }}>
+      <div style={{ fontSize: '15px', fontWeight: 700 }}>Daily history</div>
+      <div style={{ fontSize: '12px', color: textSub, marginTop: '2px', marginBottom: '10px' }}>
+        {'Each time this page runs its check, today\'s counts are saved (one entry per day, counts only, last 60 days). ' + (last ? 'Today: ' + last.p + ' table(s) need a look, ' + last.r + ' red' + (last.a != null ? ', ' + last.a + ' app(s) red' : '') + '.' + (weekAgo && weekAgo !== last ? ' On ' + weekAgo.d + ': ' + weekAgo.p + ' need a look, ' + weekAgo.r + ' red.' : '') : 'Nothing saved yet.')}
+      </div>
+      {list.length > 0 && (
+        <div style={{ display: 'flex', alignItems: 'flex-end', gap: '4px', height: '60px' }}>
+          {list.map(d => {
+            const h = Math.round(50 * (d.p || 0) / max);
+            const hr = Math.round(50 * (d.r || 0) / max);
+            return (
+              <div key={d.d} title={d.d + ': ' + d.p + ' need a look, ' + d.r + ' red'} style={{ flex: '1 1 0', maxWidth: '28px', display: 'flex', flexDirection: 'column', justifyContent: 'flex-end', height: '60px' }}>
+                <div style={{ height: Math.max(0, h - hr) + 'px', background: '#d97706', borderRadius: '2px 2px 0 0' }}></div>
+                <div style={{ height: hr + 'px', background: '#dc2626' }}></div>
+                <div style={{ height: '2px', background: '#9ca3af' }}></div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {note && <div style={{ fontSize: '11px', color: textSub, marginTop: '8px' }}>{note}</div>}
+    </div>
+  );
+}
 
 function verdictText(v, lang) {
   const es = lang === 'es';
@@ -1932,6 +2088,7 @@ export default function DataverseOrganizerApp(props) {
   const [roleBusy, setRoleBusy] = useState(false);
   const [keyResults, setKeyResults] = useState(null);
   const [keyBusy, setKeyBusy] = useState('');
+  const [history, setHistory] = useState({ days: [], note: '' });
   const scanRef = useRef(0);
 
   const toggleTheme = useCallback(mode => {
@@ -1991,10 +2148,17 @@ export default function DataverseOrganizerApp(props) {
       const old = await dvReadHubConfigRows(conn, '', ['craa5__0_hubconfig']);
       if (old.state === 'ok') oldKeys = old.rows.map(r => String(r.craa5_configkey || '').trim() || String(r.craa5_configname || '').trim()).filter(Boolean);
     }
+    // The new Hub config table is skipped when it has no Config key column; say so plainly.
+    let newNeedsKey = false;
+    if (read.table !== 'craa5__e_hubconfig') {
+      const nm = await dvReadMeta(conn, 'craa5__e_hubconfig', ['craa5_configkey']);
+      newNeedsKey = nm.state === 'found' && !!nm.cols && !nm.cols.has('craa5_configkey');
+    }
     if (scanRef.current !== myScan) return;
-    setManifests({ state: read.state, table: read.table || '', err: read.err || '', rows: read.rows, apps, maxLen, hub, oldKeys, readNotes: read.notes || [], manifestCol, mMaxLen, ownership: hubRes && hubRes.meta ? hubRes.meta.OwnershipType : '', expectedOwnership: hubSpec ? hubSpec.expectedOwnership : '' });
+    setManifests({ newNeedsKey, state: read.state, table: read.table || '', err: read.err || '', rows: read.rows, apps, maxLen, hub, oldKeys, readNotes: read.notes || [], manifestCol, mMaxLen, ownership: hubRes && hubRes.meta ? hubRes.meta.OwnershipType : '', expectedOwnership: hubSpec ? hubSpec.expectedOwnership : '' });
     setLastScanTime(new Date().toISOString());
     setScanning(false);
+    if (read.state === 'ok') setHistory(h => ({ ...h, days: dvReadHistory(read.rows).days, read: { table: read.table, rows: read.rows, manifestCol, maxLen } }));
   }, [conn, online]);
 
   useEffect(() => {
@@ -2028,6 +2192,42 @@ export default function DataverseOrganizerApp(props) {
     if (filterState === 'problems') list = list.filter(t => NOT_PROBLEMS.indexOf(verdicts[t.logicalName].code) === -1);
     return list;
   }, [filterApp, filterState, verdicts]);
+
+  // One dot per app: its tables, its saved app list and the key checks.
+  const appHealth = useMemo(() => {
+    const out = {};
+    ECOSYSTEM_APPS.forEach(app => {
+      const appTables = ECOSYSTEM_TABLES.filter(t => t.usedBy.indexOf(app.id) !== -1);
+      const man = manifests && manifests.apps ? dvAppManifest(manifests.apps, app.id) : null;
+      out[app.id] = dvAppHealth(app.id, appTables, verdicts, man, keyResults);
+    });
+    return out;
+  }, [verdicts, manifests, keyResults]);
+
+  // Daily history: after a full check (and again after key checks), today's counts replace today's entry.
+  useEffect(() => {
+    const rd = history.read;
+    if (!rd || scanning || !Object.keys(tableResults).length) return;
+    const entry = {
+      d: dvLocalDay(), v: MONITOR_VERSION, c: CONTRACT_VERSION,
+      t: ECOSYSTEM_TABLES.filter(t => verdicts[t.logicalName].code !== 'notscanned').length,
+      p: ECOSYSTEM_TABLES.filter(t => NOT_PROBLEMS.indexOf(verdicts[t.logicalName].code) === -1).length,
+      r: ECOSYSTEM_TABLES.filter(t => verdicts[t.logicalName].tone === 'red').length,
+      m: manifests && manifests.apps ? manifests.apps.filter(a => a.check && a.check.tables.some(t => t.state !== 'found' || t.missingWrite.length || t.missingRead.length)).length : undefined,
+      k: keyResults ? keyResults.filter(k => k.bad && !k.err).length : undefined,
+      a: ECOSYSTEM_APPS.filter(a => appHealth[a.id].tone === 'red').length
+    };
+    const days = dvMergeHistory(history.days, entry);
+    const text = JSON.stringify({ m: 1, days });
+    // Old table without Manifest json: Config json is too short for the list, so nothing is saved.
+    if (rd.manifestCol !== true && rd.maxLen != null && text.length > rd.maxLen) { setHistory(h => ({ ...h, days, read: null, note: 'History not saved: Config json in ' + rd.table + ' is too short.' })); return; }
+    setHistory(h => ({ ...h, days, read: null, note: 'Saving today\'s summary...' }));
+    const row = dvReadHistory(rd.rows).row;
+    dvSaveHistory(conn, rd.table, row, days, rd.manifestCol).then(res => {
+      if (res.ok && !row && res.id) rd.rows.push({ craa5_configkey: HISTORY_KEY, [rd.table + 'id']: res.id });
+      setHistory(h => ({ ...h, note: res.ok ? 'Today\'s summary saved in ' + rd.table + ' (' + HISTORY_KEY + ').' : 'History not saved: ' + res.err, rows: rd }));
+    });
+  }, [history.read, scanning, tableResults, verdicts, manifests, keyResults, appHealth, conn]);
 
   // The printout carries states, counts, column names and errors. It never carries row values.
   const printoutText = useMemo(() => {
@@ -2098,14 +2298,18 @@ export default function DataverseOrganizerApp(props) {
       }),
       securityRoles: !roleData ? 'not read (press Read security roles)' : (roleData.state !== 'ok' ? roleData.state + ': ' + roleData.err : {
         yourRoles: roleData.mine,
+        rolesWithHubRights: (roleData.hubRoles || []).map(r => r.name + ' (' + r.tables + ' tables)'),
+        builtInRolesLeftOut: roleData.builtin || [],
         findings: roleData.findings.map(f => f.table + ': ' + f.kind + (f.roles ? ' (' + f.roles.join(', ') + ')' : ''))
       }),
-      keyChecks: !keyResults ? 'not run (press Check keys)' : keyResults.filter(k => k.bad || k.err || k.targetEmpty).map(k => k.from + '.' + k.col + ' -> ' + k.to + '.' + k.toCol + ': ' + (k.err ? 'error ' + k.err : k.bad + ' of ' + k.rows + ' rows not found (' + k.badDistinct + ' distinct)' + (k.targetEmpty ? ', target empty' : '') + (k.capped ? ', first 20000 rows' : ''))),
+      keyChecks: !keyResults ? 'not run (press Check keys)' : keyResults.filter(k => k.bad || k.err || k.targetEmpty || (k.notMade && k.notMade.length)).map(k => k.from + '.' + k.col + ' -> ' + k.to + '.' + k.toCol + ': ' + (k.notMade && k.notMade.length ? 'column not made yet: ' + k.notMade.join(', ') : (k.err ? 'error ' + k.err : k.bad + ' of ' + k.rows + ' rows not found (' + k.badDistinct + ' distinct)' + (k.examples && k.examples.length ? ', e.g. ' + k.examples.map(x => '"' + x + '"').join(', ') : '') + (dvKeyLooksLikeSamples(k) ? ', maybe Copilot sample rows' : '') + (k.targetEmpty ? ', target empty' : '') + (k.capped ? ', first 20000 rows' : '')))),
+      appHealth: ECOSYSTEM_APPS.map(a => a.name + ': ' + appHealth[a.id].tone + ' - ' + appHealth[a.id].reasons.join('; ')),
+      history: history.days.length ? history.days.slice(-7).map(d => d.d + ' problems ' + d.p + ' red ' + d.r + ' app-list ' + d.m + (d.k != null ? ' keys ' + d.k : '')) : 'none saved yet',
       tablesNotOnList: unclaimed ? unclaimed.map(d => d.logicalName) : 'could not list (no Web API address)',
       browserStorage: storageState.filter(s => printoutMode === 'full' || s.status === 'warn' || s.status === 'bad').map(s => ({ key: s.key, status: s.status, detail: s.detail, issue: s.issue || null }))
     };
     return JSON.stringify(payload, null, 2);
-  }, [tableResults, verdicts, summary, lastScanTime, conn, printoutMode, unclaimed, storageState, fillCounts, manifests, roleData, keyResults]);
+  }, [tableResults, verdicts, summary, lastScanTime, conn, printoutMode, unclaimed, storageState, fillCounts, manifests, roleData, keyResults, appHealth, history]);
 
   // Work for the table maker, one card per table. Copilot does best with one short prompt per table and
   // cannot edit tables, so a missing table gets a short create prompt (required columns only) and missing
@@ -2196,6 +2400,8 @@ export default function DataverseOrganizerApp(props) {
       .map(t => ({ logicalName: t.logicalName, resolved: tableResults[t.logicalName].resolvedName || t.logicalName, ownership: tableResults[t.logicalName].ownership || (tableResults[t.logicalName].meta && tableResults[t.logicalName].meta.OwnershipType) || '', written: (t.writers || []).some(w => !/admin/i.test(w)) }));
     d.tables = found;
     d.findings = d.state === 'ok' ? dvRoleFindings(d.roles, found) : [];
+    d.hubRoles = d.state === 'ok' ? dvHubRoles(d.roles) : [];
+    d.builtin = d.state === 'ok' ? d.roles.filter(r => dvIsBuiltinRole(r.name)).map(r => r.name) : [];
     setRoleData(d);
     setRoleBusy(false);
   }, [conn, msUser, tableResults]);
@@ -2206,6 +2412,7 @@ export default function DataverseOrganizerApp(props) {
     const res = await dvKeyCheck(conn, plan, 20000, (i, n) => setKeyBusy('Checking ' + i + ' / ' + n));
     setKeyResults(res);
     setKeyBusy('');
+    setHistory(h => (h.rows ? { ...h, read: h.rows } : h));
   }, [conn, tableResults]);
 
   const promptCards = useMemo(() => {
@@ -2367,7 +2574,7 @@ export default function DataverseOrganizerApp(props) {
           { id: 'scancode', label: L('Scan app code', 'Escanear codigo') },
           { id: 'copy', label: L('Copy column values', 'Copiar valores') },
           { id: 'security', label: 'Security roles' + (roleData && roleData.findings ? ' (' + roleData.findings.length + ')' : '') },
-          { id: 'keys', label: 'Key checks' + (keyResults ? ' (' + keyResults.filter(k => k.bad || k.err).length + ')' : '') }
+          { id: 'keys', label: 'Key checks' + (keyResults ? ' (' + keyResults.filter(k => (k.bad || k.err) && !(k.notMade && k.notMade.length)).length + ')' : '') }
         ].map(tab => (
           <button key={tab.id} type="button" onClick={() => setActiveTab(tab.id)} style={{ padding: '9px 16px', borderRadius: '6px', border: '1px solid ' + (activeTab === tab.id ? '#3b82f6' : borderCol), background: activeTab === tab.id ? '#1d4ed8' : bgCard, color: activeTab === tab.id ? '#ffffff' : textMain, fontWeight: 600, fontSize: '13px', cursor: 'pointer' }}>
             {tab.label}
@@ -2606,20 +2813,20 @@ export default function DataverseOrganizerApp(props) {
 
       {/* APPS */}
       {activeTab === 'apps' && (
+        <div>
+        <HistoryPanel days={history.days} note={history.note} bgCard={bgCard} borderCol={borderCol} textSub={textSub} />
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '16px' }}>
           {ECOSYSTEM_APPS.map(app => {
             const appTables = ECOSYSTEM_TABLES.filter(t => t.usedBy.indexOf(app.id) !== -1);
-            const problems = appTables.filter(t => NOT_PROBLEMS.indexOf(verdicts[t.logicalName].code) === -1);
+            const h = appHealth[app.id];
+            const dot = { green: '#16a34a', amber: '#d97706', red: '#dc2626', gray: '#9ca3af' }[h.tone];
             return (
               <div key={app.id} style={{ background: bgCard, padding: '16px', borderRadius: '8px', border: '1px solid ' + borderCol }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span title={h.tone} style={{ width: '12px', height: '12px', borderRadius: '50%', background: dot, flexShrink: 0 }}></span>
                   <h3 style={{ margin: 0, fontSize: '16px' }}>{app.name}</h3>
-                  {Object.keys(tableResults).length > 0 && (
-                    <span style={pill(problems.length ? 'amber' : 'green')}>
-                      {problems.length ? problems.length + L(' table(s) need a look', ' tabla(s) por revisar') : L('Tables OK', 'Tablas OK')}
-                    </span>
-                  )}
                 </div>
+                <div style={{ fontSize: '12px', color: h.tone === 'red' ? TONES.red.fg : (h.tone === 'amber' ? TONES.amber.fg : textSub), marginTop: '6px' }}>{h.reasons.join('; ')}</div>
                 <div style={{ fontSize: '13px', color: textSub, marginTop: '6px', marginBottom: '10px' }}>
                   {L('Writes ', 'Escribe ') + appTables.filter(t => t.writers.map(appIdOf).indexOf(app.id) !== -1).length + L(' table(s), reads ', ' tabla(s), lee ') + appTables.filter(t => t.readers.map(appIdOf).indexOf(app.id) !== -1).length}
                 </div>
@@ -2636,6 +2843,7 @@ export default function DataverseOrganizerApp(props) {
               </div>
             );
           })}
+        </div>
         </div>
       )}
 
@@ -2656,6 +2864,12 @@ export default function DataverseOrganizerApp(props) {
             <div style={{ fontSize: '12px', color: textSub, marginBottom: '10px' }}>
               {L('Manifest json column is there', 'La columna Manifest json existe') + (manifests.mMaxLen != null ? L(' (holds up to ', ' (acepta hasta ') + manifests.mMaxLen.toLocaleString() + ')' : '') + L('; app lists are read from it, and from Config json for rows without it.', '; las listas se leen de ahi, y de Config json en filas sin ella.')}
               {manifests.mMaxLen != null && manifests.mMaxLen < 10000 && <span style={{ color: TONES.amber.fg }}>{L(' It is too short: it needs 100000.', ' Es muy corta: necesita 100000.')}</span>}
+            </div>
+          )}
+          {manifests && manifests.newNeedsKey && (
+            <div style={{ fontSize: '13px', color: TONES.red.fg, background: TONES.red.bg, padding: '10px 12px', borderRadius: '6px', marginBottom: '14px' }}>
+              <b>To do: add the Config key column to the new Hub config table. </b>
+              {'craa5__e_hubconfig is there but has no Config key column (craa5_configkey), so no app can find its settings in it and everything still runs from the old craa5__0_hubconfig. In Tables - _e_ Hub config - New - Column add: Display name Config key, type Single line of text, Maximum character count 200. Then press Run check again.'}
             </div>
           )}
           {manifests && manifests.readNotes && manifests.readNotes.length > 0 && (
@@ -2908,13 +3122,14 @@ export default function DataverseOrganizerApp(props) {
           {roleData && roleData.state !== 'ok' && <div style={{ fontSize: '13px', color: TONES.amber.fg, marginTop: '10px' }}>{(roleData.state === 'denied' ? 'Your role cannot read security roles. ' : 'Could not read security roles. ') + roleData.err}</div>}
           {roleData && roleData.state === 'ok' && (
             <div style={{ marginTop: '12px' }}>
-              <div style={{ fontSize: '12px', color: textSub, marginBottom: '8px' }}>{'Your roles: ' + (roleData.mine.length ? roleData.mine.join(', ') : '(could not tell)') + '. Roles with any hub table rights: ' + roleData.roles.length + '.'}</div>
+              <div style={{ fontSize: '12px', color: textSub, marginBottom: '8px' }}>{'Your roles: ' + (roleData.mine.length ? roleData.mine.join(', ') : '(could not tell)') + '. Roles with hub table rights: ' + (roleData.hubRoles.length ? roleData.hubRoles.map(r => r.name).join(', ') : 'none yet, so only administrators can use the hub tables') + '.'}</div>
+              {roleData.builtin.length > 0 && <div style={{ fontSize: '12px', color: textSub, marginBottom: '8px' }}>{'Left out (built into Dataverse, not used by hub staff): ' + roleData.builtin.join(', ') + '.'}</div>}
               {roleData.findings.length > 0 && (
                 <div style={{ marginBottom: '12px' }}>
                   {roleData.findings.map((f, i) => (
                     <div key={i} style={{ fontSize: '12px', marginBottom: '3px', color: f.kind === 'noread' ? TONES.red.fg : TONES.amber.fg }}>
                       <span style={{ fontFamily: 'Consolas, monospace' }}>{f.table}</span>
-                      {f.kind === 'noread' ? ': no role can read it (only administrators see it)' : (f.kind === 'nowrite' ? ': no role can write or create rows, but an app saves here' : ': owned by user, and these roles read only their own rows, so they miss other people\'s: ' + f.roles.join(', '))}
+                      {f.kind === 'noread' ? ': no hub role can read it (only administrators see it)' : (f.kind === 'nowrite' ? ': no role can write or create rows, but an app saves here' : ': owned by user, and these roles read only their own rows, so they miss other people\'s: ' + f.roles.join(', '))}
                     </div>
                   ))}
                 </div>
@@ -2924,14 +3139,14 @@ export default function DataverseOrganizerApp(props) {
                   <thead>
                     <tr>
                       <th style={{ textAlign: 'left', padding: '4px 6px', borderBottom: '1px solid ' + borderCol, position: 'sticky', left: 0, background: bgCard }}>Table</th>
-                      {roleData.roles.map(r => <th key={r.id} style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol, whiteSpace: 'nowrap', color: roleData.mine.indexOf(r.name) !== -1 ? '#60a5fa' : textMain }}>{r.name}</th>)}
+                      {roleData.roles.filter(r => !dvIsBuiltinRole(r.name)).map(r => <th key={r.id} style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol, whiteSpace: 'nowrap', color: roleData.mine.indexOf(r.name) !== -1 ? '#60a5fa' : textMain }}>{r.name}</th>)}
                     </tr>
                   </thead>
                   <tbody>
                     {roleData.tables.map(t => (
                       <tr key={t.resolved}>
                         <td style={{ padding: '3px 6px', borderBottom: '1px solid ' + borderCol, fontFamily: 'Consolas, monospace', position: 'sticky', left: 0, background: bgCard, whiteSpace: 'nowrap' }}>{t.resolved}</td>
-                        {roleData.roles.map(r => {
+                        {roleData.roles.filter(r => !dvIsBuiltinRole(r.name)).map(r => {
                           const p = r.privs[t.resolved] || {};
                           const txt = ['Read', 'Write', 'Create'].filter(op => p[op]).map(op => op[0] + ':' + p[op]).join(' ');
                           return <td key={r.id} style={{ padding: '3px 6px', borderBottom: '1px solid ' + borderCol, whiteSpace: 'nowrap', color: txt ? textMain : textSub }}>{txt || '-'}</td>;
@@ -2951,7 +3166,7 @@ export default function DataverseOrganizerApp(props) {
         <div style={{ background: bgCard, borderRadius: '8px', padding: '18px', border: '1px solid ' + borderCol }}>
           <h2 style={{ margin: 0, fontSize: '18px' }}>Key checks between apps</h2>
           <div style={{ fontSize: '13px', color: textSub, marginTop: '4px', marginBottom: '14px' }}>
-            The contract says some columns must match another table (for example an asset's area name must be an area in the MSS area table). This counts the rows whose value is not found there. Only counts are shown, never the values. Area and room names are compared ignoring case, spaces and punctuation; ids are compared exactly. Reads up to 20,000 rows per table.
+            The contract says some columns must match another table (for example an asset's area name must be an area in the MSS area table). This counts the rows whose value is not found there. For places and things (areas, rooms, items, SAP work areas, vendors, equipment ids) up to 3 unmatched values are shown so you can tell typos from sample rows; values from people columns are never shown. A pair whose column has not been made yet says so instead of failing. Area and room names are compared ignoring case, spaces and punctuation; ids are compared exactly. Reads up to 20,000 rows per table.
           </div>
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
             <button type="button" disabled={!!keyBusy || !Object.keys(tableResults).length} onClick={runKeyChecks} style={btn(true)}>{keyBusy || 'Check keys'}</button>
@@ -2966,16 +3181,18 @@ export default function DataverseOrganizerApp(props) {
                 </thead>
                 <tbody>
                   {keyResults.map((k, i) => {
-                    const tone = k.err ? 'gray' : (k.bad ? 'amber' : (k.targetEmpty ? 'gray' : 'green'));
-                    const word = k.err ? 'could not read' : (k.bad ? k.bad + ' rows (' + k.badDistinct + ' values) not found' : (k.targetEmpty ? 'target empty' : 'all match'));
+                    const notMade = k.notMade && k.notMade.length;
+                    const tone = notMade || k.err ? 'gray' : (k.bad ? 'amber' : (k.targetEmpty ? 'gray' : 'green'));
+                    const word = notMade ? 'column not made yet' : (k.err ? 'could not read' : (k.bad ? k.bad + ' rows (' + k.badDistinct + ' values) not found' : (k.targetEmpty ? 'target empty' : 'all match')));
+                    const extra = notMade ? ' ' + k.notMade.join(', ') : (k.err ? ' ' + k.err : ((k.examples && k.examples.length ? ' e.g. ' + k.examples.map(x => '"' + x + '"').join(', ') : '') + (dvKeyLooksLikeSamples(k) ? ' (only a few: maybe the sample rows the Copilot table maker adds)' : '')));
                     return (
                       <tr key={i}>
                         <td style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol, fontFamily: 'Consolas, monospace', wordBreak: 'break-word' }}>{k.from + '.' + k.col}</td>
                         <td style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol, fontFamily: 'Consolas, monospace', wordBreak: 'break-word' }}>{k.to + '.' + k.toCol}</td>
-                        <td style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol }}>{k.err ? '-' : k.rows + (k.capped ? '+' : '')}</td>
-                        <td style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol }}>{k.err ? '-' : k.blank}</td>
-                        <td style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol }}>{k.err ? '-' : k.bad}</td>
-                        <td style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol }}><span style={pill(tone)}>{word}</span>{k.err ? <span style={{ color: textSub }}>{' ' + k.err}</span> : null}</td>
+                        <td style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol }}>{k.err || notMade ? '-' : k.rows + (k.capped ? '+' : '')}</td>
+                        <td style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol }}>{k.err || notMade ? '-' : k.blank}</td>
+                        <td style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol }}>{k.err || notMade ? '-' : k.bad}</td>
+                        <td style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol, wordBreak: 'break-word' }}><span style={pill(tone)}>{word}</span>{extra ? <span style={{ color: textSub }}>{extra}</span> : null}</td>
                       </tr>
                     );
                   })}
