@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.48, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.49, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -108,7 +108,7 @@ Time loss log keeps the column names it was created with: `craa5_assetguid` hold
 | `craa5__m_formtemplate`, `craa5__m_quicktask` (both User-owned; quick tasks are a personal list on purpose) | live | Manager hub | Manager hub |
 | `craa5__m_employeenote` Manager notes on people | live | Manager hub | Manager hub, manager role only. Sensitive: User-owned, never shown to peers, never in exports or the repo. Key `craa5_employeeguid`. |
 | `craa5__e_shifttask` Shift tasks (mandatory work with no clean minutes: trash, admin, chemical clerk, janitorial, steam pits) | **proposed, not approved** (Scheduler game plan, https://claude.ai/artifact/Cmr1VxEDcNhNZDxyxuFVg7) | Production Scheduler (Crew plan) | MSS Log Input, Shift Start, Ganttly, Manager hub | Organization-owned. Key `craa5_taskkey` (`night|trash`); `craa5_shift` day / night / both; `craa5_days` 7 digits Sun..Sat; `craa5_minutes` per shift, blank = whole shift. Replaces the fixed posts in `MSS_LOG_MANPOWER_SETUP` only if Gerald chooses one manpower engine. |
-| `craa5__g_assignment` Equipment to people, per shift | proposed (Gerald made it 2026-10-22; name to confirm) | **Shift Start** and **Ganttly**, both (pinned beats auto; higher `craa5_rev` wins between pinned saves) | Shift Start, Ganttly, Manager hub | Organization-owned. Key `<shift date>|<crew>|<equipment guid>|<kind>`, row id `hubIdFromKey('asg|' + key)`. Spec: `/mnt/project-files/ganttly-overhaul/shared-assignment.md`. |
+| `craa5__g_assignment` Equipment to people, per shift | proposed (Gerald made it 2026-10-22; name to confirm) | **Shift Start** and **Ganttly**, both (pinned beats auto; higher `craa5_rev` wins between pinned saves). New pieces are split evenly by the ASSIGN SPLIT block (12.2): saved rows keep their people (first writer wins), new rows are `auto` and not pinned, a reorder sets `craa5_order` and pins the row, a drag in Ganttly is `ganttly` and pinned; Ganttly fills `craa5_plannedstart` / `craa5_plannedminutes` without bumping `craa5_rev` | Shift Start, Ganttly, Manager hub | Organization-owned. Key `<shift date>|<crew>|<equipment guid>|<kind>`, row id `hubIdFromKey('asg|' + key)`. Spec: `/mnt/project-files/ganttly-overhaul/shared-assignment.md`. |
 | `craa5__g_obstacle`, `craa5__g_handover` Floor obstacles and crew handovers | proposed; used by Ganttly 1.4 | Ganttly | Ganttly | Organization-owned. Keys `craa5_obstaclekey` / `craa5_handoverkey`; area, equipment and shift date as in section 2. Prompts: `/mnt/project-files/ganttly-overhaul/g-tables-prompts.md`. |
 | `craa5__g_personnelnote` Floor notes on people (high fives, incidents, coaching) | proposed; used by Ganttly 1.4 (incidents and coaching no longer go to Employee `craa5_remarks`) | Ganttly | Ganttly (writer's own notes), Manager hub (managers read all) | **Sensitive**: User-owned; floor users Create + User-level Read/Write, managers Organization Read. Never shown to peers, exported or in the repo. Separate from `craa5__m_employeenote`. Replaces the `craa5_remarks` JSON on the Employee row. Key `craa5_employeeguid`. |
 | `craa5__c_*` chemical tables (14 in contract.json, taken from the chemical hub's own spec file chemical-ordering/contract/c-tables.json, with full columns; 11 live, Chemical alias and Sanitation budget proposed, Chemical standard unknown) | live | Chemical hub | Chemical hub; Manager hub for cost. User/team-owned with Organization-level Read. The old chem log's employee, shift and equipment columns stay as text as written. |
@@ -380,6 +380,16 @@ Each app says in its own code which tables and columns it uses, and saves that l
 - **One-time copy:** the monitor has a tab Gerald runs once to copy `craa5_allergenclean` into `craa5_eggallergen` and `craa5_pecanallergen`. After that the MSS Calendar owns those flags.
 - **First app:** Ganttly, in its Phase 2. The others add theirs when they next change.
 
+### 12.2 Shared code blocks
+
+Each block is pasted unchanged into every app that uses it. Its owner changes it and tells this thread; a new version goes in the change log here.
+
+| Block | File | Owner | Pasted by |
+|---|---|---|---|
+| HUB SHARED v1.1 | [hub-shared.js](/mnt/project-files/ecosystem-contract/hub-shared.js) | this thread | every hub app |
+| MSS LOG WRITE v1.3 | [mss-log-write.js](/mnt/project-files/mss-log-input/mss-log-write.js) | MSS log input thread | every MSS log writer: Ganttly, MSS Log Input, MSS Calendar (section 6.3) |
+| ASSIGN SPLIT v1.0 | [assign-split.js](/mnt/project-files/ganttly-overhaul/assign-split.js), tests [assign-split.test.js](/mnt/project-files/ganttly-overhaul/test/assign-split.test.js) | Ganttly thread | Ganttly v1.5, Shift Start v0.0012+ (the even split for `_g_ Assignment`; rules in [shared-assignment.md](/mnt/project-files/ganttly-overhaul/shared-assignment.md)) |
+
 ---
 
 ## 13. New tables and columns in this version
@@ -429,6 +439,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.49 (2026-10-23)** New section 12.2, the list of shared code blocks (HUB SHARED, MSS LOG WRITE, ASSIGN SPLIT). `_g_ Assignment` even-split rules from ASSIGN SPLIT v1.0 (Gerald: auto assign evenly, reorder for completion).
 - **1.0.48 (2026-10-23)** Section 6.5 follows Scheduler v4.6 (PR #39, b35d8e9): window details gain optional `pin`, `after`, `order`; config row may hold `links` and `order`; override pin is `pin|who|why|YYYY-MM-DDTHH:MM`; Scheduler reads `craa5_linepriority` as the default clean order; a night stop counts for the day it starts on (more Daily windows for IBL5 and Waterjet). Built under Gerald's passive mode; he reviews at the end.
 - **1.0.47 (2026-10-23)** Section 6.3 follows MSS LOG WRITE v1.3 (PR #40, 200f922): names need two letters (`not_a_name`), `craa5_allergenclean` tries `Yes` then `true`, Check tab flags over 24 labor hours on a piece (`hours_high`). MSS Log Input now uses `hub_lang` / `hub_theme`.
 - **1.0.46 (2026-10-23)** Gerald moved to passive mode (follow the plan, use sensible defaults, say which). Q9 closed as plain wage (the rates entered are hourly pay; screens say "wage cost"). Q8 closed: send `Yes`, readers accept Yes / true / 1.
