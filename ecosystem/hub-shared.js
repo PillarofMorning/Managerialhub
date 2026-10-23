@@ -170,17 +170,19 @@ function hubSetLang(l) { try { window.localStorage.setItem(HUB_LANG_KEY, l === '
 var HUB_ACC = { a: 225, e: 233, i: 237, o: 243, u: 250, n: 241, A: 193, E: 201, I: 205, O: 211, U: 218, N: 209, '?': 191, '!': 161, w: 252 };
 function hubDecodeEs(s) { return String(s).replace(/%([aeiounAEIOUN?!w%])/g, function (m, c) { return c === '%' ? '%' : String.fromCharCode(HUB_ACC[c]); }); }
 // The shared words (data-contract.md section 9). An app's own word list adds to these; it never gives one of these another Spanish.
+// Mexican plant Spanish (es-MX), usted form: computadora, celular, tomar, presionar / dar clic, llenar; never vosotros,
+// ordenador, movil, coger, pulsar, rellenar.
 var HUB_ES = {
     'Planned': 'Planeado', 'Started': 'En proceso', 'Done': 'Terminado', 'Skipped': 'Omitido', 'Overdue': 'Atrasado', 'At risk': 'En riesgo',
-    'Daily': 'Diaria', 'Midweek 72h': 'Media semana 72h', 'End of week': 'Fin de semana', 'EOW': 'FDS', 'Allergen': 'Al%ergeno', 'Egg allergen': 'Al%ergeno huevo', 'Pecan allergen': 'Al%ergeno nuez pecana',
+    'Daily': 'Diaria', 'Midweek 72h': 'Media semana 72h', 'End of week': 'Fin de semana', 'EOW': 'Fin de semana', 'Allergen': 'Al%ergeno', 'Egg allergen': 'Al%ergeno huevo', 'Pecan allergen': 'Al%ergeno nuez pecana',
     'Changeover': 'Cambio de producto', 'Monthly': 'Mensual', 'Quarterly': 'Trimestral', 'Semiannual': 'Semestral', 'Annual': 'Anual',
     'Corrective': 'Correctiva', 'Other': 'Otra',
-    'Present': 'Presente', 'Late': 'Lleg%o tarde', 'Sick': 'Enfermo', 'PTO': 'Vacaciones (PTO)', 'Left early': 'Sali%o temprano',
-    'No call': 'Falta sin aviso', 'Loaned': 'Prestado', 'Training': 'Entrenamiento',
+    'Present': 'Presente', 'Late': 'Retardo', 'Sick': 'Enfermo', 'PTO': 'Vacaciones (PTO)', 'Left early': 'Sali%o temprano',
+    'No call': 'Falta sin aviso', 'Loaned': 'Prestado', 'Training': 'Capacitaci%on',
     'Sanitor': 'Sanitizador', 'Lead': 'L%ider', 'Supervisor': 'Supervisor', 'Manager': 'Gerente',
     'Loading': 'Cargando', 'Ready': 'Listo', 'Nothing here yet': 'Todav%ia no hay datos', 'Table missing': 'Falta la tabla',
     'No access': 'Sin acceso', 'Could not load': 'No se pudo cargar',
-    'Area': '%Area', 'Room': 'Sala', 'Line': 'L%inea', 'Equipment': 'Equipo', 'Shift': 'Turno', 'Crew': 'Cuadrilla', 'Team': 'Grupo',
+    'Area': '%Area', 'Room': 'Cuarto', 'Line': 'L%inea', 'Equipment': 'Equipo', 'Shift': 'Turno', 'Crew': 'Cuadrilla', 'Team': 'Grupo',
     'Clean': 'Limpieza', 'Run': 'Corrida', 'Headcount': 'Personal', 'Minutes': 'Minutos', 'Standard': 'Est%andar', 'Pace': 'Ritmo',
     'On time': 'A tiempo', 'Labor cost': 'Costo de mano de obra', 'Swab': 'Hisopo', 'Pathogen': 'Pat%ogeno', 'Work order': 'Orden de trabajo',
     'Skip code': 'C%odigo de omisi%on', 'High five': 'Reconocimiento', 'Sign-off': 'Aprobaci%on', 'Help': 'Ayuda', 'Print': 'Imprimir'

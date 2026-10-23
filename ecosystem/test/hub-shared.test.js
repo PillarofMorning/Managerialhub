@@ -38,7 +38,7 @@ ok(H.hubIdFromKey('ABC'), H.hubIdFromKey('abc'));
 ok(H.hubStdMinutes(35), 35); ok(H.hubStdMinutes('6'), 6); ok(H.hubStdMinutes(600), 600); ok(H.hubStdMinutes(''), null); ok(H.hubStdMinutes(0), null);
 ok(H.hubPace(90, 120), 75); ok(H.hubPace(90, 0), null); ok(H.hubShare(90, 2), 45); ok(H.hubLaborCost(90, 21), 31.5);
 ok(H.hubGetLang(), 'en'); store.itp_lang_v1 = 'es'; ok(H.hubGetLang(), 'es'); H.hubSetLang('en'); ok(H.hubGetLang(), 'en'); H.hubSetLang('es');
-ok(H.hubT('Done'), 'Terminado'); ok(H.hubT('Allergen'), 'Alérgeno'); ok(H.hubT('Late'), 'Llegó tarde'); ok(H.hubT('Overdue'), 'Atrasado');
+ok(H.hubT('Done'), 'Terminado'); ok(H.hubT('Allergen'), 'Alérgeno'); ok(H.hubT('Late'), 'Retardo'); ok(H.hubT('Room'), 'Cuarto'); ok(H.hubT('Training'), 'Capacitación'); ok(H.hubT('EOW'), 'Fin de semana'); ok(H.hubT('Overdue'), 'Atrasado');
 ok(H.hubT('Unknown words'), 'Unknown words'); ok(H.hubT('Mine', 'es', { 'Mine': 'M%io' }), 'Mío'); ok(H.hubT('Done', 'en'), 'Done');
 ok(H.hubDecodeEs('%%5 %?Listo%!'), '%5 ¿Listo¡');
 // frequency periods and due
