@@ -281,11 +281,43 @@ test('allergen flag of another type: the save drops only that column', async () 
     const m = load();
     const api = mockApi();
     const c = api.create;
-    api.create = async (t, body) => { if (body.craa5_allergenclean !== undefined) throw new Error("Cannot convert the literal 'Yes' to the expected type 'Edm.Boolean'."); return c(t, body); };
+    api.create = async (t, body) => { if (body.craa5_allergenclean !== undefined) throw new Error("Cannot convert the literal '" + body.craa5_allergenclean + "' to the expected type 'Edm.Int32'."); return c(t, body); };
     const r = await m.mlwWrite(api, Object.assign({}, base, { kind: 'allergen' }), { now: NOW });
     assert.strictEqual(r.status, 'saved');
     assert.strictEqual(api.created[0].craa5_cleankind, 'allergen');
     assert.strictEqual(api.created[0].craa5_allergenclean, undefined);
+});
+
+test('allergen flag on a Yes/No column (v1.3): after the text is refused, true is sent, and kept for the next saves', async () => {
+    const m = load();
+    const api = mockApi();
+    const c = api.create, tried = [];
+    api.create = async (t, body) => {
+        if (body.craa5_allergenclean !== undefined) tried.push(body.craa5_allergenclean);
+        if (body.craa5_allergenclean !== undefined && body.craa5_allergenclean !== true) throw new Error("Cannot convert the literal 'Yes' to the expected type 'Edm.Boolean'.");
+        return c(t, body);
+    };
+    const r = await m.mlwWrite(api, Object.assign({}, base, { kind: 'egg' }), { now: NOW });
+    eq([r.status, api.created[0].craa5_allergenclean, tried], ['saved', true, ['Yes', true]]);
+    await m.mlwWrite(api, Object.assign({}, base, { kind: 'pecan' }), { now: NOW });
+    eq([api.created[1].craa5_allergenclean, tried.length], [true, 3], 'the second save sends true straight away');
+});
+
+test('placeholder names (v1.3): "X", "-", "?" and one letter are not names; initials and real names are', () => {
+    const m = load();
+    ['X', 'x', '-', '?', '1', 'X / Ana Lopez', 'none', 'Unknown', 'xx'].forEach(n => eq(m.mlwBuildRow(Object.assign({}, base, { cleanedBy: n }), NOW).problems, ['not_a_name'], n));
+    ['AL', 'Ana Lopez', 'Lopez, Ana / JP', 'Jose Maria'].forEach(n => eq(m.mlwBuildRow(Object.assign({}, base, { cleanedBy: n }), NOW).problems, [], n));
+    eq(m.mlwBuildRow(Object.assign({}, base, { cleanedBy: 'Crew' }), NOW).problems, ['crew_name'], '"Crew" keeps its own message');
+});
+
+test('check (v1.3): a placeholder name, and more than 24 labor hours on one piece', () => {
+    const m = load();
+    const row = { craa5_equipmentguid: G, craa5_lastcleaned: '2026-10-16T00:00:00Z', craa5_lastcleanedby: 'X', craa5_daily: true, craa5_pathogen: 'No' };
+    eq(m.mlwCheckRow(Object.assign({}, row, { craa5_hoursworked: 143, craa5_laborminutes: null }), NOW), ['not_a_name', 'hours_high'], 'old rows: hours worked 143, no labor minutes');
+    eq(m.mlwCheckRow(Object.assign({}, row, { craa5_lastcleanedby: 'AL', craa5_hoursworked: 24 }), NOW), [], '24 hours is the limit, not over it');
+    eq(m.mlwCheckRow(Object.assign({}, row, { craa5_lastcleanedby: 'AL', craa5_hoursworked: 30, craa5_laborminutes: 90 }), NOW), [], 'labor minutes win over hours worked when filled');
+    eq(m.mlwCheckRow(Object.assign({}, row, { craa5_lastcleanedby: 'AL', craa5_laborminutes: 1500 }), NOW), ['hours_high']);
+    ['not_a_name', 'hours_high'].forEach(c => assert.notStrictEqual(m.mlwSay(c, 'es'), m.mlwSay(c, 'en'), c));
 });
 
 test('egg and pecan allergen cleans (contract 1.0.23): daily flag plus craa5_allergenclean, own completion key', () => {

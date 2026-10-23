@@ -1,4 +1,4 @@
-/* ============================== START MSS LOG WRITE v1.2 ============================== */
+/* ============================== START MSS LOG WRITE v1.3 ============================== */
 // The one place in the ecosystem that builds and saves a finished clean in the MSS log (craa5__log_), by the rule in the data
 // contract, section 6.3. Paste it unchanged into every app that logs a clean (Ganttly, MSS Log Input, MSS Calendar), right after
 // the HUB SHARED block (1.1 or later), which it needs (hubGuid, hubShiftDate, hubCompletionKey, hubLogIdOf, hubCleanKind, hubCrew, ...).
@@ -11,16 +11,19 @@
 //     device updates the same row instead of adding one. Before saving, that row is read: there and active = already logged.
 //   - The flags (craa5_daily / weekly / monthly) come from the kind of clean done (contract 6.2), never from the piece's highest
 //     frequency. Midweek = daily only; EOW = daily + weekly; monthly and longer = all three; other = none.
-//   - People: craa5_lastcleanedby = names joined with " / ", never "Crew"; craa5_employeeguids; craa5_markedby = who pressed Done.
+//   - People: craa5_lastcleanedby = names joined with " / ", never "Crew" or a placeholder such as "X" (v1.3: a name has at least
+//     two letters); craa5_employeeguids; craa5_markedby = who pressed Done.
 //   - craa5_laborminutes = person-minutes; craa5_hoursworked = round(minutes / 60) for older pages.
 //   - craa5_pathogen = Yes or No, never blank. craa5_source = Ganttly, Log input, Calendar or Import.
+//   - craa5_allergenclean: sent as text 'Yes'; when the column is Yes/No (two options) instead, true is sent (v1.3); any other
+//     type only drops that column. The check (mlwCheckRow) also flags more than 24 labor hours on one piece (v1.3).
 //   - A failed save waits in this browser's queue (mlwQueue) and is tried again (mlwRetryQueue). It is never dropped or marked sent.
 //   - Undo (mlwUndo) deactivates the row (statecode 1); it never deletes it.
 // The new columns are optional: a column the table does not have yet is left out (remembered for the page session).
 // The host passes an api with query(table, { select, filter, top }) -> rows, create(table, body) and update(table, id, body);
 // mlwApi(xrm, dataApi) builds one from Xrm.WebApi or the page's dataApi.
 
-var MLW_VERSION = '1.2';
+var MLW_VERSION = '1.3';
 var MLW_TABLE = 'craa5__log_';
 var MLW_ID = 'craa5__log_id';
 var MLW_QUEUE_KEY = 'mss_log_write_queue_v1';
@@ -58,6 +61,8 @@ var MLW_TEXT = {
     future_day: ['The date is in the future.', 'La fecha es futura.'],
     no_names: ['Who cleaned it? Add at least one name.', '%?Qui%en lo limpi%o? Agregue al menos un nombre.'],
     crew_name: ['"Crew" is not a name. Add who cleaned it.', '"Crew" no es un nombre. Agregue qui%en lo limpi%o.'],
+    not_a_name: ['A name like "X" is not a name. Add who cleaned it.', 'Algo como "X" no es un nombre. Agregue qui%en lo limpi%o.'],
+    hours_high: ['More than 24 labor hours on one piece. Often the whole order\'s time was put on every piece. Check the hours.', 'M%as de 24 horas de trabajo en una pieza. Muchas veces se puso el tiempo de toda la orden en cada pieza. Revise las horas.'],
     bad_minutes: ['Minutes must be a number from 0 to 1440.', 'Los minutos deben ser un n%umero de 0 a 1440.'],
     long_minutes: ['Over 8 hours on one piece. Check the time.', 'M%as de 8 horas en una pieza. Revise el tiempo.'],
     bad_source: ['Unknown app name for the log.', 'Nombre de app desconocido para el registro.'],
@@ -97,6 +102,8 @@ function mlwNames(v) {
     return out;
 }
 function mlwIsCrew(n) { return /^(crew|equipo|cuadrilla|team|grupo|n\/?a|tbd|operator|operador)$/i.test(String(n).trim()); }
+// A stand-in, not a person: fewer than two letters ("X", "-", "?", "1"), or a word such as none / unknown / test / xx.
+function mlwIsPlaceholder(n) { var t = String(n).trim(); return (t.match(/[A-Za-z\u00C0-\u024F]/g) || []).length < 2 || /^(none|nobody|nadie|unknown|desconocido|test|xx+|\?+)$/i.test(t); }
 function mlwYes(v) { return v === true || v === 1 || /^(true|yes|si|y|1)$/i.test(String(v === undefined || v === null ? '' : v).trim()); }
 function mlwDay(v) { var s = String(v || ''); return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ''; }
 
@@ -119,6 +126,7 @@ function mlwBuildRow(entry, now) {
     var names = mlwNames(e.cleanedBy);
     if (!names.length) problems.push('no_names');
     else if (names.some(mlwIsCrew)) problems.push('crew_name');
+    else if (names.some(mlwIsPlaceholder)) problems.push('not_a_name');
     var minutes = e.minutes;
     if ((minutes === undefined || minutes === null || minutes === '') && e.durationMins !== undefined) minutes = Number(e.durationMins) * Math.max(1, Number(e.heads) || 1);
     minutes = minutes === undefined || minutes === null || minutes === '' ? NaN : Number(minutes);
@@ -183,7 +191,9 @@ function mlwCheckRow(r, now) {
     if (!day) p.push('no_day');
     else if (day > hubAddDays(hubPlantDay(now || Date.now()), 1)) p.push('future_day');
     var names = mlwNames(r && r.craa5_lastcleanedby);
-    if (!names.length) p.push('no_names'); else if (names.some(mlwIsCrew)) p.push('crew_name');
+    if (!names.length) p.push('no_names'); else if (names.some(mlwIsCrew)) p.push('crew_name'); else if (names.some(mlwIsPlaceholder)) p.push('not_a_name');
+    var lm = r && r.craa5_laborminutes, hw = r && r.craa5_hoursworked;
+    if ((lm !== null && lm !== undefined && lm !== '' && Number(lm) > 1440) || ((lm === null || lm === undefined || lm === '') && Number(hw) > 24)) p.push('hours_high');
     if (!mlwRowKind(r)) p.push('no_kind');
     if (r && (r.craa5_pathogen === null || r.craa5_pathogen === undefined || String(r.craa5_pathogen).trim() === '')) p.push('no_pathogen');
     return p;
@@ -191,17 +201,30 @@ function mlwCheckRow(r, now) {
 
 // Columns this table turned out not to have (for the page session)
 var mlwMissing = {};
+// craa5_allergenclean as the table takes it: text 'Yes' first, then true for a Yes/No column (found on the first refusal)
+var MLW_ALLERGEN_FORMS = ['Yes', true];
+var mlwAllergenForm = 0;
 function mlwErrText(e) { return String((e && (e.message || e.errorMessage || (e.error && e.error.message))) || e || ''); }
 function mlwIsMissingCol(msg) { return /could not find a property|undeclared property|not a valid property|invalid property|0x80060888|does not exist|isn't valid|is not valid for|cannot find property/i.test(msg); }
 function mlwIsDuplicate(msg) { return /duplicate|already exists|0x80040237|matching key values/i.test(msg); }
-function mlwStrip(row) { var o = {}; Object.keys(row).forEach(function (k) { if (!mlwMissing[k] && row[k] !== '') o[k] = row[k]; }); return o; }
+function mlwStrip(row) {
+    var o = {};
+    Object.keys(row).forEach(function (k) {
+        if (mlwMissing[k] || row[k] === '') return;
+        o[k] = k === 'craa5_allergenclean' && mlwYes(row[k]) ? MLW_ALLERGEN_FORMS[mlwAllergenForm] : row[k];
+    });
+    return o;
+}
 // Drop the optional column an error names (or every optional column that was sent, when it names none). false = not a column
 // problem. A column another save already dropped still counts (saves run side by side), so the retry goes without it.
 function mlwDropFor(e, sent) {
     var msg = mlwErrText(e);
     var low = msg.toLowerCase();
-    // craa5_allergenclean's type is not known yet: a value it cannot take only drops that column
-    if (sent.indexOf('craa5_allergenclean') > -1 && (low.indexOf('craa5_allergenclean') > -1 || /cannot convert|edm\.|type mismatch|incompatible/.test(low))) { mlwMissing.craa5_allergenclean = true; return true; }
+    // craa5_allergenclean's type is not known yet: the next form is tried (text, then Yes/No); when none fits, only that column is dropped
+    if (sent.indexOf('craa5_allergenclean') > -1 && (low.indexOf('craa5_allergenclean') > -1 || /cannot convert|edm\.|type mismatch|incompatible/.test(low))) {
+        if (mlwAllergenForm < MLW_ALLERGEN_FORMS.length - 1) mlwAllergenForm++; else mlwMissing.craa5_allergenclean = true;
+        return true;
+    }
     if (!mlwIsMissingCol(msg)) return false;
     var named = MLW_OPTIONAL.filter(function (c) { return sent.indexOf(c) > -1 && low.indexOf(c) > -1; });
     var drop = named.length ? named : MLW_OPTIONAL.filter(function (c) { return sent.indexOf(c) > -1; });
@@ -328,4 +351,4 @@ function mlwApi(xrm, dataApi) {
     };
     return null;
 }
-/* ============================== END MSS LOG WRITE v1.2 ============================== */
+/* ============================== END MSS LOG WRITE v1.3 ============================== */
