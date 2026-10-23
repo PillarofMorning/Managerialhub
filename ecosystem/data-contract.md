@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.56, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.57, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -392,7 +392,7 @@ Each block is pasted unchanged into every app that uses it. Its owner changes it
 | Block | File | Owner | Pasted by |
 |---|---|---|---|
 | HUB SHARED v1.1 | [hub-shared.js](/mnt/project-files/ecosystem-contract/hub-shared.js) | this thread | every hub app |
-| MSS MANPOWER v1.1 | (in MSS Log Input, PR #40) | MSS log input thread | MSS Log Input, Production Scheduler (shift hours from Work Shifts) |
+| MSS MANPOWER v1.1 | (in MSS Log Input, PR #40) | MSS log input thread | MSS Log Input, Production Scheduler, Sanitation director (shift hours from Work Shifts) |
 | MSS LOG WRITE v1.4 | [mss-log-write.js](/mnt/project-files/mss-log-input/mss-log-write.js) | MSS log input thread | every MSS log writer: Ganttly, MSS Log Input, MSS Calendar (section 6.3) |
 | ASSIGN SPLIT v1.0 | [assign-split.js](/mnt/project-files/ganttly-overhaul/assign-split.js), tests [assign-split.test.js](/mnt/project-files/ganttly-overhaul/test/assign-split.test.js) | Ganttly thread | Ganttly v1.5, Shift Start v0.0012+ (the even split for `_g_ Assignment`; rules in [shared-assignment.md](/mnt/project-files/ganttly-overhaul/shared-assignment.md)) |
 
@@ -445,6 +445,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.57 (2026-10-23)** Sanitation director page on draft PR #44: reads Employees, Work Shifts, clean plan (published weeks only), Equipment, MSS log, shift board and archive, labor rate, `PRODSCHED_CREWPLAN`; writes only `director_settings` and `manifest|director`; pastes HUB SHARED v1.1 and MSS MANPOWER v1.1.
 - **1.0.56 (2026-10-23)** `craa5_roleid` confirmed a lookup to `craa5__aa_role` (role names listed in section 3). `_e_ Hub config` was made User-owned, so every hub role needs Organization Read and Write on it. New `table-prompts.md` part 10: two security roles (Hub floor, Hub manager) with each table's privileges, since only admins can read hub tables today.
 - **1.0.55 (2026-10-23)** New Sanitation objectives director app (appId `director`, key `director_settings`, reads only). Section 7: Scheduled hours, Utilization % (actual, separate from the Scheduler's planned `used`), Unused wage (fixed posts left out so they never read as idle), Projected hours (year out).
 - **1.0.54 (2026-10-23)** MSS LOG WRITE v1.4 (PR #40, 5fcab26): a clean already logged by other people is saved as its own entry `key|2`..`key|9` instead of being dropped. Readers count cleans by the base key and add every entry's minutes. MSS Log Input's manpower panel reads the Scheduler's staff rows (f14234e).
