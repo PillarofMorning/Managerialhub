@@ -1,6 +1,6 @@
 # Clean Plan reader guide (craa5_cleanplan)
 
-Written by the Production Scheduler ("hub - production schedule" v4.7). No other app writes this table. Ganttly, Shift Start, the MSS Calendar, PBED and the Manager hub only read it. This guide wins over section 6.5 of the data contract on any detail.
+Written by the Production Scheduler ("hub - production schedule" v4.7.1). No other app writes this table. Ganttly, Shift Start, the MSS Calendar, PBED and the Manager hub only read it. This guide wins over section 6.5 of the data contract on any detail.
 
 All date-times are UTC. Read only active rows (`statecode eq 0`). The line key in `craa5_linekey` is the Scheduler's `canonLine(area, line)`, which is the same as `hubLineKey`: lowercase letters and digits only, for example `ibl4`, `highspeed1`.
 
@@ -114,7 +114,7 @@ One row per sanitation shift, written with the week it starts in (read it only w
 - MSS pieces in `work.mss`: pieces due by frequency (data contract section 7, `hubFreqDone`), outside every line's clean scope for Daily and weekly pieces, plus every monthly, quarterly, 6-month and annual piece. A long-period piece is given one week of its period, spread evenly among the weeks still to come. Overdue pieces (last period missed too) go into this week first unless the shared setting Ignore overdue is on.
 - **MSS Log Input:** read these rows for its manpower panel instead of working the heads out again, so both screens show the same number.
 
-Settings and tasks: Hub config key `PRODSCHED_CREWPLAN` holds `{v: 1, share, vacation, ignoreOverdue, tasks?, at}` (`tasks` only while the Shift task table does not exist). The tasks live in the new table `craa5__e_shifttask` once Gerald makes it (prompt in section 9).
+Settings and tasks: Hub config key `PRODSCHED_CREWPLAN` holds `{v: 1, share, vacation, ignoreOverdue, tasks?, at}` (`tasks` only while the Shift task table does not exist). The tasks live in the new table `craa5__e_shifttask` once Gerald makes it (prompt in section 9). The Scheduler reads only `craa5__e_shifttask` or `craa5_e_shifttask`, never the plain `craa5_shifttask`, which is an old, unrelated table.
 
 ## 7. Clean rules this plan follows (v4.7, rules stamp `...|mw72last|scope1|dskip1|link1|pin1|night1|staff1`)
 
