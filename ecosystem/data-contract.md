@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.43, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.44, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -291,7 +291,7 @@ Stored as lower-case English codes. Shown with the label in the language chosen.
 - **One switch for all apps:** browser key `hub_lang` (`en` or `es`), read with `hubGetLang()`. On first use it picks up the old per-app keys. Every app header has the same EN / ES toggle.
 - **es-MX.** Every visible word goes through the app's translate function, keyed by the English text, as in PBED's `pbT`. Each app's build check fails when a string has no Spanish.
 - **ASCII only:** Spanish is written with % codes (`%a` = á, `%n` = ñ, `%?` = ¿; full list in `hub-shared.js`) and decoded at run time.
-- **Shared words:** the `HUB_ES` list in `hub-shared.js`. Status words, clean kinds, attendance, roles, load states and core nouns. An app may add words but never gives a shared word another Spanish, and never reuses a shared English key with a different meaning (for example "Late" is attendance only; a late piece is "Overdue"). An app whose own list uses a shared key differently renames its key. Examples: Done = Terminado, Started = En proceso, Overdue = Atrasado, Late (attendance) = Retardo, Area = Área, Line = Línea, Crew = Cuadrilla, Team = Grupo (not "Equipo", which is Equipment), Swab = Hisopo, EOW = Fin de semana, Room = Cuarto, Training = Capacitación. **Mexican plant Spanish (es-MX), usted form:** computadora, celular, tomar, presionar / dar clic, llenar, tarima, retardo; never vosotros forms, ordenador, móvil, coger, pulsar or rellenar (Gerald, 2026-10-23: some text read as Spain Spanish). **Gerald: please have a Spanish-speaking lead check these words once (Q6).**
+- **Shared words:** the `HUB_ES` list in `hub-shared.js`. Status words, clean kinds, attendance, roles, load states and core nouns. An app may add words but never gives a shared word another Spanish, and never reuses a shared English key with a different meaning (for example "Late" is attendance only; a late piece is "Overdue"). An app whose own list uses a shared key differently renames its key. Examples: Done = Terminado, Started = En proceso, Overdue = Atrasado, Late (attendance) = Retardo, Area = Área, Line = Línea, Crew = Cuadrilla, Team = Grupo (not "Equipo", which is Equipment), Swab = Hisopo, EOW = Fin de semana, Room = Cuarto, Training = Capacitación. **Mexican plant Spanish (es-MX), usted form:** computadora, celular, tomar, presionar / dar clic, llenar, tarima, retardo; never vosotros forms, ordenador, móvil for a phone (the adjective is fine: Promedio móvil, Zona 4 / Móvil), coger, pulsar or rellenar (Gerald, 2026-10-23: some text read as Spain Spanish). **Gerald: please have a Spanish-speaking lead check these words once (Q6).**
 - **Manuals:** every screen has a `?` button that opens a one-page picture guide in the current language. It can be printed for training. At most 7 short steps, one action each ("Tap the piece. Check your name. Tap Done."), a screenshot per step, and the same layout in every app. Each app keeps its guide text in its own word list, so the Spanish check covers it.
 
 ---
@@ -425,6 +425,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.44 (2026-10-23)** Spanish rule: "móvil" is banned only for a phone (use celular); the adjective stays (Promedio móvil, Zona 4 / Móvil). `craa5_shiftlog` writers stay Shift Start and MSS Log Input: Ganttly's archive log row goes away with its fallback archive.
 - **1.0.43 (2026-10-23)** Shift Start is the only writer of `craa5_shiftarchive` and its shift log row; Ganttly drops its 4-hour fallback archive (Shift Start has a close-out button and archives overdue boards itself). Ganttly's Employee `craa5_remarks` and Shift board `craa5_updatesjson` writes stay as column owners.
 - **1.0.42 (2026-10-23)** Spanish set to Mexican plant usage: Room = Cuarto, EOW = Fin de semana (not FDS), Training = Capacitación, Late = Retardo; Spain words listed as never-use (section 9). `hub-shared.js` 113 checks.
 - **1.0.41 (2026-10-23)** Ganttly 1.4 (PR #32) uses the three `_g_` tables, saves `manifest|ganttly`, and reads egg / pecan flags and minutes. The tables stay "proposed" until the monitor sees them in Dataverse.
