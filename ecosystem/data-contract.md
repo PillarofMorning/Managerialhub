@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.46, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.47, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -186,11 +186,15 @@ One row = one piece of equipment, one clean, one shift date. The rules (from the
 4. `craa5_lastcleaned` = `hubDateOnlyUtc(shiftDate)`. `craa5_shiftdate` = shiftDate, `craa5_shiftcode` = crew.
 5. `craa5_cleankind` = the kind from 6.2. The flags are set from it.
 6. `craa5_sap` = the real SAP order number, or `auto-<kind>` (e.g. `auto-eow`). `craa5_sapw` = the piece's work area code. `craa5_uid` keeps its current meaning (the SAP code) and is **not** reused as a key. It is the table's primary name column, so writers should still fill it with the SAP code (the same value as `craa5_sapw`), or the row shows blank in forms and views.
-7. People: `craa5_employeeguids` = every person who did it (`hubGuidList`). `craa5_lastcleanedby` = their names, "First Last", joined with ` / `, never "Crew". `craa5_markedby` = the signed-in person who pressed Done.
+7. People: `craa5_employeeguids` = every person who did it (`hubGuidList`). `craa5_lastcleanedby` = their names, "First Last", joined with ` / `, never "Crew". A name needs at least two letters; `X`, `-`, `?`, none, unknown, test and xx are refused (`not_a_name`). `craa5_markedby` = the signed-in person who pressed Done.
 8. Minutes: `craa5_laborminutes` = **person-minutes** actually spent (see 7). `craa5_hoursworked` = `Math.round(laborminutes / 60)` for older readers.
 9. `craa5_doneat` = when Done was pressed. `craa5_plankey` and `craa5_linekey` = the clean window it belonged to, when known.
 10. `craa5_source` = `Ganttly`, `Log input`, `Calendar` or `Import`. `craa5_pathogen` = `Yes` or `No`, never blank.
 11. Mark the row "sent" only after the save succeeds. Keep failed saves in the retry queue.
+12. `craa5_allergenclean`: try the text `Yes` first, then `true` (a Yes/No column); drop the column only if neither fits. Readers count `Yes`, `true` or `1` as done.
+13. Checks: MSS Log Input's Check tab flags more than 24 labor hours on one piece (`hours_high`).
+
+The block that does all of this is MSS LOG WRITE v1.3 ([mss-log-write.js](/mnt/project-files/mss-log-input/mss-log-write.js), commit 200f922 on PR #40). Every log writer pastes it unchanged.
 
 **Transition (until Ganttly logs piece by piece):** Shift Start may keep logging an area at 100%, only that clean's pieces, behind its switch `SHIFT_START_LOGS_MSS`, dated by `hubShiftDate`. Those rows should use the same completion key and row id as above, so Ganttly's later row for the same piece updates them instead of adding a second. The switch goes off when Ganttly's per-piece logging is live.
 
@@ -418,13 +422,14 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 - **Q5.** Answered 2026-10-21: labor rate by role, not per person (pay stays private and rates forecast better).
 - **Q6.** Partly answered 2026-10-21: one Spanish-speaking lead looked and said it is okay. More checks welcome.
 - **Q7.** Answered 2026-10-21: keep obstacles, handovers and personnel notes; they move to tables (section 11).
-- **Q8.** Answered in part 2026-10-21: `craa5_allergenclean` says an allergen clean was done. Egg and pecan are split into separate cleans with different times (kinds `egg`, `pecan`; Equipment columns in part 7). Type closed by default 2026-10-23 (Gerald's passive mode): the log block sends `Yes` and drops the column if Dataverse refuses it; readers count `Yes`, `true` or `1` as done.
+- **Q8.** Answered in part 2026-10-21: `craa5_allergenclean` says an allergen clean was done. Egg and pecan are split into separate cleans with different times (kinds `egg`, `pecan`; Equipment columns in part 7). Type closed by default 2026-10-23 (Gerald's passive mode): MSS LOG WRITE v1.3 tries `Yes`, then `true`, and drops the column only if neither fits; readers count `Yes`, `true` or `1` as done (6.3 rule 12).
 - **Q9.** Closed by default 2026-10-23: plain wage. The rates Gerald entered ($19 / $21 / $24 / $20) are hourly pay, so cost screens say "wage cost" (Spanish "costo de salario"). If he later enters loaded rates, the label changes to "loaded labor cost"; nothing else does.
 
 ---
 
 ## 15. Change log
 
+- **1.0.47 (2026-10-23)** Section 6.3 follows MSS LOG WRITE v1.3 (PR #40, 200f922): names need two letters (`not_a_name`), `craa5_allergenclean` tries `Yes` then `true`, Check tab flags over 24 labor hours on a piece (`hours_high`). MSS Log Input now uses `hub_lang` / `hub_theme`.
 - **1.0.46 (2026-10-23)** Gerald moved to passive mode (follow the plan, use sensible defaults, say which). Q9 closed as plain wage (the rates entered are hourly pay; screens say "wage cost"). Q8 closed: send `Yes`, readers accept Yes / true / 1.
 - **1.0.45 (2026-10-23)** `_e_ Labor rate` is live (Gerald's export, 5 pay roles: sanitation tech 1-3, Adm, Int; no Sanitor or All row). Labor cost uses the employee's pay role `craa5_roleid`, falling back to `sanitation tech 2`, then Sanitor, then All. Projected and planned cost use `sanitation tech 2`. Same as PBED v1.7 (PR #31).
 - **1.0.44 (2026-10-23)** Spanish rule: "móvil" is banned only for a phone (use celular); the adjective stays (Promedio móvil, Zona 4 / Móvil). `craa5_shiftlog` writers stay Shift Start and MSS Log Input: Ganttly's archive log row goes away with its fallback archive.
