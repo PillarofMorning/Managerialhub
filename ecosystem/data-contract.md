@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.62, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.63, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -394,7 +394,7 @@ Each block is pasted unchanged into every app that uses it. Its owner changes it
 | Block | File | Owner | Pasted by |
 |---|---|---|---|
 | HUB SHARED v1.3 | [hub-shared.js](/mnt/project-files/ecosystem-contract/hub-shared.js) | this thread | every hub app |
-| MSS MANPOWER v1.1 | (in MSS Log Input, PR #40) | MSS log input thread | MSS Log Input, Production Scheduler, Sanitation director (shift hours from Work Shifts) |
+| MSS MANPOWER v1.1 | [mss-manpower.js](/mnt/project-files/mss-log-input/mss-manpower.js) (repo `ecosystem/mss-manpower.js`, PR #40) | MSS log input thread, moving to the Sanitation director thread | Production Scheduler, Sanitation director (shift hours from Work Shifts). MSS Log Input no longer pastes it |
 | MSS LOG WRITE v1.4 | [mss-log-write.js](/mnt/project-files/mss-log-input/mss-log-write.js) | MSS log input thread | every MSS log writer: Ganttly, MSS Log Input, MSS Calendar (section 6.3) |
 | HUB SHARED v1.3 note | 1.2 kept the manifest build fields (`cols`, `label`, `new`, `owner`, `primary`); 1.3 adds `prompt`. Apps on 1.1 or 1.2 keep working; re-paste 1.3 at the next version. | | |
 | ASSIGN SPLIT v1.0 | [assign-split.js](/mnt/project-files/ganttly-overhaul/assign-split.js), tests [assign-split.test.js](/mnt/project-files/ganttly-overhaul/test/assign-split.test.js) | Ganttly thread | Ganttly v1.5, Shift Start v0.0012+ (the even split for `_g_ Assignment`; rules in [shared-assignment.md](/mnt/project-files/ganttly-overhaul/shared-assignment.md)) |
@@ -460,6 +460,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.63 (2026-10-23)** MSS Log Input done with 12.3 (PR #40, d6d1f4d): manpower plan removed (`MSS_LOG_MANPOWER_SETUP` no longer written; its row stays for the director to read), MSS MANPOWER block has its own file and is pasted only by the Scheduler and the director. Skip codes live only in Hub config `MSS_SKIP_CODES`, so `craa5_mss_skipcode` is optional with no writer and MSS Log Input no longer writes `craa5_mss_useraccesslog`. `craa5__log_` colType `craa5_sapw` text 100.
 - **1.0.62 (2026-10-23)** Gerald's correction: ground rule 10 is now "only Gerald builds tables". The Dataverse monitor never writes Dataverse either; it reads, shows and tests what apps need, and Gerald builds from its prompts. HUB SHARED v1.3: manifests also keep each table's recommended Copilot `prompt` (2,000 characters max; 123 checks). `MONITOR_BUILD_LOG` is legacy.
 - **1.0.61 (2026-10-23)** `craa5_schedulechange` is optional (proposed, not missing). `contract.json` column types add `image` and `file` for existing picture and file columns (contract and monitor only; manifests cannot declare them in HUB SHARED v1.2).
 - **1.0.60 (2026-10-23)** Gerald's ruling: ground rule 10 (apps never build tables; the Dataverse monitor is the only table builder, from manifests and `contract.json`) and ground rule 11 (headcount planning only in the Sanitation director). Migration in 12.3. HUB SHARED v1.2: manifests keep `cols` ({column: {type, len, label, options, min, max, precision, default}}; types text, memo, int, decimal, money, yesno, date, datetime, choice, guid), `label`, `new`, `owner`, `primary` (the monitor thread's shape; 121 checks). `contract.json` gains `buildRule`, `columnTypes`, per-table `colTypes` (the contract decides types), `new` tables, and config key `MONITOR_BUILD_LOG`. Heads needed per shift moves to the director (Scheduler staff rows until then); `MSS_LOG_MANPOWER_SETUP` and `PRODSCHED_CREWPLAN` retiring.
