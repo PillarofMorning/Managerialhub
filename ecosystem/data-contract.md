@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.57, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.58, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -100,7 +100,7 @@ Time loss log keeps the column names it was created with: `craa5_assetguid` hold
 
 | Table | Status | Writes it | Reads it |
 |---|---|---|---|
-| `craa5__facilityobservation` Map problems and pins | live | Map submission tool (owner). **Pathogen BOLO** creates its own pin rows only (a positive or harborage concern), row id `hubIdFromKey('bolo|' + swab key)`, and never edits a Map tool row. BOLO rows are marked by `craa5__description` starting `(PATHOGEN BOLO - ` or `(HARBORAGE CONCERN - ` (keep these exact); the Map tool shows them read only | Pathogen BOLO, Manager hub |
+| `craa5__facilityobservation` Map problems and pins | live | Map submission tool (owner). **Pathogen BOLO** creates its own pin rows only (a positive or harborage concern), row id `hubIdFromKey('bolo|' + swab key)`, and never edits a Map tool row. BOLO rows are marked by `craa5__description` starting `(PATHOGEN BOLO - ` or `(HARBORAGE CONCERN - ` (keep these exact); the Map tool shows them read only. A few early pins (BOLO v2.4) carry an older id, so readers find BOLO pins by the prefix, never by computing the id | Pathogen BOLO, Manager hub |
 | `craa5___maps` Floor maps | live | Map submission tool | Pathogen BOLO |
 | `craa5_pathogenboloswabcatalog0320` Swab sites | live | Pathogen BOLO | Pathogen BOLO, Ganttly, Map tool |
 | `craa5__b_swabresult` Swab results (columns in contract.json; one row per sample, description and test; open hit = `craa5_result` positive, `craa5_closedkey` blank, `statecode` 0, and `craa5_collectiondate` within the alert window (`alertMonths` in Hub config key `PATHOGEN_BOLO_RULES`, default 2 months; older positives are history). A hit is closed by **any** MSS log row on the same equipment (or area, when the site has no equipment) with a shift date on or after the collection date: every clean follows the presumptive process (Gerald, 2026-10-23)) | **proposed** (BOLO v2.4, PR #37) | Pathogen BOLO | Manager hub, Ganttly, MSS Calendar |
@@ -445,6 +445,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.58 (2026-10-23)** BOLO v2.5 (PR #37): early v2.4 map pins keep an older id and are updated in place; readers find BOLO pins by the description prefix only.
 - **1.0.57 (2026-10-23)** Sanitation director page on draft PR #44: reads Employees, Work Shifts, clean plan (published weeks only), Equipment, MSS log, shift board and archive, labor rate, `PRODSCHED_CREWPLAN`; writes only `director_settings` and `manifest|director`; pastes HUB SHARED v1.1 and MSS MANPOWER v1.1.
 - **1.0.56 (2026-10-23)** `craa5_roleid` confirmed a lookup to `craa5__aa_role` (role names listed in section 3). `_e_ Hub config` was made User-owned, so every hub role needs Organization Read and Write on it. New `table-prompts.md` part 10: two security roles (Hub floor, Hub manager) with each table's privileges, since only admins can read hub tables today.
 - **1.0.55 (2026-10-23)** New Sanitation objectives director app (appId `director`, key `director_settings`, reads only). Section 7: Scheduled hours, Utilization % (actual, separate from the Scheduler's planned `used`), Unused wage (fixed posts left out so they never read as idle), Projected hours (year out).
