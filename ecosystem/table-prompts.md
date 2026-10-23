@@ -116,3 +116,12 @@ Then check before adding any rows:
 
 Leave the old hubconfig alone. Apps read the new table first and the old one second, so nothing breaks while both exist. Add the keys once the apps have been pasted with the new version, or let the apps create their own rows when they first save.
 
+## Part 9. New table: _e_ Shift task (`craa5__e_shifttask`), for the Scheduler's crew plan
+
+Mandatory work with no clean minutes (trash, admin, chemical clerk, janitorial, steam pits). Until you make it, the crew plan keeps its tasks in Hub config `PRODSCHED_CREWPLAN`, so nothing breaks while you wait. Power Apps > **Tables** > **New table** > **Start with Copilot**, paste, check the names, **Save and exit**. Choose **Organization** ownership if it asks.
+
+```text
+Create a table named "Shift task" with schema prefix craa5__e_, Organization ownership. Primary column "Name" (single line of text, 100). Columns: "Task key" craa5_taskkey (single line of text, 100, the shift and task name, for example night|trash); "Shift" craa5_shift (single line of text, 10: day, night or both); "Days" craa5_days (single line of text, 7, one digit per day Sunday to Saturday, 1 = on, for example 0111110); "Heads" craa5_heads (whole number); "Minutes" craa5_minutes (whole number, minutes per shift, blank = the whole shift); "Area" craa5_area (single line of text, 100, the MSS area name if it has one); "Active" craa5_active (yes/no, default yes); "Sort order" craa5_sortorder (whole number). No lookup or choice columns.
+```
+
+After it is made: open the Scheduler's Crew plan tab, unlock the page, press **Edit tasks**, then **Save tasks** once. The tasks are copied into the new table. Source: the Scheduler's guide, section 9 of /mnt/project-files/production-schedule/clean-plan-contract.md.
