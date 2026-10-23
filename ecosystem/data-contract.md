@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.39, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.40, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -103,7 +103,7 @@ Time loss log keeps the column names it was created with: `craa5_assetguid` hold
 | `craa5__facilityobservation` Map problems and pins | live | Map submission tool | Pathogen BOLO, Manager hub |
 | `craa5___maps` Floor maps | live | Map submission tool | Pathogen BOLO |
 | `craa5_pathogenboloswabcatalog0320` Swab sites | live | Pathogen BOLO | Pathogen BOLO, Ganttly, Map tool |
-| `craa5__b_swabresult` Swab results (columns in contract.json; one row per sample, description and test; open hit = `craa5_result` positive, `craa5_closedkey` blank, `statecode` 0) | **proposed** (BOLO v2.3, PR #37) | Pathogen BOLO | Manager hub, Ganttly, MSS Calendar |
+| `craa5__b_swabresult` Swab results (columns in contract.json; one row per sample, description and test; open hit = `craa5_result` positive, `craa5_closedkey` blank, `statecode` 0, and `craa5_collectiondate` within the alert window (`alertMonths` in Hub config key `PATHOGEN_BOLO_RULES`, default 2 months; older positives are history). A hit is closed by **any** MSS log row on the same equipment (or area, when the site has no equipment) with a shift date on or after the collection date: every clean follows the presumptive process (Gerald, 2026-10-23)) | **proposed** (BOLO v2.4, PR #37) | Pathogen BOLO | Manager hub, Ganttly, MSS Calendar |
 | `craa5__supervisor_todo` | live | Manager hub | Manager hub |
 | `craa5__m_formtemplate`, `craa5__m_quicktask` (both User-owned; quick tasks are a personal list on purpose) | live | Manager hub | Manager hub |
 | `craa5__m_employeenote` Manager notes on people | live | Manager hub | Manager hub, manager role only. Sensitive: User-owned, never shown to peers, never in exports or the repo. Key `craa5_employeeguid`. |
@@ -169,7 +169,7 @@ Ganttly, Shift Start and the MSS Calendar do **not** keep their own copy of thes
 | `allergen` | `allergen` | Allergen / Alérgeno (old: egg and pecan together, until the split) | daily, and `craa5_allergenclean` = Yes |
 | `changeover` | `changeover` | Changeover / Cambio de producto | daily |
 | `monthly`, `quarterly`, `semiannual`, `annual` | (none: the MSS frequency) | Mensual, Trimestral, Semestral, Anual | daily + weekly + monthly |
-| `corrective` | (none: a pathogen or inspection follow-up) | Corrective / Correctiva | daily, and `craa5_pathogen` = Yes when it closes a swab hit |
+| `corrective` | (none: a pathogen or inspection follow-up) | Corrective / Correctiva | daily, and `craa5_pathogen` = Yes when it follows a swab hit (any clean after the hit closes it; section 3) |
 | `other` | (none) | Other / Otra | none |
 
 Old spellings the apps still use map like this (MSS LOG WRITE v1.0, `ecosystem/mss-log-write.js` on PR #40): shift, nightly -> `daily`; weekly, biweekly, 2-week -> `eow`; 2-month, 4-month, deepclean -> `monthly`; 6-month -> `semiannual`; as-needed -> `other` (no flags).
@@ -281,7 +281,7 @@ Stored as lower-case English codes. Shown with the label in the language chosen.
 4. **Attendance** (on a board row): `present`, `late`, `sick`, `pto`, `left_early`, `no_call`, `loaned`, `training`. Shift Start's current PTO / Sick / Late / Left Early map to these. The badge reader will later write the same words.
 5. **Role** (`craa5__aa_employee.craa5_role`): Sanitor 256000000, Lead 256000001, Supervisor 256000002. Manager and Admin come from the Dataverse security role.
 6. **Loading a table** (every app, same words): Loading, Ready, Nothing here yet (read worked, no rows), Table missing, No access (privilege), Could not load (network or other). An app shows one of these per table it reads. It never shows sample data instead.
-7. **Swab result** (BOLO): `positive`, `negative`, `pending`, `count` (a lab number with no pass or fail: never in pass rates), `replaced` (a superseded row, kept, never deleted: skip it everywhere). In the MSS log, `craa5_pathogen` is `Yes` / `No`.
+7. **Swab result** (BOLO): `positive`, `negative`, `pending`, `count` (a lab number: counts as a pass in APC and ATP rates, in no rate elsewhere, such as Listeria and Salmonella). A reading with `>` or TNTC on APC, ATP, coliform or yeast/mold is stored `positive` (always past the threshold); "EST" is wording only, so 2,500 EST is the count 2,500. Targets and the alert window are in Hub config key `PATHOGEN_BOLO_RULES` (defaults: pathogen 2 %, APC 5 %, ATP 5 %, repeat 21 days, alert window 2 months), `replaced` (a superseded row, kept, never deleted: skip it everywhere). In the MSS log, `craa5_pathogen` is `Yes` / `No`.
 8. **Order / cart** (chemical hub): Draft (not in SAP yet), Submitted, Approved, Ordered, Partially received, Received, Cancelled.
 
 ---
@@ -358,7 +358,7 @@ Apps look a table up by its prefixed name first and its plain name second, as Ma
 **Shared settings** live in **Hub config**: the new `craa5__e_hubconfig` ("_e_ Hub config", Organization-owned; columns `craa5_configname` primary, `craa5_configkey`, `craa5_configjson` Multiple lines max 1,048,576; prompt in `table-prompts.md` part 8). One row per `craa5_configkey`, each key written by one app, and the key is always filled. Apps look for `craa5__e_hubconfig` first and the old `craa5__0_hubconfig` second (`HUB_CONFIG_TABLES`). On the old table the JSON goes in `craa5_manifestjson`, because its `craa5_configjson` holds only 100 characters; on the new table it goes in `craa5_configjson`. A row with empty JSON means "no settings yet" (the monitor can pre-create rows with only the key and name): readers treat an empty string as no settings and use their defaults, and the owning app fills it on its first save. Readers use `hubConfigJsonOf(row)` and match `craa5_configkey` first, `craa5_configname` second for old rows with a blank key. Gerald adds the keys to the new table once it exists; the old one stays until every app has switched. Keys:
 `hub_people_thresholds` (Manager hub), `ganttly_settings` (Ganttly), `mss_view_rules` (MSS Log Input), `scheduler_shared` (Production Scheduler; today its `config` row in the Clean Plan, which may stay there), `training_settings` (Training page: minimum shifts, refresher days), `mss_completion_exclusions` and `mss_line_downtime` (MSS Calendar; downtime only for lines the Scheduler does not plan). Plus one `manifest|<appId>` row per app, written by that app (12.1).
 
-**Keys in use today** (older names, listed so the monitor does not flag them): `MSS_CALENDAR_VIEW_CONFIG` and `MSS_SKIPPED_ENTRIES_LOG` (MSS Calendar), `MSS_LOG_SKIPPED_ENTRIES` and `MSS_LOG_MANPOWER_SETUP` (MSS Log Input; the manpower plan's fixed posts and vacation cover, a screen estimate, not a section 7 number). Proposed, not approved: `PRODSCHED_CREWPLAN` and `PRODSCHED_SCENARIOS` (Production Scheduler), `MSS_LOG_VIEW_CONFIG` (MSS Log Input; becomes `mss_view_rules`), `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG` (MSS Log Input; the Calendar only reads skip codes), `MSS_CALENDAR_ACCESS_LOG` (MSS Calendar's own access log), `PBED_WEEKEND_PLAN` (old PBED, unused), nine `PATHOGEN_BOLO_*` keys (Pathogen BOLO). Keys match exactly, case included. The full list with owners is `configKeys` in `contract.json`.
+**Keys in use today** (older names, listed so the monitor does not flag them): `MSS_CALENDAR_VIEW_CONFIG` and `MSS_SKIPPED_ENTRIES_LOG` (MSS Calendar), `MSS_LOG_SKIPPED_ENTRIES` and `MSS_LOG_MANPOWER_SETUP` (MSS Log Input; the manpower plan's fixed posts and vacation cover, a screen estimate, not a section 7 number). Proposed, not approved: `PRODSCHED_CREWPLAN` and `PRODSCHED_SCENARIOS` (Production Scheduler), `MSS_LOG_VIEW_CONFIG` (MSS Log Input; becomes `mss_view_rules`), `MSS_SKIP_CODES` and `MSS_LOG_ACCESS_LOG` (MSS Log Input; the Calendar only reads skip codes), `MSS_CALENDAR_ACCESS_LOG` (MSS Calendar's own access log), `PBED_WEEKEND_PLAN` (old PBED, unused), ten `PATHOGEN_BOLO_*` keys (Pathogen BOLO; `PATHOGEN_BOLO_RULES` holds targets and the alert window that other apps read). Keys match exactly, case included. The full list with owners is `configKeys` in `contract.json`.
 
 ### 12.1 App manifests (self-check)
 
@@ -425,6 +425,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.40 (2026-10-23)** BOLO v2.4 (Gerald's answers): any clean after a swab hit closes it; open hits only inside the alert window; `>` / TNTC readings are positive, EST is wording; count is a pass in APC and ATP rates only; new key `PATHOGEN_BOLO_RULES`.
 - **1.0.39 (2026-10-23)** Due by frequency: `hubLogRank` ranks old log rows by their flags; which days and weeks owe a job follows the MSS Calendar (due days, weekend stretch, idle weeks). 110 checks.
 - **1.0.38 (2026-10-23)** Section 7: Due by frequency, the MSS Calendar's period rule, now shared in `hub-shared.js` (`HUB_FREQS`, `hubKindRank`, `hubPeriodKey`, `hubFreqDone`; 105 checks) so the Scheduler and others reuse it instead of writing a second one.
 - **1.0.37 (2026-10-23)** Scheduler game plan, all **proposed, not approved by Gerald**: `_e_ Shift task` table; changeover rule types together / apart / nights-only / clean-order; override form `pin|who|why|HH:MM`; clean plan rowtype `staff`; hub config keys `PRODSCHED_CREWPLAN`, `PRODSCHED_SCENARIOS`.
