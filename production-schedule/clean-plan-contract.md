@@ -1,6 +1,6 @@
 # Clean Plan reader guide (craa5_cleanplan)
 
-Written by the Production Scheduler ("hub - production schedule" v4.2). No other app writes this table. Ganttly, Shift Start, the MSS Calendar, PBED and the Manager hub only read it. This guide wins over section 6.5 of the data contract on any detail.
+Written by the Production Scheduler ("hub - production schedule" v4.5). No other app writes this table. Ganttly, Shift Start, the MSS Calendar, PBED and the Manager hub only read it. This guide wins over section 6.5 of the data contract on any detail.
 
 All date-times are UTC. Read only active rows (`statecode eq 0`). The line key in `craa5_linekey` is the Scheduler's `canonLine(area, line)`, which is the same as `hubLineKey`: lowercase letters and digits only, for example `ibl4`, `highspeed1`.
 
@@ -94,10 +94,10 @@ Readers do not need this column. Its effect is already in the windows and alerts
 
 These have not changed from v4.0. Day rows: `craa5_cleankind` is `due`, `stretch`, `covered`, `none` or `unplanned`, and `craa5_status` is `ran`, `idle` or `unplanned`. Their details are `{v, prod, len, kind, weekOn, planned, job, lines, areaId}`. The config row holds the shared cleaning settings, which now include the skip words per area (`skipMidweek`, `skipDaily`). When the settings are longer than 1,900 characters, the config row's details are only `{v: 2, tz, at, parts, hash}`, and the settings JSON is split across the `configpart` rows `c|1` to `c|<parts>` (raw text, joined in order). Only the Scheduler reads these rows; other apps can skip both.
 
-## 7. Clean rules this plan follows (v4.1, rules stamp `...|mw72last|scope1`)
+## 7. Clean rules this plan follows (v4.5, rules stamp `...|mw72last|scope1|dskip1`)
 
 - **IBL4:** at most 72 run hours. The midweek clean goes in the last stop before the 72 h mark that is long enough. If none is long enough, it goes in the longest stop before the mark. If there is no stop before the mark, the first stop after it gets the clean, and an `over72` alert is written. The midweek clean covers everything except caseout, dry clean and freezer pieces (skip words, editable in Cleaning Times).
-- **IBL5 and waterjet:** a Daily clean every night. Pieces left out (some PIC areas) are set with the Daily skip words in Cleaning Times. Those words are still to be confirmed by Gerald.
+- **IBL5 and waterjet:** a Daily clean every night. It covers every PIC item but leaves out the floors, the shadow boards and anything on caseout (Gerald, 23 Oct). These are the default Daily skip words, editable per line in Cleaning Times; left-out pieces carry the word in `leftOutBy`.
 - **Every line:** an End of Week clean when production ends for the week, usually Saturday or Sunday.
 - **Highspeed and Custard:** never scheduled together (`apart` alerts). Minimal dailies, then an End of Week clean that includes the kettles, silo, sifter and dough room.
 - **Dough room, silo and sifter:** start 5 h before the line by default (Gerald said 4 to 6 h). This is set per supporting area in Cleaning Times.
