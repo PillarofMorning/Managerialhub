@@ -14,7 +14,7 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 
 const LOGO_URL = ""; // the logo image is left out of the public repo; the copy in project files has it
 const BRAND = { blue: '#0072CE', blueDark: '#00468B', blueSoft: '#E6F1FB', yellow: '#FFB81C', yellowSoft: '#FFF6E0', red: '#E4002B', redSoft: '#FDE8EC' };
-const MONITOR_VERSION = 'v2.6.1';
+const MONITOR_VERSION = 'v2.7';
 
 const ORG_LANG_KEY = 'stillwell_org_lang_v1';
 const ORG_THEME_KEY = 'stillwell_org_dark_v1';
@@ -1649,6 +1649,120 @@ async function dvRunCopy(conn, logical, plan, onProgress) {
   return { done, failed };
 }
 
+// ---------------------------------------------------------------------------
+// Security roles: which roles can read, write and create each craa5 table, and
+// at what level (own rows, business unit, organization). Read only.
+// ---------------------------------------------------------------------------
+const DEPTH_NAMES = { Basic: 'User', Local: 'BU', Deep: 'Parent BU', Global: 'Org', 0: 'User', 1: 'BU', 2: 'Parent BU', 3: 'Org' };
+const DEPTH_RANK = { User: 1, BU: 2, 'Parent BU': 3, Org: 4 };
+const PRIV_OPS = ['Create', 'Read', 'Write', 'Delete', 'AppendTo', 'Append', 'Assign', 'Share'];
+
+function dvParsePrivName(name) {
+  const n = String(name || '');
+  for (let i = 0; i < PRIV_OPS.length; i++) {
+    const p = 'prv' + PRIV_OPS[i];
+    if (n.indexOf(p) === 0 && /^craa5_/i.test(n.slice(p.length))) return { op: PRIV_OPS[i], table: n.slice(p.length).toLowerCase() };
+  }
+  return null;
+}
+
+// Resolves { state: 'ok'|'denied'|'unknown', roles: [{ id, name, privs: { table: { Read: 'Org', ... } } }], mine: [names], err }.
+async function dvReadRoles(conn, userId) {
+  if (!conn.clientUrl) return { state: 'unknown', roles: [], mine: [], err: 'Needs the Web API address, which this page does not have.' };
+  const pr = await dvFetchJson(conn, "privileges?$select=privilegeid,name&$filter=contains(name,'craa5_')");
+  if (!pr.ok) return { state: dvClassify(pr.err) === 'denied' ? 'denied' : 'unknown', roles: [], mine: [], err: pr.err };
+  const privById = {};
+  (pr.json.value || []).forEach(p => { const x = dvParsePrivName(p.name); if (x) privById[String(p.privilegeid).toLowerCase()] = x; });
+  const rr = await dvFetchJson(conn, 'roles?$select=name,roleid&$filter=_parentroleid_value eq null&$orderby=name');
+  if (!rr.ok) return { state: dvClassify(rr.err) === 'denied' ? 'denied' : 'unknown', roles: [], mine: [], err: rr.err };
+  const roles = (rr.json.value || []).map(r => ({ id: String(r.roleid), name: String(r.name || ''), privs: {}, err: '' }));
+  await dvRunPool(roles, async role => {
+    const res = await dvFetchJson(conn, 'RetrieveRolePrivilegesRole(RoleId=' + role.id + ')');
+    if (!res.ok) { role.err = res.err; return; }
+    (res.json.RolePrivileges || []).forEach(p => {
+      const x = privById[String(p.PrivilegeId).toLowerCase()];
+      if (!x) return;
+      const d = DEPTH_NAMES[p.Depth] || String(p.Depth);
+      const t = role.privs[x.table] = role.privs[x.table] || {};
+      if (!t[x.op] || DEPTH_RANK[d] > DEPTH_RANK[t[x.op]]) t[x.op] = d;
+    });
+  }, 4);
+  let mine = [];
+  if (userId) {
+    const ur = await dvFetchJson(conn, 'systemusers(' + String(userId).replace(/[{}]/g, '') + ')/systemuserroles_association?$select=name');
+    if (ur.ok) mine = (ur.json.value || []).map(r => String(r.name || ''));
+  }
+  return { state: 'ok', roles: roles.filter(r => Object.keys(r.privs).length || r.err), mine, err: '' };
+}
+
+// What the role levels mean for the apps. tables: [{ logicalName, resolved, ownership }].
+function dvRoleFindings(roles, tables) {
+  const out = [];
+  tables.forEach(t => {
+    const name = t.resolved || t.logicalName;
+    const withRead = roles.filter(r => r.privs[name] && r.privs[name].Read);
+    if (!withRead.length) { out.push({ table: name, kind: 'noread' }); return; }
+    if (/user/i.test(t.ownership || '')) {
+      const partial = withRead.filter(r => r.privs[name].Read !== 'Org').map(r => r.name);
+      if (partial.length) out.push({ table: name, kind: 'ownonly', roles: partial });
+    }
+    if (t.written && !roles.some(r => r.privs[name] && (r.privs[name].Write || r.privs[name].Create))) out.push({ table: name, kind: 'nowrite' });
+  });
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-app keys: for each contract key "this column must match that table's
+// column", counts rows whose value is not found there. Counts only, no values.
+// ---------------------------------------------------------------------------
+const KEY_EXACT_KINDS = ['equipment', 'employee', 'employees', 'areaguid', 'user'];
+function dvKeyCanon(kind, v) {
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  if (KEY_EXACT_KINDS.indexOf(kind) !== -1) return s.replace(/[{}]/g, '');
+  return s.replace(/[^a-z0-9]/g, '');
+}
+
+// Which keys can be checked: mustMatch names one table.column, and both tables were found.
+function dvKeyPlan(tables, results) {
+  const byName = {};
+  tables.forEach(t => { byName[t.logicalName] = t; });
+  const plan = [];
+  tables.forEach(t => (t.keys || []).forEach(k => {
+    const m = String(k.mustMatch || '').match(/^(craa5_[a-z0-9_]+)\.(craa5_[a-z0-9_]+)/);
+    if (!m || !byName[m[1]]) return;
+    const rFrom = results[t.logicalName];
+    const rTo = results[m[1]];
+    if (!rFrom || rFrom.state !== 'found' || !rTo || rTo.state !== 'found') return;
+    plan.push({ from: t.logicalName, fromAs: rFrom.resolvedName || t.logicalName, col: k.column, to: m[1], toAs: rTo.resolvedName || m[1], toCol: m[2], kind: k.kind });
+  }));
+  return plan;
+}
+
+async function dvKeyCheck(conn, plan, limit, onProgress) {
+  const cache = {};
+  const readCol = (t, c) => (cache[t + '|' + c] = cache[t + '|' + c] || dvReadAllRows(conn, t, [c], limit));
+  const out = [];
+  for (let i = 0; i < plan.length; i++) {
+    const p = plan[i];
+    if (onProgress) onProgress(i + 1, plan.length);
+    const [a, b] = await Promise.all([readCol(p.fromAs, p.col), readCol(p.toAs, p.toCol)]);
+    if (!a.ok || !b.ok) { out.push(Object.assign({}, p, { err: (a.ok ? b.err : a.err) || 'could not read' })); continue; }
+    const target = new Set();
+    b.rows.forEach(r => String(r[p.toCol] == null ? '' : r[p.toCol]).split(';').forEach(v => { const c = dvKeyCanon(p.kind, v); if (c) target.add(c); }));
+    let blank = 0;
+    let bad = 0;
+    const badDistinct = new Set();
+    a.rows.forEach(r => {
+      const parts = String(r[p.col] == null ? '' : r[p.col]).split(';').map(v => dvKeyCanon(p.kind, v)).filter(Boolean);
+      if (!parts.length) { blank++; return; }
+      const miss = parts.filter(v => !target.has(v));
+      if (miss.length) { bad++; miss.forEach(v => badDistinct.add(v)); }
+    });
+    out.push(Object.assign({}, p, { rows: a.rows.length, blank, bad, badDistinct: badDistinct.size, capped: a.rows.length >= (limit || 20000), targetEmpty: target.size === 0, err: '' }));
+  }
+  return out;
+}
+
 
 function BrandLogo({ isDark, lang }) {
   return (
@@ -1814,6 +1928,10 @@ export default function DataverseOrganizerApp(props) {
   const [copyDone, setCopyDone] = useState(null);
   const [copyConfirm, setCopyConfirm] = useState(false);
   const [keyAdd, setKeyAdd] = useState('');
+  const [roleData, setRoleData] = useState(null);
+  const [roleBusy, setRoleBusy] = useState(false);
+  const [keyResults, setKeyResults] = useState(null);
+  const [keyBusy, setKeyBusy] = useState('');
   const scanRef = useRef(0);
 
   const toggleTheme = useCallback(mode => {
@@ -1978,11 +2096,16 @@ export default function DataverseOrganizerApp(props) {
           notYet: a.check ? a.check.tables.filter(t => t.notYet.length).map(t => t.t + ' ' + t.notYet.join(',')) : []
         }))
       }),
+      securityRoles: !roleData ? 'not read (press Read security roles)' : (roleData.state !== 'ok' ? roleData.state + ': ' + roleData.err : {
+        yourRoles: roleData.mine,
+        findings: roleData.findings.map(f => f.table + ': ' + f.kind + (f.roles ? ' (' + f.roles.join(', ') + ')' : ''))
+      }),
+      keyChecks: !keyResults ? 'not run (press Check keys)' : keyResults.filter(k => k.bad || k.err || k.targetEmpty).map(k => k.from + '.' + k.col + ' -> ' + k.to + '.' + k.toCol + ': ' + (k.err ? 'error ' + k.err : k.bad + ' of ' + k.rows + ' rows not found (' + k.badDistinct + ' distinct)' + (k.targetEmpty ? ', target empty' : '') + (k.capped ? ', first 20000 rows' : ''))),
       tablesNotOnList: unclaimed ? unclaimed.map(d => d.logicalName) : 'could not list (no Web API address)',
       browserStorage: storageState.filter(s => printoutMode === 'full' || s.status === 'warn' || s.status === 'bad').map(s => ({ key: s.key, status: s.status, detail: s.detail, issue: s.issue || null }))
     };
     return JSON.stringify(payload, null, 2);
-  }, [tableResults, verdicts, summary, lastScanTime, conn, printoutMode, unclaimed, storageState, fillCounts, manifests]);
+  }, [tableResults, verdicts, summary, lastScanTime, conn, printoutMode, unclaimed, storageState, fillCounts, manifests, roleData, keyResults]);
 
   // Work for the table maker, one card per table. Copilot does best with one short prompt per table and
   // cannot edit tables, so a missing table gets a short create prompt (required columns only) and missing
@@ -2064,6 +2187,26 @@ export default function DataverseOrganizerApp(props) {
     setKeyAdd(L('Added ', 'Agregadas ') + ok + L(' rows', ' filas') + (errs.length ? L('. Failed: ', '. Fallaron: ') + errs.join('; ') : '.'));
     runScan();
   }, [conn, manifests, L]);
+
+  // Security roles (on demand, read only).
+  const readRoles = useCallback(async () => {
+    setRoleBusy(true);
+    const d = await dvReadRoles(conn, msUser && msUser.userId);
+    const found = ECOSYSTEM_TABLES.filter(t => t.status === 'live' && tableResults[t.logicalName] && tableResults[t.logicalName].state === 'found')
+      .map(t => ({ logicalName: t.logicalName, resolved: tableResults[t.logicalName].resolvedName || t.logicalName, ownership: tableResults[t.logicalName].ownership || (tableResults[t.logicalName].meta && tableResults[t.logicalName].meta.OwnershipType) || '', written: (t.writers || []).some(w => !/admin/i.test(w)) }));
+    d.tables = found;
+    d.findings = d.state === 'ok' ? dvRoleFindings(d.roles, found) : [];
+    setRoleData(d);
+    setRoleBusy(false);
+  }, [conn, msUser, tableResults]);
+  // Cross-app keys (on demand; reads the key columns only, counts only).
+  const runKeyChecks = useCallback(async () => {
+    const plan = dvKeyPlan(ECOSYSTEM_TABLES, tableResults);
+    setKeyBusy('Checking 0 / ' + plan.length);
+    const res = await dvKeyCheck(conn, plan, 20000, (i, n) => setKeyBusy('Checking ' + i + ' / ' + n));
+    setKeyResults(res);
+    setKeyBusy('');
+  }, [conn, tableResults]);
 
   const promptCards = useMemo(() => {
     const cards = [];
@@ -2222,7 +2365,9 @@ export default function DataverseOrganizerApp(props) {
           { id: 'manifests', label: L('Hub config', 'Hub config') + (manifests && manifests.hub ? ' (' + manifests.hub.rows.length + (manifests.hub.problems ? ', ' + manifests.hub.problems + L(' to fix', ' por corregir') : '') + ')' : '') },
           { id: 'prompts', label: L('Table maker prompt', 'Prompt para crear tablas') },
           { id: 'scancode', label: L('Scan app code', 'Escanear codigo') },
-          { id: 'copy', label: L('Copy column values', 'Copiar valores') }
+          { id: 'copy', label: L('Copy column values', 'Copiar valores') },
+          { id: 'security', label: 'Security roles' + (roleData && roleData.findings ? ' (' + roleData.findings.length + ')' : '') },
+          { id: 'keys', label: 'Key checks' + (keyResults ? ' (' + keyResults.filter(k => k.bad || k.err).length + ')' : '') }
         ].map(tab => (
           <button key={tab.id} type="button" onClick={() => setActiveTab(tab.id)} style={{ padding: '9px 16px', borderRadius: '6px', border: '1px solid ' + (activeTab === tab.id ? '#3b82f6' : borderCol), background: activeTab === tab.id ? '#1d4ed8' : bgCard, color: activeTab === tab.id ? '#ffffff' : textMain, fontWeight: 600, fontSize: '13px', cursor: 'pointer' }}>
             {tab.label}
@@ -2747,6 +2892,96 @@ export default function DataverseOrganizerApp(props) {
           {copyDone && (
             <div style={{ fontSize: '13px', marginTop: '10px', color: copyDone.failed.length ? TONES.red.fg : TONES.green.fg }}>
               {L('Done: ', 'Listo: ') + (copyDone.done - copyDone.failed.length) + L(' rows changed', ' filas cambiadas') + (copyDone.failed.length ? L(', ', ', ') + copyDone.failed.length + L(' failed (first error: ', ' fallaron (primer error: ') + copyDone.failed[0] + ')' : '') + L('. Press Check first again to confirm.', '. Presione Revisar primero otra vez para confirmar.')}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* SECURITY ROLES */}
+      {activeTab === 'security' && (
+        <div style={{ background: bgCard, borderRadius: '8px', padding: '18px', border: '1px solid ' + borderCol }}>
+          <h2 style={{ margin: 0, fontSize: '18px' }}>Security roles</h2>
+          <div style={{ fontSize: '13px', color: textSub, marginTop: '4px', marginBottom: '14px' }}>
+            Which roles can read (R), write (W) and create (C) each hub table, and how far: User = own rows only, BU = business unit, Org = everyone's rows. Read only. Needs a role that may read security roles (System Customizer or System Administrator); otherwise it says no permission.
+          </div>
+          <button type="button" disabled={roleBusy || !Object.keys(tableResults).length} onClick={readRoles} style={btn(true)}>{roleBusy ? 'Reading...' : 'Read security roles'}</button>
+          {roleData && roleData.state !== 'ok' && <div style={{ fontSize: '13px', color: TONES.amber.fg, marginTop: '10px' }}>{(roleData.state === 'denied' ? 'Your role cannot read security roles. ' : 'Could not read security roles. ') + roleData.err}</div>}
+          {roleData && roleData.state === 'ok' && (
+            <div style={{ marginTop: '12px' }}>
+              <div style={{ fontSize: '12px', color: textSub, marginBottom: '8px' }}>{'Your roles: ' + (roleData.mine.length ? roleData.mine.join(', ') : '(could not tell)') + '. Roles with any hub table rights: ' + roleData.roles.length + '.'}</div>
+              {roleData.findings.length > 0 && (
+                <div style={{ marginBottom: '12px' }}>
+                  {roleData.findings.map((f, i) => (
+                    <div key={i} style={{ fontSize: '12px', marginBottom: '3px', color: f.kind === 'noread' ? TONES.red.fg : TONES.amber.fg }}>
+                      <span style={{ fontFamily: 'Consolas, monospace' }}>{f.table}</span>
+                      {f.kind === 'noread' ? ': no role can read it (only administrators see it)' : (f.kind === 'nowrite' ? ': no role can write or create rows, but an app saves here' : ': owned by user, and these roles read only their own rows, so they miss other people\'s: ' + f.roles.join(', '))}
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div style={{ overflowX: 'auto' }}>
+                <table style={{ borderCollapse: 'collapse', fontSize: '11px', minWidth: '100%' }}>
+                  <thead>
+                    <tr>
+                      <th style={{ textAlign: 'left', padding: '4px 6px', borderBottom: '1px solid ' + borderCol, position: 'sticky', left: 0, background: bgCard }}>Table</th>
+                      {roleData.roles.map(r => <th key={r.id} style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol, whiteSpace: 'nowrap', color: roleData.mine.indexOf(r.name) !== -1 ? '#60a5fa' : textMain }}>{r.name}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {roleData.tables.map(t => (
+                      <tr key={t.resolved}>
+                        <td style={{ padding: '3px 6px', borderBottom: '1px solid ' + borderCol, fontFamily: 'Consolas, monospace', position: 'sticky', left: 0, background: bgCard, whiteSpace: 'nowrap' }}>{t.resolved}</td>
+                        {roleData.roles.map(r => {
+                          const p = r.privs[t.resolved] || {};
+                          const txt = ['Read', 'Write', 'Create'].filter(op => p[op]).map(op => op[0] + ':' + p[op]).join(' ');
+                          return <td key={r.id} style={{ padding: '3px 6px', borderBottom: '1px solid ' + borderCol, whiteSpace: 'nowrap', color: txt ? textMain : textSub }}>{txt || '-'}</td>;
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* KEY CHECKS */}
+      {activeTab === 'keys' && (
+        <div style={{ background: bgCard, borderRadius: '8px', padding: '18px', border: '1px solid ' + borderCol }}>
+          <h2 style={{ margin: 0, fontSize: '18px' }}>Key checks between apps</h2>
+          <div style={{ fontSize: '13px', color: textSub, marginTop: '4px', marginBottom: '14px' }}>
+            The contract says some columns must match another table (for example an asset's area name must be an area in the MSS area table). This counts the rows whose value is not found there. Only counts are shown, never the values. Area and room names are compared ignoring case, spaces and punctuation; ids are compared exactly. Reads up to 20,000 rows per table.
+          </div>
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+            <button type="button" disabled={!!keyBusy || !Object.keys(tableResults).length} onClick={runKeyChecks} style={btn(true)}>{keyBusy || 'Check keys'}</button>
+          </div>
+          {keyResults && (
+            <div style={{ overflowX: 'auto', marginTop: '12px' }}>
+              <table style={{ borderCollapse: 'collapse', fontSize: '12px', width: '100%', minWidth: '600px' }}>
+                <thead>
+                  <tr style={{ textAlign: 'left', color: textSub }}>
+                    {['Column', 'Must match', 'Rows', 'Blank', 'Not found', 'Result'].map(h => <th key={h} style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol, fontWeight: 600 }}>{h}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {keyResults.map((k, i) => {
+                    const tone = k.err ? 'gray' : (k.bad ? 'amber' : (k.targetEmpty ? 'gray' : 'green'));
+                    const word = k.err ? 'could not read' : (k.bad ? k.bad + ' rows (' + k.badDistinct + ' values) not found' : (k.targetEmpty ? 'target empty' : 'all match'));
+                    return (
+                      <tr key={i}>
+                        <td style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol, fontFamily: 'Consolas, monospace', wordBreak: 'break-word' }}>{k.from + '.' + k.col}</td>
+                        <td style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol, fontFamily: 'Consolas, monospace', wordBreak: 'break-word' }}>{k.to + '.' + k.toCol}</td>
+                        <td style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol }}>{k.err ? '-' : k.rows + (k.capped ? '+' : '')}</td>
+                        <td style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol }}>{k.err ? '-' : k.blank}</td>
+                        <td style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol }}>{k.err ? '-' : k.bad}</td>
+                        <td style={{ padding: '4px 6px', borderBottom: '1px solid ' + borderCol }}><span style={pill(tone)}>{word}</span>{k.err ? <span style={{ color: textSub }}>{' ' + k.err}</span> : null}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              {keyResults.length === 0 && <div style={{ fontSize: '13px', color: textSub }}>No key pairs to check yet: both tables of a pair must be found first.</div>}
             </div>
           )}
         </div>
