@@ -4,6 +4,17 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
  * ============================================================================
  * HUB - CHEMICALS: sanitation chemical and supply ordering (shown on screen as the Ordering hub)
  * ============================================================================
+ * Version 0.12: the expected count on the Count tab (Phase B of the plan). Beside each count box: what the shelf should hold on
+ * the count date (the last count before it, plus deliveries since, minus what the chemical log says was used from the day of
+ * that count through the day before this one, as counts are taken at the start of the day), a Matches button that types it into
+ * an empty box, and How it was worked out. A typed count far from it (a container and a fifth) gets an amber note and a reason
+ * picker from the Chemical count table's own Variance reason choices; Save keeps Expected and the reason on the count row and is
+ * never held up by either. A number that is too high is worse than none, so it is hidden, and said so, when it cannot be
+ * trusted: an item at more than one place, no container size, an item the log has no rows for, a last count over 45 days old,
+ * a chemical log with a day of use missing since the last count, or one that could not be read. When most of a Save was set with
+ * Matches the save panel asks for a look at the shelf. The Count tab reads the chemical log (the last 90 days) beside its tables
+ * and only reads it. The printed sheet and Copy for Excel stay blank on purpose. Nothing new is needed in Dataverse (Expected and
+ * Variance reason were in the spec from the start).
  * Version 0.11: apps never build tables (Gerald, 2026-10-23; ecosystem contract 1.0.60, ground rule 10). The Tables tab is gone,
  * with its column check, its Copy what to create prompts and the copy of the full spec: this page only reads and writes rows,
  * and the Dataverse monitor is the one place that shows what is missing and what to build (Gerald builds it from there). The
@@ -912,7 +923,7 @@ function chPool(items, limit, fn) {
 // cannot disagree.
 // ============================================================================
 const CH_APP_ID = 'chemicals';
-const CH_APP_VERSION = '0.11';
+const CH_APP_VERSION = '0.12';
 // The tables this build uses: 'rw' read and written, 'r' read only. Tables the spec lists for later screens (the checklist,
 // the standards, the budget) stay out until a screen uses them, so the monitor never asks for what nothing here needs.
 const CH_USES = { craa5__c_distributor: 'rw', craa5__c_chemical: 'rw', craa5__c_chemicalinventory: 'rw', craa5__c_cart: 'rw', craa5__c_cartline: 'rw',
@@ -7412,6 +7423,216 @@ function cntReceived(lineRows, day) {
     return { after: after, same: same };
 }
 
+// ---------------------------------------------------------------- the expected count (Phase B)
+// What the shelf should hold on the count date: the last count before it, plus what Receive added after that count (up to and
+// including the count date), minus what the chemical log says was used from the day of that count through the day before the
+// count date (gallons, or pounds, over the item's container size; returns go the other way). A count is taken to be made at the
+// start of its date, before that day's use is written down: the use of the date of the last count is taken off, the count
+// date's own is not. A number that is too high is worse than none (Matches would save it and the next order would run short),
+// so it is worked out only when it can be trusted and hidden otherwise: one place per item (the log has no place), a container
+// size, an item the log has rows for, a last count not older than CNT_OLD_DAYS, and use written down on every day since that
+// count. The printed sheet and Copy for Excel stay blank on purpose. The chemical log is read CNT_LOG_DAYS back, beside the
+// tables; a read that fails only hides the expected counts.
+const CNT_LOG_DAYS = 90;
+const CNT_OLD_DAYS = 45;
+// this many days with no use in the log hide the expected counts of the lines those days fall in
+const CNT_THIN_DAYS = 1;
+// far from expected: at least one container and at least a fifth of the larger of the two numbers
+const CNT_GAP_MIN = 1;
+const CNT_GAP_PCT = 0.2;
+// the save panel asks for a look at the shelf when this many counts, and this share of the counts, were set with Matches
+const CNT_MATCH_MIN = 5;
+const CNT_MATCH_PCT = 0.8;
+const CNT_LOG_COLS = ['craa5_entrytype', 'craa5_logdate', 'craa5_itemnumber', 'craa5_amount', 'craa5_amountunit', 'craa5_gallons'];
+// where a line's Expected cell sits: a row of its own under the name on a phone, 272 px beside the box from 640 px up (so the boxes line up)
+const CNT_XCELL = 'order-5 basis-full sm:order-none sm:basis-auto sm:w-[272px]';
+const CNT_FIRST_TEXT = 'No expected counts yet: they are worked out from an earlier count, so they start with the next count after a first count is saved.';
+// the days shown beside a count date in a note: 10/20
+function cntShortDay(s) { const d = ordDate(s); return d ? (d.getMonth() + 1) + '/' + d.getDate() : String(s || ''); }
+function cntDayAdd(s, n) { return ordIsoDay(insAddDays(ordDate(s), n)); }
+function cntDaysBetween(a, b) { return Math.round((ordDate(b).getTime() - ordDate(a).getTime()) / 86400000); }
+// Rounded to 2 places the way people do it by hand (halves go away from 0, and a sum like 1.995 stays 2), and never -0.
+function cntR2(x) { const r = Math.round(Math.abs(x) * 100 + 1e-9) / 100; return x < 0 && r > 0 ? -r : r; }
+// The count of a line before a day: the latest day with counts that is before it (that day's counts added up), or null.
+// bad: a count of that day has no number in it (blank, negative or not a number), which the sum would take for 0.
+function cntBase(l, day) {
+    const days = Object.keys(l.saved || {}).filter(function (d) { return d < day; }).sort();
+    if (!days.length) return null;
+    const d = days[days.length - 1], rows = l.saved[d];
+    let bad = false;
+    rows.forEach(function (r) { const q = r.craa5_quantity; if (typeof q !== 'number' || !isFinite(q) || q < 0) bad = true; });
+    return { day: d, qty: ordRound(rows.reduce(function (t, r) { return t + ordNum(r.craa5_quantity); }, 0), 4), n: rows.length, bad: bad };
+}
+// A typed count (n) against the expected one (e, as shown): the difference, and whether it is far from expected.
+function cntGap(e, n) {
+    const d = n - e;
+    return { diff: cntR2(d), big: Math.abs(d) + 1e-9 >= Math.max(CNT_GAP_MIN, CNT_GAP_PCT * Math.max(e, n)) };
+}
+// Names for a note: the first six, then how many more.
+function cntNamesText(names) { return names.slice(0, 6).join(', ') + (names.length > 6 ? ', and ' + (names.length - 6) + ' more' : ''); }
+// The note for the whole tab when the chemical log cannot be used. thin: { empty, of, days } from cntExAll.
+function cntExNote(state, err, thin) {
+    if (state === 'reading') return { code: 'reading', text: 'Working out the expected counts from the chemical log...' };
+    if (state === 'missing') return { code: 'missing', text: 'The _c_ Chemical usage log table is not made yet (see the Dataverse monitor), so there are no expected counts.' };
+    if (state === 'failed') {
+        // a 401 or 403: Refresh cannot give a role a privilege, and the raw text names ids that mean nothing to a clerk
+        if (/^No permission to read the rows/.test(err || '')) return { code: 'failed', text: 'Your role cannot read the _c_ Chemical usage log, so there are no expected counts. It needs Read on that table at Organization level.' };
+        return { code: 'failed', text: 'The chemical log could not be read, so there are no expected counts. Press Refresh to read it again.' + (err ? ' ' + err : '') };
+    }
+    if (state === 'capped') return { code: 'capped', text: 'The chemical log has more rows than the page reads (' + chNumber(ORD_MAX_ROWS) + ' in the last ' + CNT_LOG_DAYS + ' days), so there are no expected counts.' };
+    const days = thin.days.slice(0, 6).map(cntShortDay).join(', ') + (thin.days.length > 6 ? ', and ' + (thin.days.length - 6) + ' more' : '');
+    return { code: 'thin', text: 'Expected counts are hidden where the chemical log looks behind. It has no use logged on ' + thin.empty + ' of the last ' + thin.of + ' days (' + days + '). Log those days on the Log tab, then press Refresh. You can still count and save.' };
+}
+// The expected count of every line. lines: cntLines' lines; lineRows: the cart lines; log: { state ('reading', 'ok', 'missing',
+// 'failed' or 'capped'), rows (cuRows' rows), from (the first day read), err }; o: { day (the count date), today (a Date) }.
+// Returns { byLine: { lineId: result }, eligible (lines that passed the line checks), note (for the whole tab: { code, text } or
+// null), thin ({ lines, empty, of, days } for the line with most days missing, or null), thinNow (thin is not null), noconv (the
+// names of the chemicals with no container size), nolog (the names of the chemicals the log has no rows for) }. A result is
+// { ok: false, why } with why 'day', 'noitem', 'places', 'noconv' (chem), 'nocount' (later), 'badbase' (day), 'old' (days), 'log',
+// 'window', 'nolog' (chem), 'thin' (empty), 'badrows' (n), 'neg' (e, shown), or
+// { ok: true, e, shown, base, useFrom, useTo, recv: { qty, list: [{ day, qty, cart }] }, use, ret, unit, per }.
+function cntExAll(lines, lineRows, log, o) {
+    const day = o && o.day ? o.day : '', today = o && o.today ? ordIsoDay(o.today) : '';
+    const out = { byLine: {}, eligible: 0, note: null, thin: null, thinNow: false, noconv: [], nolog: [] };
+    const state = log && log.state ? log.state : 'reading';
+    const dayOk = cntIsDay(day) && !(today && day > today);
+    const per = {};
+    lines.forEach(function (l) { per[l.key] = (per[l.key] || 0) + 1; });
+    // only a chemical (or an item with no category) is named in a note about container sizes or the log: supplies and test
+    // reagents are not used by the gallon
+    const chem = function (item) { const c = impClean(item.craa5_category); return !c || c === 'Chemical'; };
+    const elig = [];
+    let first = 0;
+    lines.forEach(function (l) {
+        const no = function (why, more) { out.byLine[l.id] = Object.assign({ ok: false, why: why }, more || {}); };
+        if (!dayOk) { no('day'); return; }
+        if (!l.item) { no('noitem'); return; }
+        if (per[l.key] > 1) { no('places'); return; }
+        const gpc = cuGpc(l.item), lbp = gpc > 0 ? 0 : cuLbPer(l.item);
+        if (!(gpc > 0) && !(lbp > 0)) { no('noconv', { chem: chem(l.item) }); if (chem(l.item)) out.noconv.push(l.name); return; }
+        const base = cntBase(l, day);
+        if (!base) { no('nocount', { later: !!l.last }); if (!l.last) first++; return; }
+        if (base.bad) { no('badbase', { day: base.day }); return; }
+        const age = cntDaysBetween(base.day, day);
+        if (age > CNT_OLD_DAYS) { no('old', { days: age }); return; }
+        elig.push({ l: l, base: base, unit: gpc > 0 ? 'gal' : 'lb', per: gpc > 0 ? gpc : lbp });
+    });
+    out.eligible = elig.length;
+    if (!elig.length) {
+        if (first > 0) out.note = { code: 'first', text: CNT_FIRST_TEXT };
+        return out;
+    }
+    // the log must be read in full
+    if (state !== 'ok') {
+        elig.forEach(function (x) { out.byLine[x.l.id] = { ok: false, why: 'log' }; });
+        out.note = cntExNote(state, log && log.err, null);
+        return out;
+    }
+    // the log by day and by item (a day is written up when a use row of any item has it), and the deliveries by item
+    const have = {}, used = {}, got = {};
+    (log.rows || []).forEach(function (r) {
+        if (!r.day) return;
+        if (r.kind === 'use') have[ordIsoDay(r.day)] = true;
+        if (r.key && (r.kind === 'use' || r.kind === 'return')) (used[r.key] || (used[r.key] = [])).push(r);
+    });
+    (lineRows || []).forEach(function (x) {
+        const d = x.craa5_receivedon ? ordDate(x.craa5_receivedon) : null, q = ordNum(x.craa5_quantityreceived), k = ordKey(x.craa5_itemnumber);
+        if (!d || q <= 0 || !k) return;
+        (got[k] || (got[k] = [])).push({ day: ordIsoDay(d), qty: q, cart: impClean(x.craa5__c_cartname) });
+    });
+    const last = cntDayAdd(day, -1), thinLines = [], ready = [];
+    elig.forEach(function (x) {
+        const l = x.l;
+        if (log.from && x.base.day < log.from) { out.byLine[l.id] = { ok: false, why: 'window' }; return; }
+        if (!(used[l.key] || []).length) {
+            out.byLine[l.id] = { ok: false, why: 'nolog', chem: chem(l.item) };
+            if (chem(l.item)) out.nolog.push(l.name);
+            return;
+        }
+        // the days of this line's span (the day of its last count through the day before the count date) with no use written down
+        const empty = [];
+        for (let d = x.base.day; d <= last; d = cntDayAdd(d, 1)) { if (!have[d]) empty.push(d); }
+        if (empty.length >= CNT_THIN_DAYS) { out.byLine[l.id] = { ok: false, why: 'thin', empty: empty.length }; thinLines.push({ x: x, empty: empty }); return; }
+        ready.push(x);
+    });
+    if (thinLines.length) {
+        let w = thinLines[0];
+        thinLines.forEach(function (t) { if (t.empty.length > w.empty.length || (t.empty.length === w.empty.length && t.x.base.day < w.x.base.day)) w = t; });
+        out.thin = { lines: thinLines.length, empty: w.empty.length, of: cntDaysBetween(w.x.base.day, day), days: w.empty };
+        out.thinNow = true;
+        out.note = cntExNote('thin', '', out.thin);
+    }
+    ready.forEach(function (x) {
+        const l = x.l, from = x.base.day;
+        let U = 0, Ur = 0, Un = 0, T = 0, Tr = 0, Tn = 0, R = 0, bad = 0;
+        (used[l.key] || []).forEach(function (r) {
+            const d = ordIsoDay(r.day);
+            if (d < from || d > last) return;
+            const raw = x.unit === 'gal' ? r.gal : r.lb;
+            if (typeof raw !== 'number' || !isFinite(raw) || raw < 0) { bad++; return; }
+            if (r.kind === 'use') { U += raw / x.per; Ur += raw; Un++; } else { T += raw / x.per; Tr += raw; Tn++; }
+        });
+        if (bad) { out.byLine[l.id] = { ok: false, why: 'badrows', n: bad }; return; }
+        // deliveries after the day of the last count (those of that day are in the count) up to the count date, one entry per day and cart
+        const list = [];
+        (got[l.key] || []).forEach(function (m) {
+            if (m.day <= from || m.day > day) return;
+            R += m.qty;
+            const hit = list.filter(function (y) { return y.day === m.day && y.cart === m.cart; })[0];
+            if (hit) hit.qty = ordRound(hit.qty + m.qty, 4); else list.push({ day: m.day, qty: ordRound(m.qty, 4), cart: m.cart, i: list.length });
+        });
+        list.sort(function (a, b) { return a.day < b.day ? -1 : a.day > b.day ? 1 : a.i - b.i; });
+        const recvQty = ordRound(R, 4), e = x.base.qty + recvQty - U + T, shown = cntR2(e);
+        if (shown < 0) { out.byLine[l.id] = { ok: false, why: 'neg', e: e, shown: shown }; return; }
+        out.byLine[l.id] = { ok: true, e: e, shown: shown, base: { day: x.base.day, qty: x.base.qty, n: x.base.n }, useFrom: from, useTo: last,
+            recv: { qty: recvQty, list: list.map(function (y) { return { day: y.day, qty: y.qty, cart: y.cart }; }) },
+            use: { qty: ordRound(U, 4), raw: ordRound(Ur, 4), rows: Un }, ret: { qty: ordRound(T, 4), raw: ordRound(Tr, 4), rows: Tn }, unit: x.unit, per: x.per };
+    });
+    return out;
+}
+// How an expected count was worked out, in a line; '' when there is none.
+function cntExHow(r) {
+    if (!r || !r.ok) return '';
+    const D = function (d) { return ordDay(ordDate(d)); };
+    let t = 'Last count ' + ordQty(r.base.qty) + ' on ' + D(r.base.day) + (r.base.n > 1 ? ' (' + r.base.n + ' counts that day, added up)' : '');
+    r.recv.list.forEach(function (m) { t += ', plus ' + ordQty(m.qty) + ' received on ' + D(m.day) + (m.cart ? ' (' + m.cart + ')' : ''); });
+    if (r.ret.qty > 0) t += ', plus ' + ordQty(r.ret.qty) + ' returned';
+    if (r.use.qty > 0) t += ', minus ' + ordQty(r.use.qty) + ' used (' + ordQty(r.use.raw) + ' ' + r.unit + ' at ' + ordQty(r.per) + ' ' + r.unit + ' per container)';
+    return t + ' = ' + ordQty(r.shown) + '. Use is taken from ' + D(r.useFrom) + ' to ' + D(r.useTo) + '.';
+}
+// The note for the chemicals that have no container size, said once for the whole tab ('' when there are none).
+function cntExNoconv(names) {
+    const n = names ? names.length : 0;
+    if (!n) return '';
+    return n + (n === 1 ? ' chemical has' : ' chemicals have') + ' no container size in gallons or pounds, so ' + (n === 1 ? 'it has' : 'they have') + ' no expected count: ' + cntNamesText(names) + '. Fill in Gallons per container (or Container size and Container unit) on the chemical list in Power Apps.';
+}
+// The note for the chemicals the chemical log has no rows for, said once for the whole tab ('' when there are none).
+function cntExNolog(names) {
+    const n = names ? names.length : 0;
+    if (!n) return '';
+    return n + (n === 1 ? ' chemical has' : ' chemicals have') + ' no jug, barrel or return entries in the chemical log in the last ' + CNT_LOG_DAYS + ' days, so ' + (n === 1 ? 'it has' : 'they have') + ' no expected count: ' + cntNamesText(names) + '. If ' + (n === 1 ? 'it is' : 'they are') + ' in use, the log may carry another item number for ' + (n === 1 ? 'it' : 'them') + ', or this role reads only its own log rows (Read must be at Organization level).';
+}
+// The ending of a line's sub-line when it has no expected count and the reason is worth saying ('' otherwise).
+function cntExShort(r) {
+    if (!r || r.ok) return '';
+    if (r.why === 'places') return 'no expected count, the item is on this list more than once';
+    if (r.why === 'noconv' && r.chem === true) return 'no expected count, no container size in gallons or pounds';
+    if (r.why === 'nolog' && r.chem === true) return 'no expected count, no jug, barrel or return entries in the chemical log';
+    if (r.why === 'thin') return 'no expected count, no use logged on ' + r.empty + ' day' + (r.empty === 1 ? '' : 's') + ' since the last count';
+    if (r.why === 'nocount' && r.later) return 'no expected count, no count before this date';
+    if (r.why === 'badbase') return 'no expected count, the count of ' + ordDay(ordDate(r.day)) + ' has no usable number';
+    if (r.why === 'old') return 'no expected count, last counted over ' + CNT_OLD_DAYS + ' days earlier';
+    if (r.why === 'window') return 'no expected count, the chemical log was not read back that far';
+    if (r.why === 'badrows') return 'no expected count, ' + r.n + ' log row' + (r.n === 1 ? '' : 's') + ' with no usable amount (fix them on the Log tab)';
+    return '';
+}
+// The save panel's line about counts far from expected: n of them, m with a reason, and whether the reason picker is offered.
+function cntGapSum(n, m, picker) {
+    const them = n === 1 ? 'it' : 'them';
+    return n + ' count' + (n === 1 ? ' is' : 's are') + ' far from expected' + (m ? ', ' + m + ' with a reason' : '') + '.' + (!picker ? ' Check ' + them + '.' : m < n ? ' Check ' + them + ', or pick a reason.' : '') + ' Save works either way.';
+}
+function cntExNeg(r) { return 'The log shows ' + ordQty(-r.shown) + ' more used than was on hand, so there is no expected count. Count the shelf and type the number (a delivery may not be marked received on the Ordering tab).'; }
+
 // What Save writes for the counts typed (typed: { lineId: { q, exp } }); o = { day, by, now, today, taken: { count, stock }, the
 // ids of the rows read, lower case }. Per line with a number:
 // a new count, or that day's count updated when it differs, then the stock row's on hand set to the count (plus what Receive
@@ -7419,7 +7640,7 @@ function cntReceived(lineRows, day) {
 // has a later count. Pure: builds the writes and makes no request. Any problem stops the whole Save until it is fixed.
 function cntPlan(lines, ix, lineRows, typed, o) {
     const out = { writes: [], problems: {}, dayProblem: '', filled: 0, blank: 0, newCounts: 0, updCounts: 0, sameCounts: 0, stockN: 0, newStock: 0, stockSame: 0,
-        stockLeft: [], recvAfter: [], recvSame: [], notes: {}, partial: [], warns: {} };
+        stockLeft: [], recvAfter: [], recvSame: [], notes: {}, partial: [], warns: {}, gapN: 0, reasonN: 0, exN: 0, matchN: 0 };
     const day = o.day;
     const note = function (id, text) { out.notes[id] = out.notes[id] ? out.notes[id] + ' ' + text : text; };
     // A new row's id comes from what it is (item, place and day), so the same Save sent twice makes one row. When a row of
@@ -7458,6 +7679,15 @@ function cntPlan(lines, ix, lineRows, typed, o) {
             }
             return;
         }
+        // the expected count and, for a count far from it, the reason picked (only a reason in the table's own choices is written).
+        // Counted for every count that parses, whether or not it can be saved yet: it is what the screen shows
+        const xr = o.ex ? o.ex[l.id] : null, E = xr && xr.ok ? xr.shown : null;
+        let rv = null, rl = '', big = false;
+        if (E !== null && p.n !== undefined && cntGap(E, p.n).big) {
+            big = true; out.gapN++;
+            const why = impNorm(t.why), hit = why && o.reasons ? o.reasons.filter(function (x) { return impNorm(x[0]) === why; })[0] : null;
+            if (hit) { rv = hit[1]; rl = hit[0]; out.reasonN++; }
+        }
         let bad = p.bad || '';
         if (!bad && exp && !cntIsDay(exp)) bad = 'The expiry date "' + exp + '" is not a date.';
         if (!bad && l.twin) bad = l.name + ' has two stock rows at ' + (l.loc || 'no location') + ', so the page cannot tell which one this count is for. Delete one of them in the Chemical inventory table in Power Apps, then press Refresh.';
@@ -7467,17 +7697,33 @@ function cntPlan(lines, ix, lineRows, typed, o) {
         if (!bad && had.length > 1) bad = had.length + ' counts are already saved for ' + l.name + ' at ' + l.loc + ' on ' + cntDayText(day) + ', and the Ordering tab adds them up. Delete the extra ones in the Chemical count table in Power Apps, then press Refresh.';
         if (bad) { out.problems[l.id] = bad; return; }
         out.filled++;
+        if (t.m === true) out.matchN++;
         if (out.dayProblem) return;
         const n = p.n, what = l.name + ' at ' + l.loc;
         // the count
         if (had.length) {
             const c = had[0], sameExp = !exp || (c.craa5_expirydate && ordDate(c.craa5_expirydate) && ordIsoDay(ordDate(c.craa5_expirydate)) === exp);
-            if (Math.abs(ordNum(c.craa5_quantity) - n) < 0.005 && sameExp) out.sameCounts++;
-            else {
-                if (Math.abs(ordNum(c.craa5_quantity) - n) >= 0.005) note(l.id, 'Replaces the count of ' + ordQty(ordNum(c.craa5_quantity)) + ' saved for ' + cntDayText(day) + '.');
+            const qtyDiff = Math.abs(ordNum(c.craa5_quantity) - n) >= 0.005, savedWhy = impClean(c.craa5_variancereason);
+            // the reason saved is compared by its value in Dataverse (the hub's own label for a value need not be the table's); a row
+            // read without raw values is compared by label
+            const sr = c._raw ? c._raw.craa5_variancereason : null;
+            const whyDiff = rv !== null && (sr !== null && sr !== undefined ? sr !== rv : impNorm(savedWhy) !== impNorm(rl));
+            if (!qtyDiff && sameExp && !whyDiff) out.sameCounts++;
+            else if (!qtyDiff && sameExp) {
+                // only the reason is new or different: only the reason is written, so who counted and the expected count stay as they were
+                note(l.id, 'Saves the reason on the count already saved for ' + cntDayText(day) + '.');
+                out.writes.push({ table: 'count', row: c, fields: { craa5_variancereason: rv }, what: 'The reason for the count of ' + what });
+                out.updCounts++;
+            } else {
+                if (qtyDiff) note(l.id, 'Replaces the count of ' + ordQty(ordNum(c.craa5_quantity)) + ' saved for ' + cntDayText(day) + '.');
                 const f = { craa5_quantity: n };
                 if (o.by) f.craa5_countedby = o.by;
                 if (exp) f.craa5_expirydate = exp;
+                if (E !== null) { f.craa5_expected = E; out.exN++; }
+                // a changed count that is known to be no longer far from expected no longer has the reason saved for the old one
+                // (a reason is otherwise only ever replaced, never erased: the box does not show the reason saved earlier)
+                if (rv !== null) f.craa5_variancereason = rv;
+                else if (qtyDiff && savedWhy && E !== null && !big) f.craa5_variancereason = null;
                 out.writes.push({ table: 'count', row: c, fields: f, what: 'The count of ' + what });
                 out.updCounts++;
             }
@@ -7485,6 +7731,8 @@ function cntPlan(lines, ix, lineRows, typed, o) {
             const f = { craa5__c_chemicalcountname: (l.name + ' ' + day).slice(0, 200), craa5_itemnumber: l.itemNo, craa5_location: l.locValue, craa5_countdate: day, craa5_quantity: n };
             if (o.by) f.craa5_countedby = o.by;
             if (exp) f.craa5_expirydate = exp;
+            if (E !== null) { f.craa5_expected = E; out.exN++; }
+            if (rv !== null) f.craa5_variancereason = rv;
             out.writes.push({ table: 'count', create: true, id: freeId('count|' + l.key + '|' + ordKey(l.loc) + '|' + day, cIds), fields: f, what: 'The count of ' + what });
             out.newCounts++;
         }
@@ -7540,11 +7788,43 @@ function cntSheetText(groups, day) {
     return rows.map(function (r) { return r.map(function (c) { return String(c).replace(/[\t\r\n]+/g, ' '); }).join('\t'); }).join('\r\n');
 }
 
+// The device draft keeps no chosen reason: a reason belongs to the number it was picked for and to the expected count shown then.
+function cntDraftTyped(typed) {
+    const n = {};
+    Object.keys(typed || {}).forEach(function (k) { const t = typed[k]; if (!t || typeof t !== 'object') return; const c = Object.assign({}, t); delete c.why; n[k] = c; });
+    return n;
+}
 function cntReadDraft() {
     try {
         const s = window.localStorage ? window.localStorage.getItem(CNT_DRAFT) : null, o = s ? JSON.parse(s) : null;
-        return o && o.v === 1 && typeof o.typed === 'object' && o.typed ? o : null;
+        if (!(o && o.v === 1 && typeof o.typed === 'object' && o.typed)) return null;
+        o.typed = cntDraftTyped(o.typed);
+        return o;
     } catch (e) { return null; }
+}
+// Counts set with Matches come from the expected count of their date and place: they are taken out of their boxes (with the mark and
+// any reason) when the count date changes (all of them) or when an item is added at another place (those of that item, which now has no
+// expected count). Counts typed by hand stay. Returns typed itself when none was taken out. only: the ids of the lines to take them from.
+function cntMatchedIds(typed, only) {
+    return Object.keys(typed).filter(function (k) { return !!(typed[k] && typed[k].m === true && (!only || only.indexOf(k) > -1)); });
+}
+function cntDropMatches(typed, only) {
+    const gone = cntMatchedIds(typed, only);
+    if (!gone.length) return typed;
+    const n = {};
+    Object.keys(typed).forEach(function (k) {
+        const t = typed[k];
+        if (gone.indexOf(k) < 0) { n[k] = t; return; }
+        if (String(t.exp || '').trim()) n[k] = Object.assign({}, t, { q: '', m: false, why: '' });
+    });
+    return n;
+}
+// What is said when counts set with Matches were taken out: list = one entry per count (the lines' names for 'places')
+function cntOutText(why, list) {
+    const n = list.length;
+    if (!n) return '';
+    if (why === 'places') return (n === 1 ? 'The count set with Matches for ' + list[0] + ' was' : 'The counts set with Matches for ' + list.join(', ') + ' were') + ' taken out: ' + (n === 1 ? 'the item is' : 'the items are') + ' now on the list at more than one place, so there is no expected count. Type the count at each place.';
+    return n + (n === 1 ? ' count set with Matches was' : ' counts set with Matches were') + ' taken out because the count date changed. Tap Matches again for the new date.';
 }
 function cntHasTyped(typed) { return Object.keys(typed).some(function (k) { const t = typed[k]; return !!(t && (String(t.q || '').trim() || String(t.exp || '').trim())); }); }
 
@@ -7588,6 +7868,7 @@ function CountTab(props) {
     const [readProblem, setReadProblem] = useState('');
     const [busy, setBusy] = useState(false);
     const [msg, setMsg] = useState('');
+    const [outNote, setOutNote] = useState('');
     const [err, setErr] = useState('');
     const [day, setDay] = useState(function () { return d0 && cntIsDay(d0.day) ? d0.day : ordIsoDay(insSunday(new Date())); });
     const [by, setBy] = useState(function () { return d0 && typeof d0.by === 'string' ? d0.by : chUserName(); });
@@ -7604,6 +7885,12 @@ function CountTab(props) {
     const [orphAsk, setOrphAsk] = useState(false);
     const [partialOk, setPartialOk] = useState(false);
     const [walkAsk, setWalkAsk] = useState(null);
+    // the chemical log (for the expected counts) and the reason choices are read beside the tables. The log carries the number of the
+    // read it belongs to: while that is an earlier read than the tables on screen (a newer one is on its way) it stays in use, so
+    // nothing blinks, but Matches and Save leave the expected count out (logFresh)
+    const [logRead, setLogRead] = useState(null);
+    const [reasons, setReasons] = useState(null);
+    const [howOpen, setHowOpen] = useState({});
     // after a Save that got no answer (or counts kept on this device): once read again, are the typed counts saved already?
     const [landCheck, setLandCheck] = useState(function () { return kept0(d0) ? 'kept' : ''; });
     // the count date is this Sunday until one is picked; a date that is not this Sunday (kept on this device, or a page left
@@ -7617,11 +7904,31 @@ function CountTab(props) {
         if (!base) { setReadProblem('Cannot read Dataverse from here: open the Ordering hub inside the Power Apps app.'); return Promise.resolve(); }
         const id = ++loadId.current;
         setLoading(true);
+        // the chemical log, the last CNT_LOG_DAYS days (it never holds the tables up, and a failed read only hides the expected counts)
+        const first = ordIsoDay(insAddDays(insDay(new Date()), -CNT_LOG_DAYS));
+        ordLoadTable(fetcher, base, CU_T.log, { cols: CNT_LOG_COLS, newest: 'craa5_logdate', window: { col: 'craa5_logdate', from: first }, labels: true }).then(function (lg) {
+            if (loadId.current !== id) return;
+            const state = lg.missing ? 'missing' : lg.error ? 'failed' : lg.capped ? 'capped' : 'ok';
+            setLogRead({ gen: id, state: state, rows: state === 'ok' ? cuRows(lg.rows, null, null) : [], from: first, err: lg.missing ? '' : lg.error || '' });
+        }, function (e) {
+            if (loadId.current !== id) return;
+            setLogRead({ gen: id, state: 'failed', rows: [], from: first, err: chErrText(e) });
+        });
         return ordLoadAll(fetcher, base).then(function (dd) {
             if (loadId.current !== id) return;
+            dd.gen = id;
             setData(dd); setLoading(false);
             const bad = Object.keys(dd.tables).filter(function (k) { return dd.tables[k].error; }).map(function (k) { return dd.tables[k].label + ': ' + dd.tables[k].error; });
             setReadProblem(bad.length ? 'Some tables could not be read. Press Refresh to read them again. ' + bad.join(' ') : '');
+            // the reason choices as Dataverse has them (never the hub's own list), when the count table has the column
+            const col = dd.tables.count && dd.tables.count.cols ? dd.tables.count.cols.craa5_variancereason : '';
+            if (!col) { setReasons({ state: 'absent', list: [] }); return; }
+            chRequest(fetcher, chDefUrl(base, ORD_T.count) + '/Attributes/Microsoft.Dynamics.CRM.PicklistAttributeMetadata?$select=LogicalName&$expand=OptionSet($select=Options)').then(function (r) {
+                if (loadId.current !== id) return;
+                const all = chOk(r) && r.body && Array.isArray(r.body.value) ? r.body.value : null, a = all ? all.filter(function (x) { return x && x.LogicalName === col; })[0] : null;
+                const list = a && a.OptionSet && Array.isArray(a.OptionSet.Options) ? a.OptionSet.Options.map(function (x) { return [chLabel(x.Label), x.Value]; }).filter(function (x) { return x[0] && x[1] !== null && x[1] !== undefined; }) : [];
+                setReasons({ state: list.length ? 'ok' : 'failed', list: list });
+            });
         });
     }, [base, fetcher]);
     useEffect(function () { load(); }, [load]);
@@ -7638,7 +7945,7 @@ function CountTab(props) {
     useEffect(function () {
         try {
             if (!window.localStorage) return;
-            if (cntHasTyped(typed) || adds.length) window.localStorage.setItem(CNT_DRAFT, JSON.stringify({ v: 1, day: day, by: by, typed: typed, adds: adds, at: atRef.current || new Date().toISOString() }));
+            if (cntHasTyped(typed) || adds.length) window.localStorage.setItem(CNT_DRAFT, JSON.stringify({ v: 1, day: day, by: by, typed: cntDraftTyped(typed), adds: adds, at: atRef.current || new Date().toISOString() }));
             else { window.localStorage.removeItem(CNT_DRAFT); atRef.current = ''; }
         } catch (e) { /* storage off: counts are kept only while the page is open */ }
     }, [day, by, typed, adds]);
@@ -7655,9 +7962,23 @@ function CountTab(props) {
         }
         return t;
     }, [data]);
-    const plan = useMemo(function () { return L ? cntPlan(L.lines, ix, data.tables.line.rows, typed, { day: day, by: String(by || '').trim().slice(0, 100), now: '', today: today, taken: taken }) : null; }, [L, ix, data, typed, day, by, today, taken]);
     const T = data ? data.tables : null;
     const unread = T ? ['stock', 'count', 'item', 'line'].filter(function (k) { return T[k] && (T[k].error || T[k].capped); }).map(function (k) { return T[k].label + (T[k].capped ? ' (more rows than the page reads)' : ''); }) : [];
+    const unreadN = unread.length;
+    // the expected counts: none while a table they are worked out from was not read in full (the tables Save waits for)
+    const exAll = useMemo(function () {
+        if (!L || !data || unreadN) return null;
+        // while a newer read of the log is on its way the log of the earlier read stays in use (it is replaced when the new one lands)
+        const lg = logRead || { state: 'reading', rows: [], from: '', err: '' };
+        return cntExAll(L.lines, data.tables.line.rows, lg, { day: day, today: today });
+    }, [L, data, logRead, day, today, unreadN]);
+    // the log in use was read by the read of the tables on screen or a later one; until then Matches is off and Save writes no
+    // expected count or reason (the numbers on screen are still those of the earlier log)
+    const logFresh = !!(logRead && data && logRead.gen >= data.gen);
+    const exUse = exAll && logFresh ? exAll.byLine : null;
+    const rs = reasons || { state: 'reading', list: [] };
+    const reasonList = rs.state === 'ok' ? rs.list : null;
+    const plan = useMemo(function () { return L ? cntPlan(L.lines, ix, data.tables.line.rows, typed, { day: day, by: String(by || '').trim().slice(0, 100), now: '', today: today, taken: taken, ex: exUse, reasons: reasonList }) : null; }, [L, ix, data, typed, day, by, today, taken, exUse, reasonList]);
     const hasTyped = cntHasTyped(typed) || adds.length > 0;
     const thisSun = ordIsoDay(insSunday(today));
     const dateAsk = !dayPicked && cntIsDay(day) && day !== thisSun && hasTyped;
@@ -7726,8 +8047,15 @@ function CountTab(props) {
     }, [landCheck, loading, plan, L]);
 
     const touch = function () { atRef.current = new Date().toISOString(); };
-    const setLine = function (l, patch) { setTyped(function (p) { const n = Object.assign({}, p); n[l.id] = Object.assign({}, p[l.id] || {}, patch, { name: l.name, loc: l.loc }); return n; }); touch(); setMsg(''); };
+    const setLine = function (l, patch) { setTyped(function (p) { const n = Object.assign({}, p); n[l.id] = Object.assign({}, p[l.id] || {}, patch, { name: l.name, loc: l.loc }); return n; }); touch(); setMsg(''); setOutNote(''); };
     const say = function (text) { setMsg(text); };
+    // Matches types the expected count into an empty box (like the clerk typing it), drops any reason picked and marks the count
+    // as set with Matches (any typing in the box takes the mark and the reason off); the reason buttons pick or clear the reason of
+    // a count far from expected. Neither saves anything. Matches does nothing over a number already typed, on a line with a count
+    // saved for the date, or while the log in use is older than the tables on screen.
+    const canMatch = function (l) { return !busy && logFresh && cntParse((typed[l.id] || {}).q).blank && !(cntIsDay(day) && (l.saved[day] || []).length > 0); };
+    const matches = function (l, xr) { if (!canMatch(l)) return; setLine(l, { q: ordQty(xr.shown), why: '', m: true }); };
+    const pickWhy = function (l, label) { if (busy) return; setLine(l, { why: impNorm((typed[l.id] || {}).why) === impNorm(label) ? '' : label }); };
     const url = function (tbl, id) { return base + CH_API + tbl.meta.set + (id ? '(' + String(id).replace(/[^0-9a-fA-F-]/g, '') + ')' : ''); };
     // One change set (a single write goes on its own); the tables are read again after every try. As on the Ordering tab, a new
     // row gets an id worked out from what it is and an update carries the row version read, so the same Save sent twice, or a
@@ -7748,7 +8076,7 @@ function CountTab(props) {
     const save = function () {
         if (!canSave) return;
         const now = new Date().toISOString();
-        const P = cntPlan(L.lines, ix, T.line.rows, typed, { day: day, by: String(by || '').trim().slice(0, 100), now: now, today: today, taken: taken });
+        const P = cntPlan(L.lines, ix, T.line.rows, typed, { day: day, by: String(by || '').trim().slice(0, 100), now: now, today: today, taken: taken, ex: exUse, reasons: reasonList });
         if (P.dayProblem || Object.keys(P.problems).length || !P.writes.length) return;
         const steps = P.writes.map(function (w) {
             const tbl = w.table === 'count' ? T.count : T.stock;
@@ -7758,7 +8086,7 @@ function CountTab(props) {
         // what was sent: a box changed or an item added while saving is kept (only what was saved is cleared)
         const sent = {}, sentAdds = adds.slice();
         done.forEach(function (id) { sent[id] = typed[id]; });
-        setBusy(true); setErr(''); setMsg('');
+        setBusy(true); setErr(''); setMsg(''); setOutNote('');
         send(steps).then(function (r) {
             const text = r.ok ? '' : why(r, steps);
             return load().then(function () {
@@ -7826,9 +8154,11 @@ function CountTab(props) {
         if (mp.blank || mp.bad) { setAddMsg(mp.bad || 'Type its minimum at this place (0 if it has none).'); return; }
         const k = ordKey(it.craa5_itemnumber);
         if (L.lines.some(function (l) { return l.key === k && ordKey(l.loc) === ordKey(loc); })) { setAddMsg(cntName(it, null, it.craa5_itemnumber) + ' is already on the list at ' + loc + '.'); return; }
-        setAdds(function (a) { return a.concat([{ itemNo: String(it.craa5_itemnumber), loc: loc, min: mp.n }]); }); touch();
+        // the item is now at another place too, so its other lines have no expected count: a count Matches typed for one of them goes
+        const same = L.lines.filter(function (l) { return l.key === k; }), out = same.filter(function (l) { return cntMatchedIds(typed, [l.id]).length > 0; });
+        setAdds(function (a) { return a.concat([{ itemNo: String(it.craa5_itemnumber), loc: loc, min: mp.n }]); }); setTyped(function (p) { return cntDropMatches(p, same.map(function (l) { return l.id; })); }); touch();
         setAdd({ loc: loc, item: '', min: '' });
-        say(cntName(it, null, it.craa5_itemnumber) + ' added at the end of ' + loc + '. Type its count, then Save (Save creates its stock row).');
+        say(cntName(it, null, it.craa5_itemnumber) + ' added at the end of ' + loc + '. Type its count, then Save (Save creates its stock row).' + (out.length ? ' ' + cntOutText('places', out.map(function (l) { return l.name + ' at ' + l.loc; })) : ''));
     };
     const removeAdd = function (l) {
         setAdds(function (a) { return a.filter(function (x) { return !(ordKey(x.itemNo) === l.key && x.loc === l.loc); }); });
@@ -7842,7 +8172,7 @@ function CountTab(props) {
     const printSheet = function () {
         setPrintNote(cntPrint(printRef.current) ? 'If no print window opened, this app blocks printing here: use Copy for Excel and print from Excel.' : 'Printing is not available here. Use Copy for Excel and print from Excel.');
     };
-    const clearTyped = function () { setTyped({}); setAdds([]); setKept(''); setClearAsk(false); setOrphAsk(false); setMsg(''); };
+    const clearTyped = function () { setTyped({}); setAdds([]); setKept(''); setClearAsk(false); setOrphAsk(false); setMsg(''); setOutNote(''); };
 
     const field = 'min-h-[44px] rounded-lg border border-slate-300 bg-white px-3 text-sm focus:outline-none focus:ring-2 focus:ring-[#0072CE]/40';
     const itemChoices = ix ? ix.itemList.filter(function (it) { return it.craa5_active !== false && it.craa5_itemnumber; }).map(function (it) { return { key: String(it.craa5_itemnumber), label: cntName(it, null, it.craa5_itemnumber) + ' (' + impClean(it.craa5_itemnumber) + ')' }; })
@@ -7856,6 +8186,12 @@ function CountTab(props) {
         for (let i = 0; i < all.length; i++) { if (all[i].getAttribute('data-cnt-q') === id && all[i + 1]) { all[i + 1].focus(); return; } }
     };
     const nSaved = L && cntIsDay(day) ? L.lines.filter(function (l) { return (l.saved[day] || []).length > 0; }).length : 0;
+    // lines with an expected count; whether the count table can keep it
+    const exOk = exAll ? Object.keys(exAll.byLine).filter(function (k) { return exAll.byLine[k].ok; }).length : 0;
+    const exNoCol = !!(T && T.count && T.count.cols && !T.count.cols.craa5_expected);
+    // the first read of the log is on its way: the lines that will get an Expected cell hold its place, so nothing moves when it lands
+    const xwait = !!(exAll && exAll.note && exAll.note.code === 'reading');
+    const xcol = exOk > 0 || xwait;
     const lastText = function (l) {
         if (!l.last) return 'not counted yet';
         const sv = cntIsDay(day) ? (l.saved[day] || []) : [];
@@ -7873,7 +8209,7 @@ function CountTab(props) {
                 <div className="px-5 py-4">
                     <p className="text-sm text-slate-700">Every stock row in walk order, with an empty box. Type what you find (0 when there is none); a line left blank is not counted and its stock stays as it is. Count every place of an item on the same date: the Ordering tab adds them up. Save writes the counts and sets stock on hand to them.</p>
                     <div className="mt-3 flex flex-wrap items-end gap-2">
-                        <label className="text-xs font-bold text-slate-600">Count date<input type="date" data-cnt-day value={day} max={ordIsoDay(today)} onChange={function (e) { setDay(e.target.value); setDayPicked(true); setMsg(''); }} className={field + ' block mt-1'} /></label>
+                        <label className="text-xs font-bold text-slate-600">Count date<input type="date" data-cnt-day value={day} max={ordIsoDay(today)} onChange={function (e) { const out = cntMatchedIds(typed); setDay(e.target.value); setDayPicked(true); setTyped(cntDropMatches); setMsg(''); setOutNote(cntOutText('date', out)); }} className={field + ' block mt-1'} /></label>
                         <label className="text-xs font-bold text-slate-600">Counted by<input type="text" data-cnt-by value={by} maxLength={100} onChange={function (e) { setBy(e.target.value); }} className={field + ' block mt-1 w-48'} /></label>
                         <div className="ml-auto flex flex-wrap gap-2">
                             <button type="button" data-cnt-print-btn onClick={printSheet} disabled={!L || !nLines} className={btnWhite + (!L || !nLines ? ' opacity-50 cursor-not-allowed' : '')}><PrintIcon className="w-4 h-4" />Print blank sheet</button>
@@ -7881,6 +8217,7 @@ function CountTab(props) {
                             <button type="button" data-cnt-refresh onClick={function () { if (!loading && !busy) load(); }} aria-disabled={loading || busy} className={btnWhite + (loading || busy ? ' opacity-50 cursor-not-allowed' : '')}><RefreshIcon className="w-4 h-4" />Refresh</button>
                         </div>
                     </div>
+                    {outNote && <p role="status" className="mt-3 rounded-lg border border-[#B3D4F2] bg-[#E6F1FB] px-3 py-2 text-sm text-[#00468B]" data-cnt-out-note>{outNote}</p>}
                     {printNote && <p className="mt-2 text-xs text-slate-600" data-cnt-print-note>{printNote}</p>}
                     {readProblem && <p role="alert" className="mt-3 flex items-start gap-2 rounded-lg border border-[#FFB81C] bg-[#FFF6E0] px-3 py-2 text-sm text-[#7A4B00]"><WarnIcon className="w-4 h-4 mt-0.5 flex-shrink-0" />{readProblem}</p>}
                     {kept && <div className="mt-3 rounded-lg border border-[#B3D4F2] bg-[#E6F1FB] px-3 py-2 text-sm text-[#00468B]" data-cnt-kept>
@@ -7890,7 +8227,7 @@ function CountTab(props) {
                     </div>}
                     {dateAsk && <div className="mt-3 rounded-lg border border-[#FFB81C] bg-[#FFF6E0] px-3 py-2 text-sm text-[#7A4B00]" data-cnt-date-ask>
                         {'The count date is ' + cntDayText(day) + ', not this Sunday (' + cntDayText(thisSun) + '). Which date are these counts for?'}
-                        <span className="ml-2 inline-flex flex-wrap gap-3"><button type="button" data-cnt-use-sunday onClick={function () { setDay(thisSun); setDayPicked(true); setMsg(''); }} className="underline font-bold">Use this Sunday</button>
+                        <span className="ml-2 inline-flex flex-wrap gap-3"><button type="button" data-cnt-use-sunday onClick={function () { const out = cntMatchedIds(typed); setDay(thisSun); setDayPicked(true); setTyped(cntDropMatches); setMsg(''); setOutNote(cntOutText('date', out)); }} className="underline font-bold">Use this Sunday</button>
                             <button type="button" data-cnt-keep-day onClick={function () { setDayPicked(true); }} className="underline font-bold">{'Keep ' + cntDayText(day)}</button></span>
                     </div>}
                     {orphans.length > 0 && <div className="mt-3 rounded-lg border border-[#FFB81C] bg-[#FFF6E0] px-3 py-2 text-sm text-[#7A4B00]" data-cnt-orphans>
@@ -7904,6 +8241,15 @@ function CountTab(props) {
                         {L.left.noItem > 0 && <li>{L.left.noItem + ' stock row' + (L.left.noItem === 1 ? ' has' : 's have') + ' no item number, so ' + (L.left.noItem === 1 ? 'it is' : 'they are') + ' not on the list. Fix ' + (L.left.noItem === 1 ? 'it' : 'them') + ' in the Chemical inventory table in Power Apps.'}</li>}
                         {countOnlyLocs.map(function (loc) { return <li key={loc}>{'Counted before at ' + loc + ' but with no stock row there, so not on the list: ' + L.countOnly[loc].join(', ') + '. Add them with Add an item to count them here.'}</li>; })}
                     </ul>}
+                    {exAll && (exAll.note || exOk > 0 || exAll.noconv.length > 0 || exAll.nolog.length > 0) && <div className="mt-3 space-y-2" data-cnt-exp-notes>
+                        {exAll.note && <p role="status" className={exAll.note.code === 'reading' || exAll.note.code === 'first' ? 'text-xs text-slate-600' : 'flex items-start gap-2 rounded-lg border border-[#FFB81C] bg-[#FFF6E0] px-3 py-2 text-sm text-[#7A4B00]'} data-cnt-exp-note={exAll.note.code}>
+                            {exAll.note.code !== 'reading' && exAll.note.code !== 'first' && <WarnIcon className="w-4 h-4 mt-0.5 flex-shrink-0" />}{exAll.note.text}</p>}
+                        {exOk > 0 && <p className="text-xs text-slate-600" data-cnt-exp-help>Expected is the last count, plus deliveries since, minus what the chemical log says was used (it needs Organization-level Read on the chemical log). Tap Matches only if the shelf agrees, or type what you find.</p>}
+                        {exAll.noconv.length > 0 && <p className="text-xs text-slate-600" data-cnt-exp-noconv>{cntExNoconv(exAll.noconv)}</p>}
+                        {exAll.nolog.length > 0 && <p className="text-xs text-slate-600" data-cnt-exp-nolog>{cntExNolog(exAll.nolog)}</p>}
+                        {exOk > 0 && exNoCol && <p className="text-xs text-slate-600" data-cnt-exp-nocol>Expected is not saved with the count: the Chemical count table has no Expected column (not made yet, see the Dataverse monitor).</p>}
+                        {exOk > 0 && (rs.state === 'absent' || rs.state === 'failed') && <p className="text-xs text-slate-600" data-cnt-why-none>{rs.state === 'absent' ? 'Reasons cannot be saved yet: the Chemical count table has no Variance reason column (not made yet, see the Dataverse monitor).' : 'Reasons cannot be saved: the reason choices could not be read. Press Refresh to read them again.'}</p>}
+                    </div>}
                 </div>
             </div>
             {L && L.groups.map(function (g) {
@@ -7918,23 +8264,48 @@ function CountTab(props) {
                             {shown.map(function (l, i) {
                                 const t = typed[l.id] || {}, prob = plan ? plan.problems[l.id] : '', note = plan ? plan.notes[l.id] || plan.warns[l.id] || '' : '', warn = !!(plan && !plan.notes[l.id] && plan.warns[l.id]);
                                 const pid = 'cnt-p-' + L.lines.indexOf(l);
+                                // the expected count of this line, and whether the typed count is far from it
+                                const xr = exAll ? exAll.byLine[l.id] : null, np = cntParse(t.q), walking = !!(wl && l.row);
+                                const gap = !walking && xr && xr.ok && np.n !== undefined ? cntGap(xr.shown, np.n) : null, gid = 'cnt-g-' + L.lines.indexOf(l);
+                                const xs = xr ? cntExShort(xr) : '';
+                                const xcell = !walking && !!(xr && xr.ok), xwaiting = !walking && xwait && !!(xr && !xr.ok && xr.why === 'log'), matchOff = !canMatch(l);
                                 return (
                                     <li key={l.id} className="px-5 py-2 flex flex-wrap items-center gap-x-3 gap-y-1" data-cnt-line={l.id}>
-                                        <div className="flex-1 min-w-[150px] sm:max-w-md">
+                                        <div className="flex-1 min-w-[130px] sm:max-w-md">
                                             <div className="text-sm font-bold text-slate-900">{l.name}{l.isNew && <span className="ml-2 rounded bg-[#FFF6E0] px-1.5 py-0.5 text-xs font-bold text-[#7A4B00]">new</span>}</div>
-                                            <div className="text-xs text-slate-600">{'Item ' + l.itemNo + ', min ' + ordQty(l.min) + ', ' + lastText(l)}</div>
+                                            <div className="text-xs text-slate-600">{'Item ' + l.itemNo + ', min ' + ordQty(l.min) + ', ' + lastText(l) + (xs ? ', ' + xs : '')}</div>
                                         </div>
                                         {wl && l.row ? <div className="flex gap-1">
                                             <button type="button" data-cnt-up={l.id} onClick={function () { move(g.loc, l.id, -1); }} disabled={wl.indexOf(l.id) === 0} aria-label={'Move ' + l.name + ' up'} className={btnWhite + ' px-3' + (wl.indexOf(l.id) === 0 ? ' opacity-40' : '')}><UpIcon className="w-4 h-4" /></button>
                                             <button type="button" data-cnt-down={l.id} onClick={function () { move(g.loc, l.id, 1); }} disabled={wl.indexOf(l.id) === wl.length - 1} aria-label={'Move ' + l.name + ' down'} className={btnWhite + ' px-3' + (wl.indexOf(l.id) === wl.length - 1 ? ' opacity-40' : '')}><DownIcon className="w-4 h-4" /></button>
-                                        </div> : <div className="flex flex-wrap items-center gap-2">
-                                            <input type="text" inputMode="decimal" autoComplete="off" data-cnt-q={l.id} value={t.q || ''} readOnly={busy} onChange={function (e) { setLine(l, { q: e.target.value }); }} onKeyDown={function (e) { focusNext(e, l.id); }}
-                                                aria-label={'Count of ' + l.name + ' at ' + (l.loc || 'no location')} aria-invalid={prob ? 'true' : 'false'} aria-describedby={prob || note ? pid : undefined} placeholder="count"
+                                        </div> : <div className="contents sm:flex sm:flex-wrap sm:items-center sm:gap-2">
+                                            {xcell && <div className={CNT_XCELL + ' flex flex-wrap items-center gap-x-3'} data-cnt-expcell={l.id}>
+                                                <span className="text-xs text-slate-600">Expected <b className="text-sm text-slate-900" data-cnt-expected={l.id}>{ordQty(xr.shown)}</b></span>
+                                                <button type="button" data-cnt-matches={l.id} onClick={function () { matches(l, xr); }} aria-disabled={matchOff} aria-label={'Matches: count ' + l.name + ' as ' + ordQty(xr.shown)} className={btnWhite + ' !px-3' + (matchOff ? ' opacity-50 cursor-not-allowed' : '')}>Matches</button>
+                                                <button type="button" data-cnt-how={l.id} aria-expanded={howOpen[l.id] ? 'true' : 'false'} onClick={function () { setHowOpen(function (p) { const n = Object.assign({}, p); n[l.id] = !p[l.id]; return n; }); }} aria-label={'How the expected count of ' + l.name + ' was worked out'} className="min-h-[44px] px-3 text-xs font-bold underline text-[#00468B]">How</button>
+                                            </div>}
+                                            {xwaiting && <div aria-hidden="true" className={'min-h-[44px] ' + CNT_XCELL} data-cnt-expwait={l.id}></div>}
+                                            {!xcell && !xwaiting && xcol && <span aria-hidden="true" className="hidden sm:block sm:w-[272px]" data-cnt-expgap={l.id}></span>}
+                                            <input type="text" inputMode="decimal" autoComplete="off" data-cnt-q={l.id} value={t.q || ''} readOnly={busy} onChange={function (e) { setLine(l, { q: e.target.value, m: false, why: '' }); }} onKeyDown={function (e) { focusNext(e, l.id); }}
+                                                aria-label={'Count of ' + l.name + ' at ' + (l.loc || 'no location')} aria-invalid={prob ? 'true' : 'false'} aria-describedby={[prob || note ? pid : '', gap && gap.big ? gid : ''].filter(Boolean).join(' ') || undefined} placeholder="count"
                                                 className={field + ' w-24 text-right' + (prob ? ' border-[#E4002B] ring-1 ring-[#E4002B]' : '')} />
                                             {l.reagent && <label className="text-xs font-bold text-slate-600 flex items-center gap-1">Expiry<input type="date" data-cnt-exp={l.id} value={t.exp || ''} readOnly={busy} onChange={function (e) { setLine(l, { exp: e.target.value }); }} aria-label={'Expiry date of ' + l.name} className={field + ' w-40'} /></label>}
                                             {l.isNew && <button type="button" data-cnt-remove={l.id} onClick={function () { removeAdd(l); }} className={btnWhite + ' px-3'}>Remove</button>}
                                         </div>}
-                                        {(prob || note) && <p id={pid} className={'w-full text-xs ' + (prob ? 'text-[#B0001F] font-bold' : warn ? 'text-[#7A4B00] font-bold' : 'text-slate-600')} data-cnt-problem={prob ? l.id : undefined} data-cnt-warn={!prob && warn ? l.id : undefined}>{prob || note}</p>}
+                                        {(prob || note) && <p id={pid} className={'w-full order-6 sm:order-none text-xs ' + (prob ? 'text-[#B0001F] font-bold' : warn ? 'text-[#7A4B00] font-bold' : 'text-slate-600')} data-cnt-problem={prob ? l.id : undefined} data-cnt-warn={!prob && warn ? l.id : undefined}>{prob || note}</p>}
+                                        {!walking && xr && xr.ok && howOpen[l.id] && <p className="w-full order-5 sm:order-none text-xs text-slate-600" data-cnt-how-text={l.id}>{cntExHow(xr)}</p>}
+                                        {!walking && xr && !xr.ok && xr.why === 'neg' && <p className="w-full order-6 sm:order-none text-xs font-bold text-[#7A4B00]" data-cnt-neg={l.id}>{cntExNeg(xr)}</p>}
+                                        {gap && gap.big && <div id={gid} className="w-full order-6 sm:order-none rounded-lg border border-[#FFB81C] bg-[#FFF6E0] px-3 py-2 text-sm text-[#7A4B00]" data-cnt-gap={l.id}>
+                                            <span className="font-bold" data-cnt-gap-text={l.id}>{'Expected is ' + ordQty(xr.shown) + ' and you counted ' + ordQty(np.n) + '. That is ' + ordQty(Math.abs(gap.diff)) + (gap.diff < 0 ? ' less' : ' more') + ' than expected.'}</span>
+                                            {rs.state === 'ok' && <span className="ml-2 inline-flex flex-wrap items-center gap-2" role="group" aria-label={'Reason for the difference in ' + l.name}>
+                                                <span>Reason (optional):</span>
+                                                {rs.list.map(function (o) {
+                                                    const on = impNorm(t.why) === impNorm(o[0]);
+                                                    return <button key={String(o[1])} type="button" data-cnt-why={l.id} data-cnt-why-opt={o[0]} aria-pressed={on ? 'true' : 'false'} onClick={function () { pickWhy(l, o[0]); }}
+                                                        className={'min-h-[44px] rounded-lg border px-3 text-sm font-bold ' + (on ? 'border-[#00468B] bg-[#00468B] text-white' : 'border-slate-300 bg-white text-slate-800') + (busy ? ' opacity-50 cursor-not-allowed' : '')}>{o[0]}</button>;
+                                                })}
+                                            </span>}
+                                        </div>}
                                     </li>
                                 );
                             })}
@@ -7967,6 +8338,9 @@ function CountTab(props) {
             {L && <div className="mt-4 rounded-xl border border-slate-200 bg-white shadow-sm px-5 py-4" data-cnt-save-panel>
                 <p className="text-sm text-slate-700" data-cnt-summary>{nSaved + ' of ' + nLines + ' line' + (nLines === 1 ? ' has' : 's have') + ' a count saved for ' + cntDayText(day) + '; ' + nTyped + ' typed.' + (plan && !plan.dayProblem && nTyped ? ' Save writes ' + [plan.newCounts ? plan.newCounts + ' new count' + (plan.newCounts === 1 ? '' : 's') : '', plan.updCounts ? plan.updCounts + ' changed count' + (plan.updCounts === 1 ? '' : 's') : '', plan.stockN ? 'stock on hand on ' + plan.stockN + ' row' + (plan.stockN === 1 ? '' : 's') + (plan.newStock ? ' (' + plan.newStock + ' new)' : '') : ''].filter(Boolean).join(', ') + (plan.writes.length ? '.' : 'nothing: every count typed is already saved as it is.') : '')}</p>
                 {plan && plan.stockLeft.length > 0 && <p className="mt-2 text-sm text-slate-600" data-cnt-stockleft>{'Stock on hand stays as it is for ' + plan.stockLeft.join(', ') + ': ' + (plan.stockLeft.length === 1 ? 'it has' : 'they have') + ' a later count. The count itself is saved for history.'}</p>}
+                {plan && plan.gapN > 0 && !walk && <p className="mt-2 text-sm text-[#7A4B00]" data-cnt-gap-sum>{cntGapSum(plan.gapN, plan.reasonN, rs.state === 'ok')}</p>}
+                {plan && !logFresh && exOk > 0 && plan.filled > 0 && <p className="mt-2 text-sm text-slate-600" data-cnt-stale>The chemical log is being read again, so a count saved right now is saved without its expected count or a reason.</p>}
+                {plan && plan.matchN >= CNT_MATCH_MIN && plan.matchN >= CNT_MATCH_PCT * plan.filled && <p className="mt-2 text-sm text-[#7A4B00]" data-cnt-matches-sum>{plan.matchN + ' of ' + plan.filled + ' counts were set with Matches. Look at the shelf for any you did not check.'}</p>}
                 {plan && plan.recvSame.length > 0 && <p className="mt-2 text-sm text-[#7A4B00]" data-cnt-recvsame>{'Received on the count date itself: ' + plan.recvSame.join(', ') + '. The count is taken to include ' + (plan.recvSame.length === 1 ? 'it' : 'them') + '. If ' + (plan.recvSame.length === 1 ? 'it' : 'they') + ' came after you counted, add ' + (plan.recvSame.length === 1 ? 'it' : 'them') + ' to the count.'}</p>}
                 {plan && plan.partial.length > 0 && <div className="mt-2 rounded-lg border border-[#FFB81C] bg-[#FFF6E0] px-3 py-2 text-sm text-[#7A4B00]" data-cnt-partial>
                     <p>{'Counted at one place but not at another for this date: ' + L.lines.filter(function (l) { return plan.partial.indexOf(l.id) > -1; }).map(function (l) { return l.name + ' at ' + (l.loc || 'no location'); }).join(', ') + '. The Ordering tab adds every place\'s count for a day, so until those places are counted for ' + cntDayText(day) + ' it reads them as used up and suggests ordering more.'}</p>
