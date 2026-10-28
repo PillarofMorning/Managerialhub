@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.69, 2026-10-23. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.70, 2026-10-28. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -300,9 +300,11 @@ Stored as lower-case English codes. Shown with the label in the language chosen.
 ## 9. Language, words and manuals
 
 - **One switch for all apps:** browser key `hub_lang` (`en` or `es`), read with `hubGetLang()`. On first use it picks up the old per-app keys. Every app header has the same EN / ES toggle.
+- **Default when nothing is stored:** `hubGetLang()` gives `en`. Shift Start opens in Spanish (its crews are Spanish-first) until Gerald picks one hub-wide default (asked in the [Shift Start plan](https://claude.ai/artifact/Jhkn56ae7hGpswftadKpdm), 2026-10-28). Once someone uses the toggle, `hub_lang` wins in every app.
 - **es-MX.** Every visible word goes through the app's translate function, keyed by the English text, as in PBED's `pbT`. Each app's build check fails when a string has no Spanish.
 - **ASCII only:** Spanish is written with % codes (`%a` = á, `%n` = ñ, `%?` = ¿; full list in `hub-shared.js`) and decoded at run time.
 - **Shared words:** the `HUB_ES` list in `hub-shared.js`. Status words, clean kinds, attendance, roles, load states and core nouns. An app may add words but never gives a shared word another Spanish, and never reuses a shared English key with a different meaning (for example "Late" is attendance only; a late piece is "Overdue"). An app whose own list uses a shared key differently renames its key. Examples: Done = Terminado, Started = En proceso, Overdue = Atrasado, Late (attendance) = Retardo, Area = Área, Line = Línea, Crew = Cuadrilla, Team = Grupo (not "Equipo", which is Equipment), Swab = Hisopo, EOW = Fin de semana, Room = Cuarto, Training = Capacitación. **Mexican plant Spanish (es-MX), usted form:** computadora, celular, tomar, presionar / dar clic, llenar, tarima, retardo; never vosotros forms, ordenador, móvil for a phone (the adjective is fine: Promedio móvil, Zona 4 / Móvil), coger, pulsar or rellenar (Gerald, 2026-10-23: some text read as Spain Spanish). **Gerald: please have a Spanish-speaking lead check these words once (Q6).**
+- **Assignment words (1.0.70, from Shift Start v0.0019; not in `HUB_ES` yet, they join it at the next HUB SHARED version).** Shift Start and Ganttly put these exact words in their own lists: Set / pinned = Fijado, Auto = Auto, Split evenly = Repartir parejo, Not assigned = Sin asignar, Shift Handoff = Entregar turno, Callout = Aviso, Easy Room Completion = Terminar cuartos rápido (`r%apido`), HC = Pers (short for Personal, the Spanish for Headcount).
 - **Manuals:** every screen has a `?` button that opens a one-page picture guide in the current language. It can be printed for training. At most 7 short steps, one action each ("Tap the piece. Check your name. Tap Done."), a screenshot per step, and the same layout in every app. Each app keeps its guide text in its own word list, so the Spanish check covers it.
 
 ---
@@ -324,7 +326,7 @@ Stored as lower-case English codes. Shown with the label in the language chosen.
 | primary dark (navy) | `#00468B` | `#B3D4F2` |
 | accent (CJ yellow) | `#FFB81C` | `#FFB81C` |
 
-- **Status colors** (the same in every app, `HUB_STATUS_COLORS`): done green `#059669`, started / in progress blue `#0072CE`, planned gray `#64748B`, at risk / skipped amber `#D97706`, **overdue red `#DC2626`**. Red is used only for overdue, a failed save and a positive swab. Brand red `#E4002B` is for the logo only.
+- **Status colors** (the same in every app, `HUB_STATUS_COLORS`): done green `#059669`, started / in progress blue `#0072CE`, planned gray `#64748B`, at risk / skipped amber `#D97706`, **overdue red `#DC2626`**. Red is used only for overdue, a failed save and a positive swab. A read error ("Could not load"), in admin consoles too, is amber `#D97706`. Brand red `#E4002B` is for the logo only.
 - **Clean kind colors on clocks and Gantts:** daily blue, midweek amber, EOW navy, allergen purple `#7C3AED`, changeover gray. Production runs are solid slate `#475569`.
 - Tap targets at least 44 px on phone screens. The same cards and chips in every app.
 
@@ -397,6 +399,7 @@ Each block is pasted unchanged into every app that uses it. Its owner changes it
 | MSS MANPOWER v1.1 | [mss-manpower.js](/mnt/project-files/mss-log-input/mss-manpower.js) (repo `ecosystem/mss-manpower.js`, PR #40) | Sanitation director thread (from 1.0.64) | Production Scheduler, Sanitation director (shift hours from Work Shifts). MSS Log Input no longer pastes it |
 | MSS LOG WRITE v1.4 | [mss-log-write.js](/mnt/project-files/mss-log-input/mss-log-write.js) | MSS log input thread | every MSS log writer: Ganttly, MSS Log Input, MSS Calendar (section 6.3) |
 | HUB SHARED v1.3 note | 1.2 kept the manifest build fields (`cols`, `label`, `new`, `owner`, `primary`); 1.3 adds `prompt`. Apps on 1.1 or 1.2 keep working; re-paste 1.3 at the next version. | | |
+| GUIDE PRINT v1.0 (offered) | `GUIDE_PRINT_CSS`, `guidePrintMount`, `guidePrintUnmount` in [hub - shift start v0.0019.txt](/mnt/project-files/shift-start/hub%20-%20shift%20start%20v0.0019.txt), test [s19.js](/mnt/project-files/shift-start/tools/fullapp-test/s19.js) | Shift Start thread | Shift Start. Prints the `?` picture guide (section 9), one sheet per page: a hidden print sheet is copied under `body` on beforeprint and removed on afterprint. Other apps take it when they build their printable guide; Shift Start cuts it into its own file at that point |
 | ASSIGN SPLIT v1.0 | [assign-split.js](/mnt/project-files/ganttly-overhaul/assign-split.js), tests [assign-split.test.js](/mnt/project-files/ganttly-overhaul/test/assign-split.test.js) | Ganttly thread | Ganttly v1.5, Shift Start v0.0012+ (the even split for `_g_ Assignment`; rules in [shared-assignment.md](/mnt/project-files/ganttly-overhaul/shared-assignment.md)) |
 
 
@@ -460,6 +463,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.70 (2026-10-28)** From Shift Start v0.0019 (PR #33, 765b82c): section 9 records the language default (`en`; Shift Start opens in Spanish until Gerald picks one) and eight assignment words for Shift Start and Ganttly; section 10: read errors are amber, never red; 12.2 lists GUIDE PRINT v1.0 (offered, owner Shift Start).
 - **1.0.69 (2026-10-23)** c-tables.json from the chemical thread: `primary.n` now equals `primaryName` (the real Dataverse names) for `craa5__c_chemical` (`craa5__c_chemical_name`), `craa5__c_cartline` (`craa5_cartlinename`) and `craa5__c_chemicalcount` (`craa5_chemicalname`). Found by the Dataverse monitor.
 - **1.0.68 (2026-10-23)** Shift Start v0.0018 (PR #33, 7de6a6e) finished 12.3 and rules 10/11 (no Table Setup, saves `manifest|shiftstart`, shows `DIRECTOR_HEADS` read only). contract.json `colTypes` for `craa5_shiftboard`, `craa5_shiftplan`, `craa5_shiftarchive`, `craa5_updatepreset` and `craa5_shiftlog` copied from its manifest (primary name columns untyped). Employees: Shift Start writes only `statecode` / `statuscode`. `_e_ Shift task` row: writer the Sanitation director, Shift Start a planned reader.
 - **1.0.67 (2026-10-23)** Ordering hub v0.11 (PR #30) finished 12.3: HUB SHARED v1.3, saves `manifest|chemicals`, no table building. contract.json now carries `colTypes`, `label`, `owner` "user" and `primary` for the 10 `_c_` tables the hub uses (from /mnt/project-files/chemical-ordering/contract/c-tables.json); checklist task, clerk checklist, chemical standard and sanitation budget have none yet (later phase). Week start (Sunday in the hub vs Monday here) stays open with Gerald.
