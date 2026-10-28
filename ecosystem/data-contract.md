@@ -1,6 +1,6 @@
 # Ecosystem data contract
 
-Version 1.0.70, 2026-10-28. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
+Version 1.0.71, 2026-10-28. Owner: the "Ecosystem data contract" thread. Every hub app builds against this file.
 
 Files that go with it (same folder):
 
@@ -325,6 +325,12 @@ Stored as lower-case English codes. Shown with the label in the language chosen.
 | primary (CJ blue) | `#0072CE` | `#4DA3E8` |
 | primary dark (navy) | `#00468B` | `#B3D4F2` |
 | accent (CJ yellow) | `#FFB81C` | `#FFB81C` |
+| inset (inputs, wells, table stripes) | `#F8FAFC` | `#1E2A42` |
+| raised (hover, selected row, chip fill) | `#F1F5F9` | `#2B3A57` |
+| strong border (inputs, dividers that must show) | `#CBD5E1` | `#3E4F6E` |
+
+- **Dark mode is these tokens only (1.0.71).** Tailwind slate darks (`#0F172A` page, `#1E293B` card) are retired: every app moves to the table above at its next version. Reference implementation: `PB_DARK_RULES` in [hub - pbed](https://github.com/PillarofMorning/Managerialhub/blob/claude/project-thread-1mshja/hub%20-%20pbed) (maps each Tailwind class to its dark value, including tinted status fills at 14-15% and light status text such as red `#F87171`). The three new rows join `HUB_COLORS` at the next HUB SHARED version (as `inset`, `raised`, `borderStrong`); until then apps type them in.
+- **Contrast check (1.0.71).** Text needs 4.5:1 against what it sits on; large text (24 px, or 19 px bold) and icons, chip borders and chart marks need 3:1. Check every theme with [contrast.js](/mnt/project-files/shift-start/tools/fullapp-test/contrast.js) (Shift Start's tool). Known pairs: text passes everywhere (8:1 or more). Muted text `#94A3B8` passes on background, card and inset, but fails on raised (4.4) and border gray (3.9), so muted text never sits on a raised or hover fill. `#7C8BA5` (dark slate-400) fails on card (3.7): placeholders and disabled text only. Light muted `#64748B` passes on card (4.8) but fails on background `#F1F5F9` (4.3): use text color there. Status colors used as **text** in light mode take the darker shade: amber `#B45309`, green `#047857`; the base amber `#D97706` and green `#059669` are for fills, bars and dots (3:1).
 
 - **Status colors** (the same in every app, `HUB_STATUS_COLORS`): done green `#059669`, started / in progress blue `#0072CE`, planned gray `#64748B`, at risk / skipped amber `#D97706`, **overdue red `#DC2626`**. Red is used only for overdue, a failed save and a positive swab. A read error ("Could not load"), in admin consoles too, is amber `#D97706`. Brand red `#E4002B` is for the logo only.
 - **Clean kind colors on clocks and Gantts:** daily blue, midweek amber, EOW navy, allergen purple `#7C3AED`, changeover gray. Production runs are solid slate `#475569`.
@@ -463,6 +469,7 @@ Rules for other threads' new tables: area = `craa5_area` (exact area name), equi
 
 ## 15. Change log
 
+- **1.0.71 (2026-10-28)** Section 10: one dark mode. Adds the inset / raised / strong border tokens (PBED's derived shades; Shift Start v0.0021 adopts them), retires Tailwind slate darks (MSS calendar, MSS log input, Ganttly, Production Scheduler and the Dataverse monitor move at their next version), and adds the 4.5:1 contrast check with known passing and failing pairs. Suggested by the Shift Start thread.
 - **1.0.70 (2026-10-28)** From Shift Start v0.0019 (PR #33, 765b82c): section 9 records the language default (`en`; Shift Start opens in Spanish until Gerald picks one) and eight assignment words for Shift Start and Ganttly; section 10: read errors are amber, never red; 12.2 lists GUIDE PRINT v1.0 (offered, owner Shift Start).
 - **1.0.69 (2026-10-23)** c-tables.json from the chemical thread: `primary.n` now equals `primaryName` (the real Dataverse names) for `craa5__c_chemical` (`craa5__c_chemical_name`), `craa5__c_cartline` (`craa5_cartlinename`) and `craa5__c_chemicalcount` (`craa5_chemicalname`). Found by the Dataverse monitor.
 - **1.0.68 (2026-10-23)** Shift Start v0.0018 (PR #33, 7de6a6e) finished 12.3 and rules 10/11 (no Table Setup, saves `manifest|shiftstart`, shows `DIRECTOR_HEADS` read only). contract.json `colTypes` for `craa5_shiftboard`, `craa5_shiftplan`, `craa5_shiftarchive`, `craa5_updatepreset` and `craa5_shiftlog` copied from its manifest (primary name columns untyped). Employees: Shift Start writes only `statecode` / `statuscode`. `_e_ Shift task` row: writer the Sanitation director, Shift Start a planned reader.
