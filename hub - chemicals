@@ -4,6 +4,16 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
  * ============================================================================
  * HUB - CHEMICALS: sanitation chemical and supply ordering (shown on screen as the Ordering hub)
  * ============================================================================
+ * Version 0.13: the end of Phase B. The expiry date a clerk types for a test reagent on the Count tab (or the Week sheets' Date
+ * column, imported) now feeds the Ordering tab's Alerts: a reagent that has expired, or expires within 30 days, is listed with the
+ * count the date came from, and the Count line shows the date on file (the Expiry box is now Earliest expiry; a date typed beside
+ * a count shows at once; no date is shown or alerted while the count table was only partly read, and no box is shown when the table
+ * has no Expiry date column). A day with no use logged at all, which hides the expected counts, can be ticked on the Count tab as
+ * a day no chemical was used (at most 2 days of a line, only the last day of its span at its end, only when some other day of it
+ * is written up and none of those days has a titration or another entry, so a log that is merely behind is not ticked away); a
+ * tick stays on this device, and a count that rests on one is shown but saved without its expected count. A count set with
+ * Matches is taken out of its box, and said at the line, when its expected count changes (never while a Save runs, and a take-out
+ * never moves the count date). Ticks follow the other tabs of this browser. Nothing new is needed in Dataverse.
  * Version 0.12: the expected count on the Count tab (Phase B of the plan). Beside each count box: what the shelf should hold on
  * the count date (the last count before it, plus deliveries since, minus what the chemical log says was used from the day of
  * that count through the day before this one, as counts are taken at the start of the day), a Matches button that types it into
@@ -923,7 +933,7 @@ function chPool(items, limit, fn) {
 // cannot disagree.
 // ============================================================================
 const CH_APP_ID = 'chemicals';
-const CH_APP_VERSION = '0.12';
+const CH_APP_VERSION = '0.13';
 // The tables this build uses: 'rw' read and written, 'r' read only. Tables the spec lists for later screens (the checklist,
 // the standards, the budget) stay out until a screen uses them, so the monitor never asks for what nothing here needs.
 const CH_USES = { craa5__c_distributor: 'rw', craa5__c_chemical: 'rw', craa5__c_chemicalinventory: 'rw', craa5__c_cart: 'rw', craa5__c_cartline: 'rw',
@@ -1063,6 +1073,8 @@ const ORD_CART_LIMIT = 25000;
 const ORD_PRICE_MARGIN = 0.05;
 const ORD_USE_WEEKS = 12;
 const ORD_QUOTE_WARN_DAYS = 30;
+// a test reagent whose date on file is this near (or past) is on the Alerts
+const ORD_EXPIRY_WARN_DAYS = 30;
 const ORD_STALE_DAYS = 14;
 const ORD_OPEN = ['Draft (not in SAP yet)', 'Submitted', 'Approved', 'Ordered', 'Partially received'];
 const ORD_NEXT = { 'Draft (not in SAP yet)': 'Submitted', 'Submitted': 'Approved', 'Approved': 'Ordered' };
@@ -1396,9 +1408,34 @@ function ordLoadAll(fetcher, base) {
 }
 
 // ---------------------------------------------------------------- the numbers (no React below this line until the UI)
+// The expiry date on file for one item at one place, from all of its count rows: the date typed at the latest count that has one,
+// counting only the counts after the last one that found the shelf empty (a bottle counted before that is gone). Rows of one day
+// are one count (their quantities add up). A quantity that is not a number (nothing typed, text) is unknown: it adds nothing and
+// never finds the shelf empty. A date beside a count of 0 or with no quantity is not a bottle on the shelf, so it is not on file.
+// When that day has several dates the earliest wins. A later count with no date does not take it off (the same bottle is
+// assumed). Returns { exp, day } (days as YYYY-MM-DD) or null when no date is on file.
+function cntExpiry(rows) {
+    const byDay = {};
+    (rows || []).forEach(function (r) {
+        const dd = r ? ordDate(r.craa5_countdate) : null;
+        if (!dd) return;
+        const day = ordIsoDay(dd), q = r.craa5_quantity;
+        const known = typeof q === 'number' ? isFinite(q) : (typeof q === 'string' && q.replace(/\s+/g, '') !== '' && isFinite(Number(q)));
+        const x = byDay[day] || (byDay[day] = { known: false, qty: 0, exps: [] });
+        if (!known) return;
+        x.known = true; x.qty += Number(q);
+        const e = Number(q) > 0 ? ordDate(r.craa5_expirydate) : null;
+        if (e) x.exps.push(ordIsoDay(e));
+    });
+    const days = Object.keys(byDay).sort();
+    let zero = '', at = '';
+    days.forEach(function (d) { if (byDay[d].known && byDay[d].qty <= 0) zero = d; });
+    days.forEach(function (d) { if (d > zero && byDay[d].exps.length) at = d; });
+    return at ? { exp: byDay[at].exps.slice().sort()[0], day: at } : null;
+}
 function ordIndex(d, today) {
     const T = d.tables;
-    const ix = { items: {}, itemList: [], vendors: {}, stock: {}, carts: {}, cartList: [], linesByCart: {}, requests: [], open: {}, counts: {}, today: today };
+    const ix = { items: {}, itemList: [], vendors: {}, stock: {}, carts: {}, cartList: [], linesByCart: {}, requests: [], open: {}, counts: {}, expiry: {}, today: today };
     (T.dist.rows || []).forEach(function (r) { const k = ordKey(r.craa5_vendornumber); if (k) ix.vendors[k] = r; });
     (T.item.rows || []).forEach(function (r) { const k = ordKey(r.craa5_itemnumber); if (!k || ix.items[k]) return; ix.items[k] = r; ix.itemList.push(r); });
     ix.itemList.sort(function (a, b) { return (ordNum(a.craa5_sortorder) || 9999) - (ordNum(b.craa5_sortorder) || 9999) || String(a.craa5__c_chemicalname || '').localeCompare(String(b.craa5__c_chemicalname || '')); });
@@ -1429,21 +1466,47 @@ function ordIndex(d, today) {
         const day = ordIsoDay(dd);
         m[day] = (m[day] || 0) + ordNum(r.craa5_quantity);
     });
+    // the expiry date on file of each item: worked out per place, then the earliest place is the one to watch (a tie: the later
+    // count, then the place that sorts first). Only places where the item has a stock row now: the Count tab lists no other, so a
+    // date there could be neither shown nor cleared.
+    // A date worked out from part of the counts could be an old one, so while the Chemical count table was only partly read (more
+    // rows than the page reads, or an error) no date is on file and ix.expiryUnread says why ('capped' or 'error', '' when read in full).
+    ix.expiryUnread = T.count.capped ? 'capped' : T.count.error ? 'error' : '';
+    const places = {}, shelf = {};
+    Object.keys(ix.stock).forEach(function (k) { shelf[k] = {}; ix.stock[k].rows.forEach(function (r) { shelf[k][ordKey(r.craa5_location)] = true; }); });
+    (ix.expiryUnread ? [] : (T.count.rows || [])).forEach(function (r) {
+        const k = ordKey(r.craa5_itemnumber), pk = ordKey(r.craa5_location);
+        if (!k || !shelf[k] || !shelf[k][pk]) return;
+        const p = places[k] || (places[k] = {});
+        (p[pk] || (p[pk] = { loc: impClean(r.craa5_location), rows: [] })).rows.push(r);
+    });
+    Object.keys(places).forEach(function (k) {
+        let best = null;
+        Object.keys(places[k]).sort().forEach(function (pk) {
+            const e = cntExpiry(places[k][pk].rows);
+            if (e && (!best || e.exp < best.exp || (e.exp === best.exp && e.day > best.day))) best = { exp: e.exp, day: e.day, loc: places[k][pk].loc };
+        });
+        if (best) ix.expiry[k] = best;
+    });
     return ix;
 }
 function ordLead(ix, vendorNo) { const v = ix.vendors[ordKey(vendorNo)]; const n = v ? ordNum(v.craa5_leadtimedays) : 0; return n > 0 ? n : ORD_LEAD_DAYS; }
 function ordLimit(ix, vendorNo) { const v = ix.vendors[ordKey(vendorNo)]; const n = v ? ordNum(v.craa5_cartlimit) : 0; return n > 0 ? n : ORD_CART_LIMIT; }
-// When received goods arrived: the line's received date, else the cart's, else the cart's submitted date plus the lead time.
-function ordArrivals(ix) {
+// When received goods arrived: the line's received date, else the cart's, else the cart's submitted date plus the lead time
+// (with real set, only a date that is really on a row: no guess from the lead time, and the cart's date only for a cart none of
+// whose lines has a received date of its own: Receive stamps the cart with the latest receipt, which says nothing about a line
+// closed as received).
+function ordArrivals(ix, real) {
     const out = {};
     ix.cartList.forEach(function (c) {
         const lines = ix.linesByCart[ordKey(c.craa5__c_cartname)] || [];
         const sub = ordDate(c.craa5_submittedon) || ordDate(c.craa5_draftedon);
+        const own = !!real && lines.some(function (m) { return !!ordDate(m.craa5_receivedon); });
         lines.forEach(function (l) {
             const q = ordNum(l.craa5_quantityreceived);
             if (q <= 0) return;
-            let when = ordDate(l.craa5_receivedon) || ordDate(c.craa5_receivedon);
-            if (!when && sub) when = new Date(sub.getFullYear(), sub.getMonth(), sub.getDate() + ordLead(ix, c.craa5_vendornumber), sub.getHours(), sub.getMinutes(), sub.getSeconds());
+            let when = ordDate(l.craa5_receivedon) || (own ? null : ordDate(c.craa5_receivedon));
+            if (!when && sub && !real) when = new Date(sub.getFullYear(), sub.getMonth(), sub.getDate() + ordLead(ix, c.craa5_vendornumber), sub.getHours(), sub.getMinutes(), sub.getSeconds());
             if (!when) return;
             const k = ordKey(l.craa5_itemnumber);
             (out[k] || (out[k] = [])).push({ when: when, qty: q });
@@ -1571,6 +1634,33 @@ function ordAlerts(ix) {
     const out = [];
     const today = ix.today;
     const stocked = function (k) { return !!ix.stock[k]; };
+    // Items whose date on file (the latest count that carries one, see cntExpiry) has passed or is near come first within their level:
+    // the expired ones with the most recent first (an old date is the likeliest to be stale), then the soonest to expire. A delivery
+    // received after the count the date was typed at may be a bottle with another date: said, so it is counted with its date.
+    const arr = ordArrivals(ix, true), exp = ix.expiry || {}, due = [];
+    ix.itemList.forEach(function (it) {
+        if (it.craa5_active === false) return;
+        const k = ordKey(it.craa5_itemnumber), e = exp[k];
+        if (!e) return;
+        const x = ordDate(e.exp), days = ordDaysBetween(today, x);
+        if (days > ORD_EXPIRY_WARN_DAYS) return;
+        const name = it.craa5_commonname || it.craa5__c_chemicalname || it.craa5_itemnumber;
+        const n = function (v) { return v + (v === 1 ? ' day' : ' days'); };
+        let later = null;
+        (arr[k] || []).forEach(function (a) { if (ordIsoDay(a.when) > e.day && (!later || a.when > later)) later = a.when; });
+        due.push({ exp: e.exp, name: String(name), red: days < 0, a: { kind: 'expiry', level: days < 0 ? 'red' : 'amber',
+            text: name + ': ' + (days < 0 ? 'expired ' + ordDay(x) + ' (' + n(-days) + ' ago)' : days === 0 ? 'expires today (' + ordDay(x) + ')' : 'expires ' + ordDay(x) + ' (in ' + n(days) + ')')
+                + '. The date was typed at the count of ' + ordDay(ordDate(e.day)) + (e.loc ? ' at ' + e.loc : '') + '.'
+                + (later ? ' A delivery was received on ' + ordDay(later) + ', after that count, so this may be a newer bottle. Type its date at the next count.' : '') } });
+    });
+    due.sort(function (a, b) {
+        if (a.red !== b.red) return a.red ? -1 : 1;
+        const c = a.exp < b.exp ? -1 : a.exp > b.exp ? 1 : 0;
+        return (a.red ? -c : c) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    });
+    due.forEach(function (s) { out.push(s.a); });
+    // dates worked out from part of the counts could be old ones: said once, so that "No alerts" is not read as "no reagent is near its date"
+    if (ix.expiryUnread) out.push({ kind: 'expiry-unread', level: 'blue', text: 'Expiry dates are not checked: ' + (ix.expiryUnread === 'capped' ? 'the Chemical count table has more than ' + chNumber(ORD_MAX_ROWS) + ' rows and the page reads at most that many, so a date on file could be an old one.' : 'the Chemical count table could not be read in full. Press Refresh to read it again.') });
     ix.itemList.forEach(function (it) {
         if (it.craa5_active === false) return;
         const k = ordKey(it.craa5_itemnumber), name = it.craa5_commonname || it.craa5__c_chemicalname || it.craa5_itemnumber;
@@ -2156,9 +2246,10 @@ function OrderingTab(props) {
             </div>}
             {ready && view === 'alerts' && <div className="mt-6 space-y-2">
                 <h2 className="text-sm font-black uppercase tracking-widest text-[#00468B]">Alerts</h2>
+                {alerts.some(function (a) { return a.kind === 'expiry'; }) && <p className="text-xs text-slate-600" data-ord-expiry-help>An expiry alert clears when a later count has a new date or a count of 0. An expired bottle still counts as on hand, so its date does not change what is suggested: look at Suggested carts, and add a request if you need more. If the item is no longer bought, set Active to No in Power Apps.</p>}
                 {alerts.map(function (a, i) {
                     const cls = a.level === 'red' ? 'border-[#E4002B]/40 bg-[#FDE8EC] text-[#B80022]' : a.level === 'blue' ? 'border-[#B3D4F2] bg-[#E6F1FB] text-[#00468B]' : 'border-[#FFB81C] bg-[#FFF6E0] text-[#7A4B00]';
-                    return <p key={i} className={'rounded-lg border px-3 py-2 text-sm ' + cls}>{a.text}</p>;
+                    return <p key={i} data-ord-alert={a.kind} data-ord-alert-level={a.level} className={'rounded-lg border px-3 py-2 text-sm ' + cls}>{a.text}</p>;
                 })}
                 {!alerts.length && <p className="text-sm text-slate-600">No alerts.</p>}
             </div>}
@@ -7355,7 +7446,7 @@ function cntDayText(s) { return cntIsDay(s) ? CNT_WD[ordDate(s).getDay()] + ' ' 
 // An added line whose item and place have a stock row now (saved since, here or on another device) is not listed again: it is
 // returned in merged, so the page can move its typed count to that row.
 function cntLines(d, ix, adds) {
-    const T = d.tables, byKey = {}, lines = [], seen = {}, expItem = {}, merged = [];
+    const T = d.tables, byKey = {}, lines = [], seen = {}, expItem = {}, merged = [], expRead = !T.count.capped && !T.count.error;
     const left = { inactive: [], noItem: 0 };
     (T.count.rows || []).forEach(function (r) {
         const dd = ordDate(r.craa5_countdate), k = ordKey(r.craa5_itemnumber);
@@ -7371,6 +7462,9 @@ function cntLines(d, ix, adds) {
         const ln = Object.assign({ pair: key, saved: saved, locValue: ordChoiceValue(ORD_T.count, 'craa5_location', o.loc), rank: cntLocRank(o.loc), twin: false,
             // an expiry box for test reagents, and for any item counted before with an expiry date (the Week sheets' Date column)
             reagent: !!(o.item && o.item.craa5_category === 'Test reagent') || !!expItem[o.key],
+            // the expiry date on file for this item at this place (null when none, undefined while the count table was only partly
+            // read): shown on the line, and on the Alerts when near
+            expiry: expRead ? cntExpiry(days.reduce(function (all, d) { return all.concat(saved[d]); }, [])) : undefined,
             last: lastDay ? { day: lastDay, qty: ordRound(saved[lastDay].reduce(function (t, r) { return t + ordNum(r.craa5_quantity); }, 0), 4), n: saved[lastDay].length } : null }, o);
         if (seen[key]) { seen[key].twin = true; ln.twin = true; } else seen[key] = ln;
         lines.push(ln);
@@ -7437,6 +7531,16 @@ const CNT_LOG_DAYS = 90;
 const CNT_OLD_DAYS = 45;
 // this many days with no use in the log hide the expected counts of the lines those days fall in
 const CNT_THIN_DAYS = 1;
+// A day ticked as "no chemical was used" counts as written up (use 0). A tick is offered, and counts, only for a line with at most
+// CNT_CLOSED_MAX days of its span without a use row (ticked ones too), some day of it written up, at most CNT_CLOSED_TAIL of
+// them at its very end and no row of another kind than a return on any of them: a closed day is followed by days that were logged,
+// a log that has not caught up is not, and a day with a titration or another entry was worked (it must be written up, not ticked).
+// Kept on this device.
+const CNT_CLOSED_MAX = 2;
+const CNT_CLOSED_TAIL = 1;
+// an expiry date typed more than this many years from the count date is taken for a typing slip (2062 for 2026)
+const CNT_EXPIRY_YEARS = 10;
+const CNT_CLOSED = 'hubChemicals.countClosed.1';
 // far from expected: at least one container and at least a fifth of the larger of the two numbers
 const CNT_GAP_MIN = 1;
 const CNT_GAP_PCT = 0.2;
@@ -7449,7 +7553,19 @@ const CNT_XCELL = 'order-5 basis-full sm:order-none sm:basis-auto sm:w-[272px]';
 const CNT_FIRST_TEXT = 'No expected counts yet: they are worked out from an earlier count, so they start with the next count after a first count is saved.';
 // the days shown beside a count date in a note: 10/20
 function cntShortDay(s) { const d = ordDate(s); return d ? (d.getMonth() + 1) + '/' + d.getDate() : String(s || ''); }
+// the same with the weekday, as a tick box names a day: Sat 10/24
+function cntDayShort(s) { return cntIsDay(s) ? CNT_WD[ordDate(s).getDay()] + ' ' + cntShortDay(s) : String(s || ''); }
+// 'a', 'a and b', 'a, b and c'
+function cntAnd(list) { return list.length > 1 ? list.slice(0, -1).join(', ') + ' and ' + list[list.length - 1] : list.length ? list[0] : ''; }
 function cntDayAdd(s, n) { return ordIsoDay(insAddDays(ordDate(s), n)); }
+// The date on file of a line, as its own line under the name says it: 'Expires 11/5/2026', 'Expires today', or 'Expired 10/21/2026'
+// once it has passed; soon when it is past or within ORD_EXPIRY_WARN_DAYS of todayIso (a day), past when it is before todayIso.
+// e: cntExpiry's result or null.
+function cntExpiryShort(e, todayIso) {
+    if (!e || !e.exp) return { text: '', soon: false, past: false };
+    const days = cntIsDay(todayIso) ? cntDaysBetween(todayIso, e.exp) : 1e9;
+    return { text: days < 0 ? 'Expired ' + ordDay(ordDate(e.exp)) : days === 0 ? 'Expires today' : 'Expires ' + ordDay(ordDate(e.exp)), soon: days <= ORD_EXPIRY_WARN_DAYS, past: days < 0 };
+}
 function cntDaysBetween(a, b) { return Math.round((ordDate(b).getTime() - ordDate(a).getTime()) / 86400000); }
 // Rounded to 2 places the way people do it by hand (halves go away from 0, and a sum like 1.995 stays 2), and never -0.
 function cntR2(x) { const r = Math.round(Math.abs(x) * 100 + 1e-9) / 100; return x < 0 && r > 0 ? -r : r; }
@@ -7481,7 +7597,7 @@ function cntExNote(state, err, thin) {
     }
     if (state === 'capped') return { code: 'capped', text: 'The chemical log has more rows than the page reads (' + chNumber(ORD_MAX_ROWS) + ' in the last ' + CNT_LOG_DAYS + ' days), so there are no expected counts.' };
     const days = thin.days.slice(0, 6).map(cntShortDay).join(', ') + (thin.days.length > 6 ? ', and ' + (thin.days.length - 6) + ' more' : '');
-    return { code: 'thin', text: 'Expected counts are hidden where the chemical log looks behind. It has no use logged on ' + thin.empty + ' of the last ' + thin.of + ' days (' + days + '). Log those days on the Log tab, then press Refresh. You can still count and save.' };
+    return { code: 'thin', text: 'Expected counts are hidden where the chemical log looks behind. It has no use logged on ' + thin.empty + ' of the last ' + thin.of + ' days (' + days + '). Add those days on the Import tab (the Log tab only logs today), then press Refresh. You can still count and save.' };
 }
 // The expected count of every line. lines: cntLines' lines; lineRows: the cart lines; log: { state ('reading', 'ok', 'missing',
 // 'failed' or 'capped'), rows (cuRows' rows), from (the first day read), err }; o: { day (the count date), today (a Date) }.
@@ -7490,10 +7606,16 @@ function cntExNote(state, err, thin) {
 // names of the chemicals with no container size), nolog (the names of the chemicals the log has no rows for) }. A result is
 // { ok: false, why } with why 'day', 'noitem', 'places', 'noconv' (chem), 'nocount' (later), 'badbase' (day), 'old' (days), 'log',
 // 'window', 'nolog' (chem), 'thin' (empty), 'badrows' (n), 'neg' (e, shown), or
-// { ok: true, e, shown, base, useFrom, useTo, recv: { qty, list: [{ day, qty, cart }] }, use, ret, unit, per }.
+// { ok: true, e, shown, base, useFrom, useTo, recv: { qty, list: [{ day, qty, cart }] }, use, ret, unit, per, closed (the ticked days it counts as 0 used) }.
+// o.closed: the days ticked as "no chemical was used"; the result's closed: { offer, used } lists the days a tick is offered for and the
+// ticked days that count (on every return).
 function cntExAll(lines, lineRows, log, o) {
     const day = o && o.day ? o.day : '', today = o && o.today ? ordIsoDay(o.today) : '';
-    const out = { byLine: {}, eligible: 0, note: null, thin: null, thinNow: false, noconv: [], nolog: [] };
+    const out = { byLine: {}, eligible: 0, note: null, thin: null, thinNow: false, noconv: [], nolog: [], closed: { offer: [], used: [] } };
+    // o.closed: days ticked as "no chemical was used": a day with no use written down that is ticked counts as written up (use 0)
+    // for a line that may pass such days (see CNT_CLOSED_MAX); closed.used / closed.offer: the days that count / that are offered
+    const shut = {}, offerSet = {}, usedSet = {};
+    (o && Array.isArray(o.closed) ? o.closed : []).forEach(function (d) { if (typeof d === 'string' && cntIsDay(d)) shut[d] = true; });
     const state = log && log.state ? log.state : 'reading';
     const dayOk = cntIsDay(day) && !(today && day > today);
     const per = {};
@@ -7529,10 +7651,13 @@ function cntExAll(lines, lineRows, log, o) {
         return out;
     }
     // the log by day and by item (a day is written up when a use row of any item has it), and the deliveries by item
-    const have = {}, used = {}, got = {};
+    const have = {}, seen = {}, used = {}, got = {};
     (log.rows || []).forEach(function (r) {
         if (!r.day) return;
         if (r.kind === 'use') have[ordIsoDay(r.day)] = true;
+        // a row of any kind but a return says someone worked that day (a titration, an entry of a type the hub does not know, a row
+        // with no type): such a day is not one to tick as a day when no chemical was used
+        if (r.kind !== 'return') seen[ordIsoDay(r.day)] = true;
         if (r.key && (r.kind === 'use' || r.kind === 'return')) (used[r.key] || (used[r.key] = [])).push(r);
     });
     (lineRows || []).forEach(function (x) {
@@ -7550,11 +7675,25 @@ function cntExAll(lines, lineRows, log, o) {
             return;
         }
         // the days of this line's span (the day of its last count through the day before the count date) with no use written down
-        const empty = [];
-        for (let d = x.base.day; d <= last; d = cntDayAdd(d, 1)) { if (!have[d]) empty.push(d); }
-        if (empty.length >= CNT_THIN_DAYS) { out.byLine[l.id] = { ok: false, why: 'thin', empty: empty.length }; thinLines.push({ x: x, empty: empty }); return; }
+        // (miss), and how many of them end the span (tail). Only a line with a few such days, some day of the span written up, no
+        // more than the last day missing and no row of another kind (seen) on those days can pass them as closed (ticked days count
+        // as written up, use 0): for any other line a tick is not offered and does not count, the log has to be written up.
+        const miss = [];
+        for (let d = x.base.day; d <= last; d = cntDayAdd(d, 1)) { if (!have[d]) miss.push(d); }
+        let tail = 0;
+        for (let i = miss.length - 1, d = last; i >= 0 && miss[i] === d; i--, d = cntDayAdd(d, -1)) tail++;
+        const tickable = cntDaysBetween(x.base.day, day) - miss.length >= 1 && miss.length <= CNT_CLOSED_MAX && tail <= CNT_CLOSED_TAIL && !miss.some(function (d) { return seen[d]; });
+        const closed = tickable ? miss.filter(function (d) { return shut[d]; }) : [];
+        const empty = tickable ? miss.filter(function (d) { return !shut[d]; }) : miss;
+        closed.forEach(function (d) { usedSet[d] = true; });
+        if (empty.length >= CNT_THIN_DAYS) {
+            if (tickable) empty.forEach(function (d) { offerSet[d] = true; });
+            out.byLine[l.id] = { ok: false, why: 'thin', empty: empty.length }; thinLines.push({ x: x, empty: empty }); return;
+        }
+        x.ticked = closed;
         ready.push(x);
     });
+    out.closed = { offer: Object.keys(offerSet).sort(), used: Object.keys(usedSet).sort() };
     if (thinLines.length) {
         let w = thinLines[0];
         thinLines.forEach(function (t) { if (t.empty.length > w.empty.length || (t.empty.length === w.empty.length && t.x.base.day < w.x.base.day)) w = t; });
@@ -7586,7 +7725,7 @@ function cntExAll(lines, lineRows, log, o) {
         if (shown < 0) { out.byLine[l.id] = { ok: false, why: 'neg', e: e, shown: shown }; return; }
         out.byLine[l.id] = { ok: true, e: e, shown: shown, base: { day: x.base.day, qty: x.base.qty, n: x.base.n }, useFrom: from, useTo: last,
             recv: { qty: recvQty, list: list.map(function (y) { return { day: y.day, qty: y.qty, cart: y.cart }; }) },
-            use: { qty: ordRound(U, 4), raw: ordRound(Ur, 4), rows: Un }, ret: { qty: ordRound(T, 4), raw: ordRound(Tr, 4), rows: Tn }, unit: x.unit, per: x.per };
+            use: { qty: ordRound(U, 4), raw: ordRound(Ur, 4), rows: Un }, ret: { qty: ordRound(T, 4), raw: ordRound(Tr, 4), rows: Tn }, unit: x.unit, per: x.per, closed: x.ticked || [] };
     });
     return out;
 }
@@ -7598,7 +7737,9 @@ function cntExHow(r) {
     r.recv.list.forEach(function (m) { t += ', plus ' + ordQty(m.qty) + ' received on ' + D(m.day) + (m.cart ? ' (' + m.cart + ')' : ''); });
     if (r.ret.qty > 0) t += ', plus ' + ordQty(r.ret.qty) + ' returned';
     if (r.use.qty > 0) t += ', minus ' + ordQty(r.use.qty) + ' used (' + ordQty(r.use.raw) + ' ' + r.unit + ' at ' + ordQty(r.per) + ' ' + r.unit + ' per container)';
-    return t + ' = ' + ordQty(r.shown) + '. Use is taken from ' + D(r.useFrom) + ' to ' + D(r.useTo) + '.';
+    t += ' = ' + ordQty(r.shown) + '. Use is taken from ' + D(r.useFrom) + ' to ' + D(r.useTo) + '.';
+    if (r.closed && r.closed.length) t += ' Ticked on this device as days with no chemicals used: ' + cntAnd(r.closed.map(D)) + '.';
+    return t;
 }
 // The note for the chemicals that have no container size, said once for the whole tab ('' when there are none).
 function cntExNoconv(names) {
@@ -7612,9 +7753,11 @@ function cntExNolog(names) {
     if (!n) return '';
     return n + (n === 1 ? ' chemical has' : ' chemicals have') + ' no jug, barrel or return entries in the chemical log in the last ' + CNT_LOG_DAYS + ' days, so ' + (n === 1 ? 'it has' : 'they have') + ' no expected count: ' + cntNamesText(names) + '. If ' + (n === 1 ? 'it is' : 'they are') + ' in use, the log may carry another item number for ' + (n === 1 ? 'it' : 'them') + ', or this role reads only its own log rows (Read must be at Organization level).';
 }
-// The ending of a line's sub-line when it has no expected count and the reason is worth saying ('' otherwise).
+// The ending of a line's sub-line: when it has no expected count and the reason is worth saying, or when its expected count counts
+// ticked days (it is shown, not saved with the count); '' otherwise.
 function cntExShort(r) {
-    if (!r || r.ok) return '';
+    if (!r) return '';
+    if (r.ok) return r.closed && r.closed.length ? 'expected assumes nothing was used on the ' + (r.closed.length === 1 ? 'ticked day' : r.closed.length + ' ticked days') : '';
     if (r.why === 'places') return 'no expected count, the item is on this list more than once';
     if (r.why === 'noconv' && r.chem === true) return 'no expected count, no container size in gallons or pounds';
     if (r.why === 'nolog' && r.chem === true) return 'no expected count, no jug, barrel or return entries in the chemical log';
@@ -7666,7 +7809,7 @@ function cntPlan(lines, ix, lineRows, typed, o) {
     lines.forEach(function (l) { if (l.row && l.order < CNT_LAST) maxOrder = Math.max(maxOrder, l.order); });
     let newN = 0;
     lines.forEach(function (l) {
-        const t = typed[l.id] || {}, p = cntParse(t.q), exp = String(t.exp || '').trim();
+        const t = typed[l.id] || {}, p = cntParse(t.q), exp = o.noExp ? '' : String(t.exp || '').trim();
         if (p.blank) {
             if (l.isNew) out.problems[l.id] = 'Type the count for this new line, or remove the line.';
             else if (exp) out.problems[l.id] = 'An expiry date with no count: type the count too, or clear the date.';
@@ -7690,6 +7833,7 @@ function cntPlan(lines, ix, lineRows, typed, o) {
         }
         let bad = p.bad || '';
         if (!bad && exp && !cntIsDay(exp)) bad = 'The expiry date "' + exp + '" is not a date.';
+        if (!bad && exp && cntIsDay(day) && Math.abs(Number(exp.slice(0, 4)) - Number(day.slice(0, 4))) > CNT_EXPIRY_YEARS) bad = 'The year of the expiry date ' + ordDay(ordDate(exp)) + ' looks wrong. Check the date on the bottle.';
         if (!bad && l.twin) bad = l.name + ' has two stock rows at ' + (l.loc || 'no location') + ', so the page cannot tell which one this count is for. Delete one of them in the Chemical inventory table in Power Apps, then press Refresh.';
         if (!bad && !l.item) bad = 'Item ' + l.itemNo + ' is not in Chemicals. Add it there first (paste the INDEX sheet on the Import tab), then press Refresh.';
         if (!bad && l.locValue === null) bad = l.loc ? 'Its location "' + l.loc + '" is not one of the hub\'s places (' + CH_OPT_LOCATION.map(function (x) { return x[0]; }).join(', ') + '). Fix the Location of this stock row in Power Apps.' : 'This stock row has no Location. Set it in Power Apps, then press Refresh.';
@@ -7802,6 +7946,34 @@ function cntReadDraft() {
         return o;
     } catch (e) { return null; }
 }
+// The days ticked as "no chemical was used", kept on this device: a sorted list of valid days, none after today and none more than
+// CNT_LOG_DAYS before it (the chemical log is read no further back); anything unreadable is no ticks. Never throws.
+function cntReadClosed(now) {
+    try {
+        const s = window.localStorage ? window.localStorage.getItem(CNT_CLOSED) : null, o = s ? JSON.parse(s) : null;
+        if (!(o && o.v === 1 && Array.isArray(o.days))) return [];
+        const today = ordIsoDay(insDay(now || new Date())), first = cntDayAdd(today, -CNT_LOG_DAYS), seen = {}, out = [];
+        o.days.forEach(function (d) { if (typeof d === 'string' && cntIsDay(d) && d <= today && d >= first && !seen[d]) { seen[d] = true; out.push(d); } });
+        return out.sort();
+    } catch (e) { return []; }
+}
+function cntWriteClosed(days) {
+    try {
+        if (!window.localStorage) return;
+        if (days && days.length) window.localStorage.setItem(CNT_CLOSED, JSON.stringify({ v: 1, days: days }));
+        else window.localStorage.removeItem(CNT_CLOSED);
+    } catch (e) { /* storage off: the ticks last while the page is open */ }
+}
+// The days ticked as closed that the counts set with Matches rest on: the closed days of the expected counts (byLine, from cntExAll)
+// of the lines whose typed count was set with Matches. Sorted, no duplicates.
+function cntShutMatched(lines, byLine, typed) {
+    const seen = {};
+    (lines || []).forEach(function (l) {
+        const t = typed ? typed[l.id] : null, r = byLine ? byLine[l.id] : null;
+        if (t && t.m === true && !cntParse(t.q).blank && r && r.ok) (r.closed || []).forEach(function (d) { seen[d] = true; });
+    });
+    return Object.keys(seen).sort();
+}
 // Counts set with Matches come from the expected count of their date and place: they are taken out of their boxes (with the mark and
 // any reason) when the count date changes (all of them) or when an item is added at another place (those of that item, which now has no
 // expected count). Counts typed by hand stay. Returns typed itself when none was taken out. only: the ids of the lines to take them from.
@@ -7819,10 +7991,42 @@ function cntDropMatches(typed, only) {
     });
     return n;
 }
-// What is said when counts set with Matches were taken out: list = one entry per count (the lines' names for 'places')
-function cntOutText(why, list) {
+// The expected counts that may be saved with a count: one that counts days ticked on this device is shown but not saved (a tick is
+// an assumption made on this device), so it is left out here. byLine: cntExAll's; returns a copy.
+function cntSavable(byLine) {
+    const n = {};
+    Object.keys(byLine || {}).forEach(function (k) { const r = byLine[k]; n[k] = r && r.ok && r.closed && r.closed.length ? { ok: false, why: 'closed' } : r; });
+    return n;
+}
+// A count set with Matches is a copy of the expected count it came from. The lines whose copy is not that expected count any more
+// (the tables or the log were read again): the line's expected count is another number, or it has none for a reason other than the
+// log (an unreadable or newly read log says nothing about the number). Counts typed by hand are not looked at, nor is a box that
+// holds no number. Returns the ids of the lines, in the order of lines.
+function cntStaleMatches(lines, byLine, typed) {
+    return (lines || []).filter(function (l) {
+        const t = typed ? typed[l.id] : null, r = byLine ? byLine[l.id] : null;
+        if (!(t && t.m === true) || !r) return false;
+        const p = cntParse(t.q);
+        if (p.n === undefined) return false;
+        return r.ok ? Math.abs(r.shown - p.n) >= 0.005 : r.why !== 'log';
+    }).map(function (l) { return l.id; });
+}
+// How many counts the note on show says were taken out because the expected count changed (0 for any other note, or for none)
+function cntOutShown(note) {
+    const m = /^(\d+) counts? set with Matches (?:was|were) taken out because the expected count changed\./.exec(String(note || ''));
+    return m ? Number(m[1]) : 0;
+}
+// What is said when counts set with Matches were taken out: list = one entry per count (the lines' names for 'places'). For 'changed',
+// extra = the counts the note on show already says (one Refresh takes numbers out in two reads, the log and then the tables, and the
+// note adds them up until it is cleared)
+function cntOutText(why, list, extra) {
     const n = list.length;
     if (!n) return '';
+    if (why === 'changed') {
+        const t = n + (typeof extra === 'number' && extra > 0 ? extra : 0);
+        return t + (t === 1 ? ' count set with Matches was' : ' counts set with Matches were') + ' taken out because the expected count changed. Tap Matches again, or type the count.';
+    }
+    if (why === 'closed') return n + (n === 1 ? ' count set with Matches was' : ' counts set with Matches were') + ' taken out. ' + extra + ' is no longer ticked, so ' + (n === 1 ? 'that line has' : 'those lines have') + ' no expected count.';
     if (why === 'places') return (n === 1 ? 'The count set with Matches for ' + list[0] + ' was' : 'The counts set with Matches for ' + list.join(', ') + ' were') + ' taken out: ' + (n === 1 ? 'the item is' : 'the items are') + ' now on the list at more than one place, so there is no expected count. Type the count at each place.';
     return n + (n === 1 ? ' count set with Matches was' : ' counts set with Matches were') + ' taken out because the count date changed. Tap Matches again for the new date.';
 }
@@ -7891,11 +8095,22 @@ function CountTab(props) {
     const [logRead, setLogRead] = useState(null);
     const [reasons, setReasons] = useState(null);
     const [howOpen, setHowOpen] = useState({});
+    // the days ticked as "no chemical was used" (kept on this device only, see cntReadClosed)
+    const [closed, setClosed] = useState(function () { return cntReadClosed(new Date()); });
+    // what is said, under the tick boxes, when unticking a day took counts set with Matches out of their boxes
+    const [shutNote, setShutNote] = useState('');
+    // the lines whose count set with Matches was taken out because their expected count changed (said at the line; typing there clears it)
+    const [gone, setGone] = useState({});
     // after a Save that got no answer (or counts kept on this device): once read again, are the typed counts saved already?
     const [landCheck, setLandCheck] = useState(function () { return kept0(d0) ? 'kept' : ''; });
     // the count date is this Sunday until one is picked; a date that is not this Sunday (kept on this device, or a page left
     // open since last week) is used only once the user says so
     const [dayPicked, setDayPicked] = useState(false);
+    // set by the page (never by the person) when it takes typed counts out: it holds the date on screen while nothing is typed, so the
+    // take-out does not send the date to this Sunday. It does not answer the question about the date; dayPicked does, and only the person.
+    // It ends when a count is typed or Matches is tapped (not when a date is typed in an Earliest expiry box or a reason is picked) and
+    // when the typed counts are cleared
+    const [holdDay, setHoldDay] = useState(false);
     // when the counts kept on this device were typed (not when the page was opened)
     const atRef = useRef(d0 && d0.at ? String(d0.at) : '');
     const printRef = useRef(null);
@@ -7903,7 +8118,7 @@ function CountTab(props) {
     const load = useCallback(function () {
         if (!base) { setReadProblem('Cannot read Dataverse from here: open the Ordering hub inside the Power Apps app.'); return Promise.resolve(); }
         const id = ++loadId.current;
-        setLoading(true);
+        setLoading(true); setShutNote('');
         // the chemical log, the last CNT_LOG_DAYS days (it never holds the tables up, and a failed read only hides the expected counts)
         const first = ordIsoDay(insAddDays(insDay(new Date()), -CNT_LOG_DAYS));
         ordLoadTable(fetcher, base, CU_T.log, { cols: CNT_LOG_COLS, newest: 'craa5_logdate', window: { col: 'craa5_logdate', from: first }, labels: true }).then(function (lg) {
@@ -7950,6 +8165,19 @@ function CountTab(props) {
         } catch (e) { /* storage off: counts are kept only while the page is open */ }
     }, [day, by, typed, adds]);
     useEffect(function () { return function () { cntUnmark(); }; }, []);
+    useEffect(function () { cntWriteClosed(closed); }, [closed]);
+    // another tab of this browser ticked or unticked a day: show its list here, so this tab never writes an older list back
+    useEffect(function () {
+        const fn = function (ev) {
+            try {
+                if (ev && ev.key && ev.key !== CNT_CLOSED) return;
+                const now = cntReadClosed(new Date());
+                setClosed(function (p) { return p.join(',') === now.join(',') ? p : now; });
+            } catch (e) { /* storage off */ }
+        };
+        try { window.addEventListener('storage', fn); } catch (e) { /* no window */ }
+        return function () { try { window.removeEventListener('storage', fn); } catch (e) { /* no window */ } };
+    }, []);
 
     const today = useMemo(function () { return insDay(data ? data.loadedAt : new Date()); }, [data]);
     const ix = useMemo(function () { return data ? ordIndex(data, today) : null; }, [data, today]);
@@ -7965,23 +8193,38 @@ function CountTab(props) {
     const T = data ? data.tables : null;
     const unread = T ? ['stock', 'count', 'item', 'line'].filter(function (k) { return T[k] && (T[k].error || T[k].capped); }).map(function (k) { return T[k].label + (T[k].capped ? ' (more rows than the page reads)' : ''); }) : [];
     const unreadN = unread.length;
+    // the Chemical count table has no Expiry date column (not made yet): a date typed on a line could not be saved, so the box is not shown
+    const expNoCol = !!(T && T.count && T.count.cols && !T.count.cols.craa5_expirydate);
     // the expected counts: none while a table they are worked out from was not read in full (the tables Save waits for)
     const exAll = useMemo(function () {
         if (!L || !data || unreadN) return null;
         // while a newer read of the log is on its way the log of the earlier read stays in use (it is replaced when the new one lands)
         const lg = logRead || { state: 'reading', rows: [], from: '', err: '' };
-        return cntExAll(L.lines, data.tables.line.rows, lg, { day: day, today: today });
-    }, [L, data, logRead, day, today, unreadN]);
+        return cntExAll(L.lines, data.tables.line.rows, lg, { day: day, today: today, closed: closed });
+    }, [L, data, logRead, day, today, unreadN, closed]);
     // the log in use was read by the read of the tables on screen or a later one; until then Matches is off and Save writes no
     // expected count or reason (the numbers on screen are still those of the earlier log)
     const logFresh = !!(logRead && data && logRead.gen >= data.gen);
-    const exUse = exAll && logFresh ? exAll.byLine : null;
+    // a count that counts days ticked on this device is shown but saved without its expected count and reason (cntSavable)
+    const exUse = useMemo(function () { return exAll && logFresh ? cntSavable(exAll.byLine) : null; }, [exAll, logFresh]);
     const rs = reasons || { state: 'reading', list: [] };
     const reasonList = rs.state === 'ok' ? rs.list : null;
-    const plan = useMemo(function () { return L ? cntPlan(L.lines, ix, data.tables.line.rows, typed, { day: day, by: String(by || '').trim().slice(0, 100), now: '', today: today, taken: taken, ex: exUse, reasons: reasonList }) : null; }, [L, ix, data, typed, day, by, today, taken, exUse, reasonList]);
+    const plan = useMemo(function () { return L ? cntPlan(L.lines, ix, data.tables.line.rows, typed, { day: day, by: String(by || '').trim().slice(0, 100), now: '', today: today, taken: taken, ex: exUse, reasons: reasonList, noExp: expNoCol }) : null; }, [L, ix, data, typed, day, by, today, taken, exUse, reasonList, expNoCol]);
     const hasTyped = cntHasTyped(typed) || adds.length > 0;
-    const thisSun = ordIsoDay(insSunday(today));
+    const thisSun = ordIsoDay(insSunday(today)), todayIso = ordIsoDay(today);
     const dateAsk = !dayPicked && cntIsDay(day) && day !== thisSun && hasTyped;
+    // a count taken out by the page itself (the expected count changed, a day was unticked) must not let "nothing typed" move the
+    // count date to this Sunday: the counts were typed for the date on screen. This holds the date; it does not answer the question
+    // about it, so a count typed afterwards for a date that is not this Sunday is still asked about. This Sunday is worked out from the
+    // last read of the tables: on a page left open over a Sunday it is still the old one until the tables are read again (the log can
+    // land first, and a day can be unticked before the first Refresh), so the clock is asked too
+    const keepDay = function () { if (!dayPicked && cntIsDay(day) && (day !== thisSun || day !== ordIsoDay(insSunday(insDay(new Date()))))) setHoldDay(true); };
+    // a new count date (typed in the date box, or Use this Sunday): the counts set with Matches were worked out for the old date and
+    // go (said at the top), and so do the notes about what was taken out before
+    const pickDay = function (d) {
+        const out = cntMatchedIds(typed);
+        setDay(d); setDayPicked(true); setTyped(cntDropMatches); setMsg(''); setShutNote(''); setGone({}); setOutNote(cntOutText('date', out));
+    };
     // typed counts with no line: only known once the stock table is read in full (not while reading, not after a failed read)
     const ids = {};
     if (L) L.lines.forEach(function (l) { ids[l.id] = true; });
@@ -8011,10 +8254,22 @@ function CountTab(props) {
     useEffect(function () { setPartialOk(false); }, [partialKey]);
     // a page left open over Sunday with nothing typed moves to the new Sunday by itself
     useEffect(function () {
-        if (!dayPicked && !hasTyped && cntIsDay(day) && day !== thisSun) setDay(thisSun);
-    }, [thisSun, dayPicked, hasTyped]);
+        if (!dayPicked && !holdDay && !hasTyped && cntIsDay(day) && day !== thisSun) setDay(thisSun);
+    }, [thisSun, dayPicked, hasTyped, holdDay]);
     // the note about counts kept on this device goes once nothing is typed
     useEffect(function () { if (kept && !hasTyped) setKept(''); }, [hasTyped]);
+    // a count set with Matches is a copy of its line's expected count: when the tables or the log were read again and that expected
+    // count is another number (or gone), the copy is taken out of its box and said. Only once the log in use is the latest read,
+    // and never while a Save runs (the read a Save starts would take out the very numbers it is saving).
+    useEffect(function () {
+        if (busy || !exAll || !L || !logFresh) return;
+        const stale = cntStaleMatches(L.lines, exAll.byLine, typed);
+        if (!stale.length) return;
+        setTyped(function (p) { return cntDropMatches(p, stale); });
+        keepDay();
+        setOutNote(function (prev) { return cntOutText('changed', stale, cntOutShown(prev)); });
+        setGone(function (g) { const n = Object.assign({}, g); stale.forEach(function (id) { n[id] = true; }); return n; });
+    }, [exAll, logFresh, busy]);
     // an added line whose stock row exists now (saved since, here or on another device): its typed count moves to that row's
     // box when the box is empty (otherwise it stays, named in the note about typed counts not on the list), and the add goes
     useEffect(function () {
@@ -8047,7 +8302,7 @@ function CountTab(props) {
     }, [landCheck, loading, plan, L]);
 
     const touch = function () { atRef.current = new Date().toISOString(); };
-    const setLine = function (l, patch) { setTyped(function (p) { const n = Object.assign({}, p); n[l.id] = Object.assign({}, p[l.id] || {}, patch, { name: l.name, loc: l.loc }); return n; }); touch(); setMsg(''); setOutNote(''); };
+    const setLine = function (l, patch) { setTyped(function (p) { const n = Object.assign({}, p); n[l.id] = Object.assign({}, p[l.id] || {}, patch, { name: l.name, loc: l.loc }); return n; }); touch(); if (patch.q !== undefined) setHoldDay(false); setMsg(''); setOutNote(''); setShutNote(''); setGone(function (g) { if (!g[l.id] || patch.q === undefined) return g; const n = Object.assign({}, g); delete n[l.id]; return n; }); };
     const say = function (text) { setMsg(text); };
     // Matches types the expected count into an empty box (like the clerk typing it), drops any reason picked and marks the count
     // as set with Matches (any typing in the box takes the mark and the reason off); the reason buttons pick or clear the reason of
@@ -8056,6 +8311,21 @@ function CountTab(props) {
     const canMatch = function (l) { return !busy && logFresh && cntParse((typed[l.id] || {}).q).blank && !(cntIsDay(day) && (l.saved[day] || []).length > 0); };
     const matches = function (l, xr) { if (!canMatch(l)) return; setLine(l, { q: ordQty(xr.shown), why: '', m: true }); };
     const pickWhy = function (l, label) { if (busy) return; setLine(l, { why: impNorm((typed[l.id] || {}).why) === impNorm(label) ? '' : label }); };
+    // Ticking a day as closed counts it as written up (use 0) in the expected counts; it takes nothing out. Unticking it puts the
+    // log's own numbers back: the lines whose expected count used that day have none now, so a count Matches typed for one of them
+    // goes (said under the boxes). Kept on this device; nothing is sent to Dataverse.
+    const setShut = function (d, on) {
+        if (busy || !cntIsDay(d)) return;
+        if (on) { if (closed.indexOf(d) < 0) setClosed(closed.concat([d]).sort()); setShutNote(''); return; }
+        const used = exAll && L ? L.lines.filter(function (l) { const r = exAll.byLine[l.id]; return !!(r && r.ok && (r.closed || []).indexOf(d) > -1); }).map(function (l) { return l.id; }) : [];
+        const out = cntMatchedIds(typed, used);
+        setClosed(closed.filter(function (x) { return x !== d; }));
+        if (out.length) {
+            setTyped(function (p) { return cntDropMatches(p, used); }); touch(); keepDay();
+            setGone(function (g) { const n = Object.assign({}, g); out.forEach(function (id) { n[id] = true; }); return n; });
+        }
+        setShutNote(cntOutText('closed', out, cntDayShort(d)));
+    };
     const url = function (tbl, id) { return base + CH_API + tbl.meta.set + (id ? '(' + String(id).replace(/[^0-9a-fA-F-]/g, '') + ')' : ''); };
     // One change set (a single write goes on its own); the tables are read again after every try. As on the Ordering tab, a new
     // row gets an id worked out from what it is and an update carries the row version read, so the same Save sent twice, or a
@@ -8076,7 +8346,7 @@ function CountTab(props) {
     const save = function () {
         if (!canSave) return;
         const now = new Date().toISOString();
-        const P = cntPlan(L.lines, ix, T.line.rows, typed, { day: day, by: String(by || '').trim().slice(0, 100), now: now, today: today, taken: taken, ex: exUse, reasons: reasonList });
+        const P = cntPlan(L.lines, ix, T.line.rows, typed, { day: day, by: String(by || '').trim().slice(0, 100), now: now, today: today, taken: taken, ex: exUse, reasons: reasonList, noExp: expNoCol });
         if (P.dayProblem || Object.keys(P.problems).length || !P.writes.length) return;
         const steps = P.writes.map(function (w) {
             const tbl = w.table === 'count' ? T.count : T.stock;
@@ -8086,14 +8356,14 @@ function CountTab(props) {
         // what was sent: a box changed or an item added while saving is kept (only what was saved is cleared)
         const sent = {}, sentAdds = adds.slice();
         done.forEach(function (id) { sent[id] = typed[id]; });
-        setBusy(true); setErr(''); setMsg(''); setOutNote('');
+        setBusy(true); setErr(''); setMsg(''); setOutNote(''); setShutNote(''); setGone({});
         send(steps).then(function (r) {
             const text = r.ok ? '' : why(r, steps);
             return load().then(function () {
-                setBusy(false);
-                if (!r.ok) { setErr(text); if (!r.status) setLandCheck('try'); return; }
+                if (!r.ok) { setBusy(false); setErr(text); if (!r.status) setLandCheck('try'); return; }
                 setTyped(function (p) { const n = Object.assign({}, p); done.forEach(function (id) { if (n[id] === sent[id]) delete n[id]; }); return n; });
                 setAdds(function (a) { return a.filter(function (x) { return sentAdds.indexOf(x) < 0; }); }); setKept('');
+                setBusy(false);
                 say('Saved for ' + cntDayText(day) + ': ' + [P.newCounts ? P.newCounts + ' new count' + (P.newCounts === 1 ? '' : 's') : '', P.updCounts ? P.updCounts + ' count' + (P.updCounts === 1 ? '' : 's') + ' changed' : '',
                     P.stockN ? 'stock on hand set on ' + P.stockN + ' row' + (P.stockN === 1 ? '' : 's') + (P.newStock ? ' (' + P.newStock + ' new)' : '') : ''].filter(Boolean).join(', ') +
                     '. Press Refresh on the Ordering tab to see the new stock.');
@@ -8134,7 +8404,7 @@ function CountTab(props) {
             if (moved.length) { setWalkAsk(moved); return; }
         }
         setWalkAsk(null);
-        const steps = changes.map(function (c) { return { method: 'PATCH', etag: c.line.row._etag || '', url: url(T.stock, c.line.row._id), what: 'The place of ' + c.line.name + ' at ' + c.line.loc, data: ordPayload(T.stock, { craa5_displayorder: c.order }) }; });
+        const steps = changes.map(function (c) { return { method: 'PATCH', etag: c.line.row._etag || '', url: url(T.stock, c.line.row._id), what: 'The place of ' + c.line.name + ' at ' + (c.line.loc || 'no location'), data: ordPayload(T.stock, { craa5_displayorder: c.order }) }; });
         setBusy(true); setErr(''); setMsg('');
         send(steps).then(function (r) {
             const text = r.ok ? '' : why(r, steps);
@@ -8158,7 +8428,7 @@ function CountTab(props) {
         const same = L.lines.filter(function (l) { return l.key === k; }), out = same.filter(function (l) { return cntMatchedIds(typed, [l.id]).length > 0; });
         setAdds(function (a) { return a.concat([{ itemNo: String(it.craa5_itemnumber), loc: loc, min: mp.n }]); }); setTyped(function (p) { return cntDropMatches(p, same.map(function (l) { return l.id; })); }); touch();
         setAdd({ loc: loc, item: '', min: '' });
-        say(cntName(it, null, it.craa5_itemnumber) + ' added at the end of ' + loc + '. Type its count, then Save (Save creates its stock row).' + (out.length ? ' ' + cntOutText('places', out.map(function (l) { return l.name + ' at ' + l.loc; })) : ''));
+        say(cntName(it, null, it.craa5_itemnumber) + ' added at the end of ' + loc + '. Type its count, then Save (Save creates its stock row).' + (out.length ? ' ' + cntOutText('places', out.map(function (l) { return l.name + ' at ' + (l.loc || 'no location'); })) : ''));
     };
     const removeAdd = function (l) {
         setAdds(function (a) { return a.filter(function (x) { return !(ordKey(x.itemNo) === l.key && x.loc === l.loc); }); });
@@ -8172,7 +8442,7 @@ function CountTab(props) {
     const printSheet = function () {
         setPrintNote(cntPrint(printRef.current) ? 'If no print window opened, this app blocks printing here: use Copy for Excel and print from Excel.' : 'Printing is not available here. Use Copy for Excel and print from Excel.');
     };
-    const clearTyped = function () { setTyped({}); setAdds([]); setKept(''); setClearAsk(false); setOrphAsk(false); setMsg(''); setOutNote(''); };
+    const clearTyped = function () { setHoldDay(false); setTyped({}); setAdds([]); setKept(''); setClearAsk(false); setOrphAsk(false); setMsg(''); setOutNote(''); setShutNote(''); setGone({}); };
 
     const field = 'min-h-[44px] rounded-lg border border-slate-300 bg-white px-3 text-sm focus:outline-none focus:ring-2 focus:ring-[#0072CE]/40';
     const itemChoices = ix ? ix.itemList.filter(function (it) { return it.craa5_active !== false && it.craa5_itemnumber; }).map(function (it) { return { key: String(it.craa5_itemnumber), label: cntName(it, null, it.craa5_itemnumber) + ' (' + impClean(it.craa5_itemnumber) + ')' }; })
@@ -8192,6 +8462,10 @@ function CountTab(props) {
     // the first read of the log is on its way: the lines that will get an Expected cell hold its place, so nothing moves when it lands
     const xwait = !!(exAll && exAll.note && exAll.note.code === 'reading');
     const xcol = exOk > 0 || xwait;
+    // the days to show a tick for: the ticked ones that count for some line, and the ones that can still be ticked
+    const clDays = exAll ? exAll.closed.used.concat(exAll.closed.offer).sort() : [];
+    // the days ticked as closed that counts set with Matches rest on (said by the Save button)
+    const shutMatched = exAll && L ? cntShutMatched(L.lines, exAll.byLine, typed) : [];
     const lastText = function (l) {
         if (!l.last) return 'not counted yet';
         const sv = cntIsDay(day) ? (l.saved[day] || []) : [];
@@ -8209,7 +8483,7 @@ function CountTab(props) {
                 <div className="px-5 py-4">
                     <p className="text-sm text-slate-700">Every stock row in walk order, with an empty box. Type what you find (0 when there is none); a line left blank is not counted and its stock stays as it is. Count every place of an item on the same date: the Ordering tab adds them up. Save writes the counts and sets stock on hand to them.</p>
                     <div className="mt-3 flex flex-wrap items-end gap-2">
-                        <label className="text-xs font-bold text-slate-600">Count date<input type="date" data-cnt-day value={day} max={ordIsoDay(today)} onChange={function (e) { const out = cntMatchedIds(typed); setDay(e.target.value); setDayPicked(true); setTyped(cntDropMatches); setMsg(''); setOutNote(cntOutText('date', out)); }} className={field + ' block mt-1'} /></label>
+                        <label className="text-xs font-bold text-slate-600">Count date<input type="date" data-cnt-day value={day} max={ordIsoDay(today)} onChange={function (e) { pickDay(e.target.value); }} className={field + ' block mt-1'} /></label>
                         <label className="text-xs font-bold text-slate-600">Counted by<input type="text" data-cnt-by value={by} maxLength={100} onChange={function (e) { setBy(e.target.value); }} className={field + ' block mt-1 w-48'} /></label>
                         <div className="ml-auto flex flex-wrap gap-2">
                             <button type="button" data-cnt-print-btn onClick={printSheet} disabled={!L || !nLines} className={btnWhite + (!L || !nLines ? ' opacity-50 cursor-not-allowed' : '')}><PrintIcon className="w-4 h-4" />Print blank sheet</button>
@@ -8222,18 +8496,18 @@ function CountTab(props) {
                     {readProblem && <p role="alert" className="mt-3 flex items-start gap-2 rounded-lg border border-[#FFB81C] bg-[#FFF6E0] px-3 py-2 text-sm text-[#7A4B00]"><WarnIcon className="w-4 h-4 mt-0.5 flex-shrink-0" />{readProblem}</p>}
                     {kept && <div className="mt-3 rounded-lg border border-[#B3D4F2] bg-[#E6F1FB] px-3 py-2 text-sm text-[#00468B]" data-cnt-kept>
                         {'Counts typed for ' + (d0 && cntIsDay(d0.day) ? cntDayText(d0.day) : 'a count') + (ordDate(kept) ? ' (on ' + ordDay(ordDate(kept)) + ' at ' + chTime(ordDate(kept)) + ')' : '') + ' were kept on this device and are not saved yet.'}
-                        {!clearAsk ? <button type="button" data-cnt-clear onClick={function () { setClearAsk(true); }} className="ml-2 underline font-bold">Clear them</button>
-                            : <span className="ml-2">Clear every typed count? <button type="button" data-cnt-clear-yes onClick={clearTyped} className="underline font-bold">Yes, clear</button> <button type="button" onClick={function () { setClearAsk(false); }} className="ml-2 underline">Keep them</button></span>}
+                        {!clearAsk ? <button type="button" data-cnt-clear onClick={function () { setClearAsk(true); }} className="ml-2 min-h-[44px] px-2 underline font-bold">Clear them</button>
+                            : <span className="ml-2">Clear every typed count? <button type="button" data-cnt-clear-yes onClick={clearTyped} className="min-h-[44px] px-2 underline font-bold">Yes, clear</button> <button type="button" onClick={function () { setClearAsk(false); }} className="ml-2 min-h-[44px] px-2 underline">Keep them</button></span>}
                     </div>}
                     {dateAsk && <div className="mt-3 rounded-lg border border-[#FFB81C] bg-[#FFF6E0] px-3 py-2 text-sm text-[#7A4B00]" data-cnt-date-ask>
                         {'The count date is ' + cntDayText(day) + ', not this Sunday (' + cntDayText(thisSun) + '). Which date are these counts for?'}
-                        <span className="ml-2 inline-flex flex-wrap gap-3"><button type="button" data-cnt-use-sunday onClick={function () { const out = cntMatchedIds(typed); setDay(thisSun); setDayPicked(true); setTyped(cntDropMatches); setMsg(''); setOutNote(cntOutText('date', out)); }} className="underline font-bold">Use this Sunday</button>
-                            <button type="button" data-cnt-keep-day onClick={function () { setDayPicked(true); }} className="underline font-bold">{'Keep ' + cntDayText(day)}</button></span>
+                        <span className="ml-2 inline-flex flex-wrap gap-3"><button type="button" data-cnt-use-sunday onClick={function () { pickDay(thisSun); }} className="min-h-[44px] px-2 underline font-bold">Use this Sunday</button>
+                            <button type="button" data-cnt-keep-day onClick={function () { setDayPicked(true); }} className="min-h-[44px] px-2 underline font-bold">{'Keep ' + cntDayText(day)}</button></span>
                     </div>}
                     {orphans.length > 0 && <div className="mt-3 rounded-lg border border-[#FFB81C] bg-[#FFF6E0] px-3 py-2 text-sm text-[#7A4B00]" data-cnt-orphans>
                         {(orphans.length === 1 ? 'A typed count is' : orphans.length + ' typed counts are') + ' not on the list, so ' + (orphans.length === 1 ? 'it is' : 'they are') + ' not shown or saved: ' + orphans.map(orphText).join('; ') + '. Type ' + (orphans.length === 1 ? 'it' : 'them') + ' on the right line if needed.'}
-                        {!orphAsk ? <button type="button" data-cnt-orph-clear onClick={function () { setOrphAsk(true); }} className="ml-2 underline font-bold">Clear {orphans.length === 1 ? 'it' : 'them'}</button>
-                            : <span className="ml-2">{'Clear ' + (orphans.length === 1 ? 'it' : 'them') + '? '}<button type="button" data-cnt-orph-yes onClick={function () { setTyped(function (p) { const n = Object.assign({}, p); orphans.forEach(function (k) { delete n[k]; }); return n; }); setOrphAsk(false); }} className="underline font-bold">Yes, clear</button> <button type="button" onClick={function () { setOrphAsk(false); }} className="ml-2 underline">Keep</button></span>}
+                        {!orphAsk ? <button type="button" data-cnt-orph-clear onClick={function () { setOrphAsk(true); }} className="ml-2 min-h-[44px] px-2 underline font-bold">Clear {orphans.length === 1 ? 'it' : 'them'}</button>
+                            : <span className="ml-2">{'Clear ' + (orphans.length === 1 ? 'it' : 'them') + '? '}<button type="button" data-cnt-orph-yes onClick={function () { setTyped(function (p) { const n = Object.assign({}, p); orphans.forEach(function (k) { delete n[k]; }); return n; }); setOrphAsk(false); }} className="min-h-[44px] px-2 underline font-bold">Yes, clear</button> <button type="button" onClick={function () { setOrphAsk(false); }} className="ml-2 min-h-[44px] px-2 underline">Keep</button></span>}
                     </div>}
                     {L && !nLines && !loading && !unread.length && <p className="mt-3 rounded-lg border border-[#B3D4F2] bg-[#E6F1FB] px-3 py-2 text-sm text-[#00468B]" data-cnt-empty>No stock rows yet, so there is nothing to count. Paste your latest Week sheet on the Import tab with Also set stock on hand ticked (that adds a stock row per item, in the sheet's order), or add items below.</p>}
                     {L && (L.left.inactive.length > 0 || L.left.noItem > 0 || countOnlyLocs.length > 0) && <ul className="mt-3 list-disc pl-5 text-sm text-slate-600 space-y-1" data-cnt-left>
@@ -8241,7 +8515,14 @@ function CountTab(props) {
                         {L.left.noItem > 0 && <li>{L.left.noItem + ' stock row' + (L.left.noItem === 1 ? ' has' : 's have') + ' no item number, so ' + (L.left.noItem === 1 ? 'it is' : 'they are') + ' not on the list. Fix ' + (L.left.noItem === 1 ? 'it' : 'them') + ' in the Chemical inventory table in Power Apps.'}</li>}
                         {countOnlyLocs.map(function (loc) { return <li key={loc}>{'Counted before at ' + loc + ' but with no stock row there, so not on the list: ' + L.countOnly[loc].join(', ') + '. Add them with Add an item to count them here.'}</li>; })}
                     </ul>}
-                    {exAll && (exAll.note || exOk > 0 || exAll.noconv.length > 0 || exAll.nolog.length > 0) && <div className="mt-3 space-y-2" data-cnt-exp-notes>
+                    {exAll && (exAll.note || exOk > 0 || exAll.noconv.length > 0 || exAll.nolog.length > 0 || clDays.length > 0 || shutNote) && <div className="mt-3 space-y-2" data-cnt-exp-notes>
+                        {clDays.length > 0 && <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2" data-cnt-closed>
+                            <p className="text-xs text-slate-600" data-cnt-closed-help>{exAll.closed.offer.length > 0 ? 'If a chemical was used that day, do not tick it: add that day on the Import tab (the Log tab only logs today), then press Refresh. If none was used (the plant was closed, say), tick the day: it then counts as 0 used. A tick is kept on this phone or computer only.' : 'Ticked days are kept on this phone or computer only. Removing a tick takes out counts set with Matches for it.'}</p>
+                            <div className="mt-1">{clDays.map(function (d) {
+                                return <label key={d} className="min-h-[44px] w-full flex items-center gap-2 text-sm font-bold text-slate-800"><input type="checkbox" data-cnt-closed-day={d} checked={closed.indexOf(d) > -1} disabled={busy} onChange={function (e) { setShut(d, e.target.checked); }} className="w-5 h-5 flex-shrink-0" />{cntDayShort(d) + ': no chemical was used'}</label>;
+                            })}</div>
+                        </div>}
+                        {shutNote && <p role="status" className="rounded-lg border border-[#B3D4F2] bg-[#E6F1FB] px-3 py-2 text-sm text-[#00468B]" data-cnt-closed-note>{shutNote}</p>}
                         {exAll.note && <p role="status" className={exAll.note.code === 'reading' || exAll.note.code === 'first' ? 'text-xs text-slate-600' : 'flex items-start gap-2 rounded-lg border border-[#FFB81C] bg-[#FFF6E0] px-3 py-2 text-sm text-[#7A4B00]'} data-cnt-exp-note={exAll.note.code}>
                             {exAll.note.code !== 'reading' && exAll.note.code !== 'first' && <WarnIcon className="w-4 h-4 mt-0.5 flex-shrink-0" />}{exAll.note.text}</p>}
                         {exOk > 0 && <p className="text-xs text-slate-600" data-cnt-exp-help>Expected is the last count, plus deliveries since, minus what the chemical log says was used (it needs Organization-level Read on the chemical log). Tap Matches only if the shelf agrees, or type what you find.</p>}
@@ -8250,6 +8531,8 @@ function CountTab(props) {
                         {exOk > 0 && exNoCol && <p className="text-xs text-slate-600" data-cnt-exp-nocol>Expected is not saved with the count: the Chemical count table has no Expected column (not made yet, see the Dataverse monitor).</p>}
                         {exOk > 0 && (rs.state === 'absent' || rs.state === 'failed') && <p className="text-xs text-slate-600" data-cnt-why-none>{rs.state === 'absent' ? 'Reasons cannot be saved yet: the Chemical count table has no Variance reason column (not made yet, see the Dataverse monitor).' : 'Reasons cannot be saved: the reason choices could not be read. Press Refresh to read them again.'}</p>}
                     </div>}
+                    {L && !expNoCol && L.lines.some(function (l) { return l.reagent; }) && <p className="mt-3 text-xs text-slate-600" data-cnt-expiry-help>Type the date on a reagent's bottle once. It then shows under the reagent's name and stays on file until you type another date or count 0. If the shelf has more than one bottle, type the date of the one that expires first. Leave the box empty if the bottle has no date.</p>}
+                    {expNoCol && L && L.lines.some(function (l) { return l.reagent; }) && <p className="mt-3 text-xs text-slate-600" data-cnt-expiry-nocol>Expiry dates cannot be saved: the Chemical count table has no Expiry date column (not made yet, see the Dataverse monitor).</p>}
                 </div>
             </div>
             {L && L.groups.map(function (g) {
@@ -8267,13 +8550,21 @@ function CountTab(props) {
                                 // the expected count of this line, and whether the typed count is far from it
                                 const xr = exAll ? exAll.byLine[l.id] : null, np = cntParse(t.q), walking = !!(wl && l.row);
                                 const gap = !walking && xr && xr.ok && np.n !== undefined ? cntGap(xr.shown, np.n) : null, gid = 'cnt-g-' + L.lines.indexOf(l);
-                                const xs = xr ? cntExShort(xr) : '';
+                                const xs = xr ? cntExShort(xr) : '', ex = cntExpiryShort(l.expiry, todayIso);
+                                // a date typed beside a count above 0 is what Save puts on file: said at once, so the line does not read "No expiry date
+                                // on file" (or "Expired") above the date just typed; a count of 0 takes the date on file off, and so its alert
+                                const tDay = String(t.exp || '').trim(), expNew = !expNoCol && cntIsDay(tDay) && np.n !== undefined && np.n > 0 && !prob && !(plan && plan.dayProblem) && !(l.expiry && l.expiry.exp === tDay);
+                                const zeroWarn = !expNoCol && np.n === 0 && !!l.expiry && ex.soon && cntIsDay(day) && l.expiry.day <= day;
                                 const xcell = !walking && !!(xr && xr.ok), xwaiting = !walking && xwait && !!(xr && !xr.ok && xr.why === 'log'), matchOff = !canMatch(l);
                                 return (
                                     <li key={l.id} className="px-5 py-2 flex flex-wrap items-center gap-x-3 gap-y-1" data-cnt-line={l.id}>
-                                        <div className="flex-1 min-w-[130px] sm:max-w-md">
+                                        <div className="flex-1 min-w-[130px] sm:max-w-[26rem]">
                                             <div className="text-sm font-bold text-slate-900">{l.name}{l.isNew && <span className="ml-2 rounded bg-[#FFF6E0] px-1.5 py-0.5 text-xs font-bold text-[#7A4B00]">new</span>}</div>
                                             <div className="text-xs text-slate-600">{'Item ' + l.itemNo + ', min ' + ordQty(l.min) + ', ' + lastText(l) + (xs ? ', ' + xs : '')}</div>
+                                            {expNew && <div className="mt-0.5"><span data-cnt-expiry-new={l.id} className="text-xs font-bold text-[#00468B]">{'New date ' + ordDay(ordDate(tDay)) + ', saved with the count'}</span></div>}
+                                            {!expNew && ex.text && <div className="mt-0.5"><span data-cnt-expiry={l.id} data-cnt-expiry-soon={ex.soon ? 'true' : undefined} data-cnt-expiry-past={ex.past ? 'true' : undefined}
+                                                className={ex.soon ? 'inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs font-bold ' + (ex.past ? 'border-[#E4002B]/40 bg-[#FDE8EC] text-[#B80022]' : 'border-[#FFB81C] bg-[#FFF6E0] text-[#7A4B00]') : 'text-xs text-slate-600'}>{ex.past && <WarnIcon className="w-3 h-3 flex-shrink-0" />}{ex.text}</span></div>}
+                                            {!expNew && l.expiry === null && l.reagent && !expNoCol && <div className="mt-0.5"><span data-cnt-expiry-none={l.id} className="text-xs text-slate-500">No expiry date on file</span></div>}
                                         </div>
                                         {wl && l.row ? <div className="flex gap-1">
                                             <button type="button" data-cnt-up={l.id} onClick={function () { move(g.loc, l.id, -1); }} disabled={wl.indexOf(l.id) === 0} aria-label={'Move ' + l.name + ' up'} className={btnWhite + ' px-3' + (wl.indexOf(l.id) === 0 ? ' opacity-40' : '')}><UpIcon className="w-4 h-4" /></button>
@@ -8289,15 +8580,17 @@ function CountTab(props) {
                                             <input type="text" inputMode="decimal" autoComplete="off" data-cnt-q={l.id} value={t.q || ''} readOnly={busy} onChange={function (e) { setLine(l, { q: e.target.value, m: false, why: '' }); }} onKeyDown={function (e) { focusNext(e, l.id); }}
                                                 aria-label={'Count of ' + l.name + ' at ' + (l.loc || 'no location')} aria-invalid={prob ? 'true' : 'false'} aria-describedby={[prob || note ? pid : '', gap && gap.big ? gid : ''].filter(Boolean).join(' ') || undefined} placeholder="count"
                                                 className={field + ' w-24 text-right' + (prob ? ' border-[#E4002B] ring-1 ring-[#E4002B]' : '')} />
-                                            {l.reagent && <label className="text-xs font-bold text-slate-600 flex items-center gap-1">Expiry<input type="date" data-cnt-exp={l.id} value={t.exp || ''} readOnly={busy} onChange={function (e) { setLine(l, { exp: e.target.value }); }} aria-label={'Expiry date of ' + l.name} className={field + ' w-40'} /></label>}
+                                            {l.reagent && !expNoCol && <label className="text-xs font-bold text-slate-600 flex items-center gap-1">Earliest expiry<input type="date" data-cnt-exp={l.id} value={t.exp || ''} readOnly={busy} onChange={function (e) { setLine(l, { exp: e.target.value }); }} aria-label={'Earliest expiry date of ' + l.name + ' on the shelf'} className={field + ' w-40'} /></label>}
                                             {l.isNew && <button type="button" data-cnt-remove={l.id} onClick={function () { removeAdd(l); }} className={btnWhite + ' px-3'}>Remove</button>}
                                         </div>}
                                         {(prob || note) && <p id={pid} className={'w-full order-6 sm:order-none text-xs ' + (prob ? 'text-[#B0001F] font-bold' : warn ? 'text-[#7A4B00] font-bold' : 'text-slate-600')} data-cnt-problem={prob ? l.id : undefined} data-cnt-warn={!prob && warn ? l.id : undefined}>{prob || note}</p>}
                                         {!walking && xr && xr.ok && howOpen[l.id] && <p className="w-full order-5 sm:order-none text-xs text-slate-600" data-cnt-how-text={l.id}>{cntExHow(xr)}</p>}
                                         {!walking && xr && !xr.ok && xr.why === 'neg' && <p className="w-full order-6 sm:order-none text-xs font-bold text-[#7A4B00]" data-cnt-neg={l.id}>{cntExNeg(xr)}</p>}
+                                        {gone[l.id] && <p className="w-full order-6 sm:order-none text-xs font-bold text-[#00468B]" data-cnt-gone={l.id}>{!(xr && xr.ok) ? 'The count you set with Matches was taken out: this line has no expected count now. Type the count.' : (walking || matchOff) ? 'The count you set with Matches was taken out because the expected count changed. Matches is off for this line now: type the count.' : 'The count you set with Matches was taken out because the expected count changed. Tap Matches again, or type the count.'}</p>}
+                                        {zeroWarn && <p className="w-full order-6 sm:order-none text-xs font-bold text-[#7A4B00]" data-cnt-zero-expiry={l.id}>A count of 0 takes the expiry date off and clears its alert. If a bottle is still on the shelf, type how many.</p>}
                                         {gap && gap.big && <div id={gid} className="w-full order-6 sm:order-none rounded-lg border border-[#FFB81C] bg-[#FFF6E0] px-3 py-2 text-sm text-[#7A4B00]" data-cnt-gap={l.id}>
                                             <span className="font-bold" data-cnt-gap-text={l.id}>{'Expected is ' + ordQty(xr.shown) + ' and you counted ' + ordQty(np.n) + '. That is ' + ordQty(Math.abs(gap.diff)) + (gap.diff < 0 ? ' less' : ' more') + ' than expected.'}</span>
-                                            {rs.state === 'ok' && <span className="ml-2 inline-flex flex-wrap items-center gap-2" role="group" aria-label={'Reason for the difference in ' + l.name}>
+                                            {rs.state === 'ok' && !(xr.closed && xr.closed.length) && <span className="ml-2 inline-flex flex-wrap items-center gap-2" role="group" aria-label={'Reason for the difference in ' + l.name}>
                                                 <span>Reason (optional):</span>
                                                 {rs.list.map(function (o) {
                                                     const on = impNorm(t.why) === impNorm(o[0]);
@@ -8322,8 +8615,8 @@ function CountTab(props) {
                 {walk && <p className="mt-2 text-xs text-slate-600">Move rows up or down inside each location. Receive on the Ordering tab adds a delivery to an item's first row: its row at the first location in this list.</p>}
                 {walkAsk && <div className="mt-2 rounded-lg border border-[#FFB81C] bg-[#FFF6E0] px-3 py-2 text-sm text-[#7A4B00]" data-cnt-walk-ask>
                     {'Saving this order changes the row Receive adds deliveries to: ' + walkAsk.join(', ') + '.'}
-                    <span className="ml-2 inline-flex flex-wrap gap-3"><button type="button" data-cnt-walk-sure onClick={function () { saveWalk(true); }} className="underline font-bold">Save walk order anyway</button>
-                        <button type="button" onClick={function () { setWalkAsk(null); }} className="underline">Go back</button></span>
+                    <span className="ml-2 inline-flex flex-wrap gap-3"><button type="button" data-cnt-walk-sure onClick={function () { saveWalk(true); }} className="min-h-[44px] px-2 underline font-bold">Save walk order anyway</button>
+                        <button type="button" onClick={function () { setWalkAsk(null); }} className="min-h-[44px] px-2 underline">Go back</button></span>
                 </div>}
                 {addOpen && <div className="mt-3 flex flex-wrap items-end gap-2" data-cnt-add>
                     <label className="text-xs font-bold text-slate-600">Location<select data-cnt-add-loc value={add.loc} onChange={function (e) { setAdd(Object.assign({}, add, { loc: e.target.value })); }} className={field + ' block mt-1'}>
@@ -8341,6 +8634,7 @@ function CountTab(props) {
                 {plan && plan.gapN > 0 && !walk && <p className="mt-2 text-sm text-[#7A4B00]" data-cnt-gap-sum>{cntGapSum(plan.gapN, plan.reasonN, rs.state === 'ok')}</p>}
                 {plan && !logFresh && exOk > 0 && plan.filled > 0 && <p className="mt-2 text-sm text-slate-600" data-cnt-stale>The chemical log is being read again, so a count saved right now is saved without its expected count or a reason.</p>}
                 {plan && plan.matchN >= CNT_MATCH_MIN && plan.matchN >= CNT_MATCH_PCT * plan.filled && <p className="mt-2 text-sm text-[#7A4B00]" data-cnt-matches-sum>{plan.matchN + ' of ' + plan.filled + ' counts were set with Matches. Look at the shelf for any you did not check.'}</p>}
+                {shutMatched.length > 0 && <p className="mt-2 text-sm text-[#7A4B00]" data-cnt-closed-sum>{cntAnd(shutMatched.map(cntDayShort)) + (shutMatched.length === 1 ? ' is' : ' are') + ' ticked as ' + (shutMatched.length === 1 ? 'a day' : 'days') + ' when no chemical was used, so the counts set with Matches treat ' + (shutMatched.length === 1 ? 'it' : 'them') + ' as 0 used. Look at the shelf for those counts.'}</p>}
                 {plan && plan.recvSame.length > 0 && <p className="mt-2 text-sm text-[#7A4B00]" data-cnt-recvsame>{'Received on the count date itself: ' + plan.recvSame.join(', ') + '. The count is taken to include ' + (plan.recvSame.length === 1 ? 'it' : 'them') + '. If ' + (plan.recvSame.length === 1 ? 'it' : 'they') + ' came after you counted, add ' + (plan.recvSame.length === 1 ? 'it' : 'them') + ' to the count.'}</p>}
                 {plan && plan.partial.length > 0 && <div className="mt-2 rounded-lg border border-[#FFB81C] bg-[#FFF6E0] px-3 py-2 text-sm text-[#7A4B00]" data-cnt-partial>
                     <p>{'Counted at one place but not at another for this date: ' + L.lines.filter(function (l) { return plan.partial.indexOf(l.id) > -1; }).map(function (l) { return l.name + ' at ' + (l.loc || 'no location'); }).join(', ') + '. The Ordering tab adds every place\'s count for a day, so until those places are counted for ' + cntDayText(day) + ' it reads them as used up and suggests ordering more.'}</p>
@@ -8349,8 +8643,8 @@ function CountTab(props) {
                 {blockers.length > 0 && nTyped + nProblems > 0 && <ul className="mt-2 list-disc pl-5 text-sm font-bold text-[#B0001F]" data-cnt-blockers>{blockers.map(function (b, i) { return <li key={i}>{b}</li>; })}</ul>}
                 <div className="mt-3 flex flex-wrap items-center gap-3">
                     <button type="button" data-cnt-save onClick={save} aria-disabled={!canSave} className={btnBlue + (!canSave ? ' opacity-50 cursor-not-allowed' : '')}>{busy ? 'Saving...' : 'Save count'}</button>
-                    {!kept && hasTyped && !busy && (!clearAsk ? <button type="button" data-cnt-clear2 onClick={function () { setClearAsk(true); }} className="text-sm underline font-bold text-[#00468B]">Clear typed counts</button>
-                        : <span className="text-sm">Clear every typed count? <button type="button" data-cnt-clear-yes2 onClick={clearTyped} className="underline font-bold">Yes, clear</button> <button type="button" onClick={function () { setClearAsk(false); }} className="ml-2 underline">Keep them</button></span>)}
+                    {!kept && hasTyped && !busy && (!clearAsk ? <button type="button" data-cnt-clear2 onClick={function () { setClearAsk(true); }} className="min-h-[44px] px-2 text-sm underline font-bold text-[#00468B]">Clear typed counts</button>
+                        : <span className="text-sm">Clear every typed count? <button type="button" data-cnt-clear-yes2 onClick={clearTyped} className="min-h-[44px] px-2 underline font-bold">Yes, clear</button> <button type="button" onClick={function () { setClearAsk(false); }} className="ml-2 min-h-[44px] px-2 underline">Keep them</button></span>)}
                     <span role="status" aria-live="polite" className="text-sm text-[#00468B] font-bold" data-cnt-msg>{msg}</span>
                 </div>
                 {err && <p role="alert" className="mt-3 flex items-start gap-2 rounded-lg border border-[#E4002B] bg-[#FDE8EC] px-3 py-2 text-sm text-[#7A0018]" data-cnt-err><WarnIcon className="w-4 h-4 mt-0.5 flex-shrink-0" />{err}</p>}
